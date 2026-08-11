@@ -185,6 +185,15 @@ impl Stage {
     /// reason `Vk::buffer` derives its allocate flag from the usage: a caller
     /// who lists four usage bits and forgets the fifth gets a clean
     /// `vkCreateBuffer` and a validation error at copy time.
+    ///
+    /// `TRANSFER_SRC` rides along for a different reason — every staged stream
+    /// is READABLE BACK. That is what an audit against the CPU-side source
+    /// needs (`FR_SPLIT_AUDIT`), and it is deliberately unconditional rather
+    /// than armed with the lever: a diagnostic that only runs against a
+    /// specially-built buffer set is a diagnostic whose subject is not the
+    /// shipping configuration, so it has to be trusted instead of run. The bit
+    /// is free — `TRANSFER_SRC` on a buffer is universally supported and does
+    /// not move the memory requirements.
     pub fn stream_gen<U: Copy>(
         &mut self,
         hg: &VkHeadless,
@@ -196,7 +205,7 @@ impl Stage {
         let esz = std::mem::size_of::<U>();
         let dst = vkd.buffer(
             (esz * n).max(4) as u64,
-            usage | vk::BufferUsageFlags::TRANSFER_DST,
+            usage | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
             false,
         )?;
         if n == 0 {
@@ -276,7 +285,11 @@ impl Stage {
         usage: vk::BufferUsageFlags,
     ) -> Result<Buffer, String> {
         let dst =
-            hg.vk.buffer(size.max(4), usage | vk::BufferUsageFlags::TRANSFER_DST, false)?;
+            hg.vk.buffer(
+                size.max(4),
+                usage | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+                false,
+            )?;
         self.finish(hg, dst, |d, cmd, b| unsafe {
             d.cmd_fill_buffer(cmd, b.buf, 0, vk::WHOLE_SIZE, 0);
         })

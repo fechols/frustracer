@@ -14015,7 +14015,7 @@ fn run_check_vk_render(
         }
         _ => (VK_RENDER_W, VK_RENDER_H),
     };
-    let vs = match vk::scene::VkScene::new(hg, scene) {
+    let vs = match vk::scene::VkScene::new(hg, scene, bvh) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("check-vk: FAIL V6 scene upload: {e}");
@@ -14051,6 +14051,34 @@ fn run_check_vk_render(
         vt.levels,
         vt.bytes as f64 / (1024.0 * 1024.0)
     );
+    println!("check-vk: V6 blas-split: {}", vs.blas_report);
+    // Anti-vacuity, the --check-gpu / --check-dxr twin: an armed lever that
+    // produced ONE chunk has exercised nothing the unarmed run does not —
+    // every hit lands in instance 0 and `chunk_base[0]` is 0, so a wrong
+    // arena offset, a wrong window, or a wrong instance id all still read
+    // right. A scene genuinely under the cap is a note, not a failure, and
+    // `--blas-split N` is how any scene reaches the multi-chunk path.
+    if let Some(cap) = blas_split::max_prims() {
+        if vs.n_chunks < 2 {
+            if scene.tri_count() as u32 > cap {
+                eprintln!(
+                    "check-vk: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
+                     from {} tris — the remap is untested",
+                    vs.n_chunks,
+                    scene.tri_count()
+                );
+                tg.destroy(hg);
+                vt.destroy(hg);
+                vs.destroy(hg);
+                return false;
+            }
+            println!(
+                "check-vk: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                 the remap runs as the identity here (use --blas-split N to split it)",
+                scene.tri_count()
+            );
+        }
+    }
     // What the staging ring actually carried. Reported for the reason the
     // texture line reports bytes rather than a count: a mapped upload and a
     // staged one allocate exactly the same buffers and render exactly the same

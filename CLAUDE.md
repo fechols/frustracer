@@ -5205,7 +5205,7 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
                                       # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9; --sw-rays covered
-                                      # in M3g, staging uploads in M3h).
+                                      # in M3g, staging uploads in M3h, the real --blas-split in M3i).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
@@ -5414,6 +5414,8 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # actually bind" answerable without reading the shaders);
                                       # FR_VK_DROP_BINDING=<set>:<binding> is V5's teeth above;
                                       # FR_VK_DROP_STREAM=<name> and FR_VK_AB_FRAMES=<n> are V6's (below);
+                                      # FR_SPLIT_AUDIT=1 and FR_SPLIT_NOREBASE=1 are M3i's, and are the D3D12
+                                      # levers of the same names rather than new ones;
                                       # FR_VK_AB_DUMP=1 writes the two converged images + the CPU t buffer
                                       # as raw f32 (vk-ab-{cpu,gpu,t}.f32) for spatial attribution — the
                                       # FR_CHECK_AB_DUMP idiom, and what turned "the shading is 11% dark"
@@ -5785,6 +5787,110 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # 929.6 MB through a 64 KB ring is 6735 submits with every number
                                       # IDENTICAL (radiance 0.006%, image 7.47e-9, hemi 0.97%) — the
                                       # chunking proof at a scale no default configuration reaches.
+                                      # M3i — THE REAL --blas-split (2026-08-11), the last of vk/scene.rs's M3b
+                                      # boundaries and the one with a known hazard behind it: one BLAS per maximal BVH
+                                      # subtree under the cap, each instanced identity with InstanceID = the chunk
+                                      # index, built worst-case with ALLOW_COMPACTION and compacted into an exact-size
+                                      # arena. NO SHADER CHANGES AT ALL — `BLAS_SPLIT` was already compiled in (the
+                                      # lever is on by default), `tri_of(inst, prim) = blas_tri[chunk_base[inst] +
+                                      # prim]` was already the intersector's rule on both backends, and the tracer
+                                      # already bound both streams; M3b simply filled them with the single-chunk
+                                      # values. So this is one file, and the planner (`blas_split::plan`), the vertex
+                                      # WINDOWING (`plan_windows` / SPLIT_INDEX_CEILING — the RDNA4 index-value
+                                      # workaround, which ships here rather than staying D3D12-only because it is a
+                                      # property of the geometry desc, and because the defect was found on AMD
+                                      # hardware this backend also runs on) and every structural contract they satisfy
+                                      # are the SHARED pure code `--check` already gates.
+                                      # THE MEASUREMENT IS THE WHOLE POINT, and it reproduces the D3D12 rationale
+                                      # from the other API: BLAS scratch is sized by the LARGEST SINGLE GEOMETRY, so
+                                      # san-miguel-low-poly (5.6M tris) asks **665 MB of transient scratch as one
+                                      # BLAS and 7 MB as 198 chunks** — a 95x cut — while the COMPACTED result is the
+                                      # same size either way (650 vs 648 MB). That is the number the Intel
+                                      # device-removal note predicts (one 34.4M-tri BLAS asked 1891 MB and removed the
+                                      # device); nothing here has been run at that scale, but the shape is confirmed.
+                                      # BOTH ARMS COMPACT, and that is deliberate rather than incidental: the unarmed
+                                      # `--no-blas-split` arm goes through the SAME `build_blas_set`, because with it
+                                      # on a separate uncompacted path its size report would be a worst-case number
+                                      # sitting beside the split's compacted one, and the A/B those two lines invite
+                                      # would read a COMPACTION win as a SPLIT win (measured on the procedural scene
+                                      # before the refactor: 8 MB split vs 12 MB single, of which the entire
+                                      # difference was compaction — both arms read `compacted from 12`).
+                                      # THREE VULKAN SPELLINGS, all of them the same shape as D3D12's: the arena is
+                                      # one buffer with each structure created as a VIEW at a 256-byte-aligned offset
+                                      # (`VkAccelerationStructureCreateInfoKHR::offset`, the same number D3D12 spells
+                                      # `..._BYTE_ALIGNMENT`); the compacted sizes come from a
+                                      # `ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR` query pool
+                                      # (`cmd_write_acceleration_structures_properties` after the builds, read with
+                                      # `TYPE_64 | WAIT`) rather than D3D12's postbuild-info buffer; and builds run
+                                      # SERIALLY through one shared scratch with an AS_WRITE -> AS_READ|WRITE barrier
+                                      # between them, which IS the serialization the sharing requires and not an
+                                      # optimization to remove. ONE DELIBERATE ABSENCE: no VRAM pre-flight. That check
+                                      # exists on D3D12 because WDDM silently DEMOTES an over-budget commit to system
+                                      # memory and renders at a tenth the speed; here `vkAllocateMemory` returns
+                                      # OUT_OF_DEVICE_MEMORY and `Vk::buffer` makes it a loud failure, so the
+                                      # quiet-wrong outcome the pre-flight guards against does not exist
+                                      # (VK_EXT_memory_budget is the instrument if a predictive one is ever wanted).
+                                      # STILL NOT DONE, both because their consumer does not exist here:
+                                      # `--dxr-sbt`'s `refine_by_class` (the class index means something only to a
+                                      # ray-tracing PIPELINE's SBT, and this backend has RayQuery and nothing else)
+                                      # and `--foliage-sway`'s animated TLAS ring (D3D12's STATIC TLAS holds every
+                                      # chunk at identity, which is the rest pose every headless gate traces, so this
+                                      # builds exactly that and never calls `foliage::split_plan` — the two backends'
+                                      # PARTITIONS therefore differ chunk for chunk on a swaying scene and their
+                                      # IMAGES do not, because `tri_of` follows whatever partition it was handed).
+                                      # THE COVERAGE LEVER ALREADY EXISTED, which is the one place this was easier
+                                      # than M3h: `--blas-split N` is a CLI flag, so any scene reaches the multi-chunk
+                                      # path (procedural 80k tris reads 2 chunks at the 64k default, 230 at 512, 1811
+                                      # at 64). V6 gains the `--check-gpu`/`--check-dxr` anti-vacuity twin — an armed
+                                      # cap that produced ONE chunk on an OVER-cap scene FAILS (every hit lands in
+                                      # instance 0 and `chunk_base[0]` is 0, so a wrong arena offset, a wrong window
+                                      # and a wrong instance id all still read right), while an under-cap scene is a
+                                      # NOTE — plus a `V6 blas-split:` line carrying chunks, prims min/mean/max, and
+                                      # the compacted/uncompacted/scratch sizes.
+                                      # FR_SPLIT_AUDIT=1 IS PORTED (the bistro-dusk shard hunt's instrument): read
+                                      # blas_tri, chunk_base and the reordered index stream straight back and memcmp
+                                      # against the CPU plan, so "the GPU sees wrong remap DATA" is answerable without
+                                      # touching a shader — on both backends, because the question is about the
+                                      # STREAM and the two backends stream differently. It cost one bit in
+                                      # `vk::stage`: every staged buffer now carries TRANSFER_SRC, UNCONDITIONALLY
+                                      # rather than under the lever, because a diagnostic that only runs against a
+                                      # specially-built buffer set has a subject that is not the shipping
+                                      # configuration. Found by running it — the validation layer named the missing
+                                      # usage bit exactly, the `--gpu-debug` lesson yet again.
+                                      # MEASURED (RADV, 800x600, 18 arms, 0 failures): chunks at the 64k default read
+                                      # procedural 2, --stress 200 3, Sponza 10, vokselia 52, rungholt 161, smlp 198,
+                                      # the helmet 1 (under cap — the NOTE); compaction is 850 -> 648 MB on smlp,
+                                      # 1014 -> 674 on rungholt, 283 -> 185 on vokselia. EVERY SCENE'S RADIANCE A/B
+                                      # IS UNMOVED TO THE DIGIT from the pre-split recording (0.045 / 0.008 / 0.020 /
+                                      # 0.007 / 0.007 / 0.022 / 0.006%), and unmoved ACROSS caps (smlp reads 0.006%
+                                      # at 65536, at 4096, and at --no-blas-split). Both FR_VK_RES parities,
+                                      # --sw-rays, --no-ftree, --no-wide-levels and llvmpipe all pass; llvmpipe
+                                      # additionally EXERCISES the degenerate-compaction branch for free (it reports
+                                      # no size reduction, so every chunk takes the CLONE arm — `compacted from 7` at
+                                      # 7 MB).
+                                      # ONE REAL EFFECT, and it attributes cleanly: the split perturbs V7's same-seed
+                                      # image ONLY on CANDIDATE-LOOP scenes. vokselia at 52 chunks reads EXACT 0.00e0
+                                      # with 0 hot channels, and so do the helmet and the procedural scene at every
+                                      # cap — an opaque scene has no candidate loop, so re-partitioning changes
+                                      # nothing at all. The cutout/tint scenes move a handful of channels and the
+                                      # count grows with the chunk count: smlp 7.47e-9 / 0 hot at --no-blas-split ->
+                                      # 2.76e-8 / 2 hot at 198 chunks -> 6.32e-8 / 4 hot at 2053; rungholt 3.25e-9 / 0
+                                      # -> 5.99e-8 / 3. That is the DOCUMENTED two-intersector class with a second
+                                      # source added: an alpha/tint candidate loop's enumeration order depends on the
+                                      # acceleration structure's partition exactly as it already depended on TMin, so
+                                      # a triangle at a chunk boundary can be surfaced in a different order. It is why
+                                      # the gate is a bounded hot COUNT rather than an absolute limit (4 channels of
+                                      # 1.44M), and why M3c's recorded 7.47e-9/3.25e-9 are now the --no-blas-split
+                                      # numbers rather than the default ones.
+                                      # TEETH, three planted and exercised: every instance reporting InstanceID 0 (the
+                                      # M3b bug's exact shape) takes radiance 0.045% -> **17.932%** while the
+                                      # VISIBILITY gate stays perfectly clean at class-mismatch 0 — the reason that
+                                      # bug survived its first run, reproduced deliberately; unaligned arena offsets
+                                      # are named by validation (`offset (20288) must be a multiple of 256`); and
+                                      # rebasing a chunk's indices WITHOUT sliding its vertex window reads 341148 of
+                                      # 341393 hit pixels wrong at radiance 60.520%. A fourth (every chunk pointed at
+                                      # the first chunk's index slice) HUNG the build rather than failing, which is
+                                      # its own answer: garbage vertex ids make absurd AABBs.
                                       # V8 — THE HEMISPHERE BOUNCE TIERS, the last render-path arm the Vulkan
                                       # tracer did not have (M3e, 2026-08-11). The H key's AO and GI: the batched
                                       # hemi wavefront (root -> cell levels -> leaf rays) and the one cs_compose splat
