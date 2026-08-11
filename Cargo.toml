@@ -147,6 +147,20 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_XboxController",
 ] }
 
+# The Vulkan backend's shader toolchain (src/vk/spirv.rs). `libloading` is the
+# cross-platform spelling of the footprint policy every SDK in this tree
+# already follows — dlopen + dlsym at run time, nothing linked, nothing in the
+# import table — and it is the exact Linux twin of gpu/dxc.rs's
+# LoadLibraryExW + GetProcAddress. It costs no new download: it is already in
+# Cargo.lock via sdl3's Linux graph (dlib/glutin/clang-sys).
+#
+# unix-only because the module is, and the module is only because of ONE
+# platform fact: DXC's WinAdapter typedefs LPCWSTR as `const wchar_t*`, which
+# is 4 bytes here and 2 on Windows. Vulkan-on-Windows needs that cfg and the
+# library name flipped, nothing else — see the header in vk/spirv.rs.
+[target.'cfg(unix)'.dependencies]
+libloading = "0.8"
+
 [build-dependencies]
 cc = "1"
 

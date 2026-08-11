@@ -4287,6 +4287,101 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # target; re-probe when an RDNA4 discrete card returns.
 cargo run --release -- --check-dxr    # DXR pipeline gate suite (needs a real RT GPU + the DXC DLLs;
                                       # composes with --stress; exit 2 = environment, 1 = a gate failed)
+cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, gated (unix; src/vk/spirv.rs
+                                      # + run_check_spirv in main.rs, 2026-08-10 — the Vulkan port's M2a).
+                                      # Assembles the SHIPPING corpus through gfx::shaders — the same
+                                      # functions a session calls, which is what M1 moving the assembly
+                                      # into the shared core BOUGHT — and compiles every unit to SPIR-V,
+                                      # then spirv-val's each module. NOT a spike transcription: a
+                                      # hand-mirrored concat would be gating itself.
+                                      # S0 pure (the binding scheme + blob checks; runs with no compiler
+                                      # on disk) | S1 loads libdxcompiler.so | S2 assembles+compiles |
+                                      # S3 validates. S2 and S3 answer DIFFERENT questions and neither
+                                      # substitutes: DXC will happily emit a module no driver accepts,
+                                      # and spirv-val validates a MODULE, so it can say nothing about two
+                                      # registers landing on one binding (S0's injectivity sweep is that
+                                      # guard). MEASURED: 46 units -> 77 modules, 77 validated, 0 failed
+                                      # — all four --dxr-inline libraries (mode 0's lib_6_3 all-TraceRay
+                                      # build included) plus --dxr-sbt 3's recursive arm, the wavefront
+                                      # ladder, FRD's kernels, the FSR composite, quin, and the display
+                                      # stage — with ZERO edits to any .hlsl. The corpus is one body of
+                                      # source with two code generators; it is not "D3D12 shaders we
+                                      # will have to port".
+                                      # THE FLAG SET, each entry load-bearing (vk::spirv::spirv_args):
+                                      # -spirv; -fspv-target-env=vulkan1.3 (DXC's SPIR-V DEFAULT is
+                                      # vulkan1.0, which cannot express what these kernels use — wave
+                                      # intrinsics need SPIR-V 1.3 subgroup ops and RayQuery needs
+                                      # SPV_KHR_ray_query); -fvk-use-dx-layout (what lets ONE Rust
+                                      # packer serve both backends — gfx::frame::FrameCb's 4608 bytes
+                                      # stay byte-compatible instead of needing a std140 twin; the price
+                                      # is scalarBlockLayout, core in Vulkan 1.2, which the device probe
+                                      # must REQUIRE not prefer); -fvk-{b,t,u,s}-shift N all; -HV 2021
+                                      # and -O3 identical to the DXIL side (differing optimization
+                                      # levels would make the two backends different shaders).
+                                      # REGISTERS -> DESCRIPTORS: space becomes the SET, register number
+                                      # becomes the binding shifted by TYPE so b0/t0/u0/s0 — all of
+                                      # which exist here — cannot collide (b +0, t +1000, u +2000,
+                                      # s +3000; largest register in the corpus is u32, so three orders
+                                      # of headroom). vk::spirv::binding_of IS that rule and the DXC
+                                      # flags are GENERATED from the same constants, so the compiler and
+                                      # the descriptor-set layouts cannot disagree — never hardcode a
+                                      # binding. Verified in the emitted SPIR-V, not assumed: accum
+                                      # (u0 space0) -> set 0 binding 2000, uv_buf (t0 space1) -> set 1
+                                      # binding 1000, samp_lin (s0 space1) -> set 1 binding 3000.
+                                      # GATE TEETH, all exercised: a planted undeclared identifier in
+                                      # smoke.hlsl fails 3 modules and exits 1; a unit yielding no
+                                      # [numthreads] entry FAILS rather than silently compiling nothing;
+                                      # a corpus that assembled zero units FAILS; and the vendor arms
+                                      # must assemble DIFFERENTLY or the run says so — the source-dedupe
+                                      # that keeps the module count honest is also the one thing that
+                                      # could silently HALVE reach (if cand_defs stopped distinguishing
+                                      # them, the AMD CAND_TMIN0 arm would collapse into the NVIDIA one
+                                      # and the run would still say PASSED).
+                                      # ENTRY POINTS ARE SCANNED OUT OF THE ASSEMBLED SOURCE, never
+                                      # listed: a hardcoded table goes stale the first time a kernel
+                                      # gains an entry, and silently — the gate would pass having
+                                      # compiled less. Scanning [numthreads] cannot, and it over-covers.
+                                      # SCENE-KEYED like every other suite (--check-spirv
+                                      # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
+                                      # the procedural scene cannot reach) — and the summary reports
+                                      # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
+                                      # two scenes apart: both give 46/77. Measured 7255601 B procedural
+                                      # vs 7256745 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # it EXACTLY to the procedural count — the three-way proof the
+                                      # keying reaches. (A first draft printed 2-decimal MB and read
+                                      # identical across all three: an instrument at the wrong
+                                      # RESOLUTION cannot see the effect it was built for — the v1.5.3
+                                      # lab lesson, in a different currency.) FR_SPIRV_LIST=1 names
+                                      # every unit, which is how "what did this run really cover" gets
+                                      # answered; the dedupe is visible there too (dxr-resolve and
+                                      # dxr-sky collapse into the wavefront's — evidence the sources
+                                      # really are shared, not merely claimed to be).
+                                      # WHAT ONE PROCESS CANNOT VARY: the OnceLock levers (--sw-rays,
+                                      # --no-ftree, --heightfield, the FR_* family) — re-run the gate
+                                      # under them, the rule tools/dump-hlsl.ps1 states for the same
+                                      # reason. DELIBERATELY ABSENT: nppd.hlsl (its stage is ONNX
+                                      # Runtime + the DirectML EP, which has no Vulkan execution
+                                      # provider — out of the port's scope by decision) and
+                                      # workgraph.hlsl (VK_AMDX_shader_enqueue is a vendor provisional,
+                                      # and the file is a default-off lever measured as a wash).
+                                      # Nothing else in src/shaders/ is skipped.
+                                      # SDKs: SDKs/dxc-linux (install-prerequisites.sh dxc — which
+                                      # fetches the Linux tarball and the Windows zip from the SAME
+                                      # release tag, so the compiler emitting DXIL and the one emitting
+                                      # SPIR-V cannot drift to different HLSL front ends) + SDKs/
+                                      # spirv-tools (install-prerequisites.sh spirv). Either missing =
+                                      # loud SKIP + exit 0, the bare-checkout degrade; the path lever is
+                                      # FRUSTRACER_DXC_SPIRV_PATH and NOT FRUSTRACER_DXC_PATH, which
+                                      # names the Windows drop (two artifacts, two directories — one
+                                      # path variable cannot name both). Nothing links the compiler:
+                                      # libdxcompiler.so is dlopen'd and DxcCreateInstance resolved by
+                                      # symbol, the LoadLibraryExW+GetProcAddress policy spelled
+                                      # portably, so every other --check* stays DLL-free.
+                                      # unix-only for ONE reason: DXC's WinAdapter typedefs LPCWSTR as
+                                      # `const wchar_t*`, 4 bytes here against Windows' 2, so the
+                                      # argument array is UTF-32. Vulkan-on-Windows needs that cfg, the
+                                      # library name, and the module/dep cfg lifted — nothing else; the
+                                      # vtables, CLSIDs, flags and binding scheme are already neutral
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)
 cargo run --release -- --prefer-intel # pick that vendor's adapter for the D3D12 device (also
                                       # --prefer-nvidia / --prefer-amd; default NVIDIA, or AMD under

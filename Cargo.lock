@@ -1278,6 +1278,7 @@ dependencies = [
  "image",
  "intel_tex_2",
  "lewton",
+ "libloading",
  "raw-window-handle",
  "rayon",
  "rustfft",
