@@ -30,6 +30,7 @@ use crate::vk::layout::{self, Layouts};
 use crate::vk::reflect::{DescKind, Map};
 use crate::vk::scene::VkScene;
 use crate::vk::spirv::{binding_of, Reg, Spirv};
+use crate::vk::textures::VkTextures;
 
 /// One GPU image, plus what it takes to bind and read it.
 struct Image {
@@ -76,6 +77,7 @@ impl VkTracer {
         sp: &Spirv,
         scene: &Scene,
         vs: &VkScene,
+        vt: &VkTextures,
         rw: u32,
         rh: u32,
     ) -> Result<VkTracer, String> {
@@ -122,6 +124,16 @@ impl VkTracer {
         // of the modules a session compiled. A textureless scene still needs a
         // count of at least 1 — a zero-length binding is illegal.
         let tex_cap = (scene.textures.len() as u32).max(1);
+        // Said here rather than left to `vkCreateDescriptorSetLayout`: a scene
+        // with more textures than the device can bind per stage is a fact
+        // about the pair, and the error should name both numbers.
+        if tex_cap > vkd.info.max_sampled_images {
+            return Err(format!(
+                "{} scene texture(s) exceeds this device's maxPerStageDescriptorSampledImages \
+                 ({})",
+                tex_cap, vkd.info.max_sampled_images
+            ));
+        }
         let layouts = Layouts::build(vkd, &map, tex_cap, None)?;
 
         let mut pipes = [vk::Pipeline::null(); 4];
@@ -180,8 +192,21 @@ impl VkTracer {
             unsafe { d.create_sampler(&ci, None) }
                 .map_err(|e| format!("vkCreateSampler: {e}"))
         };
+        // TWO samplers, and the split is `trace_common.hlsli`'s: `samp_lin` is
+        // trilinear and takes an explicit ray-cone lod through `SampleLevel`,
+        // `samp_aniso` is hardware anisotropic and is fed the elliptical
+        // footprint through `SampleGrad`. `--aniso 1` (or a device without the
+        // feature) makes the second a copy of the first, which is the
+        // isotropic path VERBATIM — the bit-identical off arm, by
+        // construction rather than by gate.
+        let want = crate::texture::max_aniso();
+        let aniso = if vkd.info.sampler_anisotropy {
+            want.min(vkd.info.max_anisotropy).max(1.0)
+        } else {
+            1.0
+        };
         let samp_lin = samp(1.0)?;
-        let samp_aniso = samp(1.0)?;
+        let samp_aniso = samp(aniso)?;
 
         // The pool is sized FROM THE MAP, like everything else here.
         let mut counts: std::collections::BTreeMap<vk::DescriptorType, u32> = Default::default();
@@ -235,7 +260,7 @@ impl VkTracer {
             cloud_shadow_n: srcs.cloud_shadow_n,
             map,
         };
-        t.write_descriptors(hg, vs);
+        t.write_descriptors(hg, vs, vt);
         Ok(t)
     }
 
@@ -249,7 +274,7 @@ impl VkTracer {
     /// cannot be stood in for by a buffer, so the feed targets (which the
     /// reference and resolve units do not declare at all) stay unwritten and
     /// ride the flag.
-    fn write_descriptors(&self, hg: &VkHeadless, vs: &VkScene) {
+    fn write_descriptors(&self, hg: &VkHeadless, vs: &VkScene, vt: &VkTextures) {
         let d = &hg.vk.device;
         let b = |buf: &Buffer| [vk::DescriptorBufferInfo::default().buffer(buf.buf).range(vk::WHOLE_SIZE)];
 
@@ -376,6 +401,65 @@ impl VkTracer {
             }
         }
         unsafe { d.update_descriptor_sets(&writes, &[]) };
+
+        // `FR_VK_DROP_STREAM=texs` is the whole-run lever; `bind_textures` is
+        // also what V6's own anti-vacuity probe calls, so the two share one
+        // write path and cannot disagree about what "dropped" means.
+        self.bind_textures(hg, vt, drop.as_deref() == Some("texs"));
+    }
+
+    /// Write (or rewrite) the `texs[]` array.
+    ///
+    /// Found by KIND, not by register: it is the corpus's one unbounded
+    /// sampled-image array (`Texture2D<float4> texs[]`), and V5's own
+    /// anti-vacuity already asserts exactly one exists — so this needs no
+    /// `TEX_TABLE_BUFS` literal, which is just as well, since that const lives
+    /// in the Windows-only `gpu/trace.rs` and a second copy of it here would
+    /// be the transcription M3a exists to avoid.
+    ///
+    /// `fallback = true` points every entry at the 1x1 WHITE image. That is a
+    /// strong perturbation on purpose — albedo goes white everywhere AND alpha
+    /// goes opaque, so a cutout scene loses its masks too, i.e. it perturbs
+    /// visibility as well as radiance.
+    ///
+    /// Rebinding mid-session is legal here because `VkHeadless::run` fences
+    /// every submit, so nothing is ever pending against these sets.
+    pub fn bind_textures(&self, hg: &VkHeadless, vt: &VkTextures, fallback: bool) {
+        let Some((set, binding)) = self
+            .map
+            .entries
+            .iter()
+            .find(|(_, e)| matches!(e.kind, DescKind::SampledImage) && e.count == 0)
+            .map(|(&k, _)| k)
+        else {
+            return;
+        };
+        let n = vt.texs.len().max(1);
+        let infos: Vec<vk::DescriptorImageInfo> = (0..n)
+            .map(|i| {
+                let t = if fallback || vt.texs.is_empty() { &vt.fallback } else { &vt.texs[i] };
+                vk::DescriptorImageInfo::default()
+                    .image_view(t.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            })
+            .collect();
+        if std::env::var_os("FR_VK_MAP").is_some() {
+            eprintln!(
+                "check-vk:   bind set {set} binding {binding} <- {n} sampled image(s){}",
+                if fallback { " [the 1x1 fallback]" } else { "" }
+            );
+        }
+        unsafe {
+            hg.vk.device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(self.sets[set as usize])
+                    .dst_binding(binding)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&infos)],
+                &[],
+            )
+        };
     }
 
     /// One frame: the two cache fills, the reference dispatch, then resolve.
@@ -444,6 +528,24 @@ impl VkTracer {
                 &[ib],
             );
 
+            // Counters are PER FRAME. On D3D12 `cs_seed` zeroes them at the top
+            // of the ladder; the reference kernel has no seed, so the fill is
+            // explicit — and it must exist at all, because device-local memory
+            // starts undefined and a "> 0" must-fire reading uninitialized
+            // bytes is a must-fire that passes for free.
+            d.cmd_fill_buffer(cmd, self.counters.buf, 0, vk::WHOLE_SIZE, 0);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)],
+                &[],
+                &[],
+            );
+
             if csn > 0 {
                 d.cmd_bind_pipeline(
                     cmd,
@@ -469,6 +571,15 @@ impl VkTracer {
     /// The resolved RGBA16F image, decoded to f32 RGB — the `read_hdr_output`
     /// peer, and the only thing in this file that proves the storage image was
     /// ever written.
+    /// The frame's counter block. Zeroed at the top of every `render`, so this
+    /// describes the LAST frame rather than the run — which is what a
+    /// "the path fired" must-fire wants.
+    pub fn read_counters(&self, hg: &VkHeadless) -> Result<Vec<u32>, String> {
+        let n = gs::CTR_TOTAL as usize;
+        let b = hg.read_buffer(&self.counters, n * 4)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
     pub fn read_hdr(&self, hg: &VkHeadless) -> Result<Vec<f32>, String> {
         let vkd = &hg.vk;
         let n = (self.rw as u64) * (self.rh as u64) * 8;

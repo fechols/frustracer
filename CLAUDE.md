@@ -4927,20 +4927,73 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # bisection started.
                                       # TEETH: FR_VK_DROP_STREAM=<name> binds one named stream to the zero
                                       # dummy (a layout DERIVED from the shaders cannot be tested by
-                                      # writing a wrong one). MEASURED: blas_tri, tri_mat, materials and
-                                      # indices each FAIL the stage; positions and normals do NOT, and
-                                      # that is a fact about the shading path rather than a weak gate —
+                                      # writing a wrong one). MEASURED, and THE TWO SCENES DISAGREE —
+                                      # which is why both are worth running. Procedural: blas_tri,
+                                      # tri_mat, materials, indices each FAIL. san-miguel-low-poly:
+                                      # materials 84.749% | texs 6.014% | tri_mat 1.614% + 653 moved |
+                                      # blas_tri 1.080% + 0 moved | indices 0.485% pass | positions
+                                      # 0.129% pass | normals 0.022% pass. positions/normals passing is
+                                      # a fact about the shading path rather than a weak gate —
                                       # surface_point takes the hit point from ro + rd*t, reads positions
-                                      # only for a degenerate-normal fallback and the texture-LOD term
-                                      # (dead on an untextured scene), and falls back to the face normal
-                                      # when the interpolated one is zero.
-                                      # WHAT V6 SKIPS, LOUDLY: a device with no ray query, and any scene
-                                      # with TEXTURES — VkScene writes no image descriptors, so texs[]
-                                      # would be indexed unbound, which under descriptorBindingPartiallyBound
-                                      # is undefined rather than zero. Running anyway would produce a
-                                      # number nobody could defend either way. That skip is the M3b
-                                      # boundary: images (with their sampler/format/mip machinery) are
-                                      # their own slice, as are staging uploads and the real --blas-split.
+                                      # only for a degenerate-normal fallback and the texture-LOD term,
+                                      # and falls back to the face normal when the interpolated one is
+                                      # zero; textures NARROWED it (positions went ~0 -> 0.129% once the
+                                      # LOD term stopped being dead) without crossing the bar.
+                                      # TEXTURES (M3d, 2026-08-11) — src/vk/textures.rs: one VkImage per
+                                      # Scene::textures entry, full mip chain, _SRGB vs _UNORM by the
+                                      # texture's own role flag (SceneGpu::new_uploaded's contract in the
+                                      # other API; texture.rs still owns the texels, the chain, the slope/
+                                      # variance arms and the sRGB role). Uploads batch through one
+                                      # reusable host-visible staging buffer — one submit per ~64 MB of
+                                      # whole chains, not one per (texture, mip), since 313 textures is
+                                      # ~3000 subresources and a fence each would dominate the load.
+                                      # texs[] is written by KIND, not by register: it is the corpus's one
+                                      # unbounded sampled-image array, which V5's own anti-vacuity already
+                                      # asserts exists — so no TEX_TABLE_BUFS literal, which matters
+                                      # because that const lives in the Windows-only gpu/trace.rs and a
+                                      # second copy here would be exactly the transcription M3a exists to
+                                      # avoid. samplerAnisotropy is the one CORE feature the backend
+                                      # enables, ENABLED-WHEN-PRESENT: a device without it runs --aniso 1,
+                                      # which is the isotropic ray-cone lod path VERBATIM.
+                                      # BC7 IS DEFERRED, NOT DIVERGED: every texture uploads RGBA8 (the
+                                      # --no-bc7 arm), which is a MEMORY question and moves the CPU-vs-GPU
+                                      # comparison in the SAFE direction — the CPU samplers keep exact
+                                      # RGBA8 either way, so an uncompressed upload is strictly closer to
+                                      # the reference than the shipping D3D12 default. It inherits
+                                      # bc7::should_compress verbatim when it lands, including the
+                                      # carve-out that alpha-masked and height-carrying textures never
+                                      # compress (a VISIBILITY contract).
+                                      # THE ANTI-VACUITY PROBE, and it earns its keep immediately: every
+                                      # metric above passes identically whether 313 images reached the
+                                      # shader or were uploaded and never read, so V6 re-renders the SAME
+                                      # pose with texs[] flattened to 1x1 white and requires the two GPU
+                                      # images to DIFFER (GPU-vs-GPU, one descriptor write apart — the N8
+                                      # shape). THE COUNT IS THE TEST AND THE MEAN IS ONLY REPORTED,
+                                      # because a signed mean CANCELS: Sponza moves 29.6% of its channels
+                                      # for a 0.26% mean, which a mean-based bar would have read as
+                                      # "textures barely matter". And the probe is STRICTLY STRONGER than
+                                      # the radiance bar on a textured scene: FR_VK_DROP_STREAM=blas_tri
+                                      # is M3b's own bug (every hit resolves to triangle 0) and on
+                                      # san-miguel it reads 1.080%, i.e. it PASSES the bar the stage
+                                      # shipped with — only the probe's 0-channels-moved catches it.
+                                      # COUNTERS are read back and REPORTED, never asserted: rt.hlsli's
+                                      # count_alpha_rej/count_height_rej and the tinted-shadow tally are
+                                      # all #ifdef HAVE_COUNTERS, which ctr.hlsli defines for the
+                                      # WAVEFRONT kernels and deliberately not for the reference kernel,
+                                      # so a "> 0" must-fire here would assert against an instrument that
+                                      # structurally cannot reach its target (the confidently-wrong class,
+                                      # caught by writing the must-fire and watching it read 0 on a scene
+                                      # famous for its foliage). It becomes a real must-fire in M3c; the
+                                      # readback and the per-frame vkCmdFillBuffer zero exist now so that
+                                      # gate inherits a working instrument.
+                                      # MEASURED (RADV, 400x300, 16 frames): san-miguel-low-poly 5.6M tris
+                                      # / 313 textures / 2973 subresources / 511.5 MB -> 0.007% with
+                                      # class-mismatch 0; DamagedHelmet 0.081%, Sponza.gltf 0.008%,
+                                      # vokselia 0.015%, rungholt + stress + procedural all green; the
+                                      # helmet re-run on llvmpipe reads 0.129%.
+                                      # WHAT V6 STILL SKIPS, LOUDLY: a device with no ray query. The
+                                      # remaining M3b/M3d boundaries are staging uploads, the real
+                                      # --blas-split, and BC7.
                                       # THE CLOUD CACHES ARE BUILT AND DISPATCHED HERE, not levered off:
                                       # cs_reference reads the amortized sky lattice (--sky-lod, default 4)
                                       # and the slab-space cloud-shadow cache (--cloud-shadow, default 16)
@@ -4995,10 +5048,12 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # (ALPHA_CUTOUT/HEIGHTFIELD/TRANS_SHADOW) — which is why the slot
                                       # count moves with the scene (46 procedural, 49 on
                                       # san-miguel-low-poly) and why `--check-vk san-miguel-low-poly.obj`
-                                      # covers bindings the procedural run cannot reach. NOTE the two
-                                      # stages want opposite scenes and both are worth running: V5 wants
-                                      # a TEXTURED one for coverage, V6 skips exactly those until images
-                                      # land. `ash` is the one new dependency — a generated binding, not
+                                      # covers bindings the procedural run cannot reach. SINCE M3d BOTH
+                                      # STAGES WANT THE SAME SCENE — a textured one — where before V5
+                                      # wanted coverage and V6 skipped exactly those; run the pair on
+                                      # san-miguel AND on the procedural default, since the teeth table
+                                      # above shows they catch different drops.
+                                      # `ash` is the one new dependency — a generated binding, not
                                       # a framework (no allocator, no render graph, no policy), and its
                                       # default `loaded` feature dlopens libvulkan.so.1 and resolves every
                                       # entry point by symbol: the same footprint policy as dxc/oidn/xess/

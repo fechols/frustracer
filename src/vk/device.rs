@@ -235,6 +235,12 @@ pub struct DeviceInfo {
     /// table's layout entry, since SPIR-V gives an unbounded array no length
     /// and Vulkan demands one.
     pub max_sampled_images: u32,
+    /// `samplerAnisotropy` and `maxSamplerAnisotropy`. ENABLED WHEN PRESENT,
+    /// never required: a device without it renders the `--aniso 1` arm, which
+    /// is the isotropic ray-cone lod path VERBATIM and therefore a supported
+    /// shipping configuration rather than a degradation invented here.
+    pub sampler_anisotropy: bool,
+    pub max_anisotropy: f32,
 }
 
 impl DeviceInfo {
@@ -542,9 +548,18 @@ impl Vk {
             f12 = f12.buffer_device_address(true);
         }
 
+        // Anisotropic filtering, the one CORE feature this backend enables.
+        // `--aniso 16` is the default, and on D3D12 the anisotropic arm is a
+        // static sampler fed the elliptical footprint through `SampleGrad`;
+        // the same sampler here needs the feature turned on explicitly, and a
+        // device without it simply runs the isotropic arm.
+        let core = vk::PhysicalDeviceFeatures::default()
+            .sampler_anisotropy(info.sampler_anisotropy);
+
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&exts)
+            .enabled_features(&core)
             .push_next(&mut f12)
             .push_next(&mut f13);
         if rt {
@@ -579,6 +594,10 @@ impl Vk {
         let mut feats2 =
             vk::PhysicalDeviceFeatures2::default().push_next(&mut f12).push_next(&mut f13);
         unsafe { instance.get_physical_device_features2(p, &mut feats2) };
+        // Copied out because `feats2` holds `&mut f12`/`&mut f13`: reading it
+        // inside the initializer below would keep that borrow alive across the
+        // f12/f13 field reads in the same expression.
+        let core_feats = feats2.features;
 
         let exts = unsafe { instance.enumerate_device_extension_properties(p) }.unwrap_or_default();
         let has_ext = |n: &CStr| exts.iter().any(|e| cstr(&e.extension_name) == n.to_string_lossy());
@@ -622,6 +641,8 @@ impl Vk {
                 == vk::TRUE,
             partially_bound: f12.descriptor_binding_partially_bound == vk::TRUE,
             max_sampled_images: props.limits.max_per_stage_descriptor_sampled_images,
+            sampler_anisotropy: core_feats.sampler_anisotropy != 0,
+            max_anisotropy: props.limits.max_sampler_anisotropy,
         };
 
         // Hard requirements, each traceable to a decision already made.

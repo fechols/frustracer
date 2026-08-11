@@ -12321,19 +12321,6 @@ fn run_check_vk_render(
         println!("check-vk: SKIP V6 (no ray query on this device — the shipping tracer needs it)");
         return true;
     }
-    // SAID, NOT SILENTLY WRONG. `VkScene` writes no image descriptors, so on a
-    // textured scene `texs[]` is an unbound array the shading path indexes —
-    // and under `descriptorBindingPartiallyBound` that is undefined rather
-    // than zero. A skip names the missing piece; running anyway would produce
-    // a number whose meaning nobody could defend either way.
-    if !scene.textures.is_empty() {
-        println!(
-            "check-vk: SKIP V6 ({} texture(s) — the Vulkan scene has no image uploads yet, so \
-             texs[] would be indexed unbound; run it on an untextured scene)",
-            scene.textures.len()
-        );
-        return true;
-    }
     let (gw, gh) = (VK_RENDER_W, VK_RENDER_H);
     let vs = match vk::scene::VkScene::new(hg, scene) {
         Ok(s) => s,
@@ -12342,17 +12329,34 @@ fn run_check_vk_render(
             return false;
         }
     };
-    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, gw as u32, gh as u32) {
+    let vt = match vk::textures::VkTextures::new(hg, scene) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("check-vk: FAIL V6 tracer init: {e}");
+            eprintln!("check-vk: FAIL V6 texture upload: {e}");
             vs.destroy(hg);
             return false;
         }
     };
+    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, gw as u32, gh as u32) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 tracer init: {e}");
+            vt.destroy(hg);
+            vs.destroy(hg);
+            return false;
+        }
+    };
+    // The texture line reports BYTES and SUBRESOURCES, not just a count: a run
+    // that uploaded the table and one that uploaded a table of stubs have the
+    // same count, and a chain that silently lost its mips has the same
+    // subresource count only if it had none to lose.
     println!(
-        "check-vk: V6 scene uploaded, BLAS/TLAS built ({} tris) — reference tracer at {gw}x{gh}",
-        scene.tri_count()
+        "check-vk: V6 scene uploaded, BLAS/TLAS built ({} tris), {} texture(s) \
+         [{} subresource(s), {:.1} MB, RGBA8 — the --no-bc7 arm] — reference tracer at {gw}x{gh}",
+        scene.tri_count(),
+        scene.textures.len(),
+        vt.levels,
+        vt.bytes as f64 / (1024.0 * 1024.0)
     );
 
     let q = Quality::preset(2);
@@ -12627,17 +12631,143 @@ fn run_check_vk_render(
         Err(e) => fail(&mut ok, format!("hdr readback: {e}")),
     }
 
-    // WHAT THE TEETH REACH, measured rather than claimed. `FR_VK_DROP_STREAM`
-    // binds one named stream to the zero dummy; `blas_tri`, `tri_mat`,
-    // `materials` and `indices` each fail this stage. `positions` and
-    // `normals` do NOT, and that is a fact about the shading path rather than
-    // a weak gate: `surface_point` takes the hit point from `ro + rd*t`, reads
-    // `positions` only for a degenerate-normal fallback and the texture-LOD
-    // term (dead on an untextured scene), and falls back to the face normal
-    // when the interpolated one is zero — so on this scene those two streams
-    // genuinely do not determine the answer. Do not "fix" that by widening a
-    // bar; fix it, if it matters, with a textured scene.
+    // ---- the per-scene shading arms: REPORTED, and why they read zero ----
+    //
+    // `ALPHA_CUTOUT` and `TRANS_SHADOW` compile in per scene — that is why V5's
+    // slot count moves with the scene — and a class-mismatch of 0 on a masked
+    // scene only means something if the cutout actually rejects. THE REFERENCE
+    // KERNEL CANNOT SAY: `rt.hlsli`'s `count_alpha_rej`/`count_height_rej` and
+    // the tinted-shadow tally are all `#ifdef HAVE_COUNTERS`, which
+    // `ctr.hlsli` defines for the WAVEFRONT kernels and deliberately not for
+    // the reference kernel or the DXR library. So this is a REPORT, not a
+    // must-fire: asserting `> 0` here would be asserting against an instrument
+    // that structurally cannot reach its target, which is the confidently-wrong
+    // failure mode this tree keeps re-learning. It becomes a real must-fire in
+    // M3c, where `cs_leaf` binds the slot; the readback and the per-frame zero
+    // fill exist now so that gate inherits a working instrument rather than an
+    // untested one.
+    match tg.read_counters(hg) {
+        Ok(c) => {
+            let g = |i: u32| c.get(i as usize).copied().unwrap_or(0);
+            let nz: u32 = c.iter().copied().sum();
+            println!(
+                "check-vk: V6 counters (last frame, sum {nz}): alpha-cutout rejections {} | \
+                 relief rejections {} | tinted-shadow crossings {} \
+                 — the reference kernel binds no counters (HAVE_COUNTERS is wavefront-only), \
+                 so zeros here are structural",
+                g(gfx::shaders::CTR_ALPHA_REJ),
+                g(gfx::shaders::CTR_HEIGHT_REJ),
+                g(gfx::shaders::CTR_TRANS_PASS),
+            );
+        }
+        Err(e) => fail(&mut ok, format!("counter readback: {e}")),
+    }
+
+    // ---- anti-vacuity: the texture table must MATTER ----
+    //
+    // Everything above passes identically whether the 313 images reached the
+    // shader or were uploaded and never read: a scene's albedo textures move
+    // its converged mean, but so does any other correct-looking shading, and
+    // the CPU side has no say in whether the GPU's `texs[]` was bound. So the
+    // gate re-renders the SAME pose with every entry pointed at the 1x1 white
+    // fallback and requires the two GPU images to DIFFER. GPU-vs-GPU, one
+    // descriptor write apart, so the verdict is attributable — the shape
+    // `--check-gpu`'s N8 uses for the same reason.
+    //
+    // Skipped under `FR_VK_DROP_STREAM=texs` (the arms would be identical
+    // BECAUSE the lever already dropped them, and that run is required to fail
+    // on the radiance bar above) and on a textureless scene, where the fallback
+    // IS what a correct run binds.
+    let tex_lever = std::env::var("FR_VK_DROP_STREAM").ok().as_deref() == Some("texs");
+    if scene.textures.is_empty() {
+        println!(
+            "check-vk: V6 texture anti-vacuity SKIPPED (untextured scene — \
+             the fallback is what a correct run binds)"
+        );
+    } else if tex_lever {
+        println!("check-vk: V6 texture anti-vacuity SKIPPED (FR_VK_DROP_STREAM=texs is armed)");
+    } else {
+        tg.bind_textures(hg, &vt, true);
+        let mut probe_ok = true;
+        for f in 0..frames {
+            if let Err(e) = tg.render(hg, &params(f), f + 1) {
+                fail(&mut ok, format!("texture anti-vacuity frame {f}: {e}"));
+                probe_ok = false;
+                break;
+            }
+        }
+        if probe_ok {
+            let flat = read_f32(&tg.accum, px * 3).unwrap_or_default();
+            let mut s_real = 0.0f64;
+            let mut s_flat = 0.0f64;
+            let mut moved = 0usize;
+            for i in 0..px * 3 {
+                let a = gpu_a.get(i).copied().unwrap_or(0.0);
+                let b = flat.get(i).copied().unwrap_or(0.0);
+                s_real += f64::from(a);
+                s_flat += f64::from(b);
+                if (a - b).abs() > f32::max(a.abs(), b.abs()) * 1e-3 {
+                    moved += 1;
+                }
+            }
+            println!(
+                "check-vk: V6 texture anti-vacuity: {} of {} channel(s) move when \
+                 texs[] is flattened to 1x1 white (mean {:+.2}%)",
+                moved,
+                px * 3,
+                (s_flat - s_real) / s_real.max(1e-9) * 100.0
+            );
+            // THE COUNT IS THE TEST AND THE MEAN IS ONLY REPORTED, because a
+            // SIGNED mean cancels: Sponza moves 29.6% of its channels for a
+            // 0.26% mean, which a mean-based bar would have read as "textures
+            // barely matter" and very nearly failed. Counting channels that
+            // moved answers the question actually being asked — is binding the
+            // table a no-op — and cannot cancel. 0.2% of channels is a tenth of
+            // the loosest real reading here and still catches the failure that
+            // found this: dropping `tri_mat` collapses every triangle onto
+            // material 0, textures stop mattering, and the count falls to 653.
+            if moved * 500 < px * 3 {
+                fail(
+                    &mut ok,
+                    format!(
+                        "flattening texs[] moves only {moved} channel(s) — the table may not be \
+                         reaching the shader (or this pose sees no textured surface)"
+                    ),
+                );
+            }
+        }
+        tg.bind_textures(hg, &vt, false);
+    }
+
+    // WHAT THE TEETH REACH, measured rather than claimed, and the two scenes
+    // do not agree — which is the point of running both. `FR_VK_DROP_STREAM`
+    // binds one named stream to the zero dummy (or, for `texs`, the 1x1 white
+    // fallback); on san-miguel-low-poly:
+    //
+    //   materials  FAIL  84.749%   blas_tri  FAIL  1.080% + 0 moved
+    //   texs       FAIL   6.014%   indices   pass  0.485%
+    //   tri_mat    FAIL   1.614% + 653 moved   positions pass 0.129%
+    //                                          normals   pass 0.022%
+    //
+    // THE ROW THAT JUSTIFIES THE ANTI-VACUITY PROBE IS `blas_tri`, because that
+    // is M3b's own bug: with the remap on the dummy every hit resolves to
+    // triangle 0. On the procedural scene it blows the radiance bar; HERE it
+    // reads 1.080%, i.e. it PASSES the bar the stage was shipped with, and only
+    // the probe (0 channels move when the table is flattened, because one
+    // material means textures cannot matter) catches it. `tri_mat` is the same
+    // shape one step further out. So the probe is not decoration: on a textured
+    // scene it is the strictly stronger of the two.
+    //
+    // `positions` and `normals` still pass, and that remains a fact about the
+    // shading path rather than a weak gate: `surface_point` takes the hit point
+    // from `ro + rd*t`, reads `positions` only for a degenerate-normal fallback
+    // and the texture-LOD term, and falls back to the face normal when the
+    // interpolated one is zero. Textures did narrow it — `positions` moved from
+    // ~0 to 0.129% once the LOD term stopped being dead — just not past the
+    // bar. Do not "fix" that by tightening one; fix it, if it matters, with a
+    // pose that makes those streams determine the answer.
     tg.destroy(hg);
+    vt.destroy(hg);
     vs.destroy(hg);
     ok
 }
