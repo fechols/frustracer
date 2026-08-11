@@ -3986,7 +3986,10 @@ fn write_tex_at(
 
 /// f16 bit pattern -> monotone integer (ulp distances work across the sign,
 /// unlike raw bits).
-#[cfg(windows)]
+///
+/// Portable since B3: `gate_xess_feed` below is now called by `--check-vk`'s
+/// V13 as well as by the two D3D12 suites, and this is its ulp metric.
+#[cfg(any(windows, unix))]
 fn mono16(b: u16) -> i32 {
     if b & 0x8000 != 0 { -((b & 0x7fff) as i32) } else { b as i32 }
 }
@@ -3996,7 +3999,14 @@ fn mono16(b: u16) -> i32 {
 /// under `precise`; sky BIT-EQUAL 0.0 + anti-vacuity), the mvec plane vs the
 /// pack within 1 f16 ulp, the color plane vs the 1-spp accum store within
 /// 1 f16 ulp (alpha a constant 1.0). `tag` prefixes the report lines.
-#[cfg(windows)]
+///
+/// PORTABLE, and its `#[cfg(windows)]` was incidental exactly as
+/// `unpack_gbuf_bytes`' was: every parameter is a plain slice, a
+/// `dlss::GBufs`, or a scalar, and the body names no D3D12 type. `--check-vk`
+/// V13 is the third caller, with its `gb2` oracle built by that same unpacker
+/// out of the Vulkan tracer's pack readback — a Vulkan-local copy of either
+/// would be the transcription hazard the derived layout exists to remove.
+#[cfg(any(windows, unix))]
 #[allow(clippy::too_many_arguments)]
 fn gate_xess_feed(
     tag: &str,
@@ -14296,17 +14306,20 @@ fn run_check_vk_fsr3(
                 &color,
                 &depth,
                 &motion,
-                // The renderer's own sample offset through the ONE constant
-                // that states this convention for both FidelityFX generations.
-                (jit.0 * jsign, jit.1 * jsign),
-                fsr::UPSCALE_MV_SIGN,
-                (near, far),
-                cam0.fov_y,
-                // A fixed clock, not a wall one: the nrd_gpu::NOMINAL_DT_MS
-                // precedent — a deterministic gate must not have a real timer
-                // reaching a vendor library's internal curves.
-                1000.0 / 60.0,
-                reset_every || f == 0,
+                vk::fsr3::Dispatch {
+                    // The renderer's own sample offset through the ONE constant
+                    // that states this convention for both FidelityFX
+                    // generations.
+                    jitter: (jit.0 * jsign, jit.1 * jsign),
+                    mv_scale: fsr::UPSCALE_MV_SIGN,
+                    near_far: (near, far),
+                    fov_y: cam0.fov_y,
+                    // A fixed clock, not a wall one: the nrd_gpu::NOMINAL_DT_MS
+                    // precedent — a deterministic gate must not have a real
+                    // timer reaching a vendor library's internal curves.
+                    dt_ms: 1000.0 / 60.0,
+                    reset: reset_every || f == 0,
+                },
             )?;
             if f == FRAMES - 1 {
                 out = f3.read_output(hg)?;
@@ -14889,20 +14902,32 @@ fn run_check_vk_render(
             return false;
         }
     };
-    // No pack on THIS tracer, deliberately: V12 builds its own at odd dims with
-    // `gbuf_full`, so every number V6/V7/V8/V9 record stays unmoved BY
-    // CONSTRUCTION rather than by care — the `--check-gpu` M7 / `--check-dxr`
-    // T4 shape, which both build a second pipeline for exactly this reason.
-    let tg =
-        match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32, false) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("check-vk: FAIL V6 tracer init: {e}");
-                vt.destroy(hg);
-                vs.destroy(hg);
-                return false;
-            }
-        };
+    // No pack and no feed on THIS tracer, deliberately: V12 builds its own at
+    // odd dims with `gbuf_full` and V13 a third at render res with `feed`, so
+    // every number V6/V7/V8/V9 record stays unmoved BY CONSTRUCTION rather
+    // than by care — the `--check-gpu` M7 / `--check-dxr` T4 shape, which both
+    // build a second pipeline for exactly this reason. It is also what keeps
+    // this tracer's derived map at V5's recorded 46 slots: `feed` would add
+    // three storage images to it.
+    let tg = match vk::tracer::VkTracer::new(
+        hg,
+        sp,
+        scene,
+        &vs,
+        &vt,
+        bvh,
+        gw as u32,
+        gh as u32,
+        vk::tracer::TracerOpts::default(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 tracer init: {e}");
+            vt.destroy(hg);
+            vs.destroy(hg);
+            return false;
+        }
+    };
     // The texture line reports BYTES and SUBRESOURCES, not just a count: a run
     // that uploaded the table and one that uploaded a table of stubs have the
     // same count, and a chain that silently lost its mips has the same
@@ -15410,6 +15435,11 @@ fn run_check_vk_render(
         ok = false;
     }
 
+    // ---- V13: the GPU-fed feed, and FSR3 consuming it ----
+    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural) {
+        ok = false;
+    }
+
     tg.destroy(hg);
     vt.destroy(hg);
     vs.destroy(hg);
@@ -15460,8 +15490,17 @@ fn run_check_vk_gbuf(
     // which vacuates the AO-bearing lanes a later feed gate will want.
     let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
 
-    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, vs, vt, bvh, pw as u32, ph as u32, true)
-    {
+    let tg = match vk::tracer::VkTracer::new(
+        hg,
+        sp,
+        scene,
+        vs,
+        vt,
+        bvh,
+        pw as u32,
+        ph as u32,
+        vk::tracer::TracerOpts { gbuf_full: true, ..Default::default() },
+    ) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("check-vk: FAIL V12 pack tracer init: {e}");
@@ -15623,6 +15662,296 @@ fn run_check_vk_gbuf(
         ok = false;
     }
 
+    tg.destroy(hg);
+    ok
+}
+
+/// V13 — THE GPU-FED FEED: the tracer's own pack and radiance reaching FSR3
+/// through `cs_feed_xess` instead of through three host uploads.
+///
+/// B1 put FSR3 on this backend but CPU-fed, so the Vulkan tracer still fed
+/// nothing; B2 gave it the pack those planes come from. This closes the loop,
+/// and it is the shape every `--gpu`/`--dxr` session on D3D12 has used since
+/// the pack split.
+///
+/// THE COMPARISON IS BETWEEN TWO ROUTES, NOT TWO RENDERERS, and that is what
+/// makes it assertable where V11's quality claim is not. V11 can only REPORT
+/// whether FSR3 beats a bilinear control, because that answer is
+/// scene-dependent (it wins on the procedural scene and loses on san-miguel
+/// with identical wiring). Here BOTH arms consume the SAME frame from the SAME
+/// Vulkan tracer — one through `record_feed`, one through `Fsr3::frame`'s host
+/// upload of the identical readback — so any difference is wiring, and a tight
+/// bar is honest. Scoring a CPU-RENDERED arm against a GPU-rendered one would
+/// not be this test at all: different intersector, different RNG stream, so
+/// the two would differ by the renderer and the feed route would be invisible
+/// inside that.
+///
+/// `gate_xess_feed` is the real gate and the output comparison corroborates
+/// it: the planes are scored against the pack at ulp precision by the EXACT
+/// function `--check-gpu` M8 and `--check-dxr` use, with zero new tolerances
+/// and with B2's now-portable `unpack_gbuf_bytes` supplying the oracle.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_feed(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    vs: &vk::scene::VkScene,
+    vt: &vk::textures::VkTextures,
+    cam0: Camera,
+    structural: bool,
+) -> bool {
+    if !vk::fsr3::built() {
+        println!(
+            "check-vk: SKIP V13 (FidelityFX 1.1.4 source not compiled in — \
+             ./install-prerequisites.sh fsr3src)"
+        );
+        return true;
+    }
+    // V11's ratio and resolutions, so the two stages' numbers sit on one scale.
+    let (ow, oh) = (800usize, 600usize);
+    let (rw, rh) = (ow / 2, oh / 2);
+    const FRAMES: u32 = 8;
+    let (near, far) = dlss::near_far(scene.diag);
+    // `rtgi: false` for V12's reason (M7's): under RTGI `prim.ao` is 0
+    // everywhere, which vacuates lanes a feed gate wants.
+    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+
+    let tg = match vk::tracer::VkTracer::new(
+        hg,
+        sp,
+        scene,
+        vs,
+        vt,
+        bvh,
+        rw as u32,
+        rh as u32,
+        // `feed` implies `gbuf_full`; spelled anyway, because a reader should
+        // not have to know the constructor forces it.
+        vk::tracer::TracerOpts { gbuf_full: true, feed: true },
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V13 feed tracer init: {e}");
+            return false;
+        }
+    };
+
+    // Two FFX contexts, one per route, stepped in lockstep on one frame
+    // sequence. Separate rather than one context run twice because FSR3 is
+    // TEMPORAL: a single context would carry the first route's history into
+    // the second and the comparison would measure the ordering.
+    let mk = || {
+        vk::fsr3::Fsr3::new(
+            hg,
+            (rw as u32, rh as u32),
+            (ow as u32, oh as u32),
+            vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+        )
+    };
+    let (fed, cpu) = match (mk(), mk()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            let e = a.err().or(b.err()).unwrap_or_default();
+            // V11's absent/told split verbatim: llvmpipe declines context
+            // creation outright, which is an environment fact.
+            if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+                println!("check-vk: SKIP V13 on a software device ({e})");
+            } else {
+                eprintln!("check-vk: FAIL V13 fsr3 context: {e}");
+                tg.destroy(hg);
+                return false;
+            }
+            tg.destroy(hg);
+            return true;
+        }
+    };
+
+    // Point the kernel's three output registers at THIS context's input
+    // images. Only the GPU-fed context is wired; the CPU-fed one keeps its
+    // host uploads, which is the whole comparison.
+    tg.wire_feed(hg, fed.feed_views());
+
+    // ANTI-VACUITY, and it has to be a sentinel rather than a zero check.
+    // These three images are written once per frame and read once; a feed that
+    // never dispatched leaves whatever was there before, and after frame 0
+    // that is a plausible-looking previous frame. 0xEE is a value no real
+    // plane produces (as R32F it is ~3.7e-13 in every texel, as f16 pairs a
+    // constant), so a survivor is proof the write never happened — V3's
+    // 0xEEEEEEEE and V9's re-flooded sentinel exist for this reason.
+    const POISON: u8 = 0xee;
+    if let Err(e) = fed.poison_inputs(hg, POISON) {
+        eprintln!("check-vk: FAIL V13 poison: {e}");
+        fed.destroy(hg);
+        cpu.destroy(hg);
+        tg.destroy(hg);
+        return false;
+    }
+
+    let basis = cam0.basis(rw, rh);
+    let mut ok = true;
+
+    let run = (|| -> Result<(), String> {
+        for f in 0..FRAMES {
+            let jit = dlss::jitter_for(f);
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: f,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                // A static camera, so the true motion is exactly zero and the
+                // two routes are compared on identical content — this stage is
+                // about the wire, and V12 is where the motion plane's VALUES
+                // are gated.
+                prev_cam: Some(basis),
+                q,
+                verify: false,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            tg.render_wavefront(hg, &p, true)?;
+
+            // The CPU route's planes, built from the SAME frame the GPU route
+            // is about to read on the device — which is what makes this a
+            // comparison of two routes rather than of two renderers.
+            let acc = hg.read_buffer(&tg.accum, rw * rh * 12)?;
+            let core = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+            let gb = unpack_gbuf_bytes(&core, None, rw, rh);
+            let color: Vec<f32> = (0..rw * rh * 3)
+                .map(|i| f32::from_le_bytes(acc[i * 4..][..4].try_into().unwrap()))
+                .collect();
+            let depth: Vec<f32> = (0..rw * rh)
+                .map(|i| {
+                    xess::view_z_to_clip_depth(
+                        f32::from_bits(gb.depth[i].load(Relaxed)),
+                        near,
+                        far,
+                    )
+                })
+                .collect();
+            let motion: Vec<u16> = (0..rw * rh * 2).map(|i| gb.mvec[i].load(Relaxed)).collect();
+
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: cam0.fov_y,
+                dt_ms: 1000.0 / 60.0,
+                reset: f == 0,
+            };
+            // The GPU route. `record_feed` lands in the SAME command buffer as
+            // the FFX dispatch that consumes its output — D3D12's own
+            // trace -> feed -> upscale on one list.
+            fed.frame_fed(hg, |d, cmd| unsafe { tg.record_feed(d, cmd) }, dp)?;
+            cpu.frame(hg, &color, &depth, &motion, dp)?;
+
+            if f == FRAMES - 1 {
+                let cbytes = fed.read_input(hg, 0)?;
+                let dbytes = fed.read_input(hg, 1)?;
+                let mbytes = fed.read_input(hg, 2)?;
+                let tb = hg.read_buffer(&tg.tbuf, rw * rh * 4)?;
+                let t: Vec<f32> =
+                    tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                // The sentinel check reads the DEPTH plane: R32F, so a
+                // surviving 0xEEEEEEEE word is unambiguous, where an f16 pair
+                // could in principle be a real value.
+                let alive = (0..rw * rh)
+                    .filter(|i| dbytes[i * 4..][..4] == [POISON; 4])
+                    .count();
+                if alive != 0 {
+                    eprintln!(
+                        "check-vk: FAIL V13 {alive} of {} depth texels still hold the 0x{POISON:02x} \
+                         sentinel — the feed did not write them",
+                        rw * rh
+                    );
+                    ok = false;
+                }
+                if !gate_xess_feed(
+                    "check-vk: V13",
+                    rw,
+                    rh,
+                    &dbytes,
+                    &mbytes,
+                    &cbytes,
+                    &acc,
+                    &gb,
+                    &t,
+                    near,
+                    far,
+                    structural,
+                ) {
+                    ok = false;
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V13 {e}");
+        ok = false;
+    }
+
+    // The end-to-end corroboration: same engine, same source frame, two feed
+    // routes. RELATIVE to the image's own magnitude for V6's reason — an
+    // absolute bar is a different bar on every scene.
+    if ok {
+        match (fed.read_output(hg), cpu.read_output(hg)) {
+            (Ok(a), Ok(b)) => {
+                let (mut sd, mut sa) = (0.0f64, 0.0f64);
+                for i in 0..a.len().min(b.len()) {
+                    sd += (a[i] - b[i]).abs() as f64;
+                    sa += a[i].abs() as f64;
+                }
+                let rel = if sa > 0.0 { sd / sa } else { 0.0 };
+                let finite = a.iter().all(|v| v.is_finite());
+                let nonzero = a.iter().filter(|v| **v != 0.0).count();
+                eprintln!(
+                    "check-vk: V13 gpu-fed vs cpu-fed FSR3 {rw}x{rh} -> {ow}x{oh}: \
+                     mean |d| / mean |gpu-fed| {rel:.5} | finite {finite} | non-zero ch {nonzero}"
+                );
+                if !finite {
+                    eprintln!("check-vk: FAIL V13 the GPU-fed frame carries non-finite channels");
+                    ok = false;
+                }
+                if nonzero < a.len() / 2 {
+                    eprintln!(
+                        "check-vk: FAIL V13 only {nonzero} of {} channels are non-zero",
+                        a.len()
+                    );
+                    ok = false;
+                }
+                // 2%, V6's shape and for its reason: the two routes differ
+                // only by where the f16 rounding happened, so a healthy run
+                // sits orders of magnitude under this, while a swapped or
+                // unbound plane moves it by orders of magnitude over.
+                if rel > 0.02 {
+                    eprintln!(
+                        "check-vk: FAIL V13 the two feed routes disagree by {rel:.5} — the \
+                         planes are gated above, so this is the upscaler seeing different inputs"
+                    );
+                    ok = false;
+                }
+            }
+            (a, b) => {
+                eprintln!(
+                    "check-vk: FAIL V13 output readback: {}",
+                    a.err().or(b.err()).unwrap_or_default()
+                );
+                ok = false;
+            }
+        }
+    }
+
+    fed.destroy(hg);
+    cpu.destroy(hg);
     tg.destroy(hg);
     ok
 }

@@ -5506,10 +5506,13 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 47/78. Measured 7679015 B procedural
-                                      # vs 7680159 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 47/78. Measured 7685093 B procedural
+                                      # vs 7686237 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
-                                      # keying reaches. (A first draft printed 2-decimal MB and read
+                                      # keying reaches. (Refreshed 2026-08-11: the ABSOLUTE figures
+                                      # drift with any shader edit, so treat them as a snapshot; the
+                                      # +1144 B DELTA between the two scenes is the load-bearing part
+                                      # and has not moved.) (A first draft printed 2-decimal MB and read
                                       # identical across all three: an instrument at the wrong
                                       # RESOLUTION cannot see the effect it was built for — the v1.5.3
                                       # lab lesson, in a different currency.) FR_SPIRV_LIST=1 names
@@ -6811,6 +6814,133 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # procedural + san-miguel-low-poly + rungholt, both
                                       # FR_VK_RES parities, --sw-rays, llvmpipe, --check-spirv and
                                       # tools/win-cross-check.sh
+                                      # V13 — THE GPU-FED FEED (B3, 2026-08-11): the tracer's own
+                                      # pack and 1-spp radiance reaching FSR3 through
+                                      # `cs_feed_xess` instead of through three host uploads. B1
+                                      # put FSR3 on this backend CPU-fed, so the Vulkan TRACER fed
+                                      # nothing; B2 gave it the pack those planes come from; this
+                                      # closes the loop, and it is the shape every --gpu/--dxr
+                                      # session on D3D12 has used since the pack split.
+                                      # FOUR THINGS THE CODE ALREADY GAVE, which is why one
+                                      # milestone is one pipeline and two methods: `TraceSources.
+                                      # feed` was already assembled portably (the M1 payoff);
+                                      # `layout.rs` already maps StorageImage -> STORAGE_IMAGE and
+                                      # sizes the pool by `desc_type`, so THREE NEW IMAGES ENTER
+                                      # THE LAYOUT WITH NO EDIT (M3a paying out a third time); the
+                                      # storage-image descriptor write already EXISTED at u14 for
+                                      # `cs_resolve`, so this extends a mechanism rather than
+                                      # inventing one (the plan had called it the last unwritten
+                                      # resource class, and exploration corrected that before any
+                                      # code); and `vk::fsr3::Img` already created its planes with
+                                      # STORAGE usage in exactly the formats the kernel writes.
+                                      # ONE ENTRY POINT of the several `feed.hlsl` declares, which
+                                      # is what keeps the footprint to three bindings: DXC drops
+                                      # every `feed_*` the kernel does not reference, so the unit
+                                      # contributes u16 (RGBA16F colour), u18 (R32F reversed-Z clip
+                                      # depth) and u19 (RG16F mvec) and NOTHING else — its other
+                                      # inputs (`accum` u0, `gbuf` u15 from trace_common) are the
+                                      # SAME declarations the tracer already binds, so they join no
+                                      # new slot. u16/u18/u19 are unclaimed by the tracer family
+                                      # (ladder u5..u9, hemi u10..u13, pack u15/u32) and the map's
+                                      # conflict detector is what would say so at build time.
+                                      # OPTIONAL BY CONSTRUCTION (`TracerOpts::feed`), and that is
+                                      # not thrift: the map is DERIVED, so compiling the unit
+                                      # unconditionally would move V5's slot count 46 -> 49 and
+                                      # every tracer's pool sizing — i.e. it would move recorded
+                                      # numbers for stages that never dispatch a feed. `TracerOpts`
+                                      # also retires the positional pile `VkTracer::new`'s own
+                                      # comment warned about at nine arguments; `feed` IMPLIES
+                                      # `gbuf_full` and the constructor FORCES it rather than
+                                      # asserting, since a feed over a stride-sized pack would read
+                                      # one texel's allocation per pixel.
+                                      # THE COMPARISON IS BETWEEN TWO ROUTES, NOT TWO RENDERERS,
+                                      # and that is what makes it assertable where V11's quality
+                                      # claim is not. V11 can only REPORT whether FSR3 beats a
+                                      # bilinear control, because that answer is scene-dependent
+                                      # (it wins on procedural and loses on san-miguel with
+                                      # identical wiring). Here BOTH arms consume the SAME frame
+                                      # from the SAME Vulkan tracer — one through `record_feed`,
+                                      # one through `Fsr3::frame`'s host upload of the identical
+                                      # readback — so any difference is wiring and a tight bar is
+                                      # honest. Scoring a CPU-RENDERED arm against a GPU-rendered
+                                      # one would not be this test at all: different intersector,
+                                      # different RNG stream, and the feed route would be invisible
+                                      # inside that difference. TWO FFX CONTEXTS, not one run
+                                      # twice, because FSR3 is TEMPORAL and one context would carry
+                                      # the first route's history into the second.
+                                      # `Fsr3::frame_fed` is `frame`'s sibling: it swaps the three
+                                      # buffer->image copies for transition-to-GENERAL, the caller's
+                                      # recorded kernel, and transition back — so both arms hand FFX
+                                      # images in the same layout BY CONSTRUCTION and only the
+                                      # writer differs — and both end in ONE shared `record_ffx`,
+                                      # which is what stops the dispatch desc drifting between the
+                                      # two arms of a comparison that would then be measuring
+                                      # itself.
+                                      # `gate_xess_feed` IS THE GATE, cfg-lifted exactly as B2
+                                      # lifted `unpack_gbuf_bytes` and for the same reason (plain
+                                      # slices, a `dlss::GBufs`, scalars; no D3D12 type in the
+                                      # body) — zero new tolerances, the --check-gpu M8 bar
+                                      # verbatim, with B2's now-portable unpacker supplying the
+                                      # `gb2` oracle out of the pack readback. `mono16` came with
+                                      # it, being its ulp metric.
+                                      # ANTI-VACUITY IS A SENTINEL, NOT A ZERO CHECK: the three
+                                      # images are written once and read once per frame, so a feed
+                                      # that never dispatched leaves the PREVIOUS frame's contents,
+                                      # which after frame 0 look entirely plausible (the M3d lesson
+                                      # — an operation that never happened compares clean; V3's
+                                      # 0xEEEEEEEE and V9's re-flooded sentinel exist for this).
+                                      # 0xEE is read back off the DEPTH plane because R32F makes a
+                                      # surviving word unambiguous where an f16 pair could be a
+                                      # real value.
+                                      # MEASURED (RADV, 400x300 -> 800x600, 8 frames): depth-ulp>4
+                                      # 0 (max 2) | sky-not-0.0 0 (sky px 34498) | mvec-ulp>1 0 |
+                                      # color-ulp>1 0, and gpu-fed vs cpu-fed mean |d| / mean
+                                      # |gpu-fed| **0.00081** against a 2% bar — 0.00074 on
+                                      # san-miguel-low-poly, 0.00072 on rungholt, 0.00081 under
+                                      # --sw-rays and at the other FR_VK_RES parity. Every
+                                      # pre-existing number unmoved (V5 46 slots / 45 pipelines, V6
+                                      # 0.045%, V7 0.00e0 / hot 0, V8 AO 0.0067 / GI 3.02%, V9 all
+                                      # zero, V11 0.01400, V12 mv median 1.528e-2). `FR_VK_MAP=1`
+                                      # prints `wire_feed <- 15 write(s) over 5 set-0 variant(s)` =
+                                      # 3 registers x 5 variants, which is the cheapest proof the
+                                      # three bindings really are in the derived map (the V13
+                                      # tracer does not print its own slot count; V5 reports V6's,
+                                      # and that staying at 46 is the point).
+                                      # THREE TEETH, all fired, and they SEPARATE — the B2
+                                      # absent-vs-wrong distinction again: skipping `wire_feed`
+                                      # trips BOTH arms (120000/120000 sentinel texels survive AND
+                                      # every plane gate fails); SWAPPING the depth and mvec views
+                                      # trips the plane gate alone (depth-ulp 85502, mvec-ulp
+                                      # 180962, colour untouched at 0) with the sentinel SILENT,
+                                      # which is the class a derived layout provably cannot catch
+                                      # since both are STORAGE_IMAGE to Vulkan and only the VALUES
+                                      # differ; and dropping `record_feed`'s `div_ceil` leaves
+                                      # exactly 1600 texels = 400 x the 4 rows 300/8 discards,
+                                      # caught by both. A FOURTH defect was found by the compiler
+                                      # rather than planted: the dead-code warning on `wire_feed`
+                                      # is what said the descriptors were never pointed at the
+                                      # images, before a single gate ran.
+                                      # `Fsr3::read_input`'s first draft named
+                                      # SHADER_READ_ONLY_OPTIMAL as a `vkCmdCopyImageToBuffer`
+                                      # source, which the spec forbids — the validation layer named
+                                      # the VUID exactly rather than the copy returning stale
+                                      # bytes, the good failure mode and the --gpu-debug argument
+                                      # for the third time in this port.
+                                      # COST: a third tracer takes --check-vk 26.7 -> 32.4 s, all
+                                      # of it DXC. That buys "V6-V12 unmoved" structurally rather
+                                      # than by care, and the odd-dimension coverage V12 needs.
+                                      # STILL NOT ASSERTED, and B1's owed half only half retired:
+                                      # this proves the two FEED ROUTES agree, not that the upscale
+                                      # is GOOD. That still wants a detail-preserving metric (the
+                                      # --check-oidn Laplacian shape) and a settled
+                                      # AUTO_EXPOSURE/preExposure.
+                                      # Touch `TracerOpts` / the feed unit list / `wire_feed` /
+                                      # `record_feed` / `Fsr3::frame_fed`/`record_ffx`/`feed_views`
+                                      # -> run --check (goldens byte-identical — B3 touches no
+                                      # shading path), cargo test, --check-vk on procedural +
+                                      # san-miguel-low-poly + rungholt, both FR_VK_RES parities,
+                                      # --sw-rays, llvmpipe (V11/V13 SKIP), --check-spirv,
+                                      # --check-fsr and tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
