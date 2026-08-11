@@ -560,13 +560,14 @@ pub struct Opts {
     /// term, shaded at the hemi BOUNCE_Q policy, integrated by the temporal
     /// denoisers / accumulation. Still-frame hemi tiers (H) take precedence.
     pub rtgi: bool,
-    /// `--auto-exposure` ARMS (`autoexp::set_enabled`): a display-stage
+    /// `--no-auto-exposure` clears (`autoexp::set_enabled`): a display-stage
     /// controller eases a clamped EV toward what the presented frame's mean
     /// log2-luminance asks for (src/autoexp.rs) — enclosures open up,
-    /// exteriors hold at ~0 EV. DEFAULT OFF (2026-08-08, the user's call —
-    /// the same-day flip of the one-day default-ON: with RTGI on by default
-    /// enclosures light themselves, so the aperture holds at exactly 1.0
-    /// plus any bias); `--no-auto-exposure` spells the default. The default
+    /// exteriors hold at ~0 EV. DEFAULT ON (2026-08-10, the user's call —
+    /// the third move: ON for a day, OFF 2026-08-08, ON again now that
+    /// EV_MAX is reined in to +2.0); `--auto-exposure` spells the default,
+    /// `--no-auto-exposure` is the kill lever (exposure holds at exactly
+    /// 1.0 plus any bias — the pre-feature look). The default
     /// is DUPLICATED in autoexp.rs's ENABLED initializer and settings.rs's
     /// menu-row `Toggle { default }` — flip all three in lockstep.
     /// Headless paths never run the controller either way, so every
@@ -915,7 +916,7 @@ pub fn defaults() -> Opts {
         detail_untex_scale: 1.0,
         amb_bump: true,
         rtgi: true,
-        autoexp: false,
+        autoexp: true,
         exposure_bias: 0.0,
         water: true,
         coincident_cull: true,
@@ -2657,10 +2658,11 @@ pub fn usage() {
                 eprintln!("                (the pre-RTGI renderer bit-exactly). Default ON: one cosine bounce");
                 eprintln!("                ray per pixel per frame IS the ambient — real one-bounce GI the");
                 eprintln!("                temporal denoisers/accumulation integrate (--rtgi spells the default)");
-                eprintln!("  --auto-exposure  ARM the display-stage aperture controller (OFF by default —");
-                eprintln!("                RTGI lights enclosures for real, so the aperture holds at 1.0; armed,");
-                eprintln!("                exposure eases toward mid-grey; headless paths never adapt either way)");
-                eprintln!("  --no-auto-exposure  the default, spelled explicitly (later flags win)");
+                eprintln!("  --no-auto-exposure  kill the display-stage aperture controller: exposure holds at");
+                eprintln!("                exactly 1.0 plus any --exposure-bias (the pre-feature look). Default ON:");
+                eprintln!("                exposure eases toward mid-grey, clamped to +-2 EV, so enclosures open up");
+                eprintln!("                and exteriors sit at ~0; headless paths never adapt either way");
+                eprintln!("  --auto-exposure  the default, spelled explicitly (later flags win)");
                 eprintln!("  --exposure-bias EV  manual aperture offset in stops (-8..=8, default 0; composes");
                 eprintln!("                with auto-exposure and still applies with it off — the manual lever)");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
@@ -2849,7 +2851,7 @@ pub fn self_test() -> Result<(), String> {
         "0.25",
         "--no-amb-bump",
         "--no-rtgi",
-        "--auto-exposure",
+        "--no-auto-exposure",
         "--exposure-bias",
         "1.5",
         "--no-water",
@@ -2951,8 +2953,8 @@ pub fn self_test() -> Result<(), String> {
         ("detail_untex_scale", o.detail_untex_scale == 0.25),
         ("amb_bump", !o.amb_bump),
         ("rtgi", !o.rtgi),
-        // Default OFF: "moved" means ARMED (the argv passes --auto-exposure).
-        ("autoexp", o.autoexp),
+        // Default ON: "moved" means KILLED (the argv passes --no-auto-exposure).
+        ("autoexp", !o.autoexp),
         ("exposure_bias", o.exposure_bias == 1.5),
         ("water", !o.water),
         ("coincident_cull", !o.coincident_cull),
