@@ -163,6 +163,29 @@ fn main() {
         // verification ran `--check` from a release build. `cargo test` builds
         // at the test profile, so without this the shader-source gates could
         // not link on Linux no matter which module they lived in.
-        println!("cargo:rustc-link-lib=dylib=stdc++");
+        //
+        // THE RUNTIME IS NAMED PER PLATFORM, and on macOS the difference is
+        // not cosmetic: there is no libstdc++ in the SDK at all (only
+        // `libc++.tbd` / `libc++abi.tbd`), so `-lstdc++` fails at LIBRARY
+        // RESOLUTION — before any dead-stripping can collect the reference
+        // away. That makes it fatal in EVERY profile here, release included,
+        // and it is the whole reason the tree did not build on macOS. The
+        // `intel_tex_2` archives shipped for `aarch64-apple-darwin` are clang
+        // builds, so the personality symbol they want comes from libc++abi,
+        // which `-lc++` pulls in.
+        //
+        // NOTE the mixed predicates, which is pre-existing and only safe
+        // because this tree is built natively: the enclosing `cfg(not(windows))`
+        // is a HOST test (a build script compiles for the host) while
+        // CARGO_CFG_TARGET_OS names the TARGET, and a link-lib directive is a
+        // property of the target. They agree for every supported build. If
+        // cross-compilation is ever wanted, the whole of `main` wants moving
+        // onto CARGO_CFG_TARGET_OS, not just this line.
+        let cxx = if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            "c++"
+        } else {
+            "stdc++"
+        };
+        println!("cargo:rustc-link-lib=dylib={cxx}");
     }
 }
