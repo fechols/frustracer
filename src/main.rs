@@ -1080,7 +1080,56 @@ fn main() {
     // zero-counter gates always run.
     let structural = stress.is_none() && obj.is_none() && !world_wanted;
     if check {
-        let code = run_check(&scene, &bvh, cam0, structural);
+        // WHICH FILES THE RENDERED IMAGES GO TO, and the asymmetry is the whole
+        // point. `check.png` / `check_gi.png` are TRACKED goldens: the
+        // default scene's frame, byte-compared by hand (`git status` after a
+        // suite run is how "did this move the image" is answered, and several
+        // features' bit-identity claims rest on nothing else). So:
+        //
+        //   * DEFAULT SCENE -> the goldens, whatever levers ran. A diff there
+        //     is either a regression or a deliberate RE-BASELINE (the RTGI
+        //     default flip did exactly that), and both are signal.
+        //   * ANY OTHER SCENE -> a tagged sibling. San Miguel's frame is not
+        //     the golden and can never become one, so writing it over the
+        //     golden produces a `git status` that looks EXACTLY like a
+        //     regression and is not one. That cost a real investigation once,
+        //     which is why `structural` — already the tree's name for "this is
+        //     the scene the committed expectations describe" — selects it
+        //     rather than a second, driftable predicate.
+        //
+        // The tag names the scene SOURCE, so two scenes' frames can sit side
+        // by side for comparison instead of overwriting each other.
+        let img_tag: Option<String> = if structural {
+            None
+        } else if world_wanted {
+            Some("world".to_string())
+        } else if let Some(n) = stress {
+            Some(format!("stress{n}"))
+        } else {
+            let stem = obj
+                .as_deref()
+                .map(|p| {
+                    // `.obj.zst` stems to `x.obj`, so strip twice; anything
+                    // non-alphanumeric becomes '-' so the tag is a legal,
+                    // predictable filename on every platform.
+                    let s = std::path::Path::new(p)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("scene");
+                    let s = std::path::Path::new(s).file_stem().and_then(|x| x.to_str()).unwrap_or(s);
+                    s.chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|| "scene".to_string());
+            // A tiled load is a different image from the same source, so it
+            // gets a different file rather than silently overwriting.
+            Some(match tile {
+                Some((tx, ty)) => format!("{stem}-tile{tx}x{ty}"),
+                None => stem,
+            })
+        };
+        let code = run_check(&scene, &bvh, cam0, structural, img_tag.as_deref());
         std::process::exit(code);
     }
     if check_dlss {
@@ -22322,11 +22371,28 @@ fn waveviz_dump(label: &str, bits: &[u32], w: usize, h: usize) {
 /// caps, temporal seeds/sky-tiles firing) — they are tuned to the default
 /// procedural scene; a `--stress` scene keeps only the scene-agnostic
 /// zero-counter invariants.
-fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
+///
+/// `img_tag` = None writes the TRACKED goldens (`check.png` / `check_gi.png`);
+/// `Some(t)` writes `check-<t>.png` / `check-<t>_gi.png` instead, which is what
+/// keeps a scene-keyed diagnostic run from dirtying the default scene's
+/// committed frame — see the derivation at the call site for the asymmetry.
+fn run_check(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    structural: bool,
+    img_tag: Option<&str>,
+) -> i32 {
     let (rw, rh) = (800usize, 600usize);
     let cam = cam0.basis(rw, rh);
     let q = Quality::preset(2);
     let stats = Stats::default();
+    // Resolved ONCE, here, so the two write sites far below cannot drift apart
+    // (they are ~1800 lines away and in different arms of the bench loop).
+    let (png_main, png_gi) = match img_tag {
+        None => ("check.png".to_string(), "check_gi.png".to_string()),
+        Some(t) => (format!("check-{t}.png"), format!("check-{t}_gi.png")),
+    };
 
     // Foliage-sway pose for the WHOLE suite (v0.2): bake at the pinned check
     // clock — NONZERO, so every gate that follows (verify's reference
@@ -24167,14 +24233,24 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         if hybrid && !hemi_ao && !hemi_gi {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, 1.0, &mut present, rw, rh, rw, rh);
-            save_png("check.png", &present, rw, rh);
+            save_png(&png_main, &present, rw, rh);
         } else if hemi_gi && !share {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, 1.0, &mut present, rw, rh, rw, rh);
-            save_png("check_gi.png", &present, rw, rh);
+            save_png(&png_gi, &present, rw, rh);
         }
     }
-    eprintln!("wrote check.png + check_gi.png");
+    // NAME THE FILES rather than hardcode the golden pair, which is a lie the
+    // moment a tagged run writes elsewhere — and say WHY when tagged, because
+    // "the goldens did not move" is exactly the thing a reader wants to know
+    // and exactly what a bare filename does not tell them.
+    match img_tag {
+        None => eprintln!("wrote {png_main} + {png_gi}"),
+        Some(_) => eprintln!(
+            "wrote {png_main} + {png_gi} (a non-default scene: the tracked check.png / \
+             check_gi.png goldens are the DEFAULT scene's frame and are left untouched)"
+        ),
+    }
 
     // --spp bench: the honest measurement. The quadtree is traced ONCE per
     // frame no matter the sample count, so an N-spp frame should cost less
