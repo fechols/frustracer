@@ -23,7 +23,9 @@ cbuffer Params : register(b0) {
     float mode;   // 1 = gamma 2.2 (SDR/Sdr10), 2 = HDR10 PQ (hud.hlsl's split)
     float _wvp0;
     float _wvp1;
-    float _wvp2;  // pads to NUM_ROOT_CONSTS (the tonemap layout gained exposure)
+    float _wvp2;
+    float _wvp3;  // pads to NUM_ROOT_CONSTS (the tonemap layout gained exposure,
+                  // then guard_strength)
 }
 
 // tone.rs twins (see tonemap.hlsl / hud.hlsl — same literals, change all

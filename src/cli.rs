@@ -580,6 +580,25 @@ pub struct Opts {
     /// the screen through the session controller's `set_exposure`, which
     /// headless paths never tick.
     pub exposure_bias: f32,
+    /// `--no-autoexp-spike-guard` clears (`autoexp::set_guard`): withhold the
+    /// aperture's BOOST from pixels that are outliers against their own
+    /// surround, so brightening a dark scene does not also amplify its
+    /// stochastic dots. DEFAULT ON, armed only while auto-exposure is actually
+    /// boosting (`exposure > 1`), and bounded by construction — the exemption
+    /// only ever relaxes toward 1.0, so a false positive is presented at
+    /// exactly its `--no-auto-exposure` brightness. `--autoexp-spike-guard`
+    /// spells the default. The default is DUPLICATED in autoexp.rs's GUARD
+    /// initializer and settings.rs's menu row — flip all three in lockstep.
+    ///
+    /// NOTE the vocabulary: this is the NOISE sense of "firefly". The
+    /// `--fireflies` family is the glowing INSECTS (src/fireflies.rs) and is
+    /// unrelated; their glow splats are several px wide, so the guard's
+    /// ring-max term shields them.
+    pub autoexp_guard: bool,
+    /// `--autoexp-spike-strength K` (0..=1, default 1.0): how much of the boost
+    /// a full outlier is exempted from. 1.0 presents it at exactly its
+    /// unboosted brightness; 0.0 is the structural off state.
+    pub autoexp_guard_strength: f32,
     /// `--no-water` clears (`scene::set_water`). Keys the cache lever word.
     pub water: bool,
     /// `--no-coincident-cull` clears (`scene::set_coincident_cull`): keep
@@ -930,6 +949,8 @@ pub fn defaults() -> Opts {
         rtgi: true,
         autoexp: true,
         exposure_bias: 0.0,
+        autoexp_guard: true,
+        autoexp_guard_strength: 1.0,
         water: true,
         coincident_cull: true,
         heightfield: false,
@@ -1425,6 +1446,25 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         std::process::exit(2);
                     });
                 opts.exposure_bias = ev;
+            }
+            // The spike guard rides the aperture: it only ever WITHHOLDS the
+            // boost, never adds one, so it is inert whenever the controller is
+            // not boosting. Display-stage — no gate contact.
+            "--no-autoexp-spike-guard" => opts.autoexp_guard = false,
+            "--autoexp-spike-guard" => opts.autoexp_guard = true,
+            "--autoexp-spike-strength" => {
+                let k: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&k: &f32| k.is_finite() && (0.0..=1.0).contains(&k))
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--autoexp-spike-strength needs a value in 0..=1 \
+                             (e.g. --autoexp-spike-strength 0.5)"
+                        );
+                        std::process::exit(2);
+                    });
+                opts.autoexp_guard_strength = k;
             }
             // --no-water: the fountain classifies as generic glassware (the
             // pre-water-class look) instead of the water refinement (blue-green
@@ -2699,6 +2739,17 @@ pub fn usage() {
                 eprintln!("  --auto-exposure  the default, spelled explicitly (later flags win)");
                 eprintln!("  --exposure-bias EV  manual aperture offset in stops (-8..=8, default 0; composes");
                 eprintln!("                with auto-exposure and still applies with it off — the manual lever)");
+                eprintln!("  --no-autoexp-spike-guard  let the aperture boost NOISE SPIKES along with the scene.");
+                eprintln!("                Default ON: a pixel far brighter than its own surround is exempted from");
+                eprintln!("                the boost and presented at its unboosted brightness, so brightening a");
+                eprintln!("                dark scene stops amplifying its stochastic dots. Bounded — the exemption");
+                eprintln!("                only relaxes toward 1.0, never below, and is inert unless the aperture is");
+                eprintln!("                actually boosting. (This is the NOISE sense of 'firefly'; --no-fireflies");
+                eprintln!("                is the glowing insects and is unrelated. The real fix for the noise is");
+                eprintln!("                upstream: --emissive-lights removes it at the source.)");
+                eprintln!("  --autoexp-spike-guard  the default, spelled explicitly (later flags win)");
+                eprintln!("  --autoexp-spike-strength K  how much boost a full outlier is exempted from");
+                eprintln!("                (0..=1, default 1 = presented exactly as if auto-exposure were off)");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
                 eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
                 eprintln!("  --no-coincident-cull  keep transmissive faces exactly coincident with opaque faces");
@@ -2804,7 +2855,7 @@ fn lever_snapshot() -> String {
     format!(
         "mips={} aniso={} h2n={} n2h={} smips={} saa={} tint={} spray={} depth={} detail={} dao={} \
          dstr={} daostr={} duntex={} \
-         ambb={} rtgi={} aexp={} ebias={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
+         ambb={} rtgi={} aexp={} ebias={} aguard={} agstr={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
          elcluster={} cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
@@ -2824,6 +2875,8 @@ fn lever_snapshot() -> String {
         crate::shade::rtgi_enabled(),
         crate::autoexp::enabled(),
         crate::autoexp::bias(),
+        crate::autoexp::guard(),
+        crate::autoexp::guard_strength(),
         scene::water_enabled(),
         scene::coincident_cull_enabled(),
         bvh::height_armed(),
@@ -2886,6 +2939,9 @@ pub fn self_test() -> Result<(), String> {
         "--no-amb-bump",
         "--no-rtgi",
         "--no-auto-exposure",
+        "--no-autoexp-spike-guard",
+        "--autoexp-spike-strength",
+        "0.25",
         "--exposure-bias",
         "1.5",
         "--no-water",
@@ -2990,6 +3046,11 @@ pub fn self_test() -> Result<(), String> {
         // Default ON: "moved" means KILLED (the argv passes --no-auto-exposure).
         ("autoexp", !o.autoexp),
         ("exposure_bias", o.exposure_bias == 1.5),
+        // Also default ON, so "moved" is again KILLED. The strength is pinned
+        // to its own distinct value: sharing 1.0 with the default would let a
+        // parser that never wrote it pass.
+        ("autoexp_guard", !o.autoexp_guard),
+        ("autoexp_guard_strength", o.autoexp_guard_strength == 0.25),
         ("water", !o.water),
         ("coincident_cull", !o.coincident_cull),
         ("heightfield", o.heightfield),

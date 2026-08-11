@@ -86,6 +86,153 @@ pub const TAU_S: f32 = 1.0;
 /// clouds-wind idiom).
 const LUMA_EPS: f32 = 1e-6;
 
+// ---------------------------------------------------------------------------
+// The SPIKE GUARD — a per-pixel exemption from the aperture's boost.
+// ---------------------------------------------------------------------------
+//
+// The aperture is one scalar, so it has no way to spend its gain selectively:
+// it brightens a dark scene and the stochastic dots in it by the same factor.
+// The guard withholds the boost from pixels that are outliers against their own
+// surround, under ONE invariant that is what makes it safe to arm by default:
+//
+//     auto-exposure may never make an outlier pixel BRIGHTER than the
+//     auto-exposure-off image would have made it.
+//
+// So the exemption only ever relaxes toward 1.0 and never past it, and the
+// worst case of a false positive is that a glint is presented at exactly its
+// `--no-auto-exposure` brightness — a look that already ships. Contrast the
+// NRD residual cap (`nrd::oracle::rclamp_scale`), whose correction can pull a
+// real emissive texel BELOW truth and which is therefore default-off.
+//
+// SCOPE, stated because it bounds what a feel-test can expect: the tonemap
+// saturates, so a spike already deep in the rolloff (radiance >> paper white)
+// pins white at 1x and at 4x alike and the aperture never made it worse. The
+// population auto-exposure genuinely CREATES is the near-linear one — a dot at
+// ~0.3 over a ~0.02 surround, where a 4x aperture roughly doubles the absolute
+// display gap. That is what this removes, and nothing else. The fireflies
+// themselves are 1-spp bounce variance and the fix for THEM is upstream
+// (`--emissive-lights`; see EV_MAX's note).
+//
+// COST, measured rather than assumed (4090, 1080p, guard on vs off, the aperture
+// verified BOOSTING in both arms via FR_AEXP_TRACE — a null result at exposure
+// <= 1 would be vacuous, since the block is structurally unreachable there):
+//
+//   * GPU present (bistro Exterior --tod 22, XeSS+NRD, parked terrace lamp pose,
+//     aperture 3.61x, --no-vsync --no-fg, 12 samples/arm): 140.36 vs 140.98 fps
+//     median = +0.031 ms/frame, +0.4% — INSIDE the run-to-run band (the arms'
+//     ranges overlap almost entirely). 8 extra point loads in one fullscreen PS
+//     is not something a 4090 notices.
+//   * CPU present (procedural, `--cpu --no-upscale --exposure-bias 2`, two
+//     interleaved reps): +0.8 and +2.3 ms on a ~59 ms frame, ~2.5%. This arm
+//     pays what the GPU one does not — `guard_plane` materializes a luma plane
+//     AND an exposure plane per frame — and it is the reason the guard is a
+//     prepass here instead of 8 taps inlined into `resolve`'s atomic read loop.
+//     Do NOT re-measure this on a heavy scene: CPU bistro traces at ~1000
+//     ms/frame and swamps the present stage by three orders of magnitude (that
+//     attempt read "no effect" and was measuring the tracer).
+//   * TEMPORAL STABILITY (FRUSTRACER_STAB, the same parked pose, 30 windows per
+//     arm): median 0.230/255 in BOTH arms. The concern was a pixel oscillating
+//     across the ramp between frames, which is exactly what that instrument
+//     sees; the smooth ramp is doing its job.
+
+/// Ring radius in SOURCE texels — the 8 taps sit at the four axial and four
+/// diagonal offsets of +/-`R`, a DONUT rather than the adjacent 3x3 ring both
+/// sibling clamps use.
+///
+/// The departure is forced by where this runs: at the present funnel, AFTER the
+/// upscaler, so a 1-px firefly at trace res is a several-px blob at window res.
+/// An adjacent ring samples the blob's own body, `ring_max` comes back hot, and
+/// the K_MAX arm below shields the very thing being hunted.
+///
+/// MEASURED, and this is why it is 4 rather than the 2 it shipped as for an
+/// hour (`FR_AEXP_GUARD_TRACE=1`, bistro Exterior `--tod 22`, XeSS+NRD at
+/// 1080p, the terrace and street lamp poses):
+///
+/// | r | terrace fired | street fired | street max luma/ring_max |
+/// |---|---|---|---|
+/// | 2 |  84 px | 255 px |  43.6 |
+/// | 4 | 455 px | 1287 px | 919.1 |
+///
+/// The last column is the finding: at radius 2 the brightest spike's ring is
+/// still INSIDE the spike, so `ring_max` tracks it and the shield fires; at
+/// radius 4 the ring clears the blob and the true contrast — three orders of
+/// magnitude — finally shows. The 5x rise in fired pixels is the guard reaching
+/// the population it was built for, and it is still only 0.02-0.06% of frame.
+pub const GUARD_RADIUS: i32 = 4;
+/// The ring-MEAN multiplier. A pixel must beat this many times its surround's
+/// mean to be treated as a spike.
+///
+/// MEASURED, and deliberately NOT
+/// `nrd::oracle::RCLAMP_K_MEAN`/`frd::FIREFLY_K` (both 8.0, with a recorded
+/// intent that the tree's clamps "speak one value"): those operate on raw 1-spp
+/// radiance over an adjacent ring, while this operates on DISPLAY luma over the
+/// `GUARD_RADIUS` donut after a temporal upscaler has already integrated the
+/// dot toward its surround, so the ratios here are structurally smaller. On the
+/// frames this exists for (`FR_AEXP_GUARD_TRACE=1`, bistro Exterior `--tod 22`,
+/// XeSS+NRD 1080p, the terrace and street lamp poses) the `luma/ring_mean`
+/// p99.9 is only **2.39 / 2.92** — i.e. at 8.0 this would have fired on
+/// NOTHING, which is the "it gated nothing" failure `RCLAMP_K_HARD` records,
+/// and a guard that cannot fire cannot be gated either.
+///
+/// `FR_AEXP_GUARD_K=<mean>,<max>` is the sweep lever, and the histogram to pick
+/// from is the trace's `luma/ring_mean` column (never `luma/cap`, which is a
+/// function of this very constant — see `guard_trace_dump`).
+pub const GUARD_K_MEAN: f32 = 4.0;
+/// The ring-MAX multiplier, and the term that protects RESOLVED features. The
+/// cap is a `max` of the two, so a lone stochastic dot (whose ring has
+/// `mean ~= max`) is bound by the mean term, while a real bright feature — a
+/// lamp, the sun's limb, one of `fireflies.rs`'s Gaussian glow splats — has at
+/// least one bright neighbour, giving `max >> mean`, and is shielded. Both
+/// reductions come out of one loop, so the discrimination is free.
+/// (`nrd::oracle::rclamp_scale`'s conjunction, same rationale.)
+///
+/// UNSWEPT, unlike `GUARD_K_MEAN`, and the honest reason is that this term is
+/// a SHIELD rather than a threshold: it can only ever raise the cap, so a value
+/// that is too low merely lets more pixels through to the mean term (which was
+/// measured) while one that is too high protects everything. The `--tod 22`
+/// trace records `luma/ring_max` reaching 919 at the radius this ships at, so
+/// the two terms are separated by orders of magnitude on real content and the
+/// exact value here is not what decides anything. `FR_AEXP_GUARD_K`'s second
+/// field sweeps it if a feel-test ever finds a resolved feature dimmed.
+pub const GUARD_K_MAX: f32 = 2.0;
+/// Ramp width, as a multiple of the cap: the exemption fades in over
+/// `luma/cap` in `[1, RAMP]`. Must be > 1 — that is a precondition of the
+/// ramp's own divisor, not a taste limit; at exactly 1 the fade divides by
+/// zero. A smooth ramp rather than a binary pin so a pixel sitting near the
+/// threshold cannot pop between two brightnesses on consecutive frames.
+///
+/// Not swept: with `K_MEAN` measured, the interesting question was WHICH pixels
+/// are exempted rather than how fast the exemption arrives, and 2.0 spans a
+/// factor-of-two band that the measured p99.9 sits just below. It has no env
+/// lever for the same reason — add one if a feel-test ever objects to the
+/// transition rather than to the threshold.
+pub const GUARD_RAMP: f32 = 2.0;
+/// Fewer in-range taps than this and the pixel is left UNGUARDED — a
+/// 3-neighbour estimate is not a neighbourhood (`RCLAMP_MIN_RING`'s rule). Taps
+/// off the frame are EXCLUDED rather than replicated (the NRD sentinel
+/// convention, not FRD's clamp-to-edge), so the frame border is simply
+/// un-guarded instead of guarded against a ring of copies of itself.
+pub const GUARD_MIN_RING: u32 = 4;
+
+/// The guard's tunables, resolved once per process. Passed explicitly rather
+/// than read from a global inside `guard_scale` so the rule stays a pure
+/// function of its inputs and `self_test` can sweep it without touching process
+/// state — and so the HLSL twin, which receives the same numbers as injected
+/// defines, is scored against exactly what the CPU used.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GuardParams {
+    pub k_mean: f32,
+    pub k_max: f32,
+    pub ramp: f32,
+    pub radius: i32,
+}
+
+impl Default for GuardParams {
+    fn default() -> Self {
+        Self { k_mean: GUARD_K_MEAN, k_max: GUARD_K_MAX, ramp: GUARD_RAMP, radius: GUARD_RADIUS }
+    }
+}
+
 /// `--auto-exposure` spells the default (consumed once by main's lever block,
 /// toggled live by the settings menu — the bloom shape). DEFAULT ON — the
 /// default is DUPLICATED in cli.rs's `defaults()` `autoexp` field AND
@@ -106,6 +253,100 @@ pub fn set_bias(ev: f32) {
 }
 pub fn bias() -> f32 {
     f32::from_bits(BIAS.load(Ordering::Relaxed))
+}
+
+/// `--no-autoexp-spike-guard` kills, `--autoexp-spike-guard` spells the
+/// default. DEFAULT ON, and — like `ENABLED` — the default is DUPLICATED in
+/// cli.rs's `defaults()` and settings.rs's menu-row `Toggle { default }`; flip
+/// all three in lockstep.
+static GUARD: AtomicBool = AtomicBool::new(true);
+/// `--autoexp-spike-strength` in [0, 1], f32 bits. 1.0 = a full exemption (an
+/// outlier is presented at exactly its unboosted brightness); 0.0 is the
+/// structural off state.
+static GUARD_STRENGTH: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+
+pub fn set_guard(on: bool) {
+    GUARD.store(on, Ordering::Relaxed);
+}
+pub fn guard() -> bool {
+    GUARD.load(Ordering::Relaxed)
+}
+pub fn set_guard_strength(k: f32) {
+    GUARD_STRENGTH.store(k.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+pub fn guard_strength() -> f32 {
+    f32::from_bits(GUARD_STRENGTH.load(Ordering::Relaxed))
+}
+
+/// The strength the presentation curve should actually use: the lever value, or
+/// exactly 0.0 when the guard is off. One place decides, so no call site can
+/// arm the block while the lever says otherwise.
+pub fn guard_strength_live() -> f32 {
+    if guard() { guard_strength() } else { 0.0 }
+}
+
+/// `FR_AEXP_GUARD_K=<mean>,<max>` and `FR_AEXP_GUARD_R=<n>` — the calibration
+/// sweep levers (read once). Loud on departure AND loud-plus-default on an
+/// illegal value: a mistyped sweep cell that silently measured the shipping
+/// constants is the exact failure the `FR_LEAF` rule exists to prevent.
+pub fn guard_params() -> GuardParams {
+    static P: std::sync::OnceLock<GuardParams> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let mut p = GuardParams::default();
+        if let Ok(v) = std::env::var("FR_AEXP_GUARD_K") {
+            let f: Vec<Option<f32>> = v.split(',').map(|s| s.trim().parse::<f32>().ok()).collect();
+            match f.as_slice() {
+                [Some(m), Some(x)] if *m > 0.0 && *x > 0.0 => {
+                    p.k_mean = *m;
+                    p.k_max = *x;
+                    eprintln!("FR_AEXP_GUARD_K: k_mean {m}, k_max {x} (default {GUARD_K_MEAN}, {GUARD_K_MAX})");
+                }
+                _ => eprintln!(
+                    "FR_AEXP_GUARD_K: '{v}' unrecognized (legal: <mean>,<max>, both > 0) — \
+                     using {GUARD_K_MEAN},{GUARD_K_MAX}"
+                ),
+            }
+        }
+        if let Ok(v) = std::env::var("FR_AEXP_GUARD_R") {
+            match v.trim().parse::<i32>() {
+                Ok(r) if (1..=8).contains(&r) => {
+                    p.radius = r;
+                    eprintln!("FR_AEXP_GUARD_R: ring radius {r} (default {GUARD_RADIUS})");
+                }
+                _ => eprintln!("FR_AEXP_GUARD_R: '{v}' unrecognized (legal: 1..=8) — using {GUARD_RADIUS}"),
+            }
+        }
+        p
+    })
+}
+
+/// `FR_AEXP_GUARD_TRACE=1` — the calibration probe: dumps the `luma/cap`
+/// distribution so the K constants are picked from a measured frame rather than
+/// inherited (read once).
+pub fn guard_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FR_AEXP_GUARD_TRACE").is_ok_and(|v| v != "0"))
+}
+
+/// The guard's compile-time constants as HLSL defines, pasted ahead of
+/// tonemap.hlsl (the `spp_defs`/`detail_defs` idiom).
+///
+/// Emitting them from `guard_params()` — rather than letting the shader's own
+/// `#ifndef` fallbacks stand — is what makes the `FR_AEXP_GUARD_*` sweep levers
+/// provably REACH the GPU arm. A lever that prints a departure line and then
+/// measures the shipping constants is this tree's most expensive recurring bug
+/// (the probe-reach trap); `{:?}` rather than `{}` so an integral value still
+/// prints as `4.0` and cannot be read as an HLSL int.
+pub fn guard_defs() -> String {
+    let p = guard_params();
+    format!(
+        "#define AEXP_GUARD_K_MEAN {:?}\n\
+         #define AEXP_GUARD_K_MAX {:?}\n\
+         #define AEXP_GUARD_RAMP {:?}\n\
+         #define AEXP_GUARD_R {}\n\
+         #define AEXP_GUARD_MIN_RING {}\n",
+        p.k_mean, p.k_max, p.ramp, p.radius, GUARD_MIN_RING
+    )
 }
 
 /// `FR_AEXP_TRACE=1` — the calibration/diagnostic probe (read once).
@@ -153,11 +394,253 @@ pub fn exposure(ev: f32) -> f32 {
     }
 }
 
+/// Rec.709 luma of one linear RGB pixel, clamped non-negative. The ONE weight
+/// triple in this module — the meters and the spike guard must agree about what
+/// "bright" means, and shaders/autoexp.hlsl + shaders/tonemap.hlsl mirror it as
+/// a literal (the clouds-wind idiom).
+#[inline]
+pub fn luma(r: f32, g: f32, b: f32) -> f32 {
+    0.2126 * r.max(0.0) + 0.7152 * g.max(0.0) + 0.0722 * b.max(0.0)
+}
+
 /// Rec.709 luma of one linear RGB pixel, floored for the log.
 #[inline]
 fn log2_luma(r: f32, g: f32, b: f32) -> f64 {
-    let l = 0.2126 * r.max(0.0) + 0.7152 * g.max(0.0) + 0.0722 * b.max(0.0);
-    (l.max(LUMA_EPS) as f64).log2()
+    (luma(r, g, b).max(LUMA_EPS) as f64).log2()
+}
+
+/// THE RULE — the per-pixel exposure a pixel should actually receive, given its
+/// own luma and the reductions over its ring. The single source of truth: the
+/// HLSL twin in tonemap.hlsl is scored against this by `--check-gpu`'s M12, and
+/// the CPU-presented arms reach it through `guard_plane`.
+///
+/// `nv` is the number of IN-RANGE ring taps that contributed to `ring_mean` /
+/// `ring_max`; out-of-range taps are excluded from both, not zeroed (a zeroed
+/// tap would deflate the mean and turn the frame border into a false-positive
+/// factory, the mirror of the "sky base would inflate the cap into vacuity"
+/// note on the NRD cap).
+///
+/// Every off arm is a BRANCH returning `exposure` BITWISE — never a computed
+/// `lerp(e, e, 0)` and never a `* 1.0` (`frd_temporal.hlsl`'s "the skip is a
+/// BRANCH, never a computed 1.0"), which is what makes a disarmed session
+/// bit-identical to the pre-feature renderer rather than identical by fp luck.
+#[inline]
+pub fn guard_scale(
+    luma: f32,
+    ring_mean: f32,
+    ring_max: f32,
+    nv: u32,
+    exposure: f32,
+    strength: f32,
+    p: GuardParams,
+) -> f32 {
+    // `!(x > y)` throughout so a NaN in any input takes the off arm.
+    // exposure <= 1.0 is an off arm and not merely an optimization: when the
+    // aperture is stopping DOWN, exempting an outlier would make it brighter
+    // relative to its surround — the exact inverse of the intent.
+    if !(exposure > 1.0) || !(strength > 0.0) || nv < GUARD_MIN_RING || !(luma > 0.0) {
+        return exposure;
+    }
+    let cap = (p.k_mean * ring_mean).max(p.k_max * ring_max);
+    // A NaN in either reduction reaches here and takes this arm, so `cap` is a
+    // real number below.
+    if !(luma > cap) {
+        return exposure;
+    }
+    // The ramp's saturated end is tested DIRECTLY rather than reached through
+    // `luma/cap`, for a case that is easy to write off as impossible: an
+    // exactly-black ring makes `cap` exactly 0, and that is a lit dot on
+    // absolute black — the most extreme outlier the guard can ever see. An
+    // `if !(cap > 0.0) { return exposure }` guard would hand precisely that
+    // pixel the full boost. Testing `luma >= cap * ramp` exempts it, and also
+    // means neither side has to agree about the semantics of x/0 (the division
+    // is only evaluated where `cap > 0`).
+    let t = if luma >= cap * p.ramp {
+        1.0
+    } else {
+        ((luma / cap - 1.0) / (p.ramp - 1.0)).clamp(0.0, 1.0)
+    };
+    let w = t * t * (3.0 - 2.0 * t) * strength; // smoothstep, scaled
+    if !(w > 0.0) {
+        return exposure;
+    }
+    // Written as 1 + (E-1)(1-w), NOT lerp(E, 1, w): both factors are
+    // non-negative here, so the result is >= 1.0 by CONSTRUCTION (no clamp to
+    // audit) and a full exemption lands on EXACTLY 1.0.
+    1.0 + (exposure - 1.0) * (1.0 - w)
+}
+
+/// Can the guard fire at all this frame? Checked BEFORE a luma plane is built,
+/// so a disarmed frame allocates nothing and costs one comparison.
+#[inline]
+pub fn guard_armed(exposure: f32) -> bool {
+    exposure > 1.0 && guard_strength_live() > 0.0
+}
+
+/// The guard plane for an already-averaged linear HDR image — the `resolve_hdr`
+/// arms (OIDN / NPPD / XeSS-post, and every P-screenshot re-resolve).
+pub fn guard_plane_hdr(hdr: &[f32], rw: usize, rh: usize, exposure: f32) -> Option<Vec<f32>> {
+    if !guard_armed(exposure) {
+        return None;
+    }
+    guard_plane(&luma_plane_hdr(hdr), rw, rh, exposure)
+}
+
+/// The guard plane for the accumulation buffer — the `resolve` arms.
+pub fn guard_plane_accum(
+    accum: &[std::sync::atomic::AtomicU32],
+    samples: u32,
+    rw: usize,
+    rh: usize,
+    exposure: f32,
+) -> Option<Vec<f32>> {
+    if !guard_armed(exposure) {
+        return None;
+    }
+    guard_plane(&luma_plane_accum(accum, samples), rw, rh, exposure)
+}
+
+/// Linear luma of an interleaved RGB slice — the `resolve_hdr` arms' input.
+fn luma_plane_hdr(hdr: &[f32]) -> Vec<f32> {
+    hdr.par_chunks_exact(3).map(|c| luma(c[0], c[1], c[2])).collect()
+}
+
+/// Linear luma of the accumulation buffer (bit patterns holding SUMS — the
+/// `render::resolve` input contract, hence the 1/samples).
+fn luma_plane_accum(accum: &[std::sync::atomic::AtomicU32], samples: u32) -> Vec<f32> {
+    let inv = 1.0 / samples.max(1) as f32;
+    accum
+        .par_chunks_exact(3)
+        .map(|c| {
+            let v = |a: &std::sync::atomic::AtomicU32| f32::from_bits(a.load(Ordering::Relaxed)) * inv;
+            luma(v(&c[0]), v(&c[1]), v(&c[2]))
+        })
+        .collect()
+}
+
+/// A per-pixel exposure plane for the CPU-presented arms — one rayon pass over
+/// a precomputed luma plane.
+///
+/// A PLANE rather than per-pixel ring taps at the six resolver call sites,
+/// because the no-bloom `render::resolve` fast path reads `accum` atomically
+/// inline: 8 taps x 3 relaxed loads per pixel there is real cost, and one
+/// prepass also unifies the accum and hdr sources behind one code path.
+///
+/// Returns `None` when the guard cannot fire at all, so the callers' fast path
+/// is the pre-feature one and no memory is committed.
+pub fn guard_plane(luma: &[f32], rw: usize, rh: usize, exposure: f32) -> Option<Vec<f32>> {
+    let strength = guard_strength_live();
+    if !(exposure > 1.0) || !(strength > 0.0) || luma.len() < rw * rh || rw == 0 || rh == 0 {
+        return None;
+    }
+    let p = guard_params();
+    let r = p.radius;
+    // One row per task, indexed — the `render::resolve` idiom, so ordering is a
+    // property of the construction rather than of rayon's collect.
+    let mut out = vec![0.0f32; rw * rh];
+    out.par_chunks_mut(rw).enumerate().for_each(|(y, row)| {
+        for (x, o) in row.iter_mut().enumerate() {
+            let (mut sum, mut mx, mut nv) = (0.0f32, 0.0f32, 0u32);
+            for (dx, dy) in RING_OFFSETS {
+                let (qx, qy) = (x as i32 + dx * r, y as i32 + dy * r);
+                if qx < 0 || qy < 0 || qx >= rw as i32 || qy >= rh as i32 {
+                    continue; // EXCLUDED, never replicated
+                }
+                let v = luma[qy as usize * rw + qx as usize];
+                sum += v;
+                mx = mx.max(v);
+                nv += 1;
+            }
+            let mean = if nv > 0 { sum / nv as f32 } else { 0.0 };
+            *o = guard_scale(luma[y * rw + x], mean, mx, nv, exposure, strength, p);
+        }
+    });
+    if guard_trace_on() {
+        guard_trace_dump(luma, &out, rw, rh, exposure, p);
+    }
+    Some(out)
+}
+
+/// The 8 ring directions, scaled by the radius at each use. Shared by
+/// `guard_plane` and mirrored by tonemap.hlsl's unrolled loop.
+const RING_OFFSETS: [(i32, i32); 8] =
+    [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+
+/// `FR_AEXP_GUARD_TRACE=1`'s output — the histogram the K constants are meant
+/// to be PICKED from.
+///
+/// It reports the distributions of `luma/ring_mean` and `luma/ring_max`, not of
+/// `luma/cap`: the cap is a function of the very constants being chosen, so a
+/// luma/cap histogram would be circular and would only ever tell you that the
+/// current setting is the current setting. These two ratios are exactly what
+/// `K_MEAN` and `K_MAX` are thresholds ON, so a percentile here reads directly
+/// as "this K exempts that share of the frame".
+///
+/// Rate-limited to ~1/s. Reached in a GPU session through the P-screenshot /
+/// QA-socket capture path, which is a CPU re-resolve — so the calibration
+/// workflow is `FR_AEXP_GUARD_TRACE=1` plus a `frqa screenshot` at each pose.
+fn guard_trace_dump(luma: &[f32], out: &[f32], rw: usize, rh: usize, exposure: f32, p: GuardParams) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some_and(|t| t.elapsed().as_secs_f32() < 1.0) {
+            return;
+        }
+        *g = Some(std::time::Instant::now());
+    }
+    let r = p.radius;
+    let (mut rm, mut rx) = (Vec::new(), Vec::new());
+    // Subsample: a distribution's tail percentiles are what matter here and
+    // every 3rd pixel resolves them fine, while a full pass at 4K is a real
+    // stall on a probe that runs every second.
+    for y in (0..rh).step_by(3) {
+        for x in (0..rw).step_by(3) {
+            let (mut sum, mut mx, mut nv) = (0.0f32, 0.0f32, 0u32);
+            for (dx, dy) in RING_OFFSETS {
+                let (qx, qy) = (x as i32 + dx * r, y as i32 + dy * r);
+                if qx < 0 || qy < 0 || qx >= rw as i32 || qy >= rh as i32 {
+                    continue;
+                }
+                let v = luma[qy as usize * rw + qx as usize];
+                sum += v;
+                mx = mx.max(v);
+                nv += 1;
+            }
+            let l = luma[y * rw + x];
+            if nv < GUARD_MIN_RING || !(l > 0.0) || !(sum > 0.0) {
+                continue;
+            }
+            rm.push(l / (sum / nv as f32));
+            if mx > 0.0 {
+                rx.push(l / mx);
+            }
+        }
+    }
+    if rm.is_empty() {
+        eprintln!("aexp-guard: no eligible pixels to profile");
+        return;
+    }
+    let pct = |v: &mut Vec<f32>, q: f32| -> f32 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[(((v.len() - 1) as f32) * q) as usize]
+    };
+    // `out` already carries the verdict at the CURRENT constants, so the fired
+    // share is measured rather than re-derived — it cannot drift from the plane
+    // the frame is actually presented with.
+    let fired = out.iter().filter(|&&e| e < exposure).count();
+    let (m50, m90, m99, m999, mmax) =
+        (pct(&mut rm, 0.5), pct(&mut rm, 0.9), pct(&mut rm, 0.99), pct(&mut rm, 0.999), pct(&mut rm, 1.0));
+    let (x99, x999, xmax) = (pct(&mut rx, 0.99), pct(&mut rx, 0.999), pct(&mut rx, 1.0));
+    eprintln!(
+        "aexp-guard: e {exposure:.2} k_mean {} k_max {} r {} | luma/ring_mean p50 {m50:.2} \
+         p90 {m90:.2} p99 {m99:.2} p99.9 {m999:.2} max {mmax:.2} | luma/ring_max p99 {x99:.2} \
+         p99.9 {x999:.2} max {xmax:.2} | fired {fired} px ({:.3}% of frame)",
+        p.k_mean,
+        p.k_max,
+        p.radius,
+        100.0 * fired as f32 / (rw * rh) as f32
+    );
 }
 
 /// Mean log2-luminance of an interleaved linear-RGB slice (the `resolve_hdr`
@@ -196,14 +679,16 @@ pub fn meter_accum(accum: &[std::sync::atomic::AtomicU32], samples: u32) -> f32 
 /// `--no-auto-exposure --check` still proves the on arm and a default `--check`
 /// still proves the off arm, and the run's own lever state survives this test).
 pub fn self_test() -> Result<(), String> {
-    struct Restore(bool, f32);
+    struct Restore(bool, f32, bool, f32);
     impl Drop for Restore {
         fn drop(&mut self) {
             set_enabled(self.0);
             set_bias(self.1);
+            set_guard(self.2);
+            set_guard_strength(self.3);
         }
     }
-    let _restore = Restore(enabled(), bias());
+    let _restore = Restore(enabled(), bias(), guard(), guard_strength());
 
     // (1) The structural off state: disabled + unbiased is EXACTLY 1.0, for
     // any EV the controller might hold — the bit-identity contract.
@@ -305,6 +790,143 @@ pub fn self_test() -> Result<(), String> {
     let ma = meter_accum(&accum, 4);
     if (ma - m).abs() > 1e-3 {
         return Err(format!("meter_accum {ma} disagrees with meter_hdr {m}"));
+    }
+
+    // ---- the spike guard ---------------------------------------------------
+    // Pinned with the lever save/restore above, so a `--no-autoexp-spike-guard`
+    // session still proves the ON arm and vice versa (the wide-tiles pattern).
+    let gp = GuardParams::default();
+    let spike = |e: f32, s: f32| guard_scale(1.0, 0.01, 0.01, 8, e, s, gp);
+
+    // (10) Every off arm returns the exposure BITWISE — the disarmed-stream
+    // contract. A spike over a near-black ring is used throughout, so each
+    // failure below means that arm, not a failure to detect.
+    for (name, got, want) in [
+        ("strength 0", spike(4.0, 0.0), 4.0f32),
+        ("exposure == 1", spike(1.0, 1.0), 1.0),
+        ("exposure < 1 (stopping down)", spike(0.5, 1.0), 0.5),
+        ("nv < MIN_RING", guard_scale(1.0, 0.01, 0.01, GUARD_MIN_RING - 1, 4.0, 1.0, gp), 4.0),
+        ("luma 0", guard_scale(0.0, 0.01, 0.01, 8, 4.0, 1.0, gp), 4.0),
+        ("dark ring, dark pixel", guard_scale(0.001, 0.01, 0.01, 8, 4.0, 1.0, gp), 4.0),
+        ("NaN luma", guard_scale(f32::NAN, 0.01, 0.01, 8, 4.0, 1.0, gp), 4.0),
+        ("NaN ring", guard_scale(1.0, f32::NAN, f32::NAN, 8, 4.0, 1.0, gp), 4.0),
+    ] {
+        if got.to_bits() != want.to_bits() {
+            return Err(format!("guard off arm '{name}': got {got}, want exactly {want}"));
+        }
+    }
+
+    // (11) THE SAFETY INVARIANT, swept: the guard may only ever relax TOWARD
+    // 1.0, never past it and never above the frame's own exposure. This is what
+    // bounds a false positive at "looks like --no-auto-exposure".
+    for &e in &[1.25f32, 2.0, 4.0, 16.0] {
+        for i in 0..=64 {
+            let l = 0.01 * 1.15f32.powi(i);
+            for &s in &[0.25f32, 0.5, 1.0] {
+                let g = guard_scale(l, 0.01, 0.01, 8, e, s, gp);
+                // Upper bound carries one relative ulp: the form is
+                // 1 + (E-1)(1-w), which reproduces E exactly on this range but
+                // is not required to for every representable E.
+                if !(g >= 1.0) || g > e * (1.0 + f32::EPSILON) {
+                    return Err(format!("guard invariant: luma {l}, e {e}, s {s} -> {g} outside [1, {e}]"));
+                }
+            }
+        }
+    }
+
+    // (12) The ramp: monotone non-increasing in luma (a brighter outlier is
+    // exempted at least as much), exactly `exposure` at the low endpoint, and
+    // exactly 1.0 once past the ramp at full strength.
+    let (e, ring) = (4.0f32, 0.01f32);
+    let cap = (gp.k_mean * ring).max(gp.k_max * ring);
+    let mut prev = f32::INFINITY;
+    for i in 0..=200 {
+        let l = cap * (0.5 + i as f32 * 0.02);
+        let g = guard_scale(l, ring, ring, 8, e, 1.0, gp);
+        if g > prev + 1e-6 {
+            return Err(format!("guard ramp not monotone at luma/cap {}: {g} > {prev}", l / cap));
+        }
+        prev = g;
+    }
+    if guard_scale(cap, ring, ring, 8, e, 1.0, gp).to_bits() != e.to_bits() {
+        return Err("guard ramp: luma exactly at the cap must be bitwise unguarded".into());
+    }
+    let full = guard_scale(cap * gp.ramp * 4.0, ring, ring, 8, e, 1.0, gp);
+    if full.to_bits() != 1.0f32.to_bits() {
+        return Err(format!("guard ramp: a deep outlier at strength 1 must land on exactly 1.0, got {full}"));
+    }
+
+    // (13) THE K_MAX SHIELD, with teeth BOTH ways — the assertion that keeps
+    // this from being satisfied by a guard that never fires or one that fires
+    // everywhere. Same pixel, same mean; only whether it has a bright NEIGHBOUR
+    // differs, which is exactly what separates a stochastic dot from a resolved
+    // feature (a lamp, the sun's limb, a fireflies.rs glow splat).
+    let hot = 1.0f32;
+    let lone = guard_scale(hot, hot / 8.0, hot / 8.0, 8, e, 1.0, gp); // ring ~= its own mean
+    let feature = guard_scale(hot, hot / 8.0, hot, 8, e, 1.0, gp); // one neighbour just as bright
+    if lone >= e {
+        return Err(format!("guard toothless: a lone spike over a dark ring was not exempted ({lone} vs {e})"));
+    }
+    if feature.to_bits() != e.to_bits() {
+        return Err(format!(
+            "K_MAX shield breached: a spike WITH a bright neighbour must be bitwise unguarded, got {feature}"
+        ));
+    }
+    // (13b) THE BLACK-RING CASE, which the natural `cap > 0` guard silently
+    // hands the full boost to: an exactly-zero ring makes the cap exactly 0, and
+    // that pixel is a lit dot on absolute black — the most extreme outlier the
+    // guard can see, so it must take the FULL exemption rather than the off arm.
+    // Also pinned NaN-safe, since the two live one `!(x > y)` apart.
+    let black = guard_scale(hot, 0.0, 0.0, 8, e, 1.0, gp);
+    if black.to_bits() != 1.0f32.to_bits() {
+        return Err(format!(
+            "guard: a spike on an exactly-black ring must be fully exempted (exactly 1.0), got {black}"
+        ));
+    }
+    let black_half = guard_scale(hot, 0.0, 0.0, 8, e, 0.5, gp);
+    if !(black_half > 1.0 && black_half < e) {
+        return Err(format!(
+            "guard: the black-ring arm must still honour strength (got {black_half} at 0.5)"
+        ));
+    }
+
+    // (14) `guard_plane`: the None fast path, determinism, an unguarded border,
+    // and a planted outlier actually exempted on a real grid.
+    set_guard(true);
+    set_guard_strength(1.0);
+    let (pw, ph) = (32usize, 24usize);
+    let mut lp = vec![0.01f32; pw * ph];
+    let spike_i = 12 * pw + 16;
+    lp[spike_i] = 5.0;
+    if guard_plane(&lp, pw, ph, 1.0).is_some() {
+        return Err("guard_plane must return None at exposure 1.0 (no boost to withhold)".into());
+    }
+    set_guard(false);
+    if guard_plane(&lp, pw, ph, 4.0).is_some() {
+        return Err("guard_plane must return None when the guard lever is off".into());
+    }
+    set_guard(true);
+    let plane = guard_plane(&lp, pw, ph, 4.0).ok_or("guard_plane returned None when armed")?;
+    if plane.len() != pw * ph {
+        return Err(format!("guard_plane length {} != {}", plane.len(), pw * ph));
+    }
+    if plane[spike_i] >= 4.0 {
+        return Err(format!("guard_plane: the planted outlier was not exempted ({})", plane[spike_i]));
+    }
+    let flat_i = 4 * pw + 4;
+    if plane[flat_i].to_bits() != 4.0f32.to_bits() {
+        return Err(format!("guard_plane: a flat-field pixel must be bitwise unguarded, got {}", plane[flat_i]));
+    }
+    let again = guard_plane(&lp, pw, ph, 4.0).unwrap();
+    if plane.iter().zip(&again).any(|(a, b)| a.to_bits() != b.to_bits()) {
+        return Err("guard_plane is not deterministic".into());
+    }
+    // A corner has fewer than 8 in-range taps at any radius; with MIN_RING = 4
+    // it may or may not be guarded, but it must never be NaN or out of band.
+    for (i, &g) in plane.iter().enumerate() {
+        if !g.is_finite() || !(1.0..=4.0 + f32::EPSILON * 4.0).contains(&g) {
+            return Err(format!("guard_plane px {i}: {g} outside [1, 4]"));
+        }
     }
 
     eprintln!("autoexp self-test: OK");

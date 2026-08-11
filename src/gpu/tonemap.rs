@@ -66,6 +66,13 @@ pub const SRV_HEAP_CAPACITY: u32 = 12;
 /// would catch a drifted port — gating each wire also pins each encode.
 ///
 /// `src` is w*h*3 linear f32; returns w*h RGB read back from the target.
+///
+/// `bloom` is the PS's `(strength, texel.x, texel.y)` triple, normally
+/// `(0, 0, 0)` — the curve is what this gate exists for and glare is M13's job.
+/// The one caller that arms it is M12b's pre-glare arm: the glare SRV is bound
+/// to `src` itself here, so a non-zero strength makes the PS blend a real tent
+/// of the source into the colour, which is exactly the halo the spike guard
+/// must NOT be measuring its ring against.
 pub fn selftest(
     hg: &mut super::trace::HeadlessGpu,
     src: &[f32],
@@ -73,6 +80,7 @@ pub fn selftest(
     h: u32,
     format: DXGI_FORMAT,
     tone: ToneParams,
+    bloom: (f32, f32, f32),
 ) -> Result<Vec<[f32; 3]>> {
     use super::d3d12::{
         aligned_pitch, committed_tex, footprint, loc_footprint, loc_subresource, transition,
@@ -160,7 +168,7 @@ pub fn selftest(
         // strength 0: this gate scores the CURVE, and glare is a separate pass
         // with its own gate (--check-gpu M13) — mixing them would let a bloom
         // regression masquerade as a tonemap one, and vice versa.
-        passes.record(list, &passes.tonemap_pso, SRV_SLOT_HDR, 1.0, (0.0, 0.0, 0.0), tone, rtv, w, h);
+        passes.record(list, &passes.tonemap_pso, SRV_SLOT_HDR, 1.0, bloom, tone, rtv, w, h);
         list.ResourceBarrier(&[transition(
             &target,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -282,7 +290,7 @@ pub(super) fn premultiplied_blend() -> D3D12_BLEND_DESC {
 /// step), then the five `tone::ToneParams` fields (knee/headroom/scale/mode/
 /// exposure) — the presentation curve is uniform state, not baked into the
 /// shader, which is what lets a display change be a retune.
-const NUM_ROOT_CONSTS: u32 = 9;
+const NUM_ROOT_CONSTS: u32 = 10;
 
 fn fullscreen_pso(
     device: &ID3D12Device,
@@ -427,8 +435,16 @@ impl Passes {
 
         let blit_vs = compile(BLIT_HLSL, s!("vsmain"), s!("vs_5_0"), "blit vs")?;
         let blit_ps = compile(BLIT_HLSL, s!("psmain"), s!("ps_5_0"), "blit ps")?;
-        let tm_vs = compile(TONEMAP_HLSL, s!("vsmain"), s!("vs_5_0"), "tonemap vs")?;
-        let tm_ps = compile(TONEMAP_HLSL, s!("psmain"), s!("ps_5_0"), "tonemap ps")?;
+        // The spike guard's calibration constants ride INJECTED DEFINES (the
+        // spp_defs/detail_defs idiom) rather than the cbuffer: they are a
+        // restart-tier probe, so paying four root DWORDs — and four more pads
+        // in every shader that mirrors this layout — to make them live would
+        // be the wrong trade. `guard_strength` is the one that IS live (a menu
+        // row), and that one is a cbuffer field. Pasting also means the FR_
+        // sweep levers provably REACH the shader, which is the whole point.
+        let tm_src = format!("{}{}", crate::autoexp::guard_defs(), TONEMAP_HLSL);
+        let tm_vs = compile(&tm_src, s!("vsmain"), s!("vs_5_0"), "tonemap vs")?;
+        let tm_ps = compile(&tm_src, s!("psmain"), s!("ps_5_0"), "tonemap ps")?;
         let blit_pso = fullscreen_pso(device, rtv_format, &root_sig, &blit_vs, &blit_ps)?;
         let tonemap_pso = fullscreen_pso(device, rtv_format, &root_sig, &tm_vs, &tm_ps)?;
         // --waveviz: armed sessions only — the unarmed session builds no
@@ -492,7 +508,7 @@ impl Passes {
             list.SetGraphicsRootDescriptorTable(0, self.gpu_srv(SRV_SLOT_HDR));
             list.SetGraphicsRootDescriptorTable(2, self.gpu_srv(SRV_SLOT_BLOOM));
             list.SetGraphicsRootShaderResourceView(3, tickets_va);
-            // waveviz.hlsl's Params layout: rw rh ww wh | scale mode pad pad pad.
+            // waveviz.hlsl's Params layout: rw rh ww wh | scale mode pad x4.
             let consts: [u32; NUM_ROOT_CONSTS as usize] = [
                 rw,
                 rh,
@@ -504,6 +520,7 @@ impl Passes {
                     crate::tone::ToneMode::Pq => 2.0f32,
                 }
                 .to_bits(),
+                0,
                 0,
                 0,
                 0,
@@ -599,6 +616,12 @@ impl Passes {
                     crate::tone::ToneMode::Pq => 2.0,
                 },
                 tone.exposure,
+                // The spike guard's strength, read from the lever here rather
+                // than threaded through ToneParams (the `bloom::enabled()`
+                // habit — a display-stage process lever the funnel consults).
+                // Exactly 0.0 when the guard is off, which is the shader's own
+                // structural off arm.
+                crate::autoexp::guard_strength_live(),
             ];
             list.SetGraphicsRoot32BitConstants(1, NUM_ROOT_CONSTS, consts.as_ptr() as *const _, 0);
             list.RSSetViewports(&[D3D12_VIEWPORT {

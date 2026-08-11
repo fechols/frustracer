@@ -780,6 +780,65 @@ cargo run --release -- --xess --oidn-post  # + OIDN post-denoise on the upscaled
 cargo run --release -- --xess --no-adaptive  # XeSS without the adaptive shading rate (uniform per-pixel shading)
 cargo run --release -- --xess --xess-autoexposure  # XeSS computes exposure internally (A/B lever)
 cargo run --release -- --check-fsr    # headless: FSR signal-split/encoding/MV/provider-pick contract self-test (no GPU, no DLL)
+                                      # — plus, since 2026-08-11, gate 8: the SECOND FidelityFX
+                                      # generation (SDK 1.1.4, src/ffx_fsr3.rs). Two FFX
+                                      # generations coexist and do NOT compete: everything else in
+                                      # this file is ffx-api v2.3.0 (signed prebuilt DX12 provider
+                                      # DLLs — FSR4, Ray Regeneration, frame generation), which
+                                      # cannot reach the Vulkan or Metal backends because it has NO
+                                      # Vulkan backend at all (its own readme lists "Vulkan is
+                                      # currently not supported in SDK" under known issues) and v2
+                                      # REMOVED the FfxInterface custom-backend seam, so a Metal
+                                      # implementation is not merely unwritten but unexpressible.
+                                      # v1.1.4 is the last MIT-source generation with a stock
+                                      # first-party ffx_vk AND a seam. Windows keeps v2.3.0.
+                                      # UNLIKE EVERY OTHER SDK HERE IT IS COMPILED FROM SOURCE and
+                                      # statically linked — no DLL, no fn-pointer table, no
+                                      # runtime shed; the degrade is at BUILD time
+                                      # (cfg(ffx_fsr3_src), set by build.rs only when BOTH halves
+                                      # are present). Warn-and-skip, deliberately NOT require_nrd()'s
+                                      # hard fail: NRD is the default denoiser so a tree that cannot
+                                      # produce it renders undenoised silently, while FSR3 here is
+                                      # opt-in and its absence costs a feature, not correctness.
+                                      # TWO HALVES, ONLY ONE FETCHABLE: the SDK source
+                                      # (`install-prerequisites.sh fsr3src` — 4 paths of a 189 MB
+                                      # tarball, ~19 MB, gitignored) and the SPIR-V shader
+                                      # permutations, which are COMMITTED (200 files / ~17 MiB,
+                                      # plain git, SDKs/FidelityFX-SDK-prebuilt/) because the SDK
+                                      # compiles them with FidelityFX_SC.exe, a WINDOWS-ONLY tool,
+                                      # and upstream ships no prebuilt SPIR-V — vendoring the output
+                                      # is what makes FSR3 buildable off Windows at all. They serve
+                                      # BOTH backends: Metal transpiles the same bytes to .metallib
+                                      # at build time, so no Metal shader artifact is committed.
+                                      # shim/ffx_msvc_compat.h is force-included into every SDK TU
+                                      # (`-include`, never a patch — the sources are FETCHED and a
+                                      # patch would silently un-apply on the next fetch): it
+                                      # supplies _countof/wcscpy_s/strcpy_s/sprintf_s/swprintf_s
+                                      # and, load-bearing, RAISES FFX_SDK_DEFAULT_CONTEXT_SIZE from
+                                      # the upstream 128 KB to 1 MB, because that constant is sized
+                                      # against a 2-byte wchar_t and every non-MSVC platform's
+                                      # 4-byte one bloats the private FSR3 context past it.
+                                      # MEASURED: all 7 backend-neutral TUs compile unmodified
+                                      # under clang on macOS with only that header; the blob
+                                      # accessor links 3.4 MB of SPIR-V; libffx_fsr3.a is 4.4 MB.
+                                      # Gate 8 is a PIN PAIR check in nrd.rs's GetLibraryDesc shape
+                                      # — it reads the version out of the headers the objects were
+                                      # COMPILED against and compares it to ffx_fsr3::PIN, so
+                                      # fetching a different FFX_SRC_TAG without moving the PIN
+                                      # fails loudly instead of surfacing as unattributed behaviour
+                                      # — plus a read-back of the context size THROUGH the SDK's own
+                                      # headers, which is what proves the force-include actually
+                                      # reached them rather than trusting that a build flag is still
+                                      # being passed. The pure half (the (major<<22)|(minor<<12)|patch
+                                      # round-trip + field-bleed teeth) runs on EVERY platform
+                                      # including Windows, which never builds the SDK: the packing
+                                      # is a fact about ffx_interface.h, not about the host, and a
+                                      # gate that only ran where the feature is built would stop
+                                      # covering the transcription the moment someone develops on
+                                      # the other OS. Touch shim/ffx_fsr3.* / shim/ffx_msvc_compat.h
+                                      # / build.rs's build_ffx_fsr3 / src/ffx_fsr3.rs → run
+                                      # --check-fsr with the SDK present AND with it moved aside
+                                      # (the degrade is the half nothing else covers)
 cargo run --release -- --fsr          # force-start the upscaler chain at FSR4 + Ray Regeneration
                                       # (K toggles; RDNA4 only — elsewhere the chain falls through
                                       # XeSS to FSR 3.1 upscale-only, cross-vendor; also flips the
@@ -3282,7 +3341,35 @@ cargo run --release -- --no-bloom     # A/B lever: no glare. Bloom (`src/bloom.r
                                       # <= 0.02 / worst <= 0.10, measured 0.0009/0.0024. It is a
                                       # WIRING gate (f16 + hardware bilinear will never match f32
                                       # exactly, but a bad weight/barrier/slot/pitch moves the halo
-                                      # by tens of percent). Never widen those limits to pass a port
+                                      # by tens of percent). Never widen those limits to pass a port.
+                                      # M13 STOPS AT THE PYRAMID'S OUTPUT, and the last step — the
+                                      # tonemap PS sampling that pyramid and blending it into the
+                                      # frame — was covered by NOTHING until M13b (2026-08-11),
+                                      # which is how it carried an off-by-half-texel from the
+                                      # beginning: `uv = (pos.xy + 0.5)/dims` where SV_Position
+                                      # ALREADY points at the pixel centre (the `src.Load(int3(
+                                      # pos.xy, 0))` two lines up relies on exactly that, since Load
+                                      # truncates the .5 away). The glare is half-res, so the error
+                                      # was half a full-res texel = a QUARTER of a glare texel, and
+                                      # it DISAGREED with the CPU twin (bloom.rs's textbook
+                                      # `u = (x + 0.5)*gw/w - 0.5` lands on 7.75 where the shader
+                                      # landed on 8.0). Fixed to `pos.xy / dims`. Visually tiny —
+                                      # it is a quarter texel on a deliberate blur — which is
+                                      # exactly why nothing noticed for so long; it surfaced only
+                                      # because it DEFEATED a test being written for something else
+                                      # (the M12b pre-glare plant relied on that sample landing
+                                      # squarely on a bright texel, and the slip split it across
+                                      # two). M13b's assertion is SYMMETRY and needs no CPU tent
+                                      # mirrored: one bright texel in the glare must paint a halo
+                                      # CENTRED on it, so the pixels either side come back equal.
+                                      # A half-texel slip does not erase the halo, it SPLITS it
+                                      # across two pixels — so the gate asserts the peak is a peak
+                                      # AND both axes are symmetric, and reports all five numbers in
+                                      # either failure (a bare anti-vacuity message there blames the
+                                      # test for what the shader did). Measured: correct reads peak
+                                      # 0.502 / sides 0.376 x4; the old code reads peak 0.396 | left
+                                      # 0.396 right 0.247 | up 0.396 down 0.247 — teeth verified by
+                                      # planting the original expression back (exit 1, both arms)
 cargo run --release -- --no-auto-exposure  # KILL the adaptive aperture (src/autoexp.rs +
                                       # gpu/autoexp.rs + shaders/autoexp.hlsl — DEFAULT ON
                                       # since 2026-08-10, the user's call; THREE MOVES: ON for
@@ -3373,6 +3460,240 @@ cargo run --release -- --exposure-bias 1.5  # manual aperture offset in STOPS (-
                                       # Interactive-only by construction — the bias reaches the
                                       # screen through the session controller's set_exposure,
                                       # which headless paths never tick
+cargo run --release -- --no-autoexp-spike-guard  # A/B lever: let the aperture boost NOISE SPIKES
+                                      # along with the scene. DEFAULT ON (2026-08-11) — the
+                                      # per-pixel half of auto-exposure, and the answer to
+                                      # "I still see fireflies with NRD + auto-exposure".
+                                      # THE MECHANISM, which bounds what it can buy: the
+                                      # tonemap SATURATES, so a spike already deep in the
+                                      # rolloff (radiance >> paper white) pins white at 1x and
+                                      # at 4x alike and the aperture never made it worse. The
+                                      # population auto-exposure genuinely CREATES is the
+                                      # near-LINEAR one — a dot at ~0.3 over a ~0.02 surround,
+                                      # where a 4x aperture roughly DOUBLES the absolute
+                                      # display gap. That is what this removes, and nothing
+                                      # else; EV_MAX's own note (autoexp.rs:63-77) is still
+                                      # right that the fireflies' SOURCE is upstream
+                                      # (1-spp RTGI-bounce variance on small emitters, left
+                                      # without deterministic cluster NEE by the
+                                      # upscaler_defaults narrowing — `--emissive-lights`
+                                      # removes them at the source, measured +61% pool
+                                      # brightness; this is the cosmetic complement, not a
+                                      # rival).
+                                      # THE INVARIANT, and the whole reason it is safe to arm
+                                      # by default: auto-exposure may never make an outlier
+                                      # BRIGHTER than the auto-exposure-off image would have.
+                                      # The exemption only ever relaxes toward 1.0 and never
+                                      # past it (`1 + (E-1)(1-w)`, both factors non-negative ⇒
+                                      # >= 1.0 by CONSTRUCTION, no clamp to audit), so the
+                                      # worst case of a false positive is "that glint looks
+                                      # like it did before auto-exposure" — a look that already
+                                      # ships. Contrast nrd::oracle::rclamp_scale, whose
+                                      # correction can pull a real emissive texel BELOW truth
+                                      # and which is therefore default-OFF.
+                                      # THE RULE (autoexp::guard_scale, the ONE source of
+                                      # truth; tonemap.hlsl is its twin): over an 8-tap DONUT
+                                      # at radius R, cap = max(K_MEAN*ring_mean,
+                                      # K_MAX*ring_max) — rclamp's conjunction, same rationale:
+                                      # a lone stochastic dot has mean ~= max so the mean term
+                                      # binds, while a resolved feature (a lamp, the sun's
+                                      # limb, a fireflies.rs GLOW SPLAT) has a bright
+                                      # neighbour, giving max >> mean, and is shielded; both
+                                      # reductions come out of one loop so the discrimination
+                                      # is free. Centre EXCLUDED (frd's lesson: with it in, a
+                                      # lone outlier dominates its own cap). Out-of-range taps
+                                      # EXCLUDED, never replicated, and under GUARD_MIN_RING=4
+                                      # in-range taps the pixel is left unguarded — so the
+                                      # frame border is un-guarded rather than guarded against
+                                      # copies of itself. w = smoothstep over luma/cap in
+                                      # [1, RAMP], scaled by --autoexp-spike-strength: a SMOOTH
+                                      # ramp, not a binary pin, so a pixel near the threshold
+                                      # cannot pop between two brightnesses frame to frame.
+                                      # THE SATURATED END OF THE RAMP IS TESTED DIRECTLY
+                                      # (`luma >= cap * RAMP`) rather than reached through
+                                      # luma/cap, and that is not a micro-optimization: an
+                                      # exactly-black ring makes cap exactly 0, which is a lit
+                                      # dot on absolute black — the MOST extreme outlier the
+                                      # guard can ever see — and the obvious
+                                      # `if !(cap > 0) { return exposure }` guard hands precisely
+                                      # that pixel the full boost. It shipped that way for a day.
+                                      # Testing the product exempts it AND keeps x/0 out of the
+                                      # expression, so neither compiler has to agree about inf
+                                      # (the division is only ever evaluated where cap > 0). NaN
+                                      # in either reduction still takes the off arm, one line
+                                      # earlier, via `!(luma > cap)`. Gated by self_test arm 13b.
+                                      # A DONUT AT RADIUS 4, not the adjacent 3x3 ring both
+                                      # sibling clamps use, and the constants are MEASURED
+                                      # rather than inherited — deliberately NOT rclamp/frd's
+                                      # K_MEAN = 8.0 ("the two clamps speak one value"), because
+                                      # those run on raw 1-spp radiance over an adjacent ring
+                                      # while this runs on DISPLAY luma AFTER a temporal
+                                      # upscaler has already integrated the dot toward its
+                                      # surround. MEASURED (FR_AEXP_GUARD_TRACE=1, bistro
+                                      # Exterior --tod 22, XeSS+NRD 1080p, the recorded lamp
+                                      # poses): luma/ring_mean p99.9 is only 2.39 (terrace) /
+                                      # 2.92 (street) — i.e. at K = 8 this would have fired on
+                                      # NOTHING, the "it gated nothing" failure RCLAMP_K_HARD
+                                      # records, and a guard that cannot fire cannot be gated.
+                                      # The radius is the other measured half: r 2 -> 4 takes
+                                      # fired px 84 -> 455 (terrace) and 255 -> 1287 (street),
+                                      # and the street pose's max luma/ring_max goes 43.6 ->
+                                      # 919.1 — the tell that at radius 2 the ring is still
+                                      # INSIDE the spike (so the K_MAX shield protects the very
+                                      # thing being hunted) and at radius 4 it clears the blob.
+                                      # Still only 0.02-0.06% of frame.
+                                      # DETECTION READS PRE-GLARE (the ring taps AND the centre
+                                      # luma come off `src`, not the post-glare `c`): bloom's
+                                      # whole job is spreading an outlier into its
+                                      # neighbourhood, so measuring after it would let a
+                                      # firefly's own halo raise the ring mean and shield it.
+                                      # Costs nothing — the taps are `src` loads either way.
+                                      # OFF IS STRUCTURAL: lever off / strength 0 / exposure
+                                      # <= 1 / nv < MIN_RING each BRANCH around the block and
+                                      # return the exposure BITWISE (never a computed
+                                      # `lerp(E,E,0)`, never a `* 1.0` — frd_temporal.hlsl's
+                                      # "the skip is a BRANCH"). exposure <= 1.0 is an off arm
+                                      # for a REASON, not as thrift: when the aperture is
+                                      # stopping DOWN, exempting an outlier would make it
+                                      # brighter relative to its surround, the exact inverse of
+                                      # the intent. And headless paths never tick the
+                                      # controller, so E is exactly 1.0 there and the guard is
+                                      # structurally UNREACHABLE in --check*/--spin/--cinematic
+                                      # (check.png + check_gi.png verified byte-identical
+                                      # across the whole feature, including after all six CPU
+                                      # resolvers were rewired).
+                                      # BOTH present families carry it: the GPU tonemap PS (8
+                                      # extra point loads, behind a group-UNIFORM cbuffer
+                                      # branch, so a disarmed frame executes the pre-feature
+                                      # instruction stream) and the six CPU resolvers, which
+                                      # take a per-pixel exposure PLANE computed once per frame
+                                      # from the pre-glare source and handed to the existing
+                                      # `exposure` parameter — present_px* and tone::shape are
+                                      # UNCHANGED. The CPU half is not optional: the
+                                      # P-screenshot path for a GPU session is a CPU re-resolve
+                                      # of an HDR readback (read_hdr_output), so without it
+                                      # captures would not match the screen — and QA-socket
+                                      # screenshots are the instrument this feature is measured
+                                      # with.
+                                      # NO LDS, no group-shape pin: the GPU site is a PIXEL
+                                      # shader, so none of cs_nrd_out's apparatus (groupshared
+                                      # halo, barriers hoisted above early returns,
+                                      # nrd_out_group_shape_is_derived) applies.
+                                      # NAMING: nothing here is spelled "firefly" on purpose —
+                                      # `--fireflies`/`--no-fireflies` are the glowing INSECTS
+                                      # (src/fireflies.rs) and a user reaching for the noise
+                                      # lever must not kill the bugs. Their glow splats are
+                                      # Gaussian and several px wide, so the K_MAX arm is what
+                                      # shields them.
+                                      # Levers: --autoexp-spike-guard spells the default;
+                                      # --autoexp-spike-strength K (0..=1, default 1 = the
+                                      # outlier is presented exactly as if auto-exposure were
+                                      # off); FR_AEXP_GUARD_K=<mean>,<max> and
+                                      # FR_AEXP_GUARD_R=<n> are the sweep probes (loud on
+                                      # departure, loud+default on an illegal value — the
+                                      # FR_LEAF rule) and ride INJECTED DEFINES
+                                      # (autoexp::guard_defs, the spp_defs idiom) so they
+                                      # provably REACH the shader; FR_AEXP_GUARD_TRACE=1 dumps
+                                      # the luma/ring_mean + luma/ring_max histograms the K
+                                      # constants are meant to be PICKED from (deliberately NOT
+                                      # a luma/cap histogram, which would be circular — the cap
+                                      # is a function of the very constants being chosen).
+                                      # Reached in a GPU session through the screenshot path,
+                                      # so the workflow is the lever plus a `frqa screenshot`
+                                      # per pose. Settings rows: Effects/autoexp_spike_guard
+                                      # (Toggle, LIVE, default true — the default-true fact is
+                                      # duplicated in autoexp.rs's GUARD static, cli.rs's
+                                      # defaults() and here, flip all three in lockstep) +
+                                      # autoexp_spike_strength (StepF 0..1 by 0.1).
+                                      # Gates: autoexp::self_test arms 10-14 in --check (the
+                                      # bitwise off arms incl. NaN, the safety invariant swept,
+                                      # ramp monotonicity + both endpoints, the K_MAX shield
+                                      # with TEETH BOTH WAYS — a lone spike must be exempted
+                                      # AND the same pixel with one bright neighbour must NOT
+                                      # be, since a guard that never fires and one that fires
+                                      # everywhere both pass a one-sided test — and
+                                      # guard_plane's None fast paths / determinism / unguarded
+                                      # border); --check-gpu M12b drives the REAL PSO over a
+                                      # synthetic frame carrying a lone spike, a PAIR exactly
+                                      # the ring radius apart, and flat field, scoring the
+                                      # shader against autoexp::guard_plane per pixel, plus
+                                      # strength-0 inertness, the safety invariant ON THE IMAGE
+                                      # (no channel brighter than the boosted frame, none
+                                      # darker than the unboosted one), and strength NESTING.
+                                      # Its fixture DERIVES the pair separation from the live
+                                      # radius, which makes it a probe-REACH test too: it
+                                      # passes at FR_AEXP_GUARD_R=1|2|3, and a shader stuck at
+                                      # the compiled default would ring at the wrong radius and
+                                      # blow the per-pixel arm. Teeth verified live:
+                                      # FR_AEXP_GUARD_K=4,0.0001 collapses the shield and M12b
+                                      # FAILS with the paired spike at e 1.454.
+                                      # M12b'S PRE-GLARE ARM is the one that gates the
+                                      # detection-reads-`src` decision, and it exists because
+                                      # every OTHER arm runs with bloom off, where `c0 == c`
+                                      # BITWISE — so a shader that measured the ring after the
+                                      # halo passes all of them. It renders two bloom-ON arms
+                                      # (strength 1, tent step == the ring radius) and RECOVERS
+                                      # the chosen per-pixel exposure by inverting the SDR curve
+                                      # (x = -ln(1 - v^2.2)) across them: both present the same
+                                      # post-glare colour, one at e_px and one at e_hi, so their
+                                      # ratio IS e_px/e_hi and NO tent has to be mirrored on the
+                                      # CPU (that is M13's job). The post-glare HYPOTHETICAL is
+                                      # then run through the shipped guard_plane on the recovered
+                                      # image, so the gate reports which of the two readings the
+                                      # shader actually took: measured `recovered e 1.01 tracks
+                                      # the pre-glare 1.00, not the post-glare 4.00`. Teeth
+                                      # verified live by planting the post-glare read (both the
+                                      # centre AND per-tap ring — a centre-only plant does NOT
+                                      # fail, since 0.265 still clears a pre-glare cap of 0.08):
+                                      # exit 1 with the recovered exposure landing exactly on
+                                      # 4.00. It also carries its own VACUITY note, which fired
+                                      # on the first run at bloom strength 0.6 — the halo raised
+                                      # the ring but not enough to flip the verdict (gap 0.18),
+                                      # so the constants are 1.0/ring-radius by measurement.
+                                      # COST, measured (4090, 1080p, aperture verified BOOSTING
+                                      # in both arms via FR_AEXP_TRACE — a null result at
+                                      # exposure <= 1 gates nothing, the block being structurally
+                                      # unreachable there): GPU present +0.031 ms/frame (+0.4%,
+                                      # bistro --tod 22 XeSS+NRD parked at 3.61x aperture, 140.36
+                                      # vs 140.98 fps median) — INSIDE the run-to-run band; CPU
+                                      # present +0.8/+2.3 ms on a ~59 ms frame (~2.5%, procedural
+                                      # `--cpu --no-upscale --exposure-bias 2`, two interleaved
+                                      # reps), which is the arm that materializes two planes and
+                                      # is why the guard is a prepass there rather than 8 taps
+                                      # inlined into resolve's atomic loop. Do NOT re-measure the
+                                      # CPU arm on a heavy scene — CPU bistro traces at ~1000
+                                      # ms/frame and swamps the present stage 1000:1 (that
+                                      # attempt read "no effect" and was measuring the tracer).
+                                      # FRUSTRACER_STAB parked: median 0.230/255 in BOTH arms —
+                                      # the ramp is smooth enough that no pixel oscillates across
+                                      # it between frames.
+                                      # MEASUREMENT TRAP, learned here: a guard on/off A/B
+                                      # across TWO PROCESSES is not an instrument — the
+                                      # exposure controller eases to its own value per session
+                                      # and XeSS/NRD temporal state is not reproducible across
+                                      # them, so the cross-session diff showed tens of
+                                      # thousands of pixels BRIGHTENED by a feature that can
+                                      # only darken. Difference against the same run's own
+                                      # baseline (the memory-sampler lesson, in another
+                                      # currency); a same-session toggle is the missing
+                                      # instrument, and the 16x-local-5x5-median firefly count
+                                      # is ALSO blind here (a median sits inside a blob and
+                                      # read 0 in every arm, the off one included). The
+                                      # within-frame `fired` count and the histogram are the
+                                      # valid instruments today.
+                                      # Known-accepts: SATURATING spikes are unaffected (they
+                                      # pin white at any aperture); a spike's BLOOM HALO is not
+                                      # an outlier so it still takes the full boost while the
+                                      # core does not (bloom strength is small, so this softens
+                                      # rather than inverts; guarding bloom's input would
+                                      # change what glare means); the METER still sees the
+                                      # spikes, so a sparkly frame still stops the aperture
+                                      # down slightly (an outlier-robust meter is a separate,
+                                      # additive mechanism); a genuine isolated small specular
+                                      # glint over a dark surround is a false positive, bounded
+                                      # by the invariant above; frame-border pixels are never
+                                      # guarded. OWED: the user's feel-test — the constants are
+                                      # measured but the LOOK is not gate-visible
 cargo run --release -- --gpu-debug    # D3D12 debug layer + GPU-BASED VALIDATION, draining to stderr
                                       # (`d3d12::drain_debug`, called from every present and every
                                       # headless submit). All three halves are load-bearing: the

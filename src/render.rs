@@ -2159,14 +2159,49 @@ pub fn render_frame_replay(ctx: &FrameCtx, rc: &replay::ReplayCache) {
     ctx.stats.add(&ls);
 }
 
+/// The per-pixel exposure a present loop should use: the spike guard's plane
+/// when one was built, else the frame's flat aperture.
+///
+/// `guard` is `None` on every path where the guard cannot fire (headless, the
+/// aperture at or below 1.0, the lever off), and then this returns `exposure`
+/// verbatim — which is what keeps a disarmed frame bit-identical to the
+/// pre-feature renderer rather than identical by fp luck. The plane is indexed
+/// in SOURCE space, so the nearest upscale shares one entry across the window
+/// pixels that share a source texel, exactly as the colour does.
+#[inline]
+fn guard_e(guard: Option<&[f32]>, exposure: f32, sx: usize, sy: usize, rw: usize) -> f32 {
+    match guard {
+        Some(g) => g[sy * rw + sx],
+        None => exposure,
+    }
+}
+
+/// `guard_e` for the PQ arms, whose per-pixel curve rides a whole `ToneParams`.
+/// Returns `p` VERBATIM when unguarded, so the disarmed PQ stream is untouched.
+#[inline]
+fn guard_p(
+    guard: Option<&[f32]>,
+    p: tone::ToneParams,
+    sx: usize,
+    sy: usize,
+    rw: usize,
+) -> tone::ToneParams {
+    match guard {
+        Some(g) => tone::ToneParams { exposure: g[sy * rw + sx], ..p },
+        None => p,
+    }
+}
+
 /// Average, tonemap, and upscale the accumulation buffer into the 0RGB present
 /// buffer; optionally blend the quadtree debug overlay.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve(
     accum: &[AtomicU32],
     info: &[AtomicU32],
     samples: u32,
     overlay_on: bool,
     exposure: f32,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2192,7 +2227,7 @@ pub fn resolve(
                     }
                 });
             },
-            |hdr| tonemap_to(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh),
+            |hdr| tonemap_to(hdr, info, overlay_on, exposure, guard, present, rw, rh, ww, wh),
         );
         return;
     }
@@ -2207,18 +2242,21 @@ pub fn resolve(
                 f32::from_bits(accum[i + 1].load(Relaxed)),
                 f32::from_bits(accum[i + 2].load(Relaxed)),
             ) * inv;
-            *out = present_px(c, info, overlay_on, exposure, sx, sy, rw, rh);
+            let e = guard_e(guard, exposure, sx, sy, rw);
+            *out = present_px(c, info, overlay_on, e, sx, sy, rw, rh);
         }
     });
 }
 
 /// `resolve` for an already-averaged linear HDR buffer (3 floats/px) — the
 /// OIDN output path. Same tonemap curve, overlay composite, and upscale.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_hdr(
     hdr: &[f32],
     info: &[AtomicU32],
     overlay_on: bool,
     exposure: f32,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2231,7 +2269,7 @@ pub fn resolve_hdr(
     // materializes its own HDR image and calls `tonemap_to` below with the glare
     // already applied, so nothing can double-bloom.
     crate::bloom::with_glare(hdr, rw, rh, |hdr| {
-        tonemap_to(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh)
+        tonemap_to(hdr, info, overlay_on, exposure, guard, present, rw, rh, ww, wh)
     });
 }
 
@@ -2246,6 +2284,7 @@ fn tonemap_to(
     info: &[AtomicU32],
     overlay_on: bool,
     exposure: f32,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2258,7 +2297,8 @@ fn tonemap_to(
             let sx = (wx * rw / ww).min(rw - 1);
             let i = (sy * rw + sx) * 3;
             let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
-            *out = present_px(c, info, overlay_on, exposure, sx, sy, rw, rh);
+            let e = guard_e(guard, exposure, sx, sy, rw);
+            *out = present_px(c, info, overlay_on, e, sx, sy, rw, rh);
         }
     });
 }
@@ -2272,6 +2312,7 @@ pub fn resolve_sdr10(
     samples: u32,
     overlay_on: bool,
     exposure: f32,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2297,7 +2338,7 @@ pub fn resolve_sdr10(
                     }
                 });
             },
-            |hdr| tonemap_to_sdr10(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh),
+            |hdr| tonemap_to_sdr10(hdr, info, overlay_on, exposure, guard, present, rw, rh, ww, wh),
         );
         return;
     }
@@ -2312,7 +2353,8 @@ pub fn resolve_sdr10(
                 f32::from_bits(accum[i + 1].load(Relaxed)),
                 f32::from_bits(accum[i + 2].load(Relaxed)),
             ) * inv;
-            *out = present_px_sdr10(c, info, overlay_on, exposure, sx, sy, rw, rh);
+            let e = guard_e(guard, exposure, sx, sy, rw);
+            *out = present_px_sdr10(c, info, overlay_on, e, sx, sy, rw, rh);
         }
     });
 }
@@ -2325,6 +2367,7 @@ pub fn resolve_hdr_sdr10(
     info: &[AtomicU32],
     overlay_on: bool,
     exposure: f32,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2334,7 +2377,7 @@ pub fn resolve_hdr_sdr10(
     crate::zone!("resolve-hdr-sdr10");
     // The Sdr10 twin of `resolve_hdr`: the CPU denoisers' glare comes from here.
     crate::bloom::with_glare(hdr, rw, rh, |hdr| {
-        tonemap_to_sdr10(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh)
+        tonemap_to_sdr10(hdr, info, overlay_on, exposure, guard, present, rw, rh, ww, wh)
     });
 }
 
@@ -2347,6 +2390,7 @@ fn tonemap_to_sdr10(
     info: &[AtomicU32],
     overlay_on: bool,
     exposure: f32,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2359,7 +2403,8 @@ fn tonemap_to_sdr10(
             let sx = (wx * rw / ww).min(rw - 1);
             let i = (sy * rw + sx) * 3;
             let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
-            *out = present_px_sdr10(c, info, overlay_on, exposure, sx, sy, rw, rh);
+            let e = guard_e(guard, exposure, sx, sy, rw);
+            *out = present_px_sdr10(c, info, overlay_on, e, sx, sy, rw, rh);
         }
     });
 }
@@ -2374,6 +2419,7 @@ pub fn resolve_pq(
     samples: u32,
     overlay_on: bool,
     p: tone::ToneParams,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2395,7 +2441,7 @@ pub fn resolve_pq(
                     }
                 });
             },
-            |hdr| tonemap_to_pq(hdr, info, overlay_on, p, present, rw, rh, ww, wh),
+            |hdr| tonemap_to_pq(hdr, info, overlay_on, p, guard, present, rw, rh, ww, wh),
         );
         return;
     }
@@ -2410,7 +2456,7 @@ pub fn resolve_pq(
                 f32::from_bits(accum[i + 1].load(Relaxed)),
                 f32::from_bits(accum[i + 2].load(Relaxed)),
             ) * inv;
-            *out = present_px_pq(c, p, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px_pq(c, guard_p(guard, p, sx, sy, rw), info, overlay_on, sx, sy, rw, rh);
         }
     });
 }
@@ -2423,6 +2469,7 @@ pub fn resolve_hdr_pq(
     info: &[AtomicU32],
     overlay_on: bool,
     p: tone::ToneParams,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2431,7 +2478,7 @@ pub fn resolve_hdr_pq(
 ) {
     crate::zone!("resolve-hdr-pq");
     crate::bloom::with_glare(hdr, rw, rh, |hdr| {
-        tonemap_to_pq(hdr, info, overlay_on, p, present, rw, rh, ww, wh)
+        tonemap_to_pq(hdr, info, overlay_on, p, guard, present, rw, rh, ww, wh)
     });
 }
 
@@ -2443,6 +2490,7 @@ fn tonemap_to_pq(
     info: &[AtomicU32],
     overlay_on: bool,
     p: tone::ToneParams,
+    guard: Option<&[f32]>,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2455,7 +2503,7 @@ fn tonemap_to_pq(
             let sx = (wx * rw / ww).min(rw - 1);
             let i = (sy * rw + sx) * 3;
             let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
-            *out = present_px_pq(c, p, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px_pq(c, guard_p(guard, p, sx, sy, rw), info, overlay_on, sx, sy, rw, rh);
         }
     });
 }
