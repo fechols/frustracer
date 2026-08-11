@@ -19,4 +19,6 @@ pub mod device;
 pub mod headless;
 pub mod layout;
 pub mod reflect;
+pub mod scene;
 pub mod spirv;
+pub mod tracer;

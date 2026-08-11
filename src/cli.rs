@@ -716,10 +716,12 @@ pub struct Cli {
     pub check_spirv: bool,
     /// `--check-vk`: bring up a real Vulkan device, run the indirect-dispatch
     /// smoke chain on it, probe the compiled subgroup width at every group
-    /// width the tracer dispatches, and bind every tracer kernel against the
-    /// descriptor-set layout derived from the corpus's own declarations.
-    /// SCENE-KEYED at that last stage (the tracer's scene-conditional defines
-    /// change which resources exist), unix-only today like the backend it gates.
+    /// width the tracer dispatches, bind every tracer kernel against the
+    /// descriptor-set layout derived from the corpus's own declarations, and
+    /// RENDER a frame with the reference kernel against a real BLAS/TLAS,
+    /// scored against the CPU plain reference. SCENE-KEYED from the layout
+    /// stage on (the tracer's scene-conditional defines change which resources
+    /// exist); unix-only today like the backend it gates.
     pub check_vk: bool,
     pub check_gpu: bool,
     pub check_dxr: bool,
@@ -2497,9 +2499,11 @@ pub fn usage() {
                 eprintln!("                them), probes the compiled subgroup width at every group width the tracer");
                 eprintln!("                dispatches (unpinned and pinned), and binds every tracer kernel against");
                 eprintln!("                the descriptor-set layout DERIVED from the compiled modules themselves");
-                eprintln!("                (FR_VK_MAP=1 prints it). FR_VK_DEVICE=<index|name> forces");
-                eprintln!("                the adapter; the Khronos validation layer is ARMED by default and");
-                eprintln!("                FR_VK_VALIDATION=0 disarms it");
+                eprintln!("                (FR_VK_MAP=1 prints it), then uploads the scene, builds a BLAS/TLAS and");
+                eprintln!("                RENDERS a frame with the reference kernel, scored against the CPU plain");
+                eprintln!("                reference (skipped, loudly, on a textured scene — no image uploads yet).");
+                eprintln!("                FR_VK_DEVICE=<index|name> forces the adapter; the Khronos validation");
+                eprintln!("                layer is ARMED by default and FR_VK_VALIDATION=0 disarms it");
                 eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser, OPT-IN since");
                 eprintln!("                2026-08-10 (NRD is the default). THE FAST ARM: 2.5x NRD's speed in the");
                 eprintln!("                denoiser region, no DLL and no install step — the kernels compile like");

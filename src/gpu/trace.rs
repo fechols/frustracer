@@ -41,7 +41,7 @@ use crate::bc7;
 use crate::blas_split::ChunkWindow;
 use crate::bvh::Bvh;
 use crate::camera::CamBasis;
-use crate::scene::{MatKind, Scene};
+use crate::scene::Scene;
 use glam::Vec3A;
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -1130,40 +1130,10 @@ struct GpuBvhNode {
     count: u32,
 }
 
-/// scene.rs::Material packed for StructuredBuffer<Mat> (shade.hlsli).
-/// 108 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
-/// garbage, so the two must move in the same commit.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GpuMat {
-    albedo: [f32; 3],
-    roughness: f32,
-    metallic: f32,
-    anisotropy: f32,
-    kind: u32, // 0 = diffuse, 1 = marble, 2 = textured
-    scale: f32,
-    sheen: f32,
-    translucency: f32,
-    transmission: f32,
-    /// `Scene::textures` index for MAT_TEXTURED (the space1 `texs[]` slot).
-    tex: u32,
-    emissive: [f32; 3],
-    normal_tex: u32, // NO_TEX sentinel = HLSL TEX_NONE
-    rough_tex: u32,
-    metal_tex: u32,
-    emissive_tex: u32,
-    normal_scale: f32,
-    trans_tint: [f32; 3], // transmission/absorption tint; .x < 0 = "use albedo"
-    ior: f32,             // Snell/Fresnel IOR (default 1.5; water 1.33)
-    ripple_amp: f32,      // water ripple slope amplitude (0 = none)
-    // Per-material world-space detail texel scale (Scene::detail_scales —
-    // never per-face, which seams on greedy-meshed atlases). 0 = field off.
-    detail_scale: f32,
-    // Spec-AA: the normal map's slope-variance companion texture
-    // (Scene::tex_var; TEX_NONE = none — every unmapped/lever-off material,
-    // the fold's structural map-arm off state).
-    normal_var_tex: u32,
-}
+/// The material wire format moved to `gfx::scene` (one mirror of
+/// shade.hlsli's `Mat`, read by both backends); re-exported so this file's
+/// `size_of::<GpuMat>()` accounting reads as it always did.
+use crate::gfx::scene::GpuMat;
 
 /// Bytes of reusable staging streamed per blocking submit — bounds the
 /// upload's transient commit to one chunk instead of a full second copy of
@@ -1545,88 +1515,13 @@ impl SceneGpu {
             |t| [t.x, t.y],
             srv,
         )?;
-        let materials: Vec<GpuMat> = scene
-            .materials
-            .iter()
-            .enumerate()
-            .map(|(mi, m)| GpuMat {
-                albedo: [m.albedo.x, m.albedo.y, m.albedo.z],
-                roughness: m.roughness,
-                metallic: m.metallic,
-                anisotropy: m.anisotropy,
-                kind: match m.kind {
-                    MatKind::Diffuse => 0,
-                    MatKind::Marble { .. } => 1,
-                    MatKind::Textured { .. } => 2,
-                },
-                scale: match m.kind {
-                    MatKind::Marble { scale } => scale,
-                    _ => 0.0,
-                },
-                sheen: m.sheen,
-                translucency: m.translucency,
-                transmission: m.transmission,
-                tex: match m.kind {
-                    MatKind::Textured { tex } => tex,
-                    _ => 0,
-                },
-                emissive: [m.emissive.x, m.emissive.y, m.emissive.z],
-                normal_tex: m.normal_tex,
-                rough_tex: m.rough_tex,
-                metal_tex: m.metal_tex,
-                emissive_tex: m.emissive_tex,
-                normal_scale: m.normal_scale,
-                trans_tint: [m.trans_tint.x, m.trans_tint.y, m.trans_tint.z],
-                ior: m.ior,
-                ripple_amp: m.ripple_amp,
-                detail_scale: scene.detail_scales.get(mi).copied().unwrap_or(0.0),
-                normal_var_tex: scene
-                    .tex_var
-                    .get(m.normal_tex as usize)
-                    .copied()
-                    .unwrap_or(crate::scene::NO_TEX),
-            })
-            .collect();
+        let materials = crate::gfx::scene::gpu_materials(scene);
         let materials_b = stream_buffer(device, sub, &ring, &materials, |m| *m, srv)?;
-        // Per-material cutout map the alpha_cutout helper consumes.
-        let mat_cutout: Vec<u32> = scene
-            .materials
-            .iter()
-            .map(|m| match m.kind {
-                MatKind::Textured { tex } if scene.textures[tex as usize].alpha_masked => tex + 1,
-                _ => 0,
-            })
-            .collect();
+        let mat_cutout = crate::gfx::scene::mat_cutout(scene);
         let mat_cutout_b = stream_buffer(device, sub, &ring, &mat_cutout, |m| *m, srv)?;
-        // Per-material relief map the height_march helper consumes: normal
-        // tex + 1 where the material carries a heightfield, else 0, plus the
-        // amp (texel widths). The nonzero set is exactly the h2n/n2h texture
-        // set — the same predicate `bc7::should_compress` excludes, so every
-        // texture the march can `.Load` is RGBA8 (the mat_cutout agreement
-        // argument verbatim).
-        let mat_height: Vec<[u32; 2]> = scene
-            .materials
-            .iter()
-            .map(|m| {
-                if m.height_amp > 0.0 && m.normal_tex != crate::scene::NO_TEX {
-                    [m.normal_tex + 1, m.height_amp.to_bits()]
-                } else {
-                    [0, 0]
-                }
-            })
-            .collect();
+        let mat_height = crate::gfx::scene::mat_height(scene);
         let mat_height_b = stream_buffer(device, sub, &ring, &mat_height, |m| *m, srv)?;
-        // Per-material tinted-shadow data `transmit_q` consumes: rgb = the
-        // interface tint (`Material::shadow_tint` — the ONE tint source, so
-        // CPU↔GPU agreement is by data), a = transmission (a == 0 ⇒ opaque).
-        let mat_shadow: Vec<[f32; 4]> = scene
-            .materials
-            .iter()
-            .map(|m| {
-                let t = m.shadow_tint();
-                [t.x, t.y, t.z, m.transmission]
-            })
-            .collect();
+        let mat_shadow = crate::gfx::scene::mat_shadow(scene);
         let mat_shadow_b = stream_buffer(device, sub, &ring, &mat_shadow, |m| *m, srv)?;
         // BC7 (ON BY DEFAULT — --no-bc7 kills): block-compress the OPAQUE
         // 4-aligned textures on upload (8 bpp vs 32 — Intel Sponza's set is
@@ -2584,18 +2479,7 @@ pub(crate) fn sway_mv_pair(p: &FrameParams) -> Option<(f32, f32)> {
     Some((tc, tp))
 }
 
-/// The scene AABB the slab-space cloud-shadow grid spans: the content box
-/// unioned with the ground quad's first few vertices (the ground is what a low
-/// sun's shadow footprint actually covers). Shared by TraceGpu/DxrGpu so both
-/// derive the same grid.
-pub(crate) fn scene_shadow_aabb(scene: &Scene) -> ([f32; 3], [f32; 3]) {
-    let (mut amn, mut amx) = (scene.content_min, scene.content_max);
-    for p in scene.positions.iter().take(6) {
-        amn = amn.min(*p);
-        amx = amx.max(*p);
-    }
-    ([amn.x, amn.y, amn.z], [amx.x, amx.y, amx.z])
-}
+pub(crate) use crate::gfx::scene::shadow_aabb as scene_shadow_aabb;
 
 /// D3D12 requires every acceleration structure to start on a 256-byte boundary
 /// (`D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT`), which is what

@@ -255,6 +255,21 @@ impl DeviceInfo {
         }
     }
 
+    /// The same fact in the vocabulary the shader assembly speaks. It is a
+    /// PARAMETER of `TraceKeys` rather than a process global for the reason
+    /// `--dual-gpu` records on the D3D12 side: two devices can be live, and
+    /// `cand_defs` arming on the wrong one restores a real defect on the
+    /// device that does not need it.
+    pub fn vendor(&self) -> crate::gfx::vocab::Vendor {
+        use crate::gfx::vocab::Vendor;
+        match self.vendor_id {
+            0x1002 | 0x1022 => Vendor::Amd,
+            0x10DE => Vendor::Nvidia,
+            0x8086 => Vendor::Intel,
+            _ => Vendor::Other,
+        }
+    }
+
     pub fn kind_str(&self) -> &'static str {
         match self.kind {
             vk::PhysicalDeviceType::DISCRETE_GPU => "discrete",
@@ -668,7 +683,20 @@ impl Vk {
         let idx = mem_type_index(&self.mem, req.memory_type_bits, want).ok_or_else(|| {
             format!("no memory type for {size} B with {want:?} (mask {:#x})", req.memory_type_bits)
         })?;
-        let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(idx);
+        // A buffer that asks for a device address needs its ALLOCATION flagged
+        // for one too, and the flag is derived from the usage rather than
+        // passed in for the same reason `binding_of` is computed: a caller who
+        // remembers the usage bit and forgets the allocate flag gets a clean
+        // `vkCreateBuffer` and a failure at `vkGetBufferDeviceAddress`, which
+        // is the acceleration-structure path's most confusing possible error.
+        let mut flags = vk::MemoryAllocateFlagsInfo::default()
+            .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut ai = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(idx);
+        if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+            ai = ai.push_next(&mut flags);
+        }
         let mem = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| {
             unsafe { self.device.destroy_buffer(buf, None) };
             format!("vkAllocateMemory({} B): {e}", req.size)
@@ -676,6 +704,17 @@ impl Vk {
         unsafe { self.device.bind_buffer_memory(buf, mem, 0) }
             .map_err(|e| format!("vkBindBufferMemory: {e}"))?;
         Ok(Buffer { buf, mem, size, host })
+    }
+
+    /// The buffer's GPU virtual address — D3D12's `GetGPUVirtualAddress`.
+    /// Valid only for a buffer created with `SHADER_DEVICE_ADDRESS` usage (see
+    /// `buffer`, which flags the allocation from exactly that bit).
+    pub fn buffer_device_address(&self, b: &Buffer) -> vk::DeviceAddress {
+        unsafe {
+            self.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(b.buf),
+            )
+        }
     }
 
     pub fn free_buffer(&self, b: &Buffer) {

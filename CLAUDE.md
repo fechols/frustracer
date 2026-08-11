@@ -4666,13 +4666,14 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
                                       # against, so a module can be perfectly valid and read the wrong
-                                      # resource. Six stages: V0 the pure pick/memory logic (runs with no
+                                      # resource. Seven stages: V0 the pure pick/memory logic (runs with no
                                       # Vulkan on the box at all) | V1 loader + instance + device | V2
                                       # compile smoke.hlsl to SPIR-V and build the pipelines | V3 run the
                                       # seed -> prep -> indirect-fill chain and read the results back |
                                       # V4 the wave-width table and the subgroup-size decision | V5 the
                                       # TRACER's own register map, derived from the corpus, with every one
-                                      # of its kernels bound against it.
+                                      # of its kernels bound against it | V6 the reference kernel actually
+                                      # RENDERING a frame, scored against the CPU plain reference.
                                       # V3 IS THE POINT: constants reaching a kernel, storage buffers
                                       # bound and written, a GPU-WRITTEN counter turned into dispatch
                                       # arguments by a second kernel, and a third kernel launched from
@@ -4861,7 +4862,94 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # ERROR-severity message; FR_VK_MAP=1 prints the derived register map
                                       # (the D3D12 root signature's Vulkan twin — "what does the tracer
                                       # actually bind" answerable without reading the shaders);
-                                      # FR_VK_DROP_BINDING=<set>:<binding> is V5's teeth above.
+                                      # FR_VK_DROP_BINDING=<set>:<binding> is V5's teeth above;
+                                      # FR_VK_DROP_STREAM=<name> and FR_VK_AB_FRAMES=<n> are V6's (below);
+                                      # FR_VK_AB_DUMP=1 writes the two converged images + the CPU t buffer
+                                      # as raw f32 (vk-ab-{cpu,gpu,t}.f32) for spatial attribution — the
+                                      # FR_CHECK_AB_DUMP idiom, and what turned "the shading is 11% dark"
+                                      # into "every pixel is shading as triangle 0" in one scanline print.
+                                      # V6 — THE REFERENCE KERNEL RENDERING (M3b, 2026-08-10;
+                                      # src/vk/scene.rs + src/vk/tracer.rs). V5 proved every tracer kernel
+                                      # BINDS; this is the first stage that proves one of them is RIGHT,
+                                      # and it is where the port stops being about Vulkan and starts being
+                                      # about the renderer: a stream at the wrong slot, a GpuMat stride
+                                      # skewed by -fvk-use-dx-layout, a BLAS built from the wrong device
+                                      # address, a cbuffer field landing one dword over — none of those
+                                      # fail a pipeline creation, and ALL of them make a picture that
+                                      # disagrees. The comparison is --check-gpu's own M2, transplanted:
+                                      # one unjittered frame each for primary VISIBILITY (t + hit/sky
+                                      # class, which scores the acceleration structure), then an
+                                      # accumulated pair for RADIANCE (which scores the shading, the
+                                      # materials, the sky and the cloud caches), then the RESOLVE LINK
+                                      # (hdr == accum/samples — the one thing here that touches an IMAGE,
+                                      # so also the proof that storage-image creation, the GENERAL
+                                      # transition and the image descriptor are wired). Statistical, for
+                                      # the reason recorded there: hardware watertight intersection is not
+                                      # moller_trumbore, and the RNG streams differ by design.
+                                      # MEASURED (RADV STRIX_HALO, 400x300, procedural scene):
+                                      # class-mismatch 0, rel-t violations 0, max rel t err 1.19e-5;
+                                      # radiance per-channel mean rel diff 0.030% against a 2% bar (sky
+                                      # -0.02%, geometry +0.04%); resolve link 0 channels past one f16
+                                      # step. --stress 200 reads 0.009%. AND ON llvmpipe: 0.206% at 2
+                                      # frames — a second, wholly independent ray-tracing implementation
+                                      # agreeing with the CPU tracer, which is what makes this gateable in
+                                      # CI without a GPU.
+                                      # THE BUG IT CAUGHT ON ITS FIRST RUN, because it is the whole reason
+                                      # the stage exists: --blas-split is ON BY DEFAULT, so BLAS_SPLIT is
+                                      # compiled in and every intersector site reads
+                                      # tri_of(InstanceID(), PrimitiveIndex()) = blas_tri[chunk_base[inst]
+                                      # + prim]. Those two were bound to the zero dummy, so tri_of
+                                      # returned 0 for every hit and the ENTIRE FRAME shaded as triangle
+                                      # 0's material — and the visibility gate could not see it at all,
+                                      # because `t` comes from the ray query while the triangle id is what
+                                      # indexes positions/normals/tri_mat. It presented as an 11% darkening
+                                      # that survived every feature lever; what identified it was the
+                                      # per-primary-hit SPLIT (sky matched to -0.02% while geometry was
+                                      # -11%, so the CB, the sun rows, the whole 4608-byte -fvk-use-dx-
+                                      # layout packing and both cloud caches were already proven right) and
+                                      # then a scanline print showing the GPU returning ONE colour for
+                                      # every material. The fix is the identity remap, which is not a
+                                      # stand-in: one BLAS over the index stream in original order makes
+                                      # blas_tri[i] = i and chunk_base = [0] the CORRECT single-chunk
+                                      # values.
+                                      # TWO METHOD LESSONS, both cheap and both re-learnable the hard way.
+                                      # (1) THE METRIC IS --check-gpu's, TO THE LINE, and picking a
+                                      # different one was this stage's first bug: a mean of PER-PIXEL
+                                      # relative errors reads 16% on a CORRECT image here, because it is
+                                      # dominated by dark pixels where a 1-spp path tracer's own noise
+                                      # dwarfs the value and the two sides draw independent samples by
+                                      # design. The ratio of channel SUMS asks the question that
+                                      # distinguishes a wired-wrong renderer from a noisy one, and its 2%
+                                      # bar is calibrated against exactly this disagreement on D3D12.
+                                      # (2) FR_VK_AB_FRAMES is what tells a BIAS from a slowly-converging
+                                      # one: the residual read +3.44/+3.45/+3.48% at 16/64/256 frames —
+                                      # FLAT — which is what proved it was a defect before any of the
+                                      # bisection started.
+                                      # TEETH: FR_VK_DROP_STREAM=<name> binds one named stream to the zero
+                                      # dummy (a layout DERIVED from the shaders cannot be tested by
+                                      # writing a wrong one). MEASURED: blas_tri, tri_mat, materials and
+                                      # indices each FAIL the stage; positions and normals do NOT, and
+                                      # that is a fact about the shading path rather than a weak gate —
+                                      # surface_point takes the hit point from ro + rd*t, reads positions
+                                      # only for a degenerate-normal fallback and the texture-LOD term
+                                      # (dead on an untextured scene), and falls back to the face normal
+                                      # when the interpolated one is zero.
+                                      # WHAT V6 SKIPS, LOUDLY: a device with no ray query, and any scene
+                                      # with TEXTURES — VkScene writes no image descriptors, so texs[]
+                                      # would be indexed unbound, which under descriptorBindingPartiallyBound
+                                      # is undefined rather than zero. Running anyway would produce a
+                                      # number nobody could defend either way. That skip is the M3b
+                                      # boundary: images (with their sampler/format/mip machinery) are
+                                      # their own slice, as are staging uploads and the real --blas-split.
+                                      # THE CLOUD CACHES ARE BUILT AND DISPATCHED HERE, not levered off:
+                                      # cs_reference reads the amortized sky lattice (--sky-lod, default 4)
+                                      # and the slab-space cloud-shadow cache (--cloud-shadow, default 16)
+                                      # at registers the wavefront otherwise uses for tile queues, so a
+                                      # tracer that skipped their fills would shade a black sky — and
+                                      # forcing both levers off would make the gate cover a configuration
+                                      # nobody ships. So cs_sky_lod and cs_cloud_shadow are compiled and
+                                      # dispatched exactly as record_sky_lod/record_cloud_shadow run them
+                                      # on D3D12, and both caches are covered for free.
                                       # THE M2c SUBGROUP VERDICT (V4) — waveprobe.hlsl, the D3D12 suite's
                                       # OWN kernel unmodified, at every group width the tracer dispatches
                                       # (32 for cs_level*/cs_hemi_*, SKY_GROUP=64, LEAF_GROUP=256), in
@@ -4902,12 +4990,15 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # stage wants gating, not before.
                                       # SCENE-KEYED SINCE V5, and V0-V4 are not: smoke.hlsl and
                                       # waveprobe.hlsl carry no scene-derived defines, so those stages are
-                                      # a pure function of the device, while V5 assembles the real tracer
-                                      # and therefore inherits every scene-conditional define
-                                      # (ALPHA_CUTOUT/HEIGHTFIELD/TRANS_SHADOW) — which is why its slot
-                                      # count moves with the scene and why `--check-vk
-                                      # san-miguel-low-poly.obj` covers bindings the procedural run cannot
-                                      # reach. `ash` is the one new dependency — a generated binding, not
+                                      # a pure function of the device, while V5/V6 assemble the real
+                                      # tracer and therefore inherit every scene-conditional define
+                                      # (ALPHA_CUTOUT/HEIGHTFIELD/TRANS_SHADOW) — which is why the slot
+                                      # count moves with the scene (46 procedural, 49 on
+                                      # san-miguel-low-poly) and why `--check-vk san-miguel-low-poly.obj`
+                                      # covers bindings the procedural run cannot reach. NOTE the two
+                                      # stages want opposite scenes and both are worth running: V5 wants
+                                      # a TEXTURED one for coverage, V6 skips exactly those until images
+                                      # land. `ash` is the one new dependency — a generated binding, not
                                       # a framework (no allocator, no render graph, no policy), and its
                                       # default `loaded` feature dlopens libvulkan.so.1 and resolves every
                                       # entry point by symbol: the same footprint policy as dxc/oidn/xess/

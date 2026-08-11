@@ -1142,7 +1142,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk(&scene);
+            let code = run_check_vk(&scene, &bvh, cam0);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -11794,7 +11794,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 /// the bare-checkout rule every SDK-dependent gate here follows. It does NOT
 /// degrade on a device that is present and wrong.
 #[cfg(unix)]
-fn run_check_vk(scene: &scene::Scene) -> i32 {
+fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
     let mut ok = true;
 
     // ---- V0: the pure half. Meaningful on a box with no Vulkan at all. ----
@@ -11892,6 +11892,11 @@ fn run_check_vk(scene: &scene::Scene) -> i32 {
 
     // ---- V5: the tracer's register map, derived, and every kernel bound. ----
     if !run_check_vk_layout(&hg, &sp, scene) {
+        ok = false;
+    }
+
+    // ---- V6: the reference kernel rendering, scored against the CPU. ----
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0) {
         ok = false;
     }
 
@@ -12265,6 +12270,375 @@ fn run_check_vk_layout(
         map.entries.len(),
         if sets == 1 { "" } else { "s" },
     );
+    ok
+}
+
+/// V6 — the reference kernel actually RENDERING, scored against the CPU.
+///
+/// V5 proved every tracer kernel BINDS. This is the first stage that proves
+/// one of them is right, and it is where the port stops being about Vulkan and
+/// starts being about the renderer: a stream at the wrong slot, a `GpuMat`
+/// stride skewed by `-fvk-use-dx-layout`, a BLAS built from the wrong device
+/// address, a cbuffer field landing one dword over — none of those fail a
+/// pipeline creation, and all of them make a picture that disagrees.
+///
+/// The comparison is `--check-gpu`'s own M2, transplanted: one unjittered
+/// frame each for primary VISIBILITY (`t` and hit/sky class, which is what
+/// scores the acceleration structure), then an accumulated pair for RADIANCE
+/// (which is what scores the shading, the materials, the sky and the cloud
+/// caches). It is STATISTICAL for the reason recorded there — hardware
+/// watertight intersection is not `moller_trumbore`, and the two disagree at
+/// grazing shared edges — so the bars are a bounded mismatch COUNT and a mean
+/// relative error, never exact zero. Exact-zero belongs to GPU-vs-GPU gates,
+/// which arrive with the wavefront.
+///
+/// Small on purpose (`VK_RENDER_W` x `VK_RENDER_H`): the cost here is the CPU
+/// reference, not the GPU, and this stage exists to be run on every commit.
+#[cfg(unix)]
+fn run_check_vk_render(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> bool {
+    const VK_RENDER_W: usize = 400;
+    const VK_RENDER_H: usize = 300;
+    // Accumulated frames on each side of the radiance A/B. The RNG streams
+    // differ by design, so this is variance reduction, not agreement: too few
+    // and the bar measures noise. `FR_VK_AB_FRAMES` overrides it, which is the
+    // instrument that tells a BIAS from a slowly-converging one — a
+    // disagreement that halves as the count doubles was never a defect. (It
+    // is how the blas_tri bug was proven to be one: 16/64/256 frames all read
+    // +3.4%, flat.)
+    let frames: u32 = std::env::var("FR_VK_AB_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(16);
+
+    if !hg.vk.info.ray_query || !hg.vk.info.accel_struct {
+        println!("check-vk: SKIP V6 (no ray query on this device — the shipping tracer needs it)");
+        return true;
+    }
+    // SAID, NOT SILENTLY WRONG. `VkScene` writes no image descriptors, so on a
+    // textured scene `texs[]` is an unbound array the shading path indexes —
+    // and under `descriptorBindingPartiallyBound` that is undefined rather
+    // than zero. A skip names the missing piece; running anyway would produce
+    // a number whose meaning nobody could defend either way.
+    if !scene.textures.is_empty() {
+        println!(
+            "check-vk: SKIP V6 ({} texture(s) — the Vulkan scene has no image uploads yet, so \
+             texs[] would be indexed unbound; run it on an untextured scene)",
+            scene.textures.len()
+        );
+        return true;
+    }
+    let (gw, gh) = (VK_RENDER_W, VK_RENDER_H);
+    let vs = match vk::scene::VkScene::new(hg, scene) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 scene upload: {e}");
+            return false;
+        }
+    };
+    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, gw as u32, gh as u32) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 tracer init: {e}");
+            vs.destroy(hg);
+            return false;
+        }
+    };
+    println!(
+        "check-vk: V6 scene uploaded, BLAS/TLAS built ({} tris) — reference tracer at {gw}x{gh}",
+        scene.tri_count()
+    );
+
+    let q = Quality::preset(2);
+    let basis = cam0.basis(gw, gh);
+    let params = |frame: u32| gfx::frame::FrameParams {
+        cam: basis,
+        frame,
+        accumulate: true,
+        jitter: frame > 0,
+        frame_jitter: None,
+        prev_cam: None,
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+
+    // The CPU counterpart: the plain per-pixel reference (hybrid = false), the
+    // same contract `--check-gpu` scores against.
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..gw * gh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let cpu_frame = |frame: u32| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: frame > 0,
+            rw: gw,
+            rh: gh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, false);
+    };
+
+    let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+
+    let mut ok = true;
+    let px = gw * gh;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V6 {msg}");
+        *ok = false;
+    };
+
+    // ---- visibility: one unjittered frame each ----
+    if let Err(e) = tg.render(hg, &params(0), 1) {
+        fail(&mut ok, format!("reference dispatch: {e}"));
+    }
+    let gpu_t = match read_f32(&tg.tbuf, px) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, format!("tbuf readback: {e}"));
+            vec![f32::NAN; px]
+        }
+    };
+    cpu_frame(0);
+    let cpu_t: Vec<f32> = tbuf.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
+    let (mut n_hit, mut n_sky, mut class_mismatch, mut t_viol) = (0usize, 0usize, 0usize, 0usize);
+    let mut max_rel = 0.0f32;
+    for i in 0..px {
+        let (ct, gt) = (cpu_t[i], gpu_t[i]);
+        match (ct.is_finite(), gt.is_finite()) {
+            (true, true) => {
+                n_hit += 1;
+                let rel = (ct - gt).abs() / ct.abs().max(1e-6);
+                max_rel = max_rel.max(rel);
+                if rel > 1e-3 {
+                    t_viol += 1;
+                }
+            }
+            (false, false) => n_sky += 1,
+            _ => class_mismatch += 1,
+        }
+    }
+    println!(
+        "check-vk: V6 primary visibility ({px} px): hit {n_hit} | sky {n_sky} | \
+         class-mismatch {class_mismatch} | rel-t > 1e-3: {t_viol} | max rel t err {max_rel:.2e}"
+    );
+    // Anti-vacuity, both ways: a frame that is all sky scores the AS not at
+    // all, and a frame with no sky never runs the miss path (the sky dome, the
+    // cloud caches, the whole `sky_radiance_lod` arm this stage dispatches two
+    // extra kernels to fill).
+    if n_hit == 0 || n_sky == 0 {
+        fail(
+            &mut ok,
+            format!("the frame is {} — nothing is being scored",
+                if n_hit == 0 { "all sky" } else { "all geometry" }),
+        );
+    }
+    if class_mismatch as f64 > px as f64 * 5e-4 {
+        fail(&mut ok, format!("hit/sky classification mismatch {class_mismatch} above 0.05%"));
+    }
+    if t_viol as f64 > px as f64 * 1e-4 {
+        fail(&mut ok, format!("rel-t violations {t_viol} above 0.01%"));
+    }
+
+    // ---- radiance: FRAMES accumulated each ----
+    for f in 1..frames {
+        if let Err(e) = tg.render(hg, &params(f), f + 1) {
+            fail(&mut ok, format!("frame {f}: {e}"));
+            break;
+        }
+        cpu_frame(f);
+    }
+    let gpu_a = read_f32(&tg.accum, px * 3).unwrap_or_default();
+    let inv = 1.0 / frames as f32;
+    // THE METRIC IS `--check-gpu`'s, TO THE LINE, and picking a different one
+    // was this stage's first bug. A mean of PER-PIXEL relative errors reads
+    // 16% on a correct image here, because it is dominated by dark pixels
+    // where a 1-spp path tracer's own noise dwarfs the value and the two sides
+    // draw independent samples BY DESIGN. The ratio of channel SUMS asks the
+    // question that actually distinguishes a wired-wrong renderer from a noisy
+    // one — do the two converge to the same picture — and its 2% bar is
+    // calibrated against exactly this kind of disagreement on the D3D12 side.
+    let mut sum_c = [0.0f64; 3];
+    let mut sum_g = [0.0f64; 3];
+    let mut sum_abs = 0.0f64;
+    let mut nonfinite = 0usize;
+    // SPLIT BY WHAT THE PRIMARY RAY HIT, because the two populations fail for
+    // different reasons and a single number cannot tell them apart: sky is the
+    // dome + disc + the cloud caches with no material in sight, geometry is
+    // everything else. An attribution that costs two counters is worth more
+    // than the dump it saves writing.
+    let mut sky_c = 0.0f64;
+    let mut sky_g = 0.0f64;
+    let mut hit_c = 0.0f64;
+    let mut hit_g = 0.0f64;
+    for i in 0..px * 3 {
+        let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
+        let g = gpu_a.get(i).copied().unwrap_or(f32::NAN) * inv;
+        if !g.is_finite() || g < 0.0 {
+            nonfinite += 1;
+            continue;
+        }
+        sum_c[i % 3] += f64::from(c);
+        sum_g[i % 3] += f64::from(g);
+        sum_abs += f64::from((c - g).abs());
+        if cpu_t[i / 3].is_finite() {
+            hit_c += f64::from(c);
+            hit_g += f64::from(g);
+        } else {
+            sky_c += f64::from(c);
+            sky_g += f64::from(g);
+        }
+    }
+    // FR_VK_AB_DUMP=1 — read-only diagnostic (the FR_CHECK_AB_DUMP idiom): the
+    // two converged images as raw f32 RGB, so a failing mean can be attributed
+    // spatially instead of guessed at. No gate reads these files.
+    if std::env::var_os("FR_VK_AB_DUMP").is_some() {
+        let raw = |name: &str, v: &[f32]| {
+            let mut b = Vec::with_capacity(v.len() * 4);
+            for x in v {
+                b.extend_from_slice(&(x * inv).to_le_bytes());
+            }
+            let _ = std::fs::write(name, &b);
+        };
+        let cpu_v: Vec<f32> = accum.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
+        raw("vk-ab-cpu.f32", &cpu_v);
+        raw("vk-ab-gpu.f32", &gpu_a);
+        let tb: Vec<u8> = cpu_t.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let _ = std::fs::write("vk-ab-t.f32", &tb);
+        eprintln!("check-vk: V6 FR_VK_AB_DUMP wrote vk-ab-{{cpu,gpu,t}}.f32 ({gw}x{gh})");
+    }
+
+    let mut mean_rel = 0.0f64;
+    for ch in 0..3 {
+        mean_rel = mean_rel.max((sum_c[ch] - sum_g[ch]).abs() / sum_c[ch].max(1e-9));
+    }
+    println!(
+        "check-vk: V6 radiance A/B over {frames} frames: per-channel mean rel diff {:.3}% | \
+         mean abs px diff {:.4} | non-finite {nonfinite}",
+        mean_rel * 100.0,
+        sum_abs / (px * 3) as f64
+    );
+    println!(
+        "check-vk: V6   by primary hit: sky cpu {:.4} gpu {:.4} ({:+.2}%) | \
+         geometry cpu {:.4} gpu {:.4} ({:+.2}%)",
+        sky_c / (px * 3) as f64,
+        sky_g / (px * 3) as f64,
+        (sky_g - sky_c) / sky_c.max(1e-9) * 100.0,
+        hit_c / (px * 3) as f64,
+        hit_g / (px * 3) as f64,
+        (hit_g - hit_c) / hit_c.max(1e-9) * 100.0
+    );
+    if nonfinite > 0 {
+        fail(&mut ok, format!("{nonfinite} non-finite/negative GPU channels"));
+    }
+    // Anti-vacuity: a pair of all-black images agrees perfectly.
+    if sum_c.iter().sum::<f64>() <= 0.0 || sum_g.iter().sum::<f64>() <= 0.0 {
+        fail(&mut ok, "one of the accumulated images is entirely black".into());
+    }
+    if mean_rel > 0.02 {
+        fail(&mut ok, format!("converged radiance means differ by {:.3}%, above 2%", mean_rel * 100.0));
+    }
+
+    // ---- the resolve link: hdr == accum / samples ----
+    //
+    // The one thing in this stage that touches an IMAGE rather than a buffer,
+    // so it is also the proof that storage-image creation, the GENERAL layout
+    // transition and the image descriptor are all wired. Compared against the
+    // GPU's own accum, not the CPU's: this scores the kernel and the wire, and
+    // folding a CPU disagreement in would make a resolve bug indistinguishable
+    // from a shading one.
+    match tg.read_hdr(hg) {
+        Ok(hdr) => {
+            let mut bad = 0usize;
+            let mut wmax = 0.0f32;
+            let mut nz = 0usize;
+            for i in 0..px {
+                for c in 0..3 {
+                    let want = gpu_a.get(i * 3 + c).copied().unwrap_or(0.0) * inv;
+                    let got = hdr[i * 4 + c];
+                    if want.abs() > 1e-4 {
+                        nz += 1;
+                    }
+                    // One f16 step at this magnitude, plus a floor for the
+                    // denormal end: the wire is RGBA16F, so agreement can only
+                    // ever be to the format's own resolution.
+                    let tol = (want.abs() * (1.0 / 1024.0)).max(1e-4);
+                    let d = (want - got).abs();
+                    wmax = wmax.max(d);
+                    if d > tol {
+                        bad += 1;
+                    }
+                }
+            }
+            println!(
+                "check-vk: V6 resolve link: {bad} channel(s) past one f16 step \
+                 (max |d| {wmax:.3e}, {nz} non-zero)"
+            );
+            if nz == 0 {
+                fail(&mut ok, "the resolved image is entirely zero — the resolve pass proved nothing".into());
+            }
+            if bad > 0 {
+                fail(&mut ok, format!("{bad} resolved channels disagree with accum/samples"));
+            }
+        }
+        Err(e) => fail(&mut ok, format!("hdr readback: {e}")),
+    }
+
+    // WHAT THE TEETH REACH, measured rather than claimed. `FR_VK_DROP_STREAM`
+    // binds one named stream to the zero dummy; `blas_tri`, `tri_mat`,
+    // `materials` and `indices` each fail this stage. `positions` and
+    // `normals` do NOT, and that is a fact about the shading path rather than
+    // a weak gate: `surface_point` takes the hit point from `ro + rd*t`, reads
+    // `positions` only for a degenerate-normal fallback and the texture-LOD
+    // term (dead on an untextured scene), and falls back to the face normal
+    // when the interpolated one is zero — so on this scene those two streams
+    // genuinely do not determine the answer. Do not "fix" that by widening a
+    // bar; fix it, if it matters, with a textured scene.
+    tg.destroy(hg);
+    vs.destroy(hg);
     ok
 }
 
