@@ -716,7 +716,9 @@ cargo run --release -- model.obj --tile 3       # replicate a loaded OBJ into a 
                                                 # composes with --check* as the loaded-scene gate class)
 cargo run --release -- model.obj --no-bc7  # A/B lever: upload scene textures as raw RGBA8. BC7
                                         # block compression is ON BY DEFAULT (8 bpp vs 32 — GPU
-                                        # upload only; measured live set incl. mips: Intel Sponza
+                                        # upload only; on BOTH backends since 2026-08-11, see
+                                        # src/vk/bc7.rs and the M3j block in --check-vk: one
+                                        # kernel, two hosts, and `should_compress` called verbatim; measured live set incl. mips: Intel Sponza
                                         # 4608 -> 3072 MB, Bistro 2310 -> 1725; the CPU samplers
                                         # keep exact RGBA8 and alpha-masked cutout / height-
                                         # carrying textures NEVER compress — see Real scenes). The
@@ -5138,7 +5140,7 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # substitutes: DXC will happily emit a module no driver accepts,
                                       # and spirv-val validates a MODULE, so it can say nothing about two
                                       # registers landing on one binding (S0's injectivity sweep is that
-                                      # guard). MEASURED: 46 units -> 77 modules, 77 validated, 0 failed
+                                      # guard). MEASURED: 47 units -> 78 modules, 78 validated, 0 failed
                                       # — all four --dxr-inline libraries (mode 0's lib_6_3 all-TraceRay
                                       # build included) plus --dxr-sbt 3's recursive arm, the wavefront
                                       # ladder, FRD's kernels, the FSR composite, quin, and the display
@@ -5183,8 +5185,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 46/77. Measured 7678038 B procedural
-                                      # vs 7679182 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 47/78. Measured 7679015 B procedural
+                                      # vs 7680159 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
                                       # keying reaches. (A first draft printed 2-decimal MB and read
                                       # identical across all three: an instrument at the wrong
@@ -5223,7 +5225,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
                                       # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9; --sw-rays covered
-                                      # in M3g, staging uploads in M3h, the real --blas-split in M3i).
+                                      # in M3g, staging uploads in M3h, the real --blas-split in M3i,
+                                      # BC7 in M3j).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
@@ -5531,14 +5534,13 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # avoid. samplerAnisotropy is the one CORE feature the backend
                                       # enables, ENABLED-WHEN-PRESENT: a device without it runs --aniso 1,
                                       # which is the isotropic ray-cone lod path VERBATIM.
-                                      # BC7 IS DEFERRED, NOT DIVERGED: every texture uploads RGBA8 (the
-                                      # --no-bc7 arm), which is a MEMORY question and moves the CPU-vs-GPU
-                                      # comparison in the SAFE direction — the CPU samplers keep exact
-                                      # RGBA8 either way, so an uncompressed upload is strictly closer to
-                                      # the reference than the shipping D3D12 default. It inherits
-                                      # bc7::should_compress verbatim when it lands, including the
-                                      # carve-out that alpha-masked and height-carrying textures never
-                                      # compress (a VISIBILITY contract).
+                                      # BC7 WAS DEFERRED HERE AND LANDED IN M3j (below): M3d uploaded every
+                                      # texture as RGBA8, i.e. the --no-bc7 arm, which is a MEMORY question
+                                      # that moves the CPU-vs-GPU comparison in the SAFE direction — the CPU
+                                      # samplers keep exact RGBA8 either way — and therefore a legitimate
+                                      # place to stop. It inherited bc7::should_compress verbatim when it
+                                      # did land, including the carve-out that alpha-masked and
+                                      # height-carrying textures never compress (a VISIBILITY contract).
                                       # THE ANTI-VACUITY PROBE, and it earns its keep immediately: every
                                       # metric above passes identically whether 313 images reached the
                                       # shader or were uploaded and never read, so V6 re-renders the SAME
@@ -5568,8 +5570,9 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # 0.020%, stress + procedural green. (The M3d readings were taken at the
                                       # then-default 400x300 and are superseded, not contradicted: smlp read
                                       # 0.007% there, the helmet 0.081%.)
-                                      # WHAT V6 STILL SKIPS, LOUDLY: a device with no ray query. The remaining
-                                      # M3b/M3d boundaries are staging uploads, the real --blas-split, and BC7.
+                                      # WHAT V6 STILL SKIPS, LOUDLY: a device with no ray query. M3b/M3d's other
+                                      # declared boundaries — staging uploads, the real --blas-split, BC7 — are
+                                      # M3h, M3i and M3j, all landed.
                                       # V7 — THE WAVEFRONT QUADTREE, and the first EXACT-ZERO gates on
                                       # Vulkan (M3c, 2026-08-11; the ladder half of src/vk/tracer.rs). V6's
                                       # bars are all statistical, and unavoidably so: it is scored against the
@@ -5909,6 +5912,144 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # 341393 hit pixels wrong at radiance 60.520%. A fourth (every chunk pointed at
                                       # the first chunk's index slice) HUNG the build rather than failing, which is
                                       # its own answer: garbage vertex ids make absurd AABBs.
+                                      # M3j — BC7, IN BOTH ARMS (2026-08-11), and the reason it is not
+                                      # "purely a memory question" the way the plan filed it. The
+                                      # session default is `Gpu(Fast)`, so a backend with only the ispc
+                                      # arm would have to choose, for its DEFAULT session, between a
+                                      # ~20-second encode stall and silently ignoring the flag — and
+                                      # D3D12's own rule is that neither is acceptable (an encoder that
+                                      # fails to construct falls back LOUDLY to RGBA8, never to an
+                                      # implicit CPU encode). So the GPU encoder is the port, and the
+                                      # CPU arm rides along as the independent cross-check it is there.
+                                      # THE KERNEL IS NOT PORTED. `shaders/bc7enc.hlsl` compiles to
+                                      # SPIR-V exactly as it compiles to DXIL, and the ONE thing a
+                                      # second host cost it is a byte-offset WINDOW (`src_off`/
+                                      # `dst_off`, ex-`_pad` plus one dword): D3D12 slides root SRV/UAV
+                                      # virtual addresses per band, while Vulkan binds one descriptor
+                                      # per buffer for a whole batch of levels and moves the window in
+                                      # the constants — a per-dispatch descriptor rebind would be a
+                                      # descriptor-set allocation per mip, and a dynamic-offset binding
+                                      # would make the DERIVED layout special-case one slot. D3D12
+                                      # passes 0 for both, which is exact integer arithmetic, so both
+                                      # hosts encode the same blocks (`Num32BitValues` 8 -> 9 is the
+                                      # whole D3D12-side change). `Quality::effort` moved to src/bc7.rs
+                                      # for the same reason: one kernel, two hosts, one table.
+                                      # THREE DIFFERENCES FROM THE D3D12 HOST, and only three.
+                                      # (a) NO BANDING — that path exists because an upload heap's rows
+                                      # are 256-byte-pitch-aligned and one 4K mip does not fit a ring;
+                                      # here the texture batch loop already guarantees a whole chain
+                                      # fits, so one dispatch covers a whole level at a TIGHT `mw * 4`
+                                      # source pitch and the kernel's own clamp edge-replicates the
+                                      # bottom and right edges (which is what makes a non-4-aligned mip
+                                      # legal). (b) THE CONSTANTS ARE A UNIFORM BUFFER — DXC has no flag
+                                      # to promote a cbuffer to push constants and `[[vk::push_constant]]`
+                                      # would be an HLSL edit — rewritten between dispatches with
+                                      # `vkCmdUpdateBuffer` and carrying the ladder's own lesson: BOTH
+                                      # barriers, because a per-dispatch constant block needs a
+                                      # WRITE-AFTER-READ edge as well as the read-after-write one. The
+                                      # price is that a batch's dispatches SERIALIZE, which is fine (a
+                                      # 4K level is a million blocks and fills the machine alone) and
+                                      # cheaper than a descriptor set per mip. (c) TIGHT BLOCK ROWS —
+                                      # `row_blocks` is `bw`, not the 256-byte-aligned `block_pitch`,
+                                      # because `vkCmdCopyBufferToImage` takes `bufferRowLength` in
+                                      # TEXELS with no pitch to honour, so the shear trap the kernel's
+                                      # header names cannot arise here. MEASURED, and worth not
+                                      # re-deriving: an explicit `blocks(w) * 4` row length is EXACTLY
+                                      # equivalent to 0 for a compressed image (a zero row length is
+                                      # "tightly packed per imageExtent", and that already rounds up to
+                                      # whole blocks) — the explicit form is documentation, not a fix.
+                                      # What is NOT free is the OFFSET: every staged level is padded to
+                                      # 16 B, and a 4-aligned one is a validation error naming the copy.
+                                      # NOTHING ABOUT THE DECISION IS RE-MADE: `bc7::should_compress` is
+                                      # called verbatim, carve-out included — alpha-masked cutout masks
+                                      # and height-carrying relief fields stay exact RGBA8 because the
+                                      # intersector `.Load()`s a hard threshold out of them, which is a
+                                      # VISIBILITY contract rather than a per-backend quality choice —
+                                      # and `Texture::srgb` picks `BC7_SRGB_BLOCK` vs `BC7_UNORM_BLOCK`
+                                      # exactly as it picks `_SRGB` vs `_UNORM`. `textureCompressionBC`
+                                      # is the second ENABLED-WHEN-PRESENT core feature beside
+                                      # `samplerAnisotropy`, and for the same reason: its absence lands
+                                      # on `--no-bc7`, a shipping arm, rather than on a degradation
+                                      # invented here. (On D3D12 neither is a feature bit at all —
+                                      # anisotropy is a static sampler and BC7 is a format — so this is
+                                      # one of the few places the two APIs' SHAPES differ rather than
+                                      # their spelling.) The staging ring gained `STORAGE_BUFFER` usage
+                                      # unconditionally, since the encoder reads it IN PLACE the way
+                                      # D3D12's arm reads its upload heap as a root SRV; found by
+                                      # running it and reading the validation layer, the FR_SPLIT_AUDIT
+                                      # lesson repeated one commit later.
+                                      # THE BATCH LOOP GAINED A SECOND BUDGET, and it is not the obvious
+                                      # one: a batch is bounded by the ring in SOURCE bytes and by the
+                                      # block buffer in ENCODED bytes, and encoded is NOT simply a
+                                      # quarter of source — a 1x1 mip is 4 raw bytes and a whole 16-byte
+                                      # block, so a table of tiny textures encodes to FOUR TIMES what it
+                                      # staged and would overrun a block buffer sized off the ring.
+                                      # V10 IS THE GATE, in two halves, and it exists because every
+                                      # other number in the suite is blind to the encoder. V6's radiance
+                                      # A/B is a 2% bar on a frame where textures are one term of the
+                                      # shading, and its texture anti-vacuity probe asks whether the
+                                      # table reached the shader, not whether its CONTENT survived —
+                                      # MEASURED: a kernel that ignores `src_off` moves that A/B to
+                                      # 1.132% and PASSES, while V10 reads 20.7 dB and fails. The
+                                      # STRUCTURAL half is synthetic (`--check-gpu`'s `bc7-gpu`
+                                      # transplanted, teeth for teeth: an all-even flat colour must
+                                      # round-trip BIT-EXACT through the hardware decoder, every block
+                                      # of a flat texture must be byte-identical to block 0, a gradient
+                                      # ramp must clear 30 dB at all four effort tiers, and a
+                                      # two-CLUSTER block must land within 6 LSB — which is what proves
+                                      # the mode-1 arm FIRED and that its partition/anchor tables agree
+                                      # with THIS hardware decoder), so it fires on every scene
+                                      # INCLUDING the untextured procedural default where the fidelity
+                                      # half has nothing to score. The FIDELITY half is M11's twin: the
+                                      # session's own arm over the scene's own textures, decoded back
+                                      # through `gfx::shaders::BC7_READ_HLSL` (moved out of gpu/trace.rs
+                                      # — two gates scoring one encoder against two hardware decoders
+                                      # must be reading the same text) into a plain BC7_UNORM image,
+                                      # never `_SRGB`: the kernel must see raw code values or the
+                                      # transfer function is charged to the encoder. RGB only, for M11's
+                                      # reason. The 25 dB bar is a WIRING bar — pitch/footprint/format
+                                      # errors land at 10-20 dB — and BOTH GATE PROBES ENCODE AT A
+                                      # NON-ZERO AND DIFFERENT src/dst WINDOW (16 and 32), because a
+                                      # gate that always passed 0 would score the kernel's arithmetic
+                                      # and never the one thing a second host added to it, and equal
+                                      # values would not separate a kernel that applied one offset to
+                                      # both.
+                                      # MEASURED (RADV, the 800x600 gate frame): DamagedHelmet 106.7 ->
+                                      # 42.7 MB (4 of 5 — the 5th is its n2h normal map, whose ALPHA is
+                                      # the relief field), Sponza 490.7 -> 230.7 (66 of 93),
+                                      # rungholt 42.7 -> 26.7 (1 of 2 — the other is its cutout
+                                      # atlas), vokselia 21.3 -> 21.3 (0 of 1: its ONE texture is the
+                                      # alpha-masked Minecraft atlas, so the carve-out excludes the
+                                      # whole table — a scene where BC7 is armed and correctly does
+                                      # nothing), san-miguel-low-poly 511.5 ->
+                                      # 405.6 (77 of 313 — the odd-dim carve-out, which is San Miguel's
+                                      # arbitrary-dim research scans and the same 63%-of-opaque-MB
+                                      # population the D3D12 note records). V10 structural reads flat
+                                      # bit-exact / ramp >= 39.6 dB at all four efforts / two-cluster
+                                      # 1 LSB on every scene and on llvmpipe; V10 fidelity reads worst
+                                      # 42.6 dB on the helmet and **32.0 dB on san-miguel** — the SAME
+                                      # worst-texture number D3D12's M11 records for its GPU arm at
+                                      # `fast`, one kernel scored through two vendors' decoders. The
+                                      # radiance A/B moves and stays tiny (helmet 0.020% unarmed ->
+                                      # 0.016% armed, both arms), which is the liveness signal: an
+                                      # encoder that produced nothing would leave it EXACTLY where
+                                      # `--no-bc7` does. AND llvmpipe READS THE SAME FIDELITY NUMBERS
+                                      # AS RADV TO THE DIGIT (helmet mean 0.414 LSB, max 82, worst 42.6
+                                      # dB): BC7 DECODE is spec-bit-exact, so identical numbers across
+                                      # two independent implementations say the ENCODER produced
+                                      # identical blocks — the M3e integrator result in another
+                                      # currency. Fifteen arms green (every scene, `--no-bc7`,
+                                      # `--bc7-cpu` on two scenes, `--bc7-quality slow`, `--sw-rays`,
+                                      # `FR_VK_STAGE=64k`, llvmpipe), zero validation errors.
+                                      # TEETH, three planted and exercised: a kernel ignoring `src_off`
+                                      # (V6 1.132% PASSES, V10 20.7 dB FAILS — the whole argument for
+                                      # the stage in one line), one ignoring `dst_off` (V6 2.604%, V10
+                                      # 18.4 dB), and staging offsets aligned to RGBA8's 4 instead of
+                                      # BC7's 16, which validation names exactly
+                                      # (VUID-vkCmdCopyBufferToImage-dstImage-07975). A fourth was
+                                      # planted and turned out to be a mathematical identity
+                                      # (`next_multiple_of(4)` IS `blocks(w) * 4` for every w), which is
+                                      # its own reminder that a tooth must be shown to bite.
                                       # V8 — THE HEMISPHERE BOUNCE TIERS, the last render-path arm the Vulkan
                                       # tracer did not have (M3e, 2026-08-11). The H key's AO and GI: the batched
                                       # hemi wavefront (root -> cell levels -> leaf rays) and the one cs_compose splat
@@ -6418,7 +6559,7 @@ Game-like benchmark scenes come from the McGuire Computer Graphics Archive (http
 
 **glTF 2.0 scenes** (`src/gltf_loader.rs`; `.gltf`/`.glb` on the positional arg — same CLI slot as OBJ, so exclusivity/default camera/structural-skip/`--tile`/the scene cache all compose): materials carry REAL PBR data, so `matclass` is bypassed — baseColor/metallic/roughness factors + normal/metallicRoughness (roughness=G, metallic=B, one shared map)/emissive textures map straight onto the extended `Material`; KHR_materials_transmission → `transmission` (NO albedo lift — glTF baseColor is authored for tinting, unlike San Miguel's dark exporter Kd), KHR_materials_emissive_strength multiplies, sheen reads the raw KHR_materials_sheen JSON (no crate feature exists in gltf 1.4), KHR_materials_ior is logged (GLASS_IOR fixed), unlit → matte, Blend → Mask + note. The three glTF-vs-OBJ traps, all deliberate: **NO V flip** (glTF UVs are top-left origin — the convention our texels land in after the OBJ path's load-time flip), **no glass albedo lift**, and **OPAQUE materials must not cutout** (spec ignores their baseColor alpha; `alpha_masked` is cleared unless a MASK/BLEND material references the texture — junk JPG alpha would punch holes in walls). Node graph is FLATTENED (transforms baked; normals by inverse-transpose; negative-determinant nodes flip winding so geometric face normals keep agreeing); authored TANGENTs are ignored (one tangent source: shade.rs's on-the-fly derivation); COLOR_0/TEXCOORD_1/occlusionTexture/KHR_lights_punctual ignored (the engine's one sky — scattering dome + sun disc — is the lighting model); images decode through the texture.rs rayon pipeline (only slot-referenced images; GLB buffer views, external files, and base64 data URIs); external BUFFERS resolve through `gltf_loader::resolve_buffers` with the OBJ path's `.zst` sibling fallback — committed scenes carry `.bin.zst` (raw vertex/index buffers zstd ~2-3×, measured Intel Sponza 133.5 → 60.7 MB; textures are already-deflated PNG/JPG and stay as-is), a plain `.bin` still loads verbatim, and the sibling fallback is pinned by a `self_test` case. `gltf_loader::self_test` (run by `--check`, download-free — a GLB assembled in code) pins node flattening, the mirrored-winding flip, u16 index widening, the welded-normal fallback, and the factor mapping; real-scene gates are download-optional like san-miguel (Khronos glTF-Sample-Assets DamagedHelmet/Sponza, Intel Sponza, Bistro — .gitattributes already LFS-tracks `scenes/**/*.glb|bin|gltf|jpg|jpeg`). One `gltf:` summary line prints prim/tri/material/texture counts + everything skipped.
 
-**BC7 scene textures** (ON BY DEFAULT; `--no-bc7` kills, `--bc7-cpu` = the ispc A/B arm; `src/bc7.rs` owns the mode/predicate + the CPU arm over the `intel_tex_2` crate — prebuilt ISPC binaries, an ordinary static dep like `image`, so every `--check*` stays DLL-free): block-compresses the OPAQUE scene textures on upload, **GPU upload only** — the CPU samplers keep the exact RGBA8 texels, so the feature moves ONLY the statistical GPU-vs-CPU gates (measured San Miguel/Sponza/Bistro: albedo A/B 0.0001–0.0004 vs the 0.02 limit, radiance ≤ 0.007%) while class-mismatch/`t_viol`/alpha-rejections stay **bit-identical** — the carve-out proof. **The DEFAULT arm is a GPU compute encoder** (`Bc7Mode::Gpu(Fast)`; `src/gpu/bc7gpu.rs` + `shaders/bc7enc.hlsl`, fxc cs_5_0 — the bloom no-DXC precedent, so it exists before any tracer kernel and works in both Submit harnesses), dispatched per band inside `SceneGpu::new_uploaded`: the ring stages the RGBA8 source rows, the kernel (one thread per 4×4 block) writes `block_pitch`-strided blocks into a reused UAV buffer, `CopyTextureRegion` lands them in the committed BC7 mip — blocks never touch the CPU. Encoder shape: mode-6 (single-subset 7.7.7.7+P) PCA fit — covariance power iteration seeded from the largest-diagonal COLUMN, never a fixed vector ((1,1,1) is exactly perpendicular to an anti-correlated axis and collapsed red↔green blocks to near-solid, the measured max-198-LSB class) — plus 2 least-squares refinement rounds, plus a **mode-1 two-subset arm** (64 spec partitions ranked by 2-means SSE — an UPPER-bound predictor: rank with it, never prune — top-N full-fitted, lower-SSE mode wins): mode-6-only measured 26.4 dB worst on San Miguel's patterned plate vs ispc's 33.0 — the gap was the second subset, not the fit. `--bc7-quality` maps to effort tiers: ultrafast = mode-6 no-refit (26.3 dB), fast = + conditional mode-1 (top-4, only when mode-6 SSE > ~2.5 LSB RMS — 32.0 dB), basic/slow = mode-1 always at top-8/16 (32.5/32.8). MEASURED at `fast`: SM-lp 117 ms, Bistro 229 ms (2.1 Gtexel/s), Intel Sponza **282 ms at 3.8 Gtexel/s vs the ispc arm's ~20 s** (rates count every encoded level, mips included) — the 70× that made default-on affordable; there is still deliberately **no BC7 disk cache**. Determinism: the GPU arm claims per-(device, driver) only (per-block-independent kernel, no atomics) and NOTHING depends on more — no disk cache, and M11 runs the session's own encoder in-session; the CPU arm keeps its full determinism pin. Fallback ladder: `Bc7Enc::new` failure = LOUD line + uncompressed RGBA8 for the upload (never an implicit CPU-encode stall); in `--check-gpu` the same failure is a suite FAIL. `bc7::should_compress = !alpha_masked && !h2n && !n2h && 4-aligned dims`, all arms load-bearing: **alpha-masked cutout textures must stay RGBA8** — `alpha_nearest < 128`/`alpha_cutout` is a hard binary threshold on one texel, BC7 alpha lines reach only 4/8/16 levels per block (an authored 128 CANNOT be encoded and snaps across — a *visibility* divergence, and San Miguel's masks are antialiased), and the predicate mirrors `mat_cutout`'s (`trace.rs`) so the id set `.Load` can reach is exactly the RGBA8 set — their agreement IS the soundness argument (the GPU kernel excludes alpha by construction too: mode 6 pins alpha endpoints, mode 1 carries none — the ispc `opaque_*` twin); the 4-align arm is the D3D spec ("a block-compressed texture must be created as a multiple of size 4 in all dimensions" — odd dims measured working on the dev NVIDIA driver, but that is tolerance, not contract; free where it matters: Bistro/Sponza are 100% aligned, San Miguel keeps its odd-dim 63% of opaque MB as RGBA8). Mixed BC7+RGBA8 in the one `texs[]` table needs zero shader changes (SRV format reads back off the resource; the `_SRGB`/`_UNORM` role split carries over; the GPU arm's copy-out and the CPU arm's block-row staging both speak `d3d12::footprint_block`). Gating: `bc7::self_test` (in `--check`) pins the predicate/block math/CPU-arm determinism/`Bc7Mode` flag algebra; **every `--check-gpu` runs the `bc7-gpu` structural gate** (synthetic, fires even on the untextured procedural scene: an all-even flat color must round-trip the hardware decoder BIT-EXACT — representable exactly via e0 == e1, so any loss is wiring; every flat block byte-identical to block 0, the stride catch; a gradient ramp ≥ 30 dB at every effort tier; and a two-CLUSTER block whose small max error proves the mode-1 arm fired with partition/anchor tables + packing the hardware decoder agrees with); **M11** (armed + compressible textures) encodes with the session's arm, uploads as `BC7_UNORM`, `.Load`-decodes back (BC7 *decode* is spec-bit-exact) and per-texel diffs vs the CPU texels, worst-texture RGB PSNR ≥ 25 dB (a WIRING gate: pitch/footprint/format errors land ~10–20 dB; worst honest measured at `fast`: gpu 32.0 / cpu 33.0 on SM-lp, Bistro 41.9, Intel Sponza 37.4; `FR_BC7_DUMP=1` prints per-texture PSNRs). Touch bc7.rs, bc7gpu.rs, bc7enc.hlsl, the trace.rs texture upload loop, or `footprint_block` → run `--check` plus `san-miguel-low-poly.obj --check-gpu` and `--check-dxr` (defaults armed), `--check-gpu --bc7-cpu` (the ispc arm), and `--check-gpu --no-bc7` (the RGBA8 baseline).
+**BC7 scene textures** (ON BY DEFAULT; `--no-bc7` kills, `--bc7-cpu` = the ispc A/B arm; `src/bc7.rs` owns the mode/predicate + the CPU arm over the `intel_tex_2` crate — prebuilt ISPC binaries, an ordinary static dep like `image`, so every `--check*` stays DLL-free): block-compresses the OPAQUE scene textures on upload, **GPU upload only** — the CPU samplers keep the exact RGBA8 texels, so the feature moves ONLY the statistical GPU-vs-CPU gates (measured San Miguel/Sponza/Bistro: albedo A/B 0.0001–0.0004 vs the 0.02 limit, radiance ≤ 0.007%) while class-mismatch/`t_viol`/alpha-rejections stay **bit-identical** — the carve-out proof. **The DEFAULT arm is a GPU compute encoder** (`Bc7Mode::Gpu(Fast)`; `shaders/bc7enc.hlsl` with two hosts — `src/gpu/bc7gpu.rs` at fxc cs_5_0, the bloom no-DXC precedent, so it exists before any tracer kernel and works in both Submit harnesses; `src/vk/bc7.rs` at DXC cs_6_0, where DXC is the only compiler there is. The kernel is shared, and the ONE thing the second host cost it is a byte-offset window — `src_off`/`dst_off`, which D3D12 passes as 0 because it slides root SRV/UAV virtual addresses instead. `Quality::effort` lives in `src/bc7.rs` for the same reason: one kernel, one table), dispatched per band inside `SceneGpu::new_uploaded`: the ring stages the RGBA8 source rows, the kernel (one thread per 4×4 block) writes `block_pitch`-strided blocks into a reused UAV buffer, `CopyTextureRegion` lands them in the committed BC7 mip — blocks never touch the CPU. Encoder shape: mode-6 (single-subset 7.7.7.7+P) PCA fit — covariance power iteration seeded from the largest-diagonal COLUMN, never a fixed vector ((1,1,1) is exactly perpendicular to an anti-correlated axis and collapsed red↔green blocks to near-solid, the measured max-198-LSB class) — plus 2 least-squares refinement rounds, plus a **mode-1 two-subset arm** (64 spec partitions ranked by 2-means SSE — an UPPER-bound predictor: rank with it, never prune — top-N full-fitted, lower-SSE mode wins): mode-6-only measured 26.4 dB worst on San Miguel's patterned plate vs ispc's 33.0 — the gap was the second subset, not the fit. `--bc7-quality` maps to effort tiers: ultrafast = mode-6 no-refit (26.3 dB), fast = + conditional mode-1 (top-4, only when mode-6 SSE > ~2.5 LSB RMS — 32.0 dB), basic/slow = mode-1 always at top-8/16 (32.5/32.8). MEASURED at `fast`: SM-lp 117 ms, Bistro 229 ms (2.1 Gtexel/s), Intel Sponza **282 ms at 3.8 Gtexel/s vs the ispc arm's ~20 s** (rates count every encoded level, mips included) — the 70× that made default-on affordable; there is still deliberately **no BC7 disk cache**. Determinism: the GPU arm claims per-(device, driver) only (per-block-independent kernel, no atomics) and NOTHING depends on more — no disk cache, and M11 runs the session's own encoder in-session; the CPU arm keeps its full determinism pin. Fallback ladder: `Bc7Enc::new` failure = LOUD line + uncompressed RGBA8 for the upload (never an implicit CPU-encode stall); in `--check-gpu` the same failure is a suite FAIL. `bc7::should_compress = !alpha_masked && !h2n && !n2h && 4-aligned dims`, all arms load-bearing: **alpha-masked cutout textures must stay RGBA8** — `alpha_nearest < 128`/`alpha_cutout` is a hard binary threshold on one texel, BC7 alpha lines reach only 4/8/16 levels per block (an authored 128 CANNOT be encoded and snaps across — a *visibility* divergence, and San Miguel's masks are antialiased), and the predicate mirrors `mat_cutout`'s (`trace.rs`) so the id set `.Load` can reach is exactly the RGBA8 set — their agreement IS the soundness argument (the GPU kernel excludes alpha by construction too: mode 6 pins alpha endpoints, mode 1 carries none — the ispc `opaque_*` twin); the 4-align arm is the D3D spec ("a block-compressed texture must be created as a multiple of size 4 in all dimensions" — odd dims measured working on the dev NVIDIA driver, but that is tolerance, not contract; free where it matters: Bistro/Sponza are 100% aligned, San Miguel keeps its odd-dim 63% of opaque MB as RGBA8). Mixed BC7+RGBA8 in the one `texs[]` table needs zero shader changes (SRV format reads back off the resource; the `_SRGB`/`_UNORM` role split carries over; the GPU arm's copy-out and the CPU arm's block-row staging both speak `d3d12::footprint_block`). Gating: `bc7::self_test` (in `--check`) pins the predicate/block math/CPU-arm determinism/`Bc7Mode` flag algebra; **every `--check-gpu` runs the `bc7-gpu` structural gate** (synthetic, fires even on the untextured procedural scene: an all-even flat color must round-trip the hardware decoder BIT-EXACT — representable exactly via e0 == e1, so any loss is wiring; every flat block byte-identical to block 0, the stride catch; a gradient ramp ≥ 30 dB at every effort tier; and a two-CLUSTER block whose small max error proves the mode-1 arm fired with partition/anchor tables + packing the hardware decoder agrees with); **M11** (armed + compressible textures) encodes with the session's arm, uploads as `BC7_UNORM`, `.Load`-decodes back (BC7 *decode* is spec-bit-exact) and per-texel diffs vs the CPU texels, worst-texture RGB PSNR ≥ 25 dB (a WIRING gate: pitch/footprint/format errors land ~10–20 dB; worst honest measured at `fast`: gpu 32.0 / cpu 33.0 on SM-lp, Bistro 41.9, Intel Sponza 37.4; `FR_BC7_DUMP=1` prints per-texture PSNRs). **On Vulkan the same two arms run** (`src/vk/bc7.rs` + the three per-level arms in `src/vk/textures.rs`), gated by `--check-vk`'s V10 — the `bc7-gpu` structural gate and M11 transplanted, teeth for teeth, with both probes encoding at a NON-ZERO and DIFFERENT src/dst window so the one thing the second host added is actually scored. See the M3j block in the `--check-vk` entry for the differences (no banding, a uniform buffer instead of root constants, tight block rows) and for what V10 catches that the render gates provably do not (a kernel ignoring `src_off` leaves the radiance A/B at 1.132%, inside its 2% bar, while V10 reads 20.7 dB). Touch bc7.rs, bc7gpu.rs, vk/bc7.rs, bc7enc.hlsl, the trace.rs texture upload loop, `vk/textures.rs`, or `footprint_block` → run `--check` plus `san-miguel-low-poly.obj --check-gpu` and `--check-dxr` (defaults armed), `--check-gpu --bc7-cpu` (the ispc arm), and `--check-gpu --no-bc7` (the RGBA8 baseline); on Linux `--check-vk` on a textured scene in all three arms, and `--check-spirv` (the kernel and the decode probe are both in that corpus).
 
 ## Mip-mapping + trilinear + 16× anisotropic (all three renderers)
 

@@ -123,7 +123,18 @@ impl Stage {
         // exercise. So the lever shrinks the ring exactly as far as the
         // indivisible pieces allow, and no further.
         let size = ring_cap().min(total.max(4096)).max(atom).max(4096);
-        let buf = vkd.buffer(size, vk::BufferUsageFlags::TRANSFER_SRC, true)?;
+        // `STORAGE_BUFFER` because the GPU BC7 encoder READS THE RING IN
+        // PLACE — `vk::bc7` binds it at `t0` and moves a byte window in its
+        // constants, which is what D3D12's arm does too (its `src` is the
+        // upload heap read straight as a root SRV). Unconditional rather than
+        // asked of the texture path alone, for the `TRANSFER_SRC` reason
+        // below: a bit that only some callers set makes a consumer's
+        // availability a property of who built the ring, and the bit is free.
+        let buf = vkd.buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
+            true,
+        )?;
         let ptr = match unsafe {
             vkd.device.map_memory(buf.mem, 0, buf.size, vk::MemoryMapFlags::empty())
         } {

@@ -15,6 +15,7 @@
 //! the flag set, the register-space -> descriptor-set mapping it implies, and
 //! the measurement.
 
+pub mod bc7;
 pub mod device;
 pub mod headless;
 pub mod layout;

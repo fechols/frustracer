@@ -146,6 +146,24 @@ impl Quality {
         }
     }
 
+    /// The GPU kernel's effort tier for this ispc `Quality` name: 0 = mode-6
+    /// PCA fit, no refinement; 1 = + 2 least-squares rounds + CONDITIONAL
+    /// mode-1 (top-4 partitions, only on blocks where mode 6 left visible
+    /// error); 2/3 = mode-1 always, top-8/16 partitions.
+    ///
+    /// It lives HERE, beside the quality vocabulary it maps, rather than in
+    /// either backend's encoder host: `bc7enc.hlsl` is one kernel with two
+    /// hosts, so its `effort` constant is one table with two readers, and a
+    /// copy per backend is the transcription this port exists to avoid.
+    pub fn effort(self) -> u32 {
+        match self {
+            Quality::UltraFast => 0,
+            Quality::Fast => 1,
+            Quality::Basic => 2,
+            Quality::Slow => 3,
+        }
+    }
+
     /// The `opaque_*` presets only — see the module note: they are what keeps
     /// the alpha-mode search out of the encoder.
     fn settings(self) -> bc7::EncodeSettings {

@@ -44,7 +44,15 @@ cbuffer C : register(b0) {
     uint band_rows;   // block rows in this band
     uint row_blocks;  // dst row stride in BLOCKS (= block_pitch/16)
     uint effort;      // 0 ultrafast | 1 fast | 2 basic | 3 slow
-    uint _pad;
+    // Byte offsets of THIS dispatch's window within src/dst. D3D12 passes 0
+    // for both and slides the root SRV/UAV virtual addresses instead; Vulkan
+    // binds one descriptor per buffer for a whole batch of levels and moves
+    // the window here, because a per-dispatch descriptor rebind is a
+    // descriptor-set allocation per level and a dynamic-offset binding would
+    // need the derived layout to special-case one slot. Integer address
+    // arithmetic with a 0 offset is bit-identical to not having it.
+    uint src_off;
+    uint dst_off;
 }
 
 // BC7 spec interpolation weights.
@@ -324,7 +332,7 @@ void cs_bc7_encode(uint3 id : SV_DispatchThreadID) {
     for (uint t = 0; t < 16; t++) {
         uint sx = min(bx * 4u + (t & 3u), mw - 1u);
         uint sy = min(by * 4u + (t >> 2u), staged_rows - 1u);
-        uint p = src.Load(sy * src_pitch + sx * 4u);
+        uint p = src.Load(src_off + sy * src_pitch + sx * 4u);
         uint3 c = uint3(p & 255u, (p >> 8u) & 255u, (p >> 16u) & 255u);
         ipx[t] = c;
         PX[t] = (float3)c;
@@ -554,5 +562,5 @@ void cs_bc7_encode(uint3 id : SV_DispatchThreadID) {
             put_bits(blk, pos, idx[i], 4u);
     }
 
-    dst.Store4((by * row_blocks + bx) * 16u, uint4(blk[0], blk[1], blk[2], blk[3]));
+    dst.Store4(dst_off + (by * row_blocks + bx) * 16u, uint4(blk[0], blk[1], blk[2], blk[3]));
 }

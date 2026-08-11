@@ -1193,7 +1193,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk(&scene, &bvh, cam0, structural);
+            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -13262,6 +13262,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     push!("fsr-composite", sh::fsr_composite_src(), Shape::Compute("cs_6_5"));
     push!("smoke", sh::SMOKE_HLSL.to_string(), Shape::Compute("cs_6_5"));
     push!("waveprobe", sh::WAVEPROBE_HLSL.to_string(), Shape::Compute("cs_6_5"));
+    push!("bc7read", sh::BC7_READ_HLSL.to_string(), Shape::Compute("cs_6_0"));
     push!("quin", sh::QUIN_HLSL.to_string(), Shape::Compute("cs_6_5"));
     // DELIBERATELY ABSENT: nppd.hlsl. Its staging kernels are ordinary
     // compute and would compile, but the stage they stage for is ONNX Runtime
@@ -13426,7 +13427,13 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 /// the bare-checkout rule every SDK-dependent gate here follows. It does NOT
 /// degrade on a device that is present and wrong.
 #[cfg(unix)]
-fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
+fn run_check_vk(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    structural: bool,
+    bc7_mode: bc7::Bc7Mode,
+) -> i32 {
     let mut ok = true;
 
     // ---- V0: the pure half. Meaningful on a box with no Vulkan at all. ----
@@ -13539,7 +13546,12 @@ fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: 
     }
 
     // ---- V6: the reference kernel rendering, scored against the CPU. ----
-    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural) {
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode) {
+        ok = false;
+    }
+
+    // ---- V10: the BC7 encoder, scored through the hardware decoder. ----
+    if !run_check_vk_bc7(&hg, &sp, scene, bc7_mode) {
         ok = false;
     }
 
@@ -13562,6 +13574,73 @@ fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: 
 
     println!("CHECK-VK {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// V10 — the BC7 encoder, scored through the hardware decoder.
+///
+/// IT EXISTS BECAUSE EVERY OTHER NUMBER IN THIS SUITE IS BLIND TO IT. V6's
+/// radiance A/B is a 2% bar on a frame where textures are one term of the
+/// shading, and its texture anti-vacuity probe asks whether the table reached
+/// the shader at all, not whether its CONTENT survived the encode — so a wrong
+/// row stride, a mis-set window or a broken partition table all read green
+/// there while the picture is visibly wrong. (The D3D12 twin learned this from
+/// the other side: `FR_VK_DROP_STREAM=blas_tri` PASSES san-miguel's radiance
+/// bar at 1.080% and only the probe's zero-channels-moved catches it.)
+///
+/// Two halves, because they answer different questions. The STRUCTURAL half is
+/// synthetic and therefore fires on every scene INCLUDING the untextured
+/// procedural default, where the fidelity half has nothing to score; the
+/// FIDELITY half runs the session's own arm over the scene's own textures and
+/// is the only thing that says the encoder is good rather than merely wired.
+///
+/// The 25 dB bar is `--check-gpu`'s M11: a WIRING gate, not a quality one —
+/// pitch, footprint and format errors land at ~10-20 dB, while the honest
+/// worst measured on D3D12 is 32.0 (GPU) / 33.0 (ispc) at `fast`.
+#[cfg(unix)]
+fn run_check_vk_bc7(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    mode: bc7::Bc7Mode,
+) -> bool {
+    let mut ok = true;
+    match vk::bc7::structural(hg, sp) {
+        Ok(s) => println!("check-vk: V10 bc7 structural: {s}"),
+        Err(e) => {
+            eprintln!("check-vk: FAIL V10 bc7 structural: {e}");
+            ok = false;
+        }
+    }
+    match vk::bc7::fidelity(hg, sp, scene, mode) {
+        Ok(None) => println!(
+            "check-vk: V10 bc7 fidelity SKIPPED (BC7 off, or nothing in this scene is \
+             compressible — the structural half above is what covers the encoder here)"
+        ),
+        Ok(Some(f)) => {
+            println!(
+                "check-vk: V10 bc7 fidelity over {} texture(s): mean |d| {:.3} LSB | max {} | \
+                 worst RGB PSNR {:.1} dB ({})",
+                f.textures,
+                f.mean_abs,
+                f.max_abs,
+                f.worst_psnr,
+                if f.worst_name.is_empty() { "<inline>" } else { &f.worst_name }
+            );
+            if f.worst_psnr < 25.0 {
+                eprintln!(
+                    "check-vk: FAIL V10 worst BC7 PSNR {:.1} dB < 25 — that band is a WIRING \
+                     failure (pitch/footprint/format), not encoder quality",
+                    f.worst_psnr
+                );
+                ok = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V10 bc7 fidelity: {e}");
+            ok = false;
+        }
+    }
+    ok
 }
 
 /// V4 — the wave-width table, printed WHOLE and then judged.
@@ -13955,6 +14034,7 @@ fn run_check_vk_render(
     bvh: &bvh::Bvh,
     cam0: Camera,
     structural: bool,
+    bc7_mode: bc7::Bc7Mode,
 ) -> bool {
     // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
     // frame its D3D12 twin does, so the two suites' quadtree structures are
@@ -14022,7 +14102,7 @@ fn run_check_vk_render(
             return false;
         }
     };
-    let vt = match vk::textures::VkTextures::new(hg, scene) {
+    let vt = match vk::textures::VkTextures::new(hg, sp, scene, bc7_mode) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("check-vk: FAIL V6 texture upload: {e}");
@@ -14045,11 +14125,16 @@ fn run_check_vk_render(
     // subresource count only if it had none to lose.
     println!(
         "check-vk: V6 scene uploaded, BLAS/TLAS built ({} tris), {} texture(s) \
-         [{} subresource(s), {:.1} MB, RGBA8 — the --no-bc7 arm] — reference tracer at {gw}x{gh}",
+         [{} subresource(s), {:.1} MB raw -> {:.1} MB on device, {} of {} BC7: {}] \
+         — reference tracer at {gw}x{gh}",
         scene.tri_count(),
         scene.textures.len(),
         vt.levels,
-        vt.bytes as f64 / (1024.0 * 1024.0)
+        vt.bytes as f64 / (1024.0 * 1024.0),
+        vt.device_bytes as f64 / (1024.0 * 1024.0),
+        vt.n_bc7,
+        scene.textures.len(),
+        vt.bc7_note
     );
     println!("check-vk: V6 blas-split: {}", vs.blas_report);
     // Anti-vacuity, the --check-gpu / --check-dxr twin: an armed lever that
