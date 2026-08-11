@@ -1,8 +1,12 @@
-//! Automatic exposure — the interactive aperture (`--auto-exposure` arms,
-//! `--exposure-bias EV` composes a manual offset). DEFAULT OFF since
-//! 2026-08-08 (the user's call, reverting the same day's default-ON: with
-//! RTGI on by default, enclosures light themselves and the aperture holds at
-//! exactly 1.0 — the pre-feature look — unless a session opts in).
+//! Automatic exposure — the interactive aperture (`--no-auto-exposure` kills,
+//! `--exposure-bias EV` composes a manual offset). DEFAULT ON since 2026-08-10
+//! (the user's call). THREE MOVES: default-ON for one day, OFF on 2026-08-08
+//! (with RTGI on by default enclosures light themselves, so the aperture was
+//! holding at ~1.0 and paying for nothing), and ON again now — after the
+//! 2026-08-10 `EV_MAX` rein-in to +2.0, which is what makes an armed session
+//! a bounded 4x rather than the 32x that washed genuinely dark scenes into
+//! dusk. `--no-auto-exposure` is the kill lever and restores exactly 1.0
+//! (plus any `--exposure-bias`), i.e. the pre-feature look.
 //!
 //! The tonemap is anchored at a fixed paper white, so an enclosure whose sun is
 //! occluded by construction (San Miguel's patio, Sponza's atrium) renders 2-3
@@ -43,13 +47,35 @@ use rayon::prelude::*;
 pub const TARGET_LOG2: f32 = -2.4739312;
 /// EV clamp: how far the controller may pull BACK from today's fixed exposure.
 pub const EV_MIN: f32 = -2.0;
-/// EV clamp: how far it may open up. Started at 3.0 (the enclosures'
-/// 2-3 stops); raised to 5.0 on the first feel-test — a truly dark scene
-/// (night island, deep interior) sits 5+ stops under mid-grey, so at +3 it
-/// parked on the clamp and still read dark. If a scene still parks here
-/// (`FR_AEXP_TRACE=1` shows `ev +5.000` holding), this constant is the knob —
-/// raising TARGET_LOG2 instead brightens EVERY scene, exteriors included.
-pub const EV_MAX: f32 = 5.0;
+/// EV clamp: how far it may open up. Four moves — 3.0 (the enclosures' 2-3
+/// stops) -> 5.0 on the first feel-test (a truly dark scene sits 5+ stops
+/// under mid-grey, so at +3 it parked on the clamp and still read dark) ->
+/// 3.0 on 2026-08-10 (the rein-in: +5 is a 32x aperture that washes a
+/// genuinely dark scene into dusk) -> 2.0 the same day, on the FIREFLY
+/// report below.
+///
+/// PARKING ON THIS CLAMP IS THE DESIGN, not a failure to converge: a night
+/// scene is SUPPOSED to read dark, and the clamp is what stops the controller
+/// from arguing with that. `--exposure-bias` is the per-session escape, and
+/// raising TARGET_LOG2 is NOT the alternative — that brightens every scene,
+/// exteriors included.
+///
+/// WHY THE LAST MOVE, and what it does and does not buy: XeSS+NRD sessions in
+/// dark emissive scenes show fireflies, and the aperture is why they became
+/// VISIBLE rather than why they exist (they are 1-spp RTGI-bounce variance on
+/// small bright emitters — see `upscaler_defaults`, which deliberately leaves
+/// such a session without the deterministic cluster NEE that would remove
+/// them at the source). The aperture only decides where the frame sits on the
+/// tonemap: at 32x a dark frame sat in the curve's SATURATING region, where an
+/// outlier and its surround compress together and the noise is laundered by
+/// the rolloff; lower apertures sit in the near-LINEAR region, which preserves
+/// contrast — including outlier contrast. So this constant trades one
+/// population for the other and cannot fix either: it damps a MODERATE outlier
+/// (sub-paper-white, so less gain really is less amplification) while making a
+/// SATURATING one more salient (the dot pins white at any of these apertures
+/// while the background keeps darkening). Do not read a firefly change here as
+/// evidence about the denoiser; the honest fix lives upstream.
+pub const EV_MAX: f32 = 2.0;
 /// Park band: once the eased EV is this close to the ask, hold — a controller
 /// that chases the last tenth of a stop breathes visibly on stochastic frames.
 pub const DEADBAND_EV: f32 = 0.15;
@@ -60,11 +86,11 @@ pub const TAU_S: f32 = 1.0;
 /// clouds-wind idiom).
 const LUMA_EPS: f32 = 1e-6;
 
-/// `--auto-exposure` arms (consumed once by main's lever block, toggled
-/// live by the settings menu — the bloom shape). DEFAULT OFF — the default
-/// is DUPLICATED in cli.rs's `defaults()` `autoexp` field AND settings.rs's
-/// menu-row `Toggle { default }`; flip all three in lockstep.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+/// `--auto-exposure` spells the default (consumed once by main's lever block,
+/// toggled live by the settings menu — the bloom shape). DEFAULT ON — the
+/// default is DUPLICATED in cli.rs's `defaults()` `autoexp` field AND
+/// settings.rs's menu-row `Toggle { default }`; flip all three in lockstep.
+static ENABLED: AtomicBool = AtomicBool::new(true);
 /// `--exposure-bias` in EV, f32 bits (the `scene::set_detail_strength` idiom).
 /// 0.0 encodes as bit-pattern 0, so the static's default IS the default.
 static BIAS: AtomicU32 = AtomicU32::new(0);
@@ -166,8 +192,9 @@ pub fn meter_accum(accum: &[std::sync::atomic::AtomicU32], samples: u32) -> f32 
 
 /// Closed-form gates on the controller and the CPU meters. Hooked by `--check`.
 /// Saves and restores the process levers (the wide-tiles save/restore pattern —
-/// a `--no-auto-exposure --check` must still prove the on arm, and the run's
-/// own lever state must survive this test).
+/// both arms are pinned whichever way the session's lever sits, so a
+/// `--no-auto-exposure --check` still proves the on arm and a default `--check`
+/// still proves the off arm, and the run's own lever state survives this test).
 pub fn self_test() -> Result<(), String> {
     struct Restore(bool, f32);
     impl Drop for Restore {

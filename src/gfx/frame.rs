@@ -180,6 +180,37 @@ pub const FLAG_NRD_GI: u32 = 2097152;
 /// trace_common.hlsli's FLAG_SKY_EXT_SKIP.
 pub const FLAG_SKY_EXT_SKIP: u32 = 4194304;
 
+/// `cs_nrd_out` applies NVIDIA's `NRD_SG_ReJitter` Jacobian to the denoiser
+/// DELTA (bit 23 — the SG campaign, 2026-08-10). Runtime rather than a compile
+/// define ON PURPOSE: the N8 gate must A/B both arms inside one process, and
+/// an env-keyed `OnceLock` define cannot flip (the `force_sky_ext_skip`
+/// lesson). Armed when an NRD bridge is wired, the engine behind it really is
+/// NRD (see `TraceGpu::nrd_rejitter` — FRD shares the bridge and must not
+/// inherit this), and `FR_NRD_REJITTER` is not `off`; consumed by the bridge
+/// unit alone. Lockstep with trace_common.hlsli's FLAG_NRD_REJITTER.
+pub const FLAG_NRD_REJITTER: u32 = 8388608;
+
+/// `FR_NRD_REJITTER=off` — the A/B arm for the ReJitter micro-detail
+/// restoration (loud on departure, the FR_NRD_BARRIER idiom). Default ON: the
+/// pass exists to put back exactly the texel-scale contrast a converged
+/// history's narrow blur removes, which is the parked-camera class the user
+/// reported. `on` spells the default.
+pub fn nrd_rejitter_lever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FR_NRD_REJITTER") {
+        Err(_) => true,
+        Ok(v) if v == "off" => {
+            eprintln!("nrd: FR_NRD_REJITTER=off — no SG re-jitter (the A/B arm)");
+            false
+        }
+        Ok(v) if v == "on" => true, // the default, spelled explicitly
+        Ok(v) => {
+            eprintln!("nrd: FR_NRD_REJITTER={v:?} unrecognized (legal: on, off) — on");
+            true
+        }
+    })
+}
+
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
 /// untextured since the untextured arm (shade.hlsli's post-match detail
@@ -1021,6 +1052,7 @@ impl FrameCb {
         gbuf_ext: bool,
         nrd_sig: bool,
         sky_ext_skip: bool,
+        nrd_rejitter: bool,
     ) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
@@ -1048,6 +1080,10 @@ impl FrameCb {
             // all, so it requires the GBUF flag by construction (the branch
             // sits behind gbuf_write_sky's own FLAG_GBUF/FLAG_GBUF_EXT gates).
             | ((gbuf_full && sky_ext_skip) as u32 * FLAG_SKY_EXT_SKIP)
+            // ReJitter reads the ext plane's normals (center + 4 neighbours),
+            // so it requires the ext flag by construction — the same shape
+            // the sig/GI terms above use.
+            | ((gbuf_full && (gbuf_ext || fsr_sig) && nrd_rejitter) as u32 * FLAG_NRD_REJITTER)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
             | (p.clouds.enabled as u32 * FLAG_CLOUDS)
             // count > 0 already folds in the session enable + the night fade

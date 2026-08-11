@@ -214,7 +214,7 @@ opt_fields! {
     pub struct Effects {
         /// --no-bloom inverse (live, display-stage — no reset)
         pub bloom: bool,
-        /// --auto-exposure arming (DEFAULT OFF; live, display-stage — no reset)
+        /// --auto-exposure arming (DEFAULT ON; live, display-stage — no reset)
         pub autoexp: bool,
         /// --exposure-bias in EV (live, display-stage — no reset)
         pub exposure_bias: f32,
@@ -1413,7 +1413,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             // ── Effects
             item!("tod", "time of day", "Effects", Live, StepF { min: 0.0, max: 24.0, step: 0.5, default: 12.0 }, acc_f32!(effects.tod)),
             item!("bloom", "bloom (glare)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.bloom)),
-            item!("autoexp", "auto-exposure", "Effects", Live, Toggle { default: false }, acc_bool!(effects.autoexp)),
+            item!("autoexp", "auto-exposure", "Effects", Live, Toggle { default: true }, acc_bool!(effects.autoexp)),
             item!("exposure_bias", "exposure bias (EV)", "Effects", Live, StepF { min: -8.0, max: 8.0, step: 0.5, default: 0.0 }, acc_f32!(effects.exposure_bias)),
             item!("clouds", "volumetric clouds", "Effects", Live, Toggle { default: true }, acc_bool!(effects.clouds)),
             item!("fireflies", "fireflies (night)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.fireflies)),
