@@ -2862,3 +2862,99 @@ mod sbt_recurse_shader_source_tests {
         assert!(lift < pi && clamp < pi, "the band lift and clamp must precede the pixel index");
     }
 }
+
+/// The CLEAN-ROOM guard, and it exists because a physical impossibility became
+/// a policy on 2026-08-10. Before the NRD submodule, `Shaders/NRD.hlsli` was
+/// simply not on disk, so `nrd_bridge.hlsl`'s packing math COULD only be the
+/// reimplementation-from-spec that `nrd::oracle` pins. Now NVIDIA's shader
+/// source sits in the tree beside our shader-concat path, one copy-paste from
+/// a license problem: the RTX-SDKs grant covers redistribution "as incorporated
+/// in object code format", so their HLSL must never enter ours (and `--check`'s
+/// N0/N2 gates would still pass with pasted math — they compare against the
+/// oracle, which is the very thing that would have been replaced).
+///
+/// Keyed on NVIDIA's own distinctive function names rather than on formulas:
+/// a paste brings the names with it, while our reimplementation shares only
+/// the concepts. Cheap, and it fails at `cargo test` rather than at review.
+#[cfg(test)]
+mod nrd_clean_room_tests {
+    /// Every shader source we assemble ourselves. If a unit is added to a
+    /// concat, add it here too — the point is total coverage of what we ship.
+    const OURS: &[(&str, &str)] = &[
+        ("nrd_bridge.hlsl", super::NRD_BRIDGE_HLSL),
+        ("trace_common.hlsli", super::TRACE_COMMON_HLSLI),
+        ("shade.hlsli", super::SHADE_HLSLI),
+        ("feed.hlsl", super::FEED_HLSL),
+        // FRD's three, added when the M1 corpus move made them visible from
+        // this module (they were declared in `gpu/frd_gpu.rs` when this gate
+        // was written). They are the units this gate most wants: FRD is a
+        // from-scratch denoiser whose CLEAN-ROOM RULE is load-bearing — the
+        // design comes from the published literature and the NRD source tree
+        // is never read, quoted, or transcribed — so a paste would land here
+        // first, in the one family that reimplements the same algorithms.
+        ("frd_common.hlsli", super::FRD_COMMON_HLSLI),
+        ("frd_temporal.hlsl", super::FRD_TEMPORAL_HLSL),
+        ("frd_blur.hlsl", super::FRD_BLUR_HLSL),
+    ];
+
+    /// COMMENTS MUST BE STRIPPED FIRST — the DispatchRaysIndex() source gate's
+    /// own lesson ("two of the seven occurrences are prose"), and it bites here
+    /// immediately: nrd_bridge.hlsl:77 NAMES `NRD_FrontEnd_PackNormalAndRoughness`
+    /// to document which semantics it reimplements. Citing the function you
+    /// reimplement is exactly right and must stay legal; pasting its body is
+    /// what this catches. HLSL here is `//`-commented throughout.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn no_nrd_shader_source_pasted_into_ours() {
+        // NVIDIA's public entry points (NRD.hlsli) — the names a paste of the
+        // front-end/back-end packing helpers would drag along.
+        const NVIDIA_SYMBOLS: &[&str] = &[
+            "REBLUR_FrontEnd_PackRadianceAndNormHitDist",
+            "REBLUR_BackEnd_UnpackRadianceAndNormHitDist",
+            "RELAX_FrontEnd_PackRadianceAndHitDist",
+            "SIGMA_FrontEnd_PackPenumbra",
+            "SIGMA_BackEnd_UnpackShadow",
+            "NRD_FrontEnd_PackNormalAndRoughness",
+            "NRD_FrontEnd_PackMotion",
+            "NRD_GetCorrectedHitDist",
+            "_NRD_LinearRoughnessToNormalizedLinearRoughness",
+        ];
+        for (name, src) in OURS {
+            let code = code_only(src);
+            for sym in NVIDIA_SYMBOLS {
+                assert!(
+                    !code.contains(sym),
+                    "{name} contains NVIDIA's `{sym}` — NRD shader source must never be \
+                     pasted into ours (the license grant is object-code-only, and the \
+                     reimplemented math in nrd::oracle is what the N0/N2 gates pin). \
+                     Reimplement from the spec instead."
+                );
+            }
+        }
+    }
+
+    /// TEETH. Without these the gate passes when `code_only` over-strips (an
+    /// empty haystack contains nothing) or when a symbol is misspelled — the
+    /// vacuity class every gate in this tree is required to rule out.
+    #[test]
+    fn clean_room_gate_has_teeth() {
+        // The stripper keeps code and drops prose on the same line.
+        let s = code_only("float x = 1.0; // REBLUR_FrontEnd_PackRadianceAndNormHitDist\nfloat y;");
+        assert!(s.contains("float x = 1.0;") && s.contains("float y;"));
+        assert!(!s.contains("REBLUR_FrontEnd_PackRadianceAndNormHitDist"));
+        // It does NOT gut the real sources: the bridge must still carry the
+        // kernels the gate is meant to scan.
+        let bridge = code_only(super::NRD_BRIDGE_HLSL);
+        assert!(bridge.contains("cs_nrd_pack") && bridge.contains("cs_nrd_out"));
+        // And a genuine paste is caught — the same predicate the test above
+        // runs, shown failing on planted code.
+        let pasted = code_only("float4 v = NRD_FrontEnd_PackNormalAndRoughness(n, r);");
+        assert!(pasted.contains("NRD_FrontEnd_PackNormalAndRoughness"));
+    }
+}

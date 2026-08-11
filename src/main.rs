@@ -475,21 +475,24 @@ fn main() {
         );
         std::process::exit(2);
     }
-    // FRD vs NRD: ONE denoiser slot per session. FRD IS THE COMPILED DEFAULT
-    // since the Phase-E flip (2026-08-09 — parity held at 2.5× NRD's speed);
-    // NRD is the opt-in A/B oracle until its planned deletion. Only the
-    // EXPLICIT pair is a contradiction (exit 2, the being-told shape) — a
-    // merely-DEFAULTED side (the compiled default seeds opts.frd, the
-    // settings file can seed either; neither sets its _explicit) yields to
-    // the explicit one instead: a default must never make another flag fatal
-    // (the fg_explicit precedent). An explicit --nrd disarms the defaulted
-    // frd SILENTLY (opting into the oracle is obviously opting out of the
-    // default FRD, and a note would nag every --nrd A/B session); an
-    // explicit --frd disarms a file-defaulted nrd with one loud line (the
-    // default-disarmed shape below); both defaulted = the file's nrd opted
-    // in, the compiled frd yields silently (a saved preference beats a
-    // compiled default). Runs before the nppd blocks so a --nrd session's
-    // nppd conflict reports against nrd, not the already-disarmed frd.
+    // FRD vs NRD: ONE denoiser slot per session. NRD IS THE COMPILED DEFAULT
+    // since 2026-08-10 (measured ahead where this content cares — 68% vs 42%
+    // of DLSS-RR's emissive-pool delivery, 0.29 vs 0.47 still stability);
+    // FRD is the opt-in fast arm and A/B oracle. Only the EXPLICIT pair is a
+    // contradiction (exit 2, the being-told shape) — a merely-DEFAULTED side
+    // yields to the explicit one instead: a default must never make another
+    // flag fatal (the fg_explicit precedent).
+    //   THE TIE-BREAK INVERTED WITH THE FLIP, and it is the whole reason this
+    // block changed: "a saved preference beats a compiled default" is stated
+    // in terms of which side the FILE set, but neither side's _explicit
+    // distinguishes file-set from compiled — what distinguishes them is that
+    // only ONE of the two is the compiled default. That is now NRD, so a
+    // surviving `opts.frd` in the both-defaulted case can ONLY have come from
+    // the settings file, and FRD is the side that must win (before the flip
+    // the same reasoning picked NRD). Get this backwards and a user's saved
+    // FRD preference is silently ignored on every launch.
+    // Runs before the nppd blocks so a --nrd session's nppd conflict reports
+    // against nrd, not the already-disarmed frd.
     if opts.frd && opts.nrd {
         if opts.frd_explicit && opts.nrd_explicit {
             eprintln!(
@@ -497,10 +500,20 @@ fn main() {
             );
             std::process::exit(2);
         }
-        if opts.nrd_explicit || !opts.frd_explicit {
+        if opts.nrd_explicit {
+            // Explicit --nrd beside a FILE-saved frd: the command line wins,
+            // and says so — the file asked for the other engine, so silence
+            // here would look like the preference simply failed to load.
+            eprintln!("frd: saved preference disarmed — --nrd claims the denoiser slot");
             opts.frd = false;
         } else {
-            eprintln!("nrd: default disarmed — --frd claims the denoiser slot");
+            // Explicit --frd over the compiled nrd default (loud, the
+            // default-disarmed shape), or both defaulted ⇒ the file opted
+            // into frd and beats the compiled default (silent — a preference
+            // being honored is not news).
+            if opts.frd_explicit {
+                eprintln!("nrd: default disarmed — --frd claims the denoiser slot");
+            }
             opts.nrd = false;
         }
     }
@@ -626,6 +639,15 @@ fn main() {
     nrd::set_tuning(opts.nrd_tune);
     if opts.nrd_tune.any() {
         eprintln!("nrd: ReBLUR tuning overrides {:?}", opts.nrd_tune);
+    }
+    // The CommonSettings half (--nrd-split), same one-writer shape.
+    nrd::set_common_tuning(opts.nrd_common);
+    if let Some(x) = opts.nrd_common.split_screen {
+        eprintln!(
+            "nrd: --nrd-split {x} — the left {:.0}% of the frame presents the RAW input \
+             (NRD's own noisy-vs-denoised wipe)",
+            x * 100.0
+        );
     }
     // FRD runtime tuning — the same one-writer shape (read by the FrdGpu
     // kernels' constants at record time).
@@ -4470,10 +4492,14 @@ fn lock_dynamic_note(arm: &str, res: (usize, usize)) {
 /// gets. None = neither asked (both killed, or --nppd disarmed the default).
 #[cfg(windows)]
 fn dn_kind(opts: &Opts) -> Option<gpu::DnKind<'_>> {
-    if opts.frd {
-        Some(gpu::DnKind::Frd)
-    } else if opts.nrd {
+    // Order is documentation, not logic: the lever block already guarantees
+    // at most one survives, so this reads default-first (NRD) with FRD as the
+    // opt-in arm. If both were ever true the exclusivity block has a hole.
+    debug_assert!(!(opts.nrd && opts.frd), "denoiser exclusivity left both armed");
+    if opts.nrd {
         Some(gpu::DnKind::Nrd(opts.nrd_path.as_str()))
+    } else if opts.frd {
+        Some(gpu::DnKind::Frd)
     } else {
         None
     }
@@ -8290,7 +8316,14 @@ fn run_check_gpu(
                                     (0.0, 0.0),
                                     pw as u32,
                                     ph as u32,
+                                    pw as u32,
+                                    ph as u32,
                                     far,
+                                    // The fixed nominal, not a clock: this
+                                    // gate scores a temporal DELTA across
+                                    // frames, and NRD's own timer would
+                                    // measure the readbacks between them.
+                                    gpu::nrd_gpu::NOMINAL_DT_MS,
                                     100 + k,
                                     reset,
                                 );

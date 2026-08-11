@@ -484,6 +484,35 @@ pub struct ReblurTuning {
     pub prepass_radius: Option<f32>,
     pub anti_firefly: Option<bool>,
     pub max_accum_frames: Option<u32>,
+    // --- The three SUB-STRUCTS, which had zero plumbing until 2026-08-10.
+    // `antilagSettings` (--nrd-antilag S,K): the luminance-gradient antilag —
+    // sigma scale reduces the measured delta by local variance, sensitivity
+    // is inverse (smaller = more sensitive).
+    pub antilag_sigma_scale: Option<f32>,
+    pub antilag_sensitivity: Option<f32>,
+    // `responsiveAccumulationSettings` (--nrd-responsive R[,N]): below
+    // `roughness_threshold` the history length scales WITH roughness
+    // (`maxAccum *= smoothstep(0, 1, rough/threshold)`), which is NVIDIA's
+    // stated animated-water lever — this scene's fountain/ocean water is
+    // roughness 0.05 with a ripple field that swings the mirror normal every
+    // frame, i.e. exactly the case. `min_frames` keeps a floor of history at
+    // roughness 0 so a clean signal is not thrown away entirely.
+    pub responsive_roughness: Option<f32>,
+    pub responsive_min_frames: Option<u32>,
+    // `convergenceSettings` (--nrd-convergence S,B,P): ReBLUR drives its
+    // denoising by `f = 1/(1 + k·N)` over N accumulated frames, and since
+    // v4.17 `k = s·lerp(b, 1, saturate(N/(1 + p·maxAccum)))`. b < 1 means "do
+    // MORE denoising on a short history" — deliberately blurrier just after a
+    // reset, on the grounds that blurry beats dirty. That is the same shape
+    // measured on the FRD arm during the 2026-08-10 darkening campaign (a
+    // MOVING frame is flattered by young-history wide blur bleeding light
+    // outward, while a parked frame converges onto a genuinely dimmer truth),
+    // so this triple is the tuning lever for that symptom on the NRD arm:
+    // raising `b` toward 1 narrows the young-history blur and makes the two
+    // regimes agree. NVIDIA ship a Desmos sandbox for the curve.
+    pub convergence_s: Option<f32>,
+    pub convergence_b: Option<f32>,
+    pub convergence_p: Option<f32>,
 }
 
 impl ReblurTuning {
@@ -492,6 +521,13 @@ impl ReblurTuning {
             || self.prepass_radius.is_some()
             || self.anti_firefly.is_some()
             || self.max_accum_frames.is_some()
+            || self.antilag_sigma_scale.is_some()
+            || self.antilag_sensitivity.is_some()
+            || self.responsive_roughness.is_some()
+            || self.responsive_min_frames.is_some()
+            || self.convergence_s.is_some()
+            || self.convergence_b.is_some()
+            || self.convergence_p.is_some()
     }
 
     /// Fold the overrides into a settings struct (None leaves the field).
@@ -509,6 +545,27 @@ impl ReblurTuning {
         if let Some(n) = self.max_accum_frames {
             rs.max_accumulated_frame_num = n;
         }
+        if let Some(v) = self.antilag_sigma_scale {
+            rs.antilag_settings.luminance_sigma_scale = v;
+        }
+        if let Some(v) = self.antilag_sensitivity {
+            rs.antilag_settings.luminance_sensitivity = v;
+        }
+        if let Some(v) = self.responsive_roughness {
+            rs.responsive_accumulation_settings.roughness_threshold = v;
+        }
+        if let Some(v) = self.responsive_min_frames {
+            rs.responsive_accumulation_settings.min_accumulated_frame_num = v;
+        }
+        if let Some(v) = self.convergence_s {
+            rs.convergence_settings.s = v;
+        }
+        if let Some(v) = self.convergence_b {
+            rs.convergence_settings.b = v;
+        }
+        if let Some(v) = self.convergence_p {
+            rs.convergence_settings.p = v;
+        }
     }
 }
 
@@ -522,6 +579,35 @@ pub fn set_tuning(t: ReblurTuning) {
 
 pub fn tuning() -> ReblurTuning {
     TUNING.get().copied().unwrap_or_default()
+}
+
+/// Runtime `CommonSettings` overrides — the ReblurTuning shape one level up,
+/// for the fields that belong to the shared settings block rather than to
+/// ReBLUR. `split_screen` is NRD's OWN noisy-vs-denoised wipe: at X the left
+/// X of the frame presents the RAW input and the rest the denoised output, in
+/// one library-side pass with no new resources, which replaces the hand-built
+/// two-capture A/B this project keeps rebuilding. All-None = a flagless
+/// session sends exactly what it always did.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CommonTuning {
+    pub split_screen: Option<f32>,
+}
+
+impl CommonTuning {
+    pub fn any(&self) -> bool {
+        self.split_screen.is_some()
+    }
+}
+
+static COMMON_TUNING: std::sync::OnceLock<CommonTuning> = std::sync::OnceLock::new();
+
+/// One writer: main's lever block (the `set_tuning` contract).
+pub fn set_common_tuning(t: CommonTuning) {
+    let _ = COMMON_TUNING.set(t);
+}
+
+pub fn common_tuning() -> CommonTuning {
+    COMMON_TUNING.get().copied().unwrap_or_default()
 }
 
 #[repr(C)]

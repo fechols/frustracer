@@ -89,6 +89,14 @@ __pycache__/
 !/SDKs/fidelityfx-sdk/upscalers/
 !/SDKs/fidelityfx-sdk/framegeneration/
 !/SDKs/fidelityfx-sdk/README.md
+
+# NRD: the SOURCE is a git SUBMODULE (SDKs/NRD-src -> NVIDIA-RTX/NRD), which
+# vendors nothing — the repo records a URL + a SHA and each clone fetches from
+# NVIDIA directly, exactly as install-prerequisites used to fetch the tag zip.
+# The blanket /SDKs/* above would otherwise make `git submodule add` refuse.
+# The BUILT artifacts stay ignored: they land in SDKs/NRD/bin (outside this
+# negation), and the submodule's own _Bin/_Build are covered by its .gitignore.
+!/SDKs/NRD-src
 waveviz-*.png
 
 # Crash handler artifacts (src/crash.rs) — the symbolized report and the

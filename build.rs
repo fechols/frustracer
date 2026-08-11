@@ -1,4 +1,47 @@
+/// NRD is a HARD build requirement (2026-08-10): it is the default pre-upscale
+/// denoiser for XeSS/FSR3 sessions, so a tree that cannot produce it is a tree
+/// whose default session silently runs undenoised — the failure this gate
+/// exists to make impossible. Deliberately NOT the DLSS block's
+/// `cargo:warning` degrade.
+///
+/// TWO checks, because they fail for different reasons and want different
+/// fixes: the SOURCE is the `SDKs/NRD-src` submodule (platform-neutral — a
+/// fresh clone without `--recurse-submodules` has an empty directory), and the
+/// ARTIFACT is the built DLL, which only `install-prerequisites.bat nrd` can
+/// produce. Neither shells out to CMake: NRD's configure FetchContent's
+/// ShaderMake and MathLib as URL zips, and putting the network inside every
+/// `cargo build` is not a trade worth making.
+///
+/// The artifact half is Windows-only today because the artifact itself is —
+/// a Linux build emits libNRD.so carrying SPIR-V, which is right for a Vulkan
+/// backend and unloadable by the D3D12 sessions this tree currently renders
+/// with. When the Vulkan backend lands, add its arm here beside the DLL.
+fn require_nrd() {
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rerun-if-changed=SDKs/NRD-src/CMakeLists.txt");
+    if !manifest.join("SDKs/NRD-src/CMakeLists.txt").exists() {
+        panic!(
+            "\n\nNRD source is missing: SDKs/NRD-src is empty (the submodule was not \
+             checked out).\n    git submodule update --init SDKs/NRD-src\n\nNRD is the \
+             default denoiser and is required to build.\n"
+        );
+    }
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=SDKs/NRD/bin/NRD.dll");
+        if !manifest.join("SDKs/NRD/bin/NRD.dll").exists() {
+            panic!(
+                "\n\nNRD.dll is missing: SDKs\\NRD\\bin\\NRD.dll has not been built.\n    \
+                 install-prerequisites.bat nrd\n\nNeeds CMake (3.22...3.30) + VS 2022 C++ \
+                 tools; NVIDIA ships no prebuilt binaries, so it compiles locally from the \
+                 submodule.\n"
+            );
+        }
+    }
+}
+
 fn main() {
+    require_nrd();
     #[cfg(windows)]
     {
         // FidelityFX FFI shim: the ffx-api structs (pNext chains,

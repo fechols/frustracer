@@ -20,10 +20,36 @@ jobs:
       # on the PROCEDURAL scene, and assets/{bunny,teapot}.obj are plain git. So
       # CI never downloads a byte of the ~4 GB of LFS scene data, and the scene
       # blobs stay as pointer files that nothing opens.
+      #   submodules IS required, unlike lfs: build.rs hard-fails without the
+      #   NRD source at SDKs/NRD-src (NRD is the default denoiser). ~20 MB, one
+      #   level deep — NRD itself has no submodules, it FetchContent's its deps.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # NRD.dll is the other half of build.rs's gate, and it is COMPILED (NVIDIA
+      # ships no prebuilt binaries) — a cold CMake + DXIL build is minutes, so it
+      # is cached on the submodule SHA. Only an NRD bump pays for it again.
+      # Cache the built DLLs rather than the CMake tree: they are ~3 MB, and the
+      # installer's early-out ("[=] nrd already installed") makes a hit a no-op.
+      - name: NRD version
+        id: nrdver
+        shell: bash
+        run: echo "sha=$(git -C SDKs/NRD-src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: SDKs/NRD/bin
+          key: nrd-dll-${{ runner.os }}-${{ steps.nrdver.outputs.sha }}
+
+      # Runs the real installer component so CI and a developer machine build
+      # the DLL exactly one way (incl. the configure->build->copy sequencing
+      # contract that keeps the perf variant's shaders out of the standard DLL).
+      - name: Build NRD
+        run: .\install-prerequisites.bat nrd
 
       # `quick` is the right profile here and the repo argues why: it exercises
       # every exact-zero correctness gate (which are perf-independent) without

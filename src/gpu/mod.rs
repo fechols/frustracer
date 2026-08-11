@@ -3656,6 +3656,7 @@ impl GpuContext {
                     d.rh,
                     fc,
                     jitter,
+                    frame_ms,
                     reset,
                     self.frd_sun,
                     d.nrd_sig() && p.q.rtgi,
@@ -3795,6 +3796,7 @@ impl GpuContext {
                     d.rh,
                     fc,
                     fc.jitter,
+                    frame_ms,
                     fc.reset,
                     self.frd_sun,
                     d.nrd_sig() && p.q.rtgi,
@@ -3898,6 +3900,11 @@ impl GpuContext {
         rh: u32,
         fc: &dlss::FrameConstants,
         jitter: (f32, f32),
+        // The frame's wall time in MILLISECONDS, handed to NRD as
+        // `timeDeltaBetweenFrames` (see `nrd_gpu::common_settings` for why the
+        // library's own internal timer is the wrong clock for us). FRD ignores
+        // it — its accumulation is in frames and its caps are frame counts.
+        dt_ms: f32,
         reset: bool,
         sun: Option<[f32; 3]>,
         // The shade.hlsli FLAG_NRD_GI fold is live this frame (the caller's
@@ -3919,6 +3926,7 @@ impl GpuContext {
         let step = pack()
             .and_then(|()| match dn {
                 DnGpu::Nrd(ng) => {
+                    let (prw, prh) = ng.prev_size();
                     let cs = nrd_gpu::common_settings(
                         &mats,
                         &pm,
@@ -3926,7 +3934,10 @@ impl GpuContext {
                         pj,
                         rw,
                         rh,
+                        prw,
+                        prh,
                         fc.far,
+                        dt_ms,
                         *nrd_frame_idx,
                         hist_reset,
                     );
@@ -4225,6 +4236,7 @@ impl GpuContext {
                     tg.rh,
                     fc,
                     jitter,
+                    frame_ms,
                     reset,
                     self.frd_sun,
                     tg.nrd_sig() && p.q.rtgi,
@@ -4576,6 +4588,7 @@ impl GpuContext {
                     tg.rh,
                     fc,
                     fc.jitter,
+                    frame_ms,
                     fc.reset,
                     self.frd_sun,
                     tg.nrd_sig() && p.q.rtgi,
@@ -7746,6 +7759,15 @@ impl CineDn {
             rh,
             fc,
             jitter,
+            // A capture is DETERMINISTIC by contract, so it must never hand
+            // NRD a wall clock — a sub-frame here can take a second and the
+            // frame after it a millisecond, and `m_FrameRateScale` would swing
+            // with machine load between two renders of the same shot. The
+            // nominal keeps `timeDeltaBetweenFrames` a constant of the capture.
+            // Deliberately NOT the shot's own `--cinematic-fps` either: these
+            // sub-frames are convergence passes at ONE pose, not frames of the
+            // output sequence, so neither clock describes them.
+            nrd_gpu::NOMINAL_DT_MS,
             reset,
             sun,
             gi_fold,

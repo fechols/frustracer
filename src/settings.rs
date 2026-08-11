@@ -167,10 +167,11 @@ opt_fields! {
         pub nppd: bool,
         /// "auto" | "cpu" | "dml" | "dml:<n>" (--nppd-device; restart)
         pub nppd_device: String,
-        /// --nrd / --no-nrd (restart: NRD wires at tracer init). OPT-IN
-        /// since the FRD default flip — a saved `on` claims the denoiser
-        /// slot from the compiled frd default (a saved preference beats a
-        /// compiled default, silently). The file sets `opts.nrd` but
+        /// --nrd / --no-nrd (restart: NRD wires at tracer init). THE
+        /// COMPILED DEFAULT since 2026-08-10 — a saved `off` is the kill
+        /// lever, and a saved `frd` beats it (a saved preference beats a
+        /// compiled default, silently — see main's inverted tie-break).
+        /// The file sets `opts.nrd` but
         /// deliberately NEVER `nrd_explicit` — the fg precedent, not the
         /// dxr_inline one: main makes the --nrd + --nppd pair fatal only
         /// when nrd_explicit ("a default must never make another flag
@@ -198,9 +199,10 @@ opt_fields! {
         pub nrd_anti_firefly: bool,
         pub nrd_max_accum_frames: u32,
         /// --frd / --no-frd (restart): the from-scratch pre-upscale
-        /// denoiser, THE COMPILED DEFAULT since the Phase-E flip — a saved
-        /// `off` is the kill lever. Drives the DEFAULT arm only — never
-        /// frd_explicit (the fg-row rule), so a file value can't make
+        /// denoiser, OPT-IN since 2026-08-10 (NRD is the compiled default) —
+        /// a saved `on` claims the denoiser slot from it, since only the
+        /// compiled side can be nrd here. Drives the DEFAULT arm only —
+        /// never frd_explicit (the fg-row rule), so a file value can't make
         /// another flag fatal.
         pub frd: bool,
     }
@@ -1385,8 +1387,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("oidn", "OIDN denoise (N cycles)", "Upscaler", Live, CycleFwd, acc_bool!(upscaler.oidn)),
             item!("oidn_temporal", "OIDN temporal history (M)", "Upscaler", Live, Toggle { default: true }, acc_bool!(upscaler.oidn_temporal)),
             item!("nppd", "NPPD neural denoise (J)", "Upscaler", Live, Toggle { default: false }, acc_bool!(upscaler.nppd)),
-            item!("frd", "FRD denoise", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.frd)),
-            item!("nrd", "NRD denoise (A/B oracle)", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.nrd)),
+            item!("frd", "FRD denoise (fast arm)", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.frd)),
+            item!("nrd", "NRD denoise", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.nrd)),
             item!("oidn_post", "OIDN post-upscale start (XeSS)", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.oidn_post)),
             item!("prefer", "adapter preference", "Upscaler", Restart, Cycle { options: &["nvidia", "amd", "intel"], default_ix: 0 }, acc_str!(upscaler.prefer)),
             item!("quinlight", "quinlight consensus fuse", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.quinlight)),

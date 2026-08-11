@@ -1,5 +1,8 @@
 [package]
 name = "frustracer"
+# The frqa QA client (src/bin/frqa.rs) makes this a two-binary crate; without
+# default-run every bare `cargo run` errors asking for --bin.
+default-run = "frustracer"
 version = "0.1.0"
 edition = "2024"
 description = "A frustum tracer: beam tracing crossed with ray tracing. The screen is a quadtree; empty space is proven once per tile instead of once per pixel."
