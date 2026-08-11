@@ -13388,6 +13388,17 @@ fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: 
             ok = false;
         }
     }
+    // The staging ring's chunking arithmetic, which no image gate can reach
+    // unless the scene is big enough to chunk at all — and at a 64 MB ring the
+    // procedural scene never is, so a device-side proof would be silently
+    // scene-dependent. Pure, so it runs here beside the pick.
+    match vk::stage::self_test() {
+        Ok(()) => println!("check-vk: V0 staging-ring chunk plan OK"),
+        Err(e) => {
+            eprintln!("check-vk: FAIL V0 {e}");
+            ok = false;
+        }
+    }
 
     // ---- V1: a real device. Absence is a normal condition. ----
     //
@@ -13990,6 +14001,27 @@ fn run_check_vk_render(
         scene.textures.len(),
         vt.levels,
         vt.bytes as f64 / (1024.0 * 1024.0)
+    );
+    // What the staging ring actually carried. Reported for the reason the
+    // texture line reports bytes rather than a count: a mapped upload and a
+    // staged one allocate exactly the same buffers and render exactly the same
+    // frame, so BYTES and SUBMITS are the only things that can tell a run that
+    // streamed from one that did not — and the chunk count is additionally
+    // what says whether the multi-chunk path ran on this scene at all.
+    let (sb, sc) = vs.staged;
+    let (tb, tc) = vt.staged;
+    let (rb, rc) = tg.staged;
+    println!(
+        "check-vk: V6 staged {:.1} MB in {} submit(s) — scene {:.1}/{}, textures {:.1}/{}, \
+         trees {:.1}/{}",
+        (sb + tb + rb) as f64 / (1024.0 * 1024.0),
+        sc + tc + rc,
+        sb as f64 / (1024.0 * 1024.0),
+        sc,
+        tb as f64 / (1024.0 * 1024.0),
+        tc,
+        rb as f64 / (1024.0 * 1024.0),
+        rc,
     );
 
     let q = Quality::preset(2);

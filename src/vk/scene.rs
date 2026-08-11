@@ -8,24 +8,21 @@
 //! is the part D3D12 and Vulkan genuinely spell differently: buffers, device
 //! addresses, and the acceleration-structure build.
 //!
-//! THREE THINGS THIS DOES NOT DO YET, each a deliberate M3b boundary rather
-//! than an oversight:
+//! Every stream here is DEVICE_LOCAL and written through `vk::stage`'s ring —
+//! the M3b "no staging" boundary, closed. What that buys is in that module's
+//! header; what it costs here is that the streams which needed a repack
+//! (`Vec3A` -> `float3`) or had no source slice at all (`blas_tri`'s identity
+//! remap) are now GENERATED into the ring a chunk at a time rather than
+//! collected first, so the `Vec`s they used to build are gone with them.
 //!
-//! - **No staging.** Every stream is HOST_VISIBLE and written through a map.
-//!   Correct everywhere and right on the UMA part this runs on; a discrete GPU
-//!   would want the `STAGE_CHUNK` ring `SceneGpu` carries, which is a
-//!   throughput question and not a correctness one.
-//! - **No textures.** `texs[]` is an unbounded array with no descriptors
-//!   written, which `descriptorBindingPartiallyBound` makes legal for a scene
-//!   that fetches none. A textured scene needs images, and images need the
-//!   sampler/format/mip machinery that is its own slice.
-//! - **One BLAS, not `--blas-split`'s many.** One acceleration structure over
-//!   the whole index stream in its original order, and one identity instance.
-//!   Note that this is NOT the `--no-blas-split` arm: the split is ON by
-//!   default, so `BLAS_SPLIT` is compiled in and `tri_of` goes through the
-//!   remap — which is uploaded here at its single-chunk values (see
-//!   `blas_tri`). The real split exists because one 34M-triangle BLAS removes
-//!   the device on some drivers, so it returns with the scenes that need it.
+//! ONE THING THIS STILL DOES NOT DO, and it is deliberate rather than an
+//! oversight: **one BLAS, not `--blas-split`'s many.** One acceleration
+//! structure over the whole index stream in its original order, and one
+//! identity instance. Note that this is NOT the `--no-blas-split` arm: the
+//! split is ON by default, so `BLAS_SPLIT` is compiled in and `tri_of` goes
+//! through the remap — which is uploaded here at its single-chunk values (see
+//! `blas_tri`). The real split exists because one 34M-triangle BLAS removes
+//! the device on some drivers, so it returns with the scenes that need it.
 
 use ash::vk;
 
@@ -33,6 +30,7 @@ use crate::gfx::scene as gs;
 use crate::scene::Scene;
 use crate::vk::device::Buffer;
 use crate::vk::headless::VkHeadless;
+use crate::vk::stage::Stage;
 
 /// Everything the tracer binds, plus what must merely stay ALIVE.
 pub struct VkScene {
@@ -63,8 +61,12 @@ pub struct VkScene {
     /// One 16-byte buffer standing in for every declared-but-unread binding.
     /// `PARTIALLY_BOUND` would let those slots go unwritten, but a bound dummy
     /// is strictly safer and free: it turns "the shader touched a slot nobody
-    /// expected" from undefined behaviour into a read of zeros.
+    /// expected" from undefined behaviour into a read of zeros — which became
+    /// literally true with the staging ring, since it can zero-fill (before,
+    /// this was device-local memory nobody had written).
     pub dummy: Buffer,
+    /// Bytes staged and submits spent, for the report line.
+    pub staged: (u64, u32),
     pub tlas: vk::AccelerationStructureKHR,
     /// The AS backing stores. Never read through, and never droppable: an
     /// acceleration structure is a VIEW of buffer memory, and the TLAS's
@@ -74,11 +76,6 @@ pub struct VkScene {
     tlas_mem: Buffer,
     blas: vk::AccelerationStructureKHR,
     accel: ash::khr::acceleration_structure::Device,
-}
-
-/// Bytes of a `#[repr(C)]` slice, for the host-visible writes below.
-fn bytes_of<T>(v: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 impl VkScene {
@@ -97,145 +94,162 @@ impl VkScene {
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
 
-        let up = |v: &[u8], usage: vk::BufferUsageFlags| -> Result<Buffer, String> {
-            let b = vkd.buffer(v.len().max(4) as u64, usage, true)?;
-            vkd.write(&b, v)?;
-            Ok(b)
-        };
+        // One ring for the whole set, sized to it (so a small scene commits
+        // kilobytes, not the cap) and freed before this returns — the D3D12
+        // discipline that keeps peak commit at steady-state plus one chunk
+        // rather than twice steady-state. `atom` is one element: every wire
+        // type here is tens of bytes, so the 4 KB floor covers it, but it is
+        // passed rather than assumed because `Stage` treats it as a
+        // correctness floor and not a hint.
+        let mut stage = Stage::new(vkd, gs::stream_bytes(scene) as u64, 256)?;
 
-        // `Scene::positions` is Vec3A — 16 B each — and the shaders declare
-        // `StructuredBuffer<float3>`, so the stream is repacked to 12 B on the
-        // way out. That is also what the BLAS reads, at `R32G32B32_SFLOAT`
-        // stride 12: one buffer, two consumers, exactly as on D3D12.
-        let pos: Vec<[f32; 3]> = scene.positions.iter().map(|p| [p.x, p.y, p.z]).collect();
-        let nrm: Vec<[f32; 3]> = scene.normals.iter().map(|n| [n.x, n.y, n.z]).collect();
-        let uv: Vec<[f32; 2]> = scene.texcoords.iter().map(|t| [t.x, t.y]).collect();
+        // The whole upload runs inside one closure so a failure anywhere in it
+        // still frees the ring. Everything ELSE it allocated leaks on that
+        // path, exactly as before — a scene that cannot upload ends the run,
+        // and a per-stream unwind would be machinery serving nothing.
+        let built = (|| -> Result<VkScene, String> {
+            // `Scene::positions` is Vec3A — 16 B each — and the shaders declare
+            // `StructuredBuffer<float3>`, so the stream is repacked to 12 B on
+            // the way out. That repack used to build a whole `Vec` first; now
+            // it happens INSIDE the ring, one chunk at a time. The same buffer
+            // is what the BLAS reads, at `R32G32B32_SFLOAT` stride 12: one
+            // buffer, two consumers, exactly as on D3D12.
+            let positions = stage.stream(hg, &scene.positions, |p| [p.x, p.y, p.z], as_in)?;
+            let indices = stage.stream(hg, &scene.indices, |t| *t, as_in)?;
+            let normals = stage.stream(hg, &scene.normals, |n| [n.x, n.y, n.z], sb)?;
+            let tri_mat = stage.stream(hg, &scene.tri_mat, |t| *t, sb)?;
+            let mats = gs::gpu_materials(scene);
+            let materials = stage.stream(hg, &mats, |m| *m, sb)?;
+            let uv_buf = stage.stream(hg, &scene.texcoords, |t| [t.x, t.y], sb)?;
+            let cut = gs::mat_cutout(scene);
+            let mat_cutout = stage.stream(hg, &cut, |m| *m, sb)?;
+            let hgt = gs::mat_height(scene);
+            let mat_height = stage.stream(hg, &hgt, |m| *m, sb)?;
+            let shd = gs::mat_shadow(scene);
+            let mat_shadow = stage.stream(hg, &shd, |m| *m, sb)?;
+            let dummy = stage.zeros(hg, 16, sb)?;
 
-        let positions = up(bytes_of(&pos), as_in)?;
-        let indices = up(bytes_of(&scene.indices), as_in)?;
-        let normals = up(bytes_of(&nrm), sb)?;
-        let tri_mat = up(bytes_of(&scene.tri_mat), sb)?;
-        let materials = up(bytes_of(&gs::gpu_materials(scene)), sb)?;
-        let uv_buf = up(bytes_of(&uv), sb)?;
-        let mat_cutout = up(bytes_of(&gs::mat_cutout(scene)), sb)?;
-        let mat_height = up(bytes_of(&gs::mat_height(scene)), sb)?;
-        let mat_shadow = up(bytes_of(&gs::mat_shadow(scene)), sb)?;
-        let dummy = vkd.buffer(16, sb, false)?;
+            // GENERATED, never collected: at 34.4M triangles the identity
+            // remap is 138 MB of `i`, so there is nothing worth holding.
+            let n_tris = scene.indices.len();
+            let blas_tri = stage.stream_gen(hg, n_tris, |i| i as u32, sb)?;
+            let chunk_base = stage.stream(hg, &[0u32], |v| *v, sb)?;
 
-        let n_tris = scene.indices.len() as u32;
-        let remap: Vec<u32> = (0..n_tris).collect();
-        let blas_tri = up(bytes_of(&remap), sb)?;
-        let chunk_base = up(bytes_of(&[0u32]), sb)?;
+            let n_tris = n_tris as u32;
+            let n_verts = scene.positions.len() as u32;
 
-        let n_verts = scene.positions.len() as u32;
-
-        // Geometry flags, term for term with `geometry_desc` on the D3D12 side
-        // (see its comment for why NO_DUPLICATE_ANY_HIT is transmissive-only:
-        // the cutout/relief rejects are idempotent and the tint MULTIPLY is
-        // not). The predicate itself is `gfx::shaders::non_opaque`, so the
-        // two backends cannot disagree about which scenes are fast-path.
-        let gflags = if crate::gfx::shaders::non_opaque(scene) {
-            if scene.any_transmissive {
-                vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION
+            // Geometry flags, term for term with `geometry_desc` on the D3D12
+            // side (see its comment for why NO_DUPLICATE_ANY_HIT is
+            // transmissive-only: the cutout/relief rejects are idempotent and
+            // the tint MULTIPLY is not). The predicate itself is
+            // `gfx::shaders::non_opaque`, so the two backends cannot disagree
+            // about which scenes are fast-path.
+            let gflags = if crate::gfx::shaders::non_opaque(scene) {
+                if scene.any_transmissive {
+                    vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION
+                } else {
+                    vk::GeometryFlagsKHR::empty()
+                }
             } else {
-                vk::GeometryFlagsKHR::empty()
-            }
-        } else {
-            vk::GeometryFlagsKHR::OPAQUE
-        };
+                vk::GeometryFlagsKHR::OPAQUE
+            };
 
-        let tri = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-            .vertex_format(vk::Format::R32G32B32_SFLOAT)
-            .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                device_address: vkd.buffer_device_address(&positions),
-            })
-            .vertex_stride(12)
-            .max_vertex(n_verts.saturating_sub(1))
-            .index_type(vk::IndexType::UINT32)
-            .index_data(vk::DeviceOrHostAddressConstKHR {
-                device_address: vkd.buffer_device_address(&indices),
-            });
-        let geo = vk::AccelerationStructureGeometryKHR::default()
-            .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-            .flags(gflags)
-            .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: tri });
+            let tri = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: vkd.buffer_device_address(&positions),
+                })
+                .vertex_stride(12)
+                .max_vertex(n_verts.saturating_sub(1))
+                .index_type(vk::IndexType::UINT32)
+                .index_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: vkd.buffer_device_address(&indices),
+                });
+            let geo = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                .flags(gflags)
+                .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: tri });
 
-        let (blas, blas_mem) = build_one(
-            hg,
-            &accel,
-            vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
-            &[geo],
-            &[n_tris],
-        )?;
+            let (blas, blas_mem) = build_one(
+                hg,
+                &accel,
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                &[geo],
+                &[n_tris],
+            )?;
 
-        // ONE identity instance. `instance_custom_index` is InstanceID(), which
-        // `tri_of` reads as the chunk index — 0 is the identity remap the
-        // `--no-blas-split` arm compiles.
-        let blas_addr = unsafe {
-            accel.get_acceleration_structure_device_address(
-                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                    .acceleration_structure(blas),
-            )
-        };
-        let inst = vk::AccelerationStructureInstanceKHR {
-            transform: vk::TransformMatrixKHR {
-                matrix: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            },
-            instance_custom_index_and_mask: vk::Packed24_8::new(0, 0xff),
-            instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
-                0,
-                // The kernels' intersector is two-sided (moller_trumbore is,
-                // and the CPU reference it is scored against is), so culling
-                // must be disabled on the instance — D3D12 gets this from
-                // never setting a cull flag on the ray.
-                vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
-            ),
-            acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                device_handle: blas_addr,
-            },
-        };
-        let instances = up(bytes_of(std::slice::from_ref(&inst)), as_in)?;
-        let inst_geo = vk::AccelerationStructureGeometryKHR::default()
-            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-            .flags(vk::GeometryFlagsKHR::OPAQUE)
-            .geometry(vk::AccelerationStructureGeometryDataKHR {
-                instances: vk::AccelerationStructureGeometryInstancesDataKHR::default().data(
-                    vk::DeviceOrHostAddressConstKHR {
-                        device_address: vkd.buffer_device_address(&instances),
-                    },
+            // ONE identity instance. `instance_custom_index` is InstanceID(),
+            // which `tri_of` reads as the chunk index — 0 is the identity
+            // remap the `--no-blas-split` arm compiles.
+            let blas_addr = unsafe {
+                accel.get_acceleration_structure_device_address(
+                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                        .acceleration_structure(blas),
+                )
+            };
+            let inst = vk::AccelerationStructureInstanceKHR {
+                transform: vk::TransformMatrixKHR {
+                    matrix: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                },
+                instance_custom_index_and_mask: vk::Packed24_8::new(0, 0xff),
+                instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+                    0,
+                    // The kernels' intersector is two-sided (moller_trumbore
+                    // is, and the CPU reference it is scored against is), so
+                    // culling must be disabled on the instance — D3D12 gets
+                    // this from never setting a cull flag on the ray.
+                    vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
                 ),
-            });
-        let (tlas, tlas_mem) = build_one(
-            hg,
-            &accel,
-            vk::AccelerationStructureTypeKHR::TOP_LEVEL,
-            &[inst_geo],
-            &[1],
-        )?;
-        // The instance buffer is build INPUT only — the built TLAS is
-        // self-contained, exactly as on D3D12, so this is the one AS-adjacent
-        // allocation that may be freed here.
-        vkd.free_buffer(&instances);
+                acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                    device_handle: blas_addr,
+                },
+            };
+            let instances = stage.stream(hg, std::slice::from_ref(&inst), |i| *i, as_in)?;
+            let inst_geo = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                .flags(vk::GeometryFlagsKHR::OPAQUE)
+                .geometry(vk::AccelerationStructureGeometryDataKHR {
+                    instances: vk::AccelerationStructureGeometryInstancesDataKHR::default().data(
+                        vk::DeviceOrHostAddressConstKHR {
+                            device_address: vkd.buffer_device_address(&instances),
+                        },
+                    ),
+                });
+            let (tlas, tlas_mem) = build_one(
+                hg,
+                &accel,
+                vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+                &[inst_geo],
+                &[1],
+            )?;
+            // The instance buffer is build INPUT only — the built TLAS is
+            // self-contained, exactly as on D3D12, so this is the one
+            // AS-adjacent allocation that may be freed here.
+            vkd.free_buffer(&instances);
 
-        Ok(VkScene {
-            positions,
-            normals,
-            indices,
-            tri_mat,
-            materials,
-            uv_buf,
-            mat_cutout,
-            mat_height,
-            mat_shadow,
-            blas_tri,
-            chunk_base,
-            dummy,
-            blas,
-            blas_mem,
-            tlas,
-            tlas_mem,
-            accel,
-        })
+            Ok(VkScene {
+                positions,
+                normals,
+                indices,
+                tri_mat,
+                materials,
+                uv_buf,
+                mat_cutout,
+                mat_height,
+                mat_shadow,
+                blas_tri,
+                chunk_base,
+                dummy,
+                staged: (stage.bytes(), stage.chunks()),
+                blas,
+                blas_mem,
+                tlas,
+                tlas_mem,
+                accel: accel.clone(),
+            })
+        })();
+        stage.free(vkd);
+        built
     }
 
     pub fn destroy(&self, hg: &VkHeadless) {

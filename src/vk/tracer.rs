@@ -107,30 +107,17 @@ use crate::vk::scene::VkScene;
 use crate::vk::spirv::{binding_of, Reg, Spirv};
 use crate::vk::textures::VkTextures;
 
-/// Bytes of a `#[repr(C)]` slice — a reinterpret, not a copy.
-fn bytes_of<T>(v: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
-}
-
-/// The binary BVH in `gfx::scene`'s wire format — the `--no-ftree` arm's t0
-/// stream. Eager because this backend has no staging ring yet; the field
-/// mapping itself is shared with D3D12 (`gpu_bvh_node`).
-fn nodes_wire(bvh: &crate::bvh::Bvh) -> Vec<crate::gfx::scene::GpuBvhNode> {
-    bvh.nodes.iter().map(crate::gfx::scene::gpu_bvh_node).collect()
-}
-
-/// A host-visible buffer with `bytes` already in it. The frustum tree is the
-/// one stream this file uploads, and it goes the way `vk::scene` sends the
-/// rest — mapped, no staging. The staging ring is a throughput question and
-/// lands with the rest of them.
-fn host_buf(
-    vkd: &crate::vk::device::Vk,
-    bytes: &[u8],
-    usage: vk::BufferUsageFlags,
-) -> Result<Buffer, String> {
-    let b = vkd.buffer(bytes.len().max(4) as u64, usage, true)?;
-    vkd.write(&b, bytes)?;
-    Ok(b)
+/// Upload bytes of the software trees this file owns — the sizing input for
+/// their staging ring. The wide tree is the big one: ~112 B per wide node
+/// against the binary tree's 32, and a scene's wide nodes are roughly a
+/// seventh of its binary ones, so at 34.4M triangles this is ~480 MB.
+fn tree_bytes(bvh: &crate::bvh::Bvh, ft: Option<&crate::ftree::FTree>, sw: bool) -> u64 {
+    let binary = (bvh.nodes.len() * std::mem::size_of::<crate::gfx::scene::GpuBvhNode>()) as u64;
+    let tree = match ft {
+        Some(f) => f.quantized_bytes() as u64,
+        None => binary,
+    };
+    binary + tree + if sw { (bvh.tri_idx.len() * 4) as u64 } else { 0 }
 }
 
 /// One GPU image, plus what it takes to bind and read it.
@@ -268,6 +255,11 @@ pub struct VkTracer {
     /// The derived register map, kept so `bind()` writes exactly the slots the
     /// modules declared — never a hand-listed set.
     map: Map,
+    /// Bytes staged and submits spent uploading the software trees. Reported,
+    /// never asserted — a run that staged nothing and one that staged the
+    /// whole tree allocate the same buffers, and only a byte total tells them
+    /// apart (the `--check-spirv` assembled-bytes lesson).
+    pub staged: (u64, u32),
 }
 
 const P_REFERENCE: usize = 0;
@@ -490,11 +482,35 @@ impl VkTracer {
         // in every session, and under `--sw-rays` so do the ray loops in the
         // reference, leaf and hemi-leaf units — which is also the one arm that
         // needs `tri_idx`, since a RayQuery gets its triangles from the driver.
-        let binary = host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?;
-        let sw_tri = if gs::sw_rays() {
-            Some(host_buf(vkd, bytes_of(&bvh.tri_idx), sb)?)
-        } else {
-            None
+        //
+        // These stream through `vk::stage` exactly as the scene's do, and
+        // GENERATED rather than collected for the reason that matters at
+        // scale: `nodes_wire`'s `Vec<GpuBvhNode>` was ~960 MB at 34.4M
+        // triangles and the wide tree's `quantized()` another ~480, each of
+        // them a full second copy on top of the mapped buffer it was written
+        // into. Per-node conversion is the shared thing (`gpu_bvh_node`,
+        // `FTree::quantize_node`); the iteration is each backend's own.
+        let ft = if srcs.ftree_on { Some(crate::ftree::FTree::build(bvh)) } else { None };
+        let mut stage = crate::vk::stage::Stage::new(
+            vkd,
+            tree_bytes(bvh, ft.as_ref(), gs::sw_rays()),
+            256,
+        )?;
+        let trees = (|| -> Result<(Buffer, Option<Buffer>), String> {
+            let binary = stage.stream(hg, &bvh.nodes, crate::gfx::scene::gpu_bvh_node, sb)?;
+            let sw_tri = if gs::sw_rays() {
+                Some(stage.stream(hg, &bvh.tri_idx, |t| *t, sb)?)
+            } else {
+                None
+            };
+            Ok((binary, sw_tri))
+        })();
+        let (binary, sw_tri) = match trees {
+            Ok(t) => t,
+            Err(e) => {
+                stage.free(vkd);
+                return Err(e);
+            }
         };
         let mut wave = if want_wave {
             if dd > 11 {
@@ -531,10 +547,9 @@ impl VkTracer {
             // shortcut: the CPU keeps f32 nodes, the GPU trades decode ALU for
             // -56% tree bandwidth and the decoded boxes still CONTAIN the true
             // ones, so every prune stays conservative.
-            let ft = if srcs.ftree_on { Some(crate::ftree::FTree::build(bvh)) } else { None };
             let tree = match &ft {
-                Some(f) => host_buf(vkd, bytes_of(&f.quantized()), sb)?,
-                None => host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?,
+                Some(f) => stage.stream_gen(hg, f.nodes.len(), |i| f.quantize_node(i), sb)?,
+                None => stage.stream(hg, &bvh.nodes, crate::gfx::scene::gpu_bvh_node, sb)?,
             };
             // The leaf-cut translation map. Gated on `sw_rays_leaf` rather than
             // `sw_rays` for the reason the HLSL is: under `--no-cut-rays` the
@@ -542,7 +557,7 @@ impl VkTracer {
             // translation, and the wavefront unit declares no t1 at all.
             let ft_bnode = match &ft {
                 Some(f) if gs::sw_rays_leaf() => {
-                    Some(host_buf(vkd, bytes_of(&f.bnode_flat()), sb)?)
+                    Some(stage.stream_gen(hg, f.nodes.len() * 8, |i| f.bnode_at(i), sb)?)
                 }
                 _ => None,
             };
@@ -565,6 +580,10 @@ impl VkTracer {
         } else {
             None
         };
+        // Every tree that was going to be uploaded has been; the ring is a
+        // 64 MB mapped allocation with nothing left to carry.
+        let staged = (stage.bytes(), stage.chunks());
+        stage.free(vkd);
 
         let mut hemi = if want_hemi {
             Some(Hemi {
@@ -703,6 +722,7 @@ impl VkTracer {
             sky_lod_k: srcs.sky_lod,
             cloud_shadow_n: srcs.cloud_shadow_n,
             map,
+            staged,
         };
         t.write_descriptors(hg, vs, vt);
         Ok(t)
@@ -1009,14 +1029,29 @@ impl VkTracer {
 
     /// The quadtree depth the ladder runs, and the terminal-queue capacities —
     /// the numbers the accounting gate needs to read the queues back. `None`
-    /// under `--sw-rays`, which needs a fourth set variant (module header).
+    /// only if the ladder was never built; nothing turns it off today.
     pub fn wave_shape(&self) -> Option<(u32, u32, u32)> {
         self.wave.as_ref().map(|w| (w.depth_full, w.cap_leaf, w.cap_sky))
     }
 
     /// The per-frame cbuffer, written host-side before the submit.
     fn write_cb(&self, hg: &VkHeadless, p: &FrameParams) -> Result<(), String> {
-        let mut cb = self.cb_base.with_frame(p, false, false, false, false, false, false);
+        // EVERY capture/bridge flag is off, and each for the same structural
+        // reason rather than as a default: this backend writes no G-buffer
+        // pack and wires no denoiser, so `gbuf_full` is false and the six that
+        // are gated on it (`fsr_sig`, `gbuf_ext`, `nrd_sig`, `sky_ext_skip`,
+        // `remod_exact`, and the FSR-RR half of the rest) could not arm even
+        // if asked. `nrd_rejitter` and `rclamp` live in `cs_nrd_out`, which is
+        // not compiled here at all.
+        //
+        // A POSITIONAL PILE THIS LONG IS A HAZARD, and this call site is the
+        // evidence: the NRD exact-remodulation merge added `remod_exact` and
+        // `rclamp` on the D3D12 side and left this one a compile error that
+        // only a Linux build could see. When the next one lands, decide it
+        // HERE too — a wrong `false` would be silent where the missing
+        // argument was loud.
+        let mut cb =
+            self.cb_base.with_frame(p, false, false, false, false, false, false, false, (false, false));
         cb.cloud_grid = if self.cloud_shadow_n == 0 || !p.clouds.enabled {
             [0.0; 4]
         } else {

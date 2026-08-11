@@ -5156,8 +5156,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 46/77. Measured 7332616 B procedural
-                                      # vs 7333760 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 46/77. Measured 7678038 B procedural
+                                      # vs 7679182 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
                                       # keying reaches. (A first draft printed 2-decimal MB and read
                                       # identical across all three: an instrument at the wrong
@@ -5196,7 +5196,7 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
                                       # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9; --sw-rays covered
-                                      # in M3g).
+                                      # in M3g, staging uploads in M3h).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
@@ -5413,7 +5413,8 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # V7's drained-queue check is PARITY-SELECTED, so
                                       # **FR_VK_RES=400x300 is what covers its other arm** (see V7);
                                       # FR_VK_CTRS=1 dumps V7's raw counter block, which is how the b1
-                                      # write-after-read hazard below was found.
+                                      # write-after-read hazard below was found; FR_VK_STAGE=<bytes> (a k or m
+                                      # suffix scales) is the staging ring's cap and is M3h's teeth — see below.
                                       # V6 — THE REFERENCE KERNEL RENDERING (M3b, 2026-08-10;
                                       # src/vk/scene.rs + src/vk/tracer.rs). V5 proved every tracer kernel
                                       # BINDS; this is the first stage that proves one of them is RIGHT,
@@ -5692,6 +5693,89 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # than an omission: with fb off the leaf and sky passes splat straight
                                       # into accum through accum_splat, so a compose would be a
                                       # buffer-to-buffer copy of a full screen.
+                                      # M3h — STAGING UPLOADS (2026-08-11), the last of vk/scene.rs's three
+                                      # declared M3b boundaries. Every immutable stream — the scene's eleven, the
+                                      # software trees, and the texture chains that already had their own ring —
+                                      # is DEVICE_LOCAL now and written through src/vk/stage.rs's one reusable
+                                      # host-visible chunk (64 MB cap, sized DOWN to what a scene actually
+                                      # carries, freed before each constructor returns, so peak commit is
+                                      # steady-state + one chunk rather than twice steady-state — the
+                                      # SceneGpu::new_uploaded discipline in the other API). Two costs it
+                                      # removes, only one of which is measurable here: PEAK HOST MEMORY (a
+                                      # mapped upload is a second full copy and the repack feeding it was a
+                                      # THIRD — at 34.4M tris the wide tree alone is ~480 MB and the binary tree
+                                      # ~960, so the collect-then-map shape cost ~2.9 GB of RAM to move ~1.4 GB)
+                                      # and READ BANDWIDTH FOREVER (a host-visible buffer a shader reads is host
+                                      # memory a shader reads — invisible on this UMA box and a per-access PCIe
+                                      # round trip on a discrete GPU, i.e. the half that cannot be measured here
+                                      # and so the half worth getting structurally right rather than
+                                      # empirically). The generator form is what deletes the repack outright:
+                                      # stream_gen takes a COUNT and a closure, so positions/normals/uv convert
+                                      # INSIDE the ring and blas_tri's identity remap (138 MB of `i` at 34.4M
+                                      # tris) is never built at all. WHAT STAYS MAPPED, deliberately: frame_cb,
+                                      # push, and the hemi probe points — the dynamic class, where staging would
+                                      # trade a host write for a host write plus a copy plus a barrier.
+                                      # THE BARRIER IS EMITTED ON THE LAST CHUNK ONLY, and that is a property of
+                                      # Vulkan's synchronization scopes rather than an optimization: a pipeline
+                                      # barrier's first scope is "all commands earlier in SUBMISSION ORDER",
+                                      # which spans earlier submits on the same queue, so one barrier after the
+                                      # final write covers every chunk in whatever command buffer it landed. Its
+                                      # dst mask carries ACCELERATION_STRUCTURE_READ as well as SHADER_READ,
+                                      # because positions/indices are read by the BLAS build through a device
+                                      # address and not by a shader — a shader-only mask would be right for nine
+                                      # of the eleven streams and silently wrong for the two whose corruption is
+                                      # hardest to attribute.
+                                      # THE COVERAGE PROBLEM AND ITS LEVER, which is the transferable part: the
+                                      # multi-chunk path is otherwise reachable only on a scene big enough to
+                                      # need it, so the gate's reach would be a property of which scene somebody
+                                      # happened to run — at 64 MB the procedural check scene is one chunk per
+                                      # stream and every off-by-one is invisible, while san-miguel's 67 MB index
+                                      # stream chunks by ACCIDENT. FR_VK_STAGE=<bytes> caps the ring, so
+                                      # FR_VK_STAGE=64k puts every stream on any scene through the chunked path;
+                                      # measured procedural 16 -> 88 submits with every gate's number IDENTICAL
+                                      # (radiance 0.045%, same-seed image 0.00e0, hemi 0.0067/3.02%, replay all
+                                      # zero). BYTES rather than the MiB the first draft took — the procedural
+                                      # scene's largest stream is under 1 MB, so a 1 MiB floor armed the lever
+                                      # and chunked nothing (13 submits before and after): an instrument at the
+                                      # wrong RESOLUTION cannot see what it was built for, the v1.5.3 lab lesson
+                                      # in a third currency.
+                                      # GATED IN TWO PLACES because neither reaches the other's failures.
+                                      # V0 runs vk::stage::self_test (pure, device-free, beside the device pick)
+                                      # over the CHUNK PLAN — coverage, byte-vs-element offsets, the ragged
+                                      # tail, the empty stream, a ring that is not a multiple of the element
+                                      # size (must round DOWN), and the oversized-element case where the loop's
+                                      # own `.max(1)` keeps it terminating and would overrun the mapping, which
+                                      # is why stream_gen refuses that configuration outright rather than
+                                      # trusting the plan. The loop CONSUMES `plan` rather than repeating it, so
+                                      # the gate scores the shipping code and not a parallel description of it.
+                                      # TEETH, both exercised: an offset in elements instead of bytes fails V0
+                                      # on every scene AND loses the device under FR_VK_STAGE=64k (a copy past
+                                      # the destination) while passing every device gate at the default ring —
+                                      # the coverage argument, demonstrated; a dropped tail chunk fails V0 plus
+                                      # four V6/V7 gates (class-mismatch 341393, radiance 85.194%, rtgi rays 0).
+                                      # The V6 line reports staged BYTES and SUBMITS split three ways
+                                      # (scene/textures/trees) for the reason the texture line reports bytes: a
+                                      # mapped upload and a staged one allocate the same buffers and render the
+                                      # same frame, so only the byte total tells them apart — and the chunk
+                                      # count is additionally what says whether the multi-chunk path ran at all.
+                                      # TWO SHARED-CORE MOVES FELL OUT, both the gpu_bvh_node shape: gfx::scene
+                                      # gains stream_bytes (the ring's sizing rule, beside the wire formats it
+                                      # counts — GpuMat's own size is a term, so a copy next to one backend's
+                                      # ring goes stale when the material struct grows; gpu/trace.rs imports it
+                                      # under its old local name) and ftree gains quantize_node/bnode_at, so the
+                                      # wide tree streams a node at a time while D3D12 keeps materializing —
+                                      # one per-node CONVERSION, two iterations. `quantized()` is now that
+                                      # function in a map, so the two cannot diverge.
+                                      # MEASURED (RADV, 800x600): procedural staged 4.7 MB in 16 submits,
+                                      # san-miguel-low-poly 929.6 MB in 29 (scene 327.2/16 — three of those
+                                      # chunked — textures 511.5/10, trees 90.8/3), rungholt 702.6/24,
+                                      # Sponza 507.2/24, vokselia 203.7/17, the helmet 107.7/18. Six scenes,
+                                      # both FR_VK_RES parities, --sw-rays (cuts 449, fallback 0, 768/768
+                                      # frontiers at 468.8 rays/handle — M3g's numbers to the digit),
+                                      # --no-ftree, --no-wide-levels and llvmpipe all unmoved; and the same
+                                      # 929.6 MB through a 64 KB ring is 6735 submits with every number
+                                      # IDENTICAL (radiance 0.006%, image 7.47e-9, hemi 0.97%) — the
+                                      # chunking proof at a scale no default configuration reaches.
                                       # V8 — THE HEMISPHERE BOUNCE TIERS, the last render-path arm the Vulkan
                                       # tracer did not have (M3e, 2026-08-11). The H key's AO and GI: the batched
                                       # hemi wavefront (root -> cell levels -> leaf rays) and the one cs_compose splat

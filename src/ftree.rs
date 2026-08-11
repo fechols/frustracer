@@ -188,7 +188,17 @@ impl FTree {
     /// unread — cut entries only ever reference occupied slots by
     /// construction (`refine_cut` emits from the occupancy set).
     pub fn bnode_flat(&self) -> Vec<u32> {
-        self.nodes.iter().flat_map(|n| n.bnode).collect()
+        (0..self.nodes.len() * WIDTH).map(|i| self.bnode_at(i)).collect()
+    }
+
+    /// One entry of that flat map, by its flat index — `quantize_node`'s
+    /// shape one stream over. It exists so a backend that STREAMS the map can
+    /// read it a slot at a time instead of materializing `nodes × 8` u32s
+    /// first, and `bnode_flat` is written over it so the two indexings cannot
+    /// disagree. (`FNode`'s fields stay private — its bounds and its `bnode`
+    /// lanes are collapse-internal.)
+    pub fn bnode_at(&self, flat: usize) -> u32 {
+        self.nodes[flat / WIDTH].bnode[flat % WIDTH]
     }
 
     /// Convert to the GPU wire format (QFNode): per node, a frame over the
@@ -196,53 +206,58 @@ impl FTree {
     /// the exact decode expression. Node ids (and so slot-ref cuts) are
     /// unchanged — the arrays are index-parallel.
     pub fn quantized(&self) -> Vec<QFNode> {
-        self.nodes
-            .iter()
-            .map(|nd| {
-                let mut q = QFNode {
-                    org: [0.0; 3],
-                    sca: [0.0; 3],
-                    qmn: [[0; WIDTH]; 3],
-                    qmx: [[0; WIDTH]; 3],
-                    child: nd.child,
-                    occ: 0,
-                    _pad: 0,
-                };
-                let (mn, mx) = ([&nd.min_x, &nd.min_y, &nd.min_z], [&nd.max_x, &nd.max_y, &nd.max_z]);
-                for a in 0..3 {
-                    let (mut org, mut top) = (f32::INFINITY, f32::NEG_INFINITY);
-                    for s in 0..WIDTH {
-                        if nd.bnode[s] != INVALID {
-                            org = org.min(mn[a][s]);
-                            top = top.max(mx[a][s]);
-                        }
-                    }
-                    if !org.is_finite() {
-                        continue; // no occupied slots (empty-scene root only)
-                    }
-                    q.org[a] = org;
-                    let ext = top - org;
-                    if ext > 0.0 {
-                        let mut sca = ext / 255.0;
-                        while org + 255.0 * sca < top {
-                            sca = bump_up(sca);
-                        }
-                        q.sca[a] = sca;
-                    }
+        (0..self.nodes.len()).map(|i| self.quantize_node(i)).collect()
+    }
+
+    /// ONE node in that format. Split out for `gpu_bvh_node`'s reason: D3D12
+    /// materializes the whole array and Vulkan streams it through a bounded
+    /// ring (~480 MB of wide nodes at 34.4M triangles, which is a `Vec` worth
+    /// not making), so the shared thing is the per-node CONVERSION — the part
+    /// a divergence would corrupt — and each backend keeps its own iteration.
+    pub fn quantize_node(&self, i: usize) -> QFNode {
+        let nd = &self.nodes[i];
+        let mut q = QFNode {
+            org: [0.0; 3],
+            sca: [0.0; 3],
+            qmn: [[0; WIDTH]; 3],
+            qmx: [[0; WIDTH]; 3],
+            child: nd.child,
+            occ: 0,
+            _pad: 0,
+        };
+        let (mn, mx) = ([&nd.min_x, &nd.min_y, &nd.min_z], [&nd.max_x, &nd.max_y, &nd.max_z]);
+        for a in 0..3 {
+            let (mut org, mut top) = (f32::INFINITY, f32::NEG_INFINITY);
+            for s in 0..WIDTH {
+                if nd.bnode[s] != INVALID {
+                    org = org.min(mn[a][s]);
+                    top = top.max(mx[a][s]);
                 }
-                for s in 0..WIDTH {
-                    if nd.bnode[s] == INVALID {
-                        continue;
-                    }
-                    q.occ |= 1 << s;
-                    for a in 0..3 {
-                        q.qmn[a][s] = quantize_min(mn[a][s], q.org[a], q.sca[a]);
-                        q.qmx[a][s] = quantize_max(mx[a][s], q.org[a], q.sca[a]);
-                    }
+            }
+            if !org.is_finite() {
+                continue; // no occupied slots (empty-scene root only)
+            }
+            q.org[a] = org;
+            let ext = top - org;
+            if ext > 0.0 {
+                let mut sca = ext / 255.0;
+                while org + 255.0 * sca < top {
+                    sca = bump_up(sca);
                 }
-                q
-            })
-            .collect()
+                q.sca[a] = sca;
+            }
+        }
+        for s in 0..WIDTH {
+            if nd.bnode[s] == INVALID {
+                continue;
+            }
+            q.occ |= 1 << s;
+            for a in 0..3 {
+                q.qmn[a][s] = quantize_min(mn[a][s], q.org[a], q.sca[a]);
+                q.qmx[a][s] = quantize_max(mx[a][s], q.org[a], q.sca[a]);
+            }
+        }
+        q
     }
 
     /// Deterministic collapse of the binary BVH: each wide node's slots are up

@@ -20,17 +20,21 @@
 //! it does — including the carve-out that alpha-masked and height-carrying
 //! textures never compress, which is a VISIBILITY contract.
 //!
-//! Uploads go through a reusable host-visible staging buffer in batches: one
-//! submit per batch rather than one per (texture, mip), because a 313-texture
-//! scene is ~4000 subresources and a fence wait each would dominate the load.
-//! Staging is host memory on the way out, which is the same "no staging pool
-//! yet" boundary the rest of `vk/` sits behind.
+//! Uploads go through `vk::stage`'s ring in batches: one submit per batch
+//! rather than one per (texture, mip), because a 313-texture scene is ~3000
+//! subresources and a fence wait each would dominate the load. This module
+//! had its own private staging buffer first and gave it up when the scene
+//! streams grew one — the sizing rule, the mapping and the accounting are
+//! things there should be one of, and the batch loop below (which is genuinely
+//! image-specific, since its destinations are subresources rather than a byte
+//! range) is what stayed.
 
 use ash::vk;
 
 use crate::scene::Scene;
 use crate::vk::device::Vk;
 use crate::vk::headless::VkHeadless;
+use crate::vk::stage::Stage;
 
 /// One uploaded texture, resting in `SHADER_READ_ONLY_OPTIMAL`.
 pub struct Tex {
@@ -58,12 +62,9 @@ pub struct VkTextures {
     /// reason: a chain that silently lost its mips would still show plausible
     /// bytes on a scene of 1x1 textures and nothing else would notice.
     pub levels: u32,
+    /// Bytes staged and submits spent, for the report line.
+    pub staged: (u64, u32),
 }
-
-/// Batch target. Any single texture whose whole chain exceeds this still gets
-/// its own batch — the staging buffer is sized to `max(this, largest chain)`,
-/// so a 4K texture is never a failure, just its own submit.
-const STAGE_TARGET: u64 = 64 << 20;
 
 impl VkTextures {
     pub fn new(hg: &VkHeadless, scene: &Scene) -> Result<VkTextures, String> {
@@ -79,9 +80,14 @@ impl VkTextures {
             }
             n
         };
+        // The whole table is what this ring carries, and one whole mip chain
+        // is the piece that must fit UNDIVIDED — the batch loop below splits
+        // between textures and never inside one, so a 4K texture is never a
+        // failure, just its own submit. That `atom` is the reason `Stage::new`
+        // takes one at all.
         let max_chain = scene.textures.iter().map(chain_bytes).max().unwrap_or(4);
-        let stage_size = max_chain.max(STAGE_TARGET);
-        let stage = vkd.buffer(stage_size, vk::BufferUsageFlags::TRANSFER_SRC, true)?;
+        let total: u64 = scene.textures.iter().map(chain_bytes).sum();
+        let mut stage = Stage::new(vkd, total, max_chain)?;
 
         let mut texs: Vec<Tex> = Vec::with_capacity(scene.textures.len());
         let mut bytes = 0u64;
@@ -99,7 +105,7 @@ impl VkTextures {
                     for x in &texs {
                         x.destroy(vkd);
                     }
-                    vkd.free_buffer(&stage);
+                    stage.free(vkd);
                     return Err(e);
                 }
             }
@@ -113,7 +119,7 @@ impl VkTextures {
                 for x in &texs {
                     x.destroy(vkd);
                 }
-                vkd.free_buffer(&stage);
+                stage.free(vkd);
                 return Err(e);
             }
         };
@@ -122,14 +128,14 @@ impl VkTextures {
             // The fallback rides its own tiny batch first, so the loop below
             // deals only with scene textures.
             let white = [255u8; 4];
-            upload_batch(hg, &stage, &[(&fallback, vec![(1u32, 1u32, &white[..])])])?;
+            upload_batch(hg, &mut stage, &[(&fallback, vec![(1u32, 1u32, &white[..])])])?;
 
             let mut batch: Vec<(&Tex, Vec<(u32, u32, &[u8])>)> = Vec::new();
             let mut have = 0u64;
             for (i, t) in scene.textures.iter().enumerate() {
                 let sz = chain_bytes(t);
-                if have + sz > stage.size && !batch.is_empty() {
-                    upload_batch(hg, &stage, &batch)?;
+                if have + sz > stage.size() && !batch.is_empty() {
+                    upload_batch(hg, &mut stage, &batch)?;
                     batch.clear();
                     have = 0;
                 }
@@ -142,11 +148,12 @@ impl VkTextures {
                 have += sz;
             }
             if !batch.is_empty() {
-                upload_batch(hg, &stage, &batch)?;
+                upload_batch(hg, &mut stage, &batch)?;
             }
             Ok(())
         })();
-        vkd.free_buffer(&stage);
+        let staged = (stage.bytes(), stage.chunks());
+        stage.free(vkd);
         if let Err(e) = r {
             for x in &texs {
                 x.destroy(vkd);
@@ -155,7 +162,7 @@ impl VkTextures {
             return Err(e);
         }
 
-        Ok(VkTextures { texs, fallback, bytes, levels })
+        Ok(VkTextures { texs, fallback, bytes, levels, staged })
     }
 
     pub fn destroy(&self, hg: &VkHeadless) {
@@ -238,7 +245,7 @@ fn create_tex(vkd: &Vk, w: u32, h: u32, levels: u32, fmt: vk::Format) -> Result<
 /// Stage one batch of whole mip chains and land them all in one submit.
 fn upload_batch(
     hg: &VkHeadless,
-    stage: &crate::vk::device::Buffer,
+    stage: &mut Stage,
     batch: &[(&Tex, Vec<(u32, u32, &[u8])>)],
 ) -> Result<(), String> {
     let mut host: Vec<u8> = Vec::new();
@@ -254,7 +261,7 @@ fn upload_batch(
             host.extend_from_slice(bytes);
         }
     }
-    hg.vk.write(stage, &host)?;
+    stage.write(&host)?;
 
     hg.run(|d, cmd| unsafe {
         let to_dst: Vec<vk::ImageMemoryBarrier> = batch
@@ -296,7 +303,7 @@ fn upload_batch(
                 .image_extent(vk::Extent3D { width: *w, height: *h, depth: 1 });
             d.cmd_copy_buffer_to_image(
                 cmd,
-                stage.buf,
+                stage.buf().buf,
                 *img,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[r],

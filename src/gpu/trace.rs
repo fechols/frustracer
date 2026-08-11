@@ -1120,11 +1120,12 @@ pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
 // (frustum kernels, M3), and the DXR BLAS/TLAS (every actual ray).
 // ---------------------------------------------------------------------------
 
-/// The material and BVH-node wire formats moved to `gfx::scene` (one mirror
-/// each of shade.hlsli's `Mat` and frustum.hlsli's `BvhNode`, read by both
-/// backends); re-exported so this file's `size_of::<GpuMat>()` accounting and
-/// its `GpuBvhNode { .. }` literal read as they always did.
-use crate::gfx::scene::{GpuBvhNode, GpuMat};
+/// The BVH-node wire format moved to `gfx::scene` (one mirror of
+/// frustum.hlsli's `BvhNode`, read by both backends); re-exported so this
+/// file's `GpuBvhNode { .. }` literal reads as it always did. `GpuMat` went
+/// with it and is no longer named here at all — the one place that needed its
+/// SIZE was the stream-byte accounting, which moved beside the struct.
+use crate::gfx::scene::GpuBvhNode;
 
 /// Bytes of reusable staging streamed per blocking submit — bounds the
 /// upload's transient commit to one chunk instead of a full second copy of
@@ -1135,12 +1136,11 @@ const STAGE_CHUNK: usize = 256 << 20;
 /// Steady-state byte total of the scene's buffer streams (excludes textures,
 /// acceleration structures, and the wavefront-only software trees — those
 /// live in `SwTreesGpu`) — sizes the staging ring and the init report.
-fn scene_stream_bytes(scene: &Scene) -> usize {
-    let v = scene.positions.len();
-    let t = scene.indices.len();
-    let m = scene.materials.len();
-    v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
-}
+///
+/// The arithmetic lives in `gfx::scene` beside the wire formats it is counting
+/// (`GpuMat`'s own size is a term), so both backends' rings are sized by one
+/// statement; this is the local name for it.
+use crate::gfx::scene::stream_bytes as scene_stream_bytes;
 
 /// The software acceleration structure(s) that ride t0 for the FRUSTUM
 /// queries (their only consumer — every actual ray is DXR RayQuery).

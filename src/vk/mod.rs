@@ -21,5 +21,6 @@ pub mod layout;
 pub mod reflect;
 pub mod scene;
 pub mod spirv;
+pub mod stage;
 pub mod textures;
 pub mod tracer;
