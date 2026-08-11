@@ -3585,6 +3585,14 @@ cargo run --release -- --no-autoexp-spike-guard  # A/B lever: let the aperture b
                                       # lever must not kill the bugs. Their glow splats are
                                       # Gaussian and several px wide, so the K_MAX arm is what
                                       # shields them.
+                                      # WHERE the aperture is spent is itself a lever —
+                                      # `--autoexp-mode`, below — and since `lights` became the
+                                      # DEFAULT this guard is INERT unless a session passes
+                                      # `--autoexp-mode tonemap`. It is display-stage BY NATURE (it
+                                      # relaxes a per-PIXEL display exposure, which the lights arm
+                                      # holds at exactly 1.0), so this is inherent rather than a
+                                      # wiring gap: keep that in mind before reading a firefly
+                                      # report as evidence about the guard.
                                       # Levers: --autoexp-spike-guard spells the default;
                                       # --autoexp-spike-strength K (0..=1, default 1 = the
                                       # outlier is presented exactly as if auto-exposure were
@@ -3694,6 +3702,248 @@ cargo run --release -- --no-autoexp-spike-guard  # A/B lever: let the aperture b
                                       # by the invariant above; frame-border pixels are never
                                       # guarded. OWED: the user's feel-test — the constants are
                                       # measured but the LOOK is not gate-visible
+cargo run --release -- --autoexp-mode tonemap  # WHERE the aperture is spent. DEFAULT
+                                      # `lights` since 2026-08-11 (the user's call, after a
+                                      # feel-test): the controller's EV becomes a gain on the
+                                      # SCENE'S LIGHTS (src/autoexp.rs's `Mode`,
+                                      # scene::apply_light_gain) and the presentation curve holds
+                                      # at exactly 1.0. `--autoexp-mode tonemap` is the pre-feature
+                                      # presentation-curve multiply, the opt-out AND the A/B
+                                      # partner. The default is TRIPLICATED in autoexp.rs's MODE
+                                      # initializer, cli.rs's defaults() and settings.rs's
+                                      # `Cycle { default_ix }` — flip all three in lockstep;
+                                      # cli::self_test pins that they AGREE (it reads the menu row
+                                      # back, so a flip that forgot settings.rs — which would let a
+                                      # settings FILE silently re-select the other arm on every
+                                      # launch that has one — fails loudly). Settings row:
+                                      # Effects/autoexp_mode (Live). NOTE the default makes the
+                                      # SPIKE GUARD inert: its arming test is `exposure > 1.0` and
+                                      # this arm leaves display exposure at exactly 1.0, so
+                                      # `--autoexp-spike-guard` (itself default-ON) only does
+                                      # anything under `--autoexp-mode tonemap`. Inherent, not an
+                                      # oversight — a global light gain has no per-pixel lever.
+                                      # THE PHYSICS, which is why it is cheap AND why it buys less
+                                      # than it looks: the rendering equation is LINEAR in emitted
+                                      # radiance, so scaling every emitter by g scales every path's
+                                      # radiance by exactly g — the same image the tonemap arm's
+                                      # pre-curve multiply produces. That is not asserted, it is
+                                      # GATED (`light-gain-ab` below) and MEASURED live: the same
+                                      # pose, the same +2 EV, one arm each, 1920x1080 DXR on
+                                      # DamagedHelmet at --tod 22 with --emissive-lights, reads
+                                      # mean |d| 0.0000/255, worst 1 LSB, mean level 24.24 vs 24.24.
+                                      # FIVE of the six emitter families take the gain as DATA, so
+                                      # they reach BOTH renderers with ZERO shader edits (the
+                                      # EL_BOOST parity-by-data precedent — the cbuffer already
+                                      # transports every one of them): sun/moon (`e_over_pi` AND the
+                                      # cached disc `radiance` — a fix that moved only the first
+                                      # would leave the disc behind and no arithmetic gate would
+                                      # notice), the dome (`Scene::sky_scale`), the SH ambient
+                                      # (`Sh9::scaled` — projection is LINEAR, so scaling nine
+                                      # coefficients IS the projection of the scaled dome; NEVER
+                                      # re-project, that is the measured 235 -> 17 fps stall),
+                                      # fireflies (the baked `w` lane, which both the point light
+                                      # and the glow multiply by), and the emissive NEE clusters
+                                      # (`EmissiveLight::color`). The two that CANNOT ride data take
+                                      # one CB float (`FrameCb::light_gain`, riding el_meta.y's free
+                                      # lane rather than moving CB_STRIDE — the ff_count/_pad3
+                                      # idiom; HLSL reads it through `scene_light_gain()`): the
+                                      # emissive DISPLAY add, whose magnitude lives in the
+                                      # SERIALIZED material stream — and which is exactly the term
+                                      # a first draft would forget, leaving emitters reading as
+                                      # DIMMING as the aperture opens — and the star field, whose
+                                      # constants are mirrored HLSL literals.
+                                      # THE THREE ABSOLUTE CEILINGS SCALE WITH IT (EL_E_MAX 1000,
+                                      # FF_GLOW_L_MAX 512, STAR_L_MAX 4096) and that is what keeps
+                                      # linearity EXACT rather than approximate: each is f16
+                                      # HEADROOM, i.e. a property of the presented magnitude, so a
+                                      # fixed bound would clip a gained value against an ungained
+                                      # one and go sub-linear precisely where an emitter is
+                                      # brightest. Scaling them also keeps `min` selecting the same
+                                      # side, so NO branch, clamp selection or rng draw depends on
+                                      # g — which is why the gate reads EXACTLY 0.000e0 at a
+                                      # power-of-two gain rather than merely small (x4 is an
+                                      # exponent bump, so the reassociation `(e*g)*ndl` vs
+                                      # `(e*ndl)*g` is exact too).
+                                      # REACH AND COST ARE INVARIANT, for free: `r_infl2` is derived
+                                      # ONCE at load from EL_MIN_E, and the gain multiplies
+                                      # `color` PER FRAME without re-running `derive_parts`, so every
+                                      # cluster keeps its influence radius, its per-pixel scan cost,
+                                      # its shadow-ray count and its `emissive::cull_tile` sets. The
+                                      # deliberate opposite of EL_BOOST, which lands INSIDE the
+                                      # derivation and doubles r_infl2 with the power.
+                                      # NON-COMPOUNDING: `Scene::light_canon` holds the ungained
+                                      # values and `apply_light_gain` is ABSOLUTE, always writing
+                                      # FROM it — a ratio against the live values would compound its
+                                      # own rounding over a session's thousands of controller steps
+                                      # and make "the same EV" depend on how the session got there.
+                                      # Each producer captures what IT produces (`finalize_scalars`
+                                      # the sun + dome scale, `refresh_sky_sh` the SH — separately,
+                                      # since the interactive scrub throttles re-projection at
+                                      # SH_TOD_STEP and the two legitimately disagree mid-scrub,
+                                      # `apply_tod_lit` the sun + dome scale again after a TOD
+                                      # write). Derived, never serialized (the sky_sh precedent — no
+                                      # CACHE_VERSION move, no lever word).
+                                      # THE BUG THIS SHIPPED WITH, because the shape recurs: a first
+                                      # draft ended `refresh_sky_sh` with a whole
+                                      # `apply_light_gain`, which writes the sun FROM the canon —
+                                      # and on a FLAGLESS session nothing had captured the canon yet
+                                      # (`apply_tod_lit` is structurally unreachable without --tod),
+                                      # so every session silently traded its real sun for
+                                      # LightCanon's straight-up placeholder. `check.png` caught it;
+                                      # the light-gain A/B could not, because it renders BOTH arms
+                                      # from the same already-clobbered scene. TWO fixes, and the
+                                      # second is the transferable one: capture in
+                                      # `finalize_scalars` (the one funnel every load path runs),
+                                      # and SCOPE `refresh_sky_sh`'s re-gain to the coefficients it
+                                      # just produced — which makes the clobber unrepresentable AND
+                                      # leaves an uncaptured canon VISIBLE to the canon-agreement
+                                      # gate instead of hiding it by making canon and scene agree.
+                                      # A guard that the bug itself satisfies is not a guard.
+                                      # THE CONTROLLER STAYS OPEN-LOOP, which is the one thing this
+                                      # arm genuinely had to add. Today's meter reads a frame the
+                                      # aperture never touched; here the gain feeds the RENDERER, so
+                                      # a raw measurement would close a servo loop around a
+                                      # FRAMES_IN_FLIGHT-delayed readback. `autoexp::degain`
+                                      # subtracts the stops the measured frame was RENDERED with
+                                      # (gpu/autoexp.rs carries it PER RING SLOT beside `pending`,
+                                      # since the readback lands frames later; the CPU meter is
+                                      # same-frame and uses the value still applied), which recovers
+                                      # log2(L) exactly and makes the controller mathematically
+                                      # identical to the tonemap arm's — so its convergence,
+                                      # deadband and clamp gates transfer unchanged. VERIFIED LIVE:
+                                      # both arms settle on `measured -10.004 ev +1.850 scale 3.605`
+                                      # to three decimals (FR_AEXP_TRACE=1, same pose); without the
+                                      # subtraction the lights arm would have read -8.154.
+                                      # An EV move is a LIGHTING change, so it takes the TOD block's
+                                      # semantics VERBATIM and sits beside it in session(): plain
+                                      # accumulation resets (frame = 0) while every upscaler/
+                                      # denoiser history, the temporal frustum cache, the claim ring
+                                      # and structure replay are KEPT. The controller's DEADBAND is
+                                      # what makes that affordable — a converged session leaves
+                                      # `light_gain` bitwise unchanged and never enters the block,
+                                      # so a still frame keeps accumulating.
+                                      # WHAT IT COSTS — accepted when it became the default,
+                                      # so read this as the standing known-accept rather than an
+                                      # argument against:
+                                      # (a) NO SPIKE GUARD. `autoexp::guard_scale` works by relaxing
+                                      # a per-PIXEL DISPLAY exposure toward 1.0, and this arm leaves
+                                      # display exposure at exactly 1.0, so the guard's own arming
+                                      # test (`exposure > 1.0`) is false by construction. A global
+                                      # light gain has no per-pixel lever, so this is inherent, not
+                                      # an omission — the arm re-opens the firefly issue the guard
+                                      # closed. (b) an EV move is a per-frame lighting change the
+                                      # temporal histories must absorb (they do — the TOD-scrub
+                                      # class — but the tonemap arm has nothing to absorb).
+                                      # WHAT IT BUYS: the upscalers and denoisers integrate the
+                                      # BRIGHTENED signal, so their absolute clamps
+                                      # (--fsr-max-radiance, NRD/FRD's firefly caps) act at the
+                                      # PRESENTED brightness rather than at a fixed scene
+                                      # brightness — arguably where they belong. That is the
+                                      # thing worth A/B-ing, and it is the reason both arms ship
+                                      # (and, on the user's feel-test, why this one became the
+                                      # default).
+                                      # `--exposure-bias` composes into either arm through the same
+                                      # `autoexp::ev_total`, so `--no-auto-exposure --exposure-bias 2
+                                      # --autoexp-mode lights` is a fixed "make the scene physically
+                                      # 4x brighter" lever — and is exactly how the image A/B above
+                                      # is taken (no controller, no easing, no guard).
+                                      # HEADLESS IS UNREACHABLE: the controller only ticks in
+                                      # session(), so --check*/--spin/--cinematic hold the gain at
+                                      # exactly 1.0 and every multiply is branched around it.
+                                      # check.png/check_gi.png byte-identical — verified, and it is
+                                      # the check that earned its keep here.
+                                      # Gates: `light-gain` (scene::light_gain_self_test in --check
+                                      # — pure, scene-independent: bitwise inertness at 1.0 from
+                                      # BOTH directions, non-compounding along several paths to the
+                                      # same g, every magnitude scaling EXACTLY at powers of two,
+                                      # both of the sun's, REACH invariance, and the
+                                      # scale-vs-re-project SH identity); `light-gain-ab` (the
+                                      # end-to-end renderer gate — canon agreement on the real
+                                      # loaded scene, a g==1.0 render bitwise equal to the ungained
+                                      # one, a bitwise RESTORE after a gain, and the linearity
+                                      # itself at mean rel < 1e-4 relative to the image's own
+                                      # magnitude (the --spp A/B's shape — an absolute bound is a
+                                      # different bound on every scene), with teeth both ways: a
+                                      # 1.5x-wrong gain must blow the bound, and the row PRINTS
+                                      # which families the scene could exercise, since a green run
+                                      # on a scene with no stars/fireflies/emissive proves the gain
+                                      # HARMLESS there, not correct — the N6b INERT note). TEETH
+                                      # EXERCISED, not claimed: un-gaining the emissive DISPLAY add
+                                      # takes the helmet arm to 6.594e-2 (660x over) and dropping
+                                      # the finalize_scalars capture fails four assertions naming
+                                      # `sun false`. A bad canon EARLY-OUTS rather than gaining:
+                                      # apply_light_gain writes FROM the canon, so acting on an
+                                      # uncaptured one would replace the real lights with
+                                      # placeholders for every gate below — including the TRACKED
+                                      # golden, which the user would then have to `git checkout`
+                                      # back. One red line beats a cascade plus a rewritten
+                                      # check.png.
+                                      # AND THE GPU HALF HAS ITS OWN GATE (`light-gain` in
+                                      # --check-gpu, 2026-08-11): the CPU arm proves the RENDERER
+                                      # is linear, which is a different claim from the gain
+                                      # REACHING the GPU — five families ride cbuffer rows the
+                                      # scene already transports, but the emissive DISPLAY add and
+                                      # the star field read el_meta.y through scene_light_gain(),
+                                      # three absolute ceilings scale with it, and
+                                      # FrameCb::refresh_sky_rows' el_a/el_b copy is the most
+                                      # fragile line of the lot (without it a gain move brightens
+                                      # every emitter's display add while its cluster NEE stays
+                                      # dark — a HALF-applied gain, exactly what a loose bound
+                                      # swallows). GPU vs GPU, one refresh_sky apart, never GPU vs
+                                      # CPU (the two intersectors legitimately disagree at grazing
+                                      # edges — T1/T2's statistical bars exist for that, and
+                                      # folding it in would blunt the one comparison this gate is
+                                      # for). DXR gets NO twin by argument, not omission:
+                                      # DxrGpu::refresh_sky is textually TraceGpu::refresh_sky,
+                                      # both delegating to the ONE refresh_sky_rows, and
+                                      # shade.hlsli/trace_common.hlsli are one TEXT compiled
+                                      # against two root signatures (the N8 argument). MEASURED
+                                      # exactly 0.000e0 on every arm; TEETH exercised BOTH ways —
+                                      # dropping the el_a/el_b copy reads 3.126e-4 with worst
+                                      # EXACTLY 0.75 (= 1 − 1/4, the NEE contribution missing its
+                                      # whole 4x, the signature that names the bug), and pinning
+                                      # scene_light_gain() to 1.0 reads 1.423e-1 on the helmet and
+                                      # 5.274e-2 on --tod 2 alone (so the night procedural scene
+                                      # covers the star half without needing an emissive scene).
+                                      # NOTE the el_a/el_b plant is only 3.1x over the bound —
+                                      # emissive NEE is a small share of frame energy — which is
+                                      # precisely why the bound stays at 1e-4 and why the default
+                                      # procedural run, whose families line reads [sun dome+SH]
+                                      # ALONE, proves the GPU wiring harmless rather than correct:
+                                      # `--check-gpu --tod 2` and an emissive scene are what reach
+                                      # the other four. `cli::self_test` pins the vocabulary, both
+                                      # later-flags-win orders, and that the parse never touches the
+                                      # live mode (lever_snapshot's `amode`) — which matters here
+                                      # more than usual, since --check runs autoexp::self_test and a
+                                      # parse that moved the mode would have that gate scoring the
+                                      # wrong arm. autoexp::self_test arms 15/16 pin the
+                                      # exactly-one-destination split (display x light == exposure,
+                                      # BITWISE) and the de-gain identity with teeth.
+                                      # Run after touching autoexp.rs / scene.rs's canon+gain /
+                                      # sky.rs's star gain / the shade.hlsli + trace_common.hlsli
+                                      # twins: --check (+ byte-compare BOTH goldens), --check
+                                      # --stress 5000, --check --tod 2 (stars + fireflies live),
+                                      # --check-gpu, --check-gpu --tod 2, --check-dxr, and a scene
+                                      # with real emissive (helmet or bistro --tod 22
+                                      # --emissive-lights) so BOTH families lines read all six.
+                                      # Known-red on that last one and NOT this feature: the helmet
+                                      # fails --check-gpu's two-device gates on a plain DAY run
+                                      # too, where the gain is structurally inert — the documented
+                                      # helmet-is-outside-the-two-device-scene-set caveat.
+                                      # finalize_scalars debug_asserts light_gain == 1.0 (it
+                                      # CAPTURES the canon, so it must not run on a gained scene;
+                                      # true at all eleven call sites today — all load-time, and
+                                      # the one live scene edit, the Y/Z frustum snapshot,
+                                      # rebuilds only the BVH — but capturing a gained value would
+                                      # compound the gain permanently and silently, the same class
+                                      # as the sun clobber). apply_tod_lit is the other capture
+                                      # site and legitimately runs gained: it recomputes the sun
+                                      # from the hour first, so what it captures is canonical by
+                                      # construction. Follow-on documented in
+                                      # autoexp.rs: a per-family weighting would make the arm a look
+                                      # tool rather than an equivalent — deliberately NOT built,
+                                      # since the uniform arm's whole value is being provably the
+                                      # same image
 cargo run --release -- --gpu-debug    # D3D12 debug layer + GPU-BASED VALIDATION, draining to stderr
                                       # (`d3d12::drain_debug`, called from every present and every
                                       # headless submit). All three halves are load-bearing: the

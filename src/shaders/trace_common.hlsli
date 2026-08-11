@@ -246,8 +246,11 @@ cbuffer Frame : register(b0) {
     // float4 elements (gbuf_write_hit reads sway_dmv[x + inst]), yzw unused.
     // Appended LAST (the cloud_grid precedent) so no offset above moves.
     uint4 sway_mv_base;
-    // Emissive cluster lights (src/emissive.rs): el_meta.x = count (yzw
-    // unused); per light row a = centroid.xyz | rc^2, row b = C/pi rgb |
+    // Emissive cluster lights (src/emissive.rs): el_meta.x = count,
+    // el_meta.y = the SCENE LIGHT GAIN's f32 bits (zw unused — the gain rode
+    // a free lane rather than moving CB_STRIDE, the ff_count/_pad3 idiom;
+    // read it through scene_light_gain()); per light row a = centroid.xyz |
+    // rc^2, row b = C/pi rgb |
     // r_infl^2 — the CPU's derived f32s verbatim (parity BY DATA, the ff
     // precedent). MAX_EMISSIVE_LIGHTS is injected by trace::spp_defs (the
     // MAX_FIREFLIES pattern); rows past the count are zero and never read.
@@ -495,6 +498,19 @@ float3 sky_disc(float3 d, float half_angle) {
     return sun_l.xyz * cov;
 }
 
+// The scene light gain — `--autoexp-mode lights`' aperture
+// (scene::apply_light_gain), EXACTLY 1.0 in every default and headless
+// session. Five of the six emitter families already carry it inside the values
+// this cbuffer transports (sun_e/sun_l/sky_sh/sky_scale/el_b/ff[].w), so they
+// need no shader change at all; this is what the two that CANNOT read
+// it — the emissive DISPLAY add, whose magnitude lives in the material
+// stream, and the star field, whose constants are literals here — multiply by.
+// It also scales the three ABSOLUTE ceilings (EL_E_MAX, STAR_L_MAX,
+// FF_GLOW_L_MAX), which are f16 headroom and therefore properties of the
+// presented magnitude: leaving them fixed would make those tiers go
+// sub-linear exactly where an emitter is brightest.
+float scene_light_gain() { return asfloat(el_meta.y); }
+
 // --- Stars (sky.rs::stars — term-for-term; change both together) -------------
 //
 // Procedural twinkling stars, DISPLAY paths only like the disc (never
@@ -556,7 +572,7 @@ float3 sky_stars(float3 d, float half_angle, uint twinkle) {
     float3 tint = lerp(float3(0.75, 0.85, 1.0), float3(1.0, 0.85, 0.7), warm);
     float tw = 0.75 + 0.25 * star_hash01(pcg_mix(seed ^ pcg_mix(twinkle >> 3u)));
     float l = min(STAR_E * tier / (6.2831853 * sigma * sigma), STAR_L_MAX);
-    return tint * (l * g * tw * night * star_rise(d.y, 0.0, 0.05));
+    return tint * (l * g * tw * night * star_rise(d.y, 0.0, 0.05) * scene_light_gain());
 }
 
 // The star field's smooth MEAN — what GATHER paths integrate, exactly as
@@ -580,7 +596,7 @@ float3 sky_star_glow(float3 d) {
     if (night <= 0.0) return float3(0.0, 0.0, 0.0);
     float3 l = STAR_FLUX * (STAR_AMBIENT_K / 6.2831853);
     float t = saturate((d.y + 0.05) / 0.10);
-    return l * ((SKY_GROUND_ALBEDO + (1.0 - SKY_GROUND_ALBEDO) * t) * night);
+    return l * ((SKY_GROUND_ALBEDO + (1.0 - SKY_GROUND_ALBEDO) * t) * night * scene_light_gain());
 }
 
 // GATHER paths: the scattering dome plus the star field's mean. The two GPU
@@ -621,6 +637,11 @@ float3 ff_glow(float3 o, float3 d, float t_max, float half_angle) {
     float3 acc = 0.0;
     float e = FF_E_K * ff_scale * ff_scale;
     float src_r = FF_SRC_K * ff_scale;
+    // The swarm's brightness already carries the scene light gain in ff[].w
+    // (the CPU bakes it there, so both renderers light from bit-equal rows);
+    // only this absolute ceiling has to be told. Hoisted — it is loop-invariant
+    // and the loop is per (pixel, firefly).
+    float gg = scene_light_gain();
     for (uint i = 0u; i < ff_count; ++i) {
         float3 to = ff[i].xyz - o;
         float s = dot(to, d);
@@ -636,7 +657,7 @@ float3 ff_glow(float3 o, float3 d, float t_max, float half_angle) {
         if (a > 9.22) continue;
         float g = exp(-a);
         if (g < 1e-4) continue;
-        float l = min(e * ff[i].w / (s * s * 6.2831853 * sigma * sigma), FF_GLOW_L_MAX);
+        float l = min(e * ff[i].w / (s * s * 6.2831853 * sigma * sigma), FF_GLOW_L_MAX * gg);
         acc += FF_COLOR * (l * g);
     }
     return acc;

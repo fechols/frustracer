@@ -1387,7 +1387,7 @@ pub fn shade(
             if ndl <= 0.0 {
                 continue;
             }
-            let e = crate::emissive::irradiance(l, d2);
+            let e = crate::emissive::irradiance(l, d2, scene.light_gain);
             if e == Vec3A::ZERO {
                 continue;
             }
@@ -1507,7 +1507,7 @@ pub fn shade(
                 None,          // fireflies don't light bounce surfaces (the stars rule)
                 None,          // bounce surfaces take no cluster NEE (the hemi rule)
             ),
-            None => crate::sky::gather(dir, sun, scene.sky_scale, scene.night),
+            None => crate::sky::gather(dir, sun, scene.sky_scale, scene.night, scene.light_gain),
         }
     } else {
         let mut ao = 1.0;
@@ -1658,7 +1658,14 @@ pub fn shade(
             }
             _ => mat.emissive,
         };
-        color += e;
+        // The scene light gain (`--autoexp-mode lights`) reaches emissive
+        // surfaces HERE. It has to: `mat.emissive` lives in the serialized
+        // material stream, which `apply_light_gain` cannot rescale per frame
+        // — and an emitter left un-gained while everything around it
+        // brightens reads as the emitter DIMMING as the aperture opens.
+        // Exactly 1.0 in every default and headless session, and `x * 1.0` is
+        // bit-preserving, so the pre-feature arm is untouched.
+        color += e * scene.light_gain;
     }
 
     // One specular bounce: a single direction importance-sampled from the
@@ -1755,7 +1762,7 @@ pub fn shade(
                         let dm = crate::sky::dome(rdir, sun, scene.sky_scale);
                         let backdrop = dm
                             + crate::sky::disc(rdir, &scene.sun, cone.spread * 0.5) * w_b
-                            + crate::sky::stars(rdir, cone.spread * 0.5, scene.night, 0);
+                            + crate::sky::stars(rdir, cone.spread * 0.5, scene.night, 0, scene.light_gain);
                         if cl.enabled {
                             // The ROUGH march: a reflected sky is seen
                             // through the GGX lobe — 2 steps on the 2-octave
@@ -1894,6 +1901,7 @@ pub fn shade(
                             // the per-(pixel, frame, sample) temporal dither
                             // deliberately excludes this path).
                             0.5,
+                            scene.light_gain,
                         ),
                         f32::INFINITY,
                     ),
@@ -2187,6 +2195,8 @@ pub fn tangent_self_test() -> Result<(), String> {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            light_gain: 1.0,
+            light_canon: crate::scene::LightCanon::default(),
             sway: None,
             sway_regions: Vec::new(),
             diag: 1.0,
@@ -3999,6 +4009,8 @@ pub fn detail_self_test() -> Result<(), String> {
                 sky_sh: crate::sh::Sh9::ZERO,
                 sky_scale: 1.0,
                 night: 0.0,
+                light_gain: 1.0,
+                light_canon: crate::scene::LightCanon::default(),
                 sway: None,
                 sway_regions: Vec::new(),
                 diag: 1.0,

@@ -257,7 +257,7 @@ impl EmissiveLights {
 /// influence radius (the window's zero is exact in fp: `d2 == r2 ⇒ x == 0`).
 /// Term-for-term mirrored in shade.hlsli's emissive block.
 #[inline(always)]
-pub fn irradiance(l: &EmissiveLight, d2: f32) -> Vec3A {
+pub fn irradiance(l: &EmissiveLight, d2: f32, gain: f32) -> Vec3A {
     if d2 >= l.r_infl2 {
         return Vec3A::ZERO;
     }
@@ -268,7 +268,16 @@ pub fn irradiance(l: &EmissiveLight, d2: f32) -> Vec3A {
     }
     // The disc denominator, clamped so lum(result) ≤ EL_E_MAX however close
     // the shading point stands (window ≤ 1 only tightens it).
-    let inv = (1.0 / (d2 + l.rc2)).min(EL_E_MAX / lc);
+    //
+    // The ceiling SCALES with the scene light gain (`Scene::light_gain`,
+    // exactly 1.0 outside `--autoexp-mode lights`). It has to: `l.color`
+    // arrives pre-gained, so an absolute ceiling would clip the gained value
+    // against the ungained bound and make this tier go sub-linear precisely
+    // where an emitter is brightest — the one place the linearity claim would
+    // visibly fail. EL_E_MAX is f16 HEADROOM, and headroom is a property of
+    // the presented magnitude, so it moves with it (4 x 1000 is still three
+    // orders under f16's 65504 at the EV_MAX = +2 clamp).
+    let inv = (1.0 / (d2 + l.rc2)).min(EL_E_MAX * gain / lc);
     c * (inv * crate::fireflies::window(d2, l.r_infl2))
 }
 
@@ -815,14 +824,15 @@ pub fn self_test() -> Result<(), String> {
             color: [3.0, 2.0, 1.0],
             r_infl2: 25.0,
         };
-        if irradiance(&l, l.r_infl2) != Vec3A::ZERO || irradiance(&l, l.r_infl2 * 2.0) != Vec3A::ZERO
+        if irradiance(&l, l.r_infl2, 1.0) != Vec3A::ZERO
+            || irradiance(&l, l.r_infl2 * 2.0, 1.0) != Vec3A::ZERO
         {
             return Err("irradiance not 0 at/past the influence radius".into());
         }
         let mut prev = f32::INFINITY;
         for k in 1..=64 {
             let d2 = (k as f32 / 64.0) * l.r_infl2;
-            let e = lum(irradiance(&l, d2));
+            let e = lum(irradiance(&l, d2, 1.0));
             if e > prev {
                 return Err(format!("irradiance not monotone at d2 {d2}"));
             }
@@ -831,7 +841,7 @@ pub fn self_test() -> Result<(), String> {
             }
             prev = e;
         }
-        if lum(irradiance(&l, 0.0)) > EL_E_MAX {
+        if lum(irradiance(&l, 0.0, 1.0)) > EL_E_MAX {
             return Err("near-field clamp not applied at d2 = 0".into());
         }
     }
@@ -960,7 +970,7 @@ pub fn self_test() -> Result<(), String> {
                     for t in [t_start, 6.0, 10.0, 50.0, 400.0] {
                         let p = basis.ray_dir(px as f32 + 0.5, py as f32 + 0.5) * t;
                         let d2 = (p - Vec3A::from(l.pos)).length_squared();
-                        if irradiance(l, d2) != Vec3A::ZERO {
+                        if irradiance(l, d2, 1.0) != Vec3A::ZERO {
                             return Err(format!(
                                 "over-cull: light at {:?} reaches a tile point at t {t}",
                                 l.pos
