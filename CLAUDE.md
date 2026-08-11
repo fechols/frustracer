@@ -5207,7 +5207,19 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # fetches the Linux tarball and the Windows zip from the SAME
                                       # release tag, so the compiler emitting DXIL and the one emitting
                                       # SPIR-V cannot drift to different HLSL front ends) + SDKs/
-                                      # spirv-tools (install-prerequisites.sh spirv). Either missing =
+                                      # spirv-tools (install-prerequisites.sh spirv). ON macOS THE DXC
+                                      # HALF DOES NOT EXIST and the pin is why, not effort: DXC_TAG
+                                      # publishes a Windows zip, a linux x86_64 tarball and a PDB zip —
+                                      # no macOS build, no arm64 build of anything — so a community
+                                      # binary would not be from the tag, breaking the same-front-end
+                                      # invariant above, which is exactly the drift no gate can see. The
+                                      # route that keeps it is a source build at DXC_TAG (the shape
+                                      # `nrd` already uses); the installer says so and stands the half
+                                      # down rather than substituting. spirv DOES have a macOS prebuilt,
+                                      # x86_64-only, so it runs under Rosetta on Apple silicon and the
+                                      # installer checks that it EXECUTES rather than assuming. So
+                                      # --check-spirv/--check-vk SKIP on macOS today, which is the
+                                      # bare-checkout degrade and not a failure. Either missing =
                                       # loud SKIP + exit 0, the bare-checkout degrade; the path lever is
                                       # FRUSTRACER_DXC_SPIRV_PATH and NOT FRUSTRACER_DXC_PATH, which
                                       # names the Windows drop (two artifacts, two directories — one
