@@ -95,7 +95,8 @@
 use ash::vk;
 
 use crate::gfx::frame::{
-    fb_mode_of, FrameCb, FrameParams, CB_STRIDE, HEMI_BATCH, HEMI_MAX_DEPTH,
+    fb_mode_of, FrameCb, FrameParams, CB_STRIDE, GBUF_EXT_STRIDE, GBUF_STRIDE, HEMI_BATCH,
+    HEMI_MAX_DEPTH,
 };
 use crate::gfx::shaders as gs;
 use crate::scene::Scene;
@@ -221,6 +222,18 @@ pub struct VkTracer {
     pub accum: Buffer,
     pub tbuf: Buffer,
     pub info: Buffer,
+    /// The G-buffer pack, `dlss::GBufs` interleaved on the GPU: CORE at u15
+    /// (16 B/px — mv.xy | view_z | prev_z) and the guide/signal half at u32
+    /// (72 B/px). Full-size only when `gbuf_full`; otherwise a stride-sized
+    /// minimum, exactly as D3D12 sizes them, because `FLAG_GBUF` is the ONLY
+    /// thing standing between the stores and an out-of-bounds write — a
+    /// storage buffer bound with `WHOLE_SIZE` has no bounds check, and the
+    /// alternative stand-in (`VkScene::dummy`) is SIXTEEN BYTES.
+    pub gbuf: Buffer,
+    pub gbuf_ext: Buffer,
+    /// Whether the two above are full-size. Read by `write_cb` — it is what
+    /// arms `FLAG_GBUF`, so it cannot drift from the allocation above.
+    gbuf_full: bool,
     counters: Buffer,
     cloud_lod: Buffer,
     cloud_shadow: Buffer,
@@ -297,6 +310,12 @@ impl VkTracer {
         bvh: &crate::bvh::Bvh,
         rw: u32,
         rh: u32,
+        // Size the G-buffer pack full and arm `FLAG_GBUF` on every frame this
+        // tracer records — the D3D12 `TraceGpu::new` argument of the same
+        // name, and a CONSTRUCTION property there for the same reason: the
+        // buffers are sized by it, so it cannot be a per-frame choice without
+        // the stores outrunning their allocation.
+        gbuf_full: bool,
     ) -> Result<VkTracer, String> {
         let vkd = &hg.vk;
         let d = &vkd.device;
@@ -441,6 +460,16 @@ impl VkTracer {
         let accum = vkd.buffer(px * 12, sb, false)?;
         let tbuf = vkd.buffer(px * 4, sb, false)?;
         let info = vkd.buffer(px * 4, sb, false)?;
+        // The pack. Full-size only under `gbuf_full`; otherwise ONE stride, the
+        // D3D12 sizing verbatim (gpu/trace.rs's `committed_buffer` pair). The
+        // ext half is allocated whenever the core one is, NOT only when a
+        // guide-consuming kind is wired — D3D12's own reason applies here
+        // unchanged: the consumer arrives after construction, so the buffer
+        // must always be able to receive the stores, and `FLAG_GBUF_EXT` gates
+        // the WRITES, which is where the cost is.
+        let gbuf = vkd.buffer(if gbuf_full { px * GBUF_STRIDE } else { GBUF_STRIDE }, sb, false)?;
+        let gbuf_ext =
+            vkd.buffer(if gbuf_full { px * GBUF_EXT_STRIDE } else { GBUF_EXT_STRIDE }, sb, false)?;
         let counters = vkd.buffer(u64::from(gs::CTR_TOTAL) * 4, sb, false)?;
         // The amortized cloud lattice: one float4 per point, one point of
         // border past each far edge — `TraceGpu::new`'s sizing verbatim,
@@ -701,6 +730,9 @@ impl VkTracer {
             accum,
             tbuf,
             info,
+            gbuf,
+            gbuf_ext,
+            gbuf_full,
             counters,
             cloud_lod,
             cloud_shadow,
@@ -846,6 +878,14 @@ impl VkTracer {
             (0, Reg::U, 1, &self.tbuf),
             (0, Reg::U, 2, &self.info),
             (0, Reg::U, 3, &self.counters),
+            // The pack. Bound in EVERY variant and whether or not `gbuf_full`
+            // is set: an unarmed tracer's pair is stride-sized rather than
+            // absent, so binding them costs nothing and is strictly better
+            // than letting them fall through to a 16-byte dummy that a
+            // mis-set `FLAG_GBUF` would then overrun. The flag is still the
+            // safety boundary — this just removes one way to be unlucky.
+            (0, Reg::U, 15, &self.gbuf),
+            (0, Reg::U, 32, &self.gbuf_ext),
             (1, Reg::T, 0, &vs.uv_buf),
             (1, Reg::T, 1, &vs.indices),
             (1, Reg::T, 2, &vs.tri_mat),
@@ -1036,12 +1076,24 @@ impl VkTracer {
 
     /// The per-frame cbuffer, written host-side before the submit.
     fn write_cb(&self, hg: &VkHeadless, p: &FrameParams) -> Result<(), String> {
-        // EVERY capture/bridge flag is off, and each for the same structural
-        // reason rather than as a default: this backend writes no G-buffer
-        // pack and wires no denoiser, so `gbuf_full` is false and the six that
-        // are gated on it (`fsr_sig`, `gbuf_ext`, `nrd_sig`, `sky_ext_skip`,
-        // `remod_exact`, and the FSR-RR half of the rest) could not arm even
-        // if asked. `nrd_rejitter` and `rclamp` live in `cs_nrd_out`, which is
+        // `gbuf_full` and `gbuf_ext` follow the ALLOCATION (the field is set by
+        // the constructor argument that sized the two buffers), which is what
+        // keeps `FLAG_GBUF` from ever arming over a stride-sized pack — a
+        // storage buffer has no bounds check, so that flag is memory safety
+        // and not an optimization (gfx/frame.rs's own note on it).
+        //
+        // The ext half arms WITH the core one rather than on demand, matching
+        // `--check-gpu` M7's `force_gbuf_ext(true)` and for its reason: the
+        // consumer here is a CPU readback, not a feed kernel, and
+        // `dlss::mv_selftest`'s sky arm reads the normal lane, which lives in
+        // ext. Core-only would fail that arm for a reason unrelated to the
+        // pack.
+        //
+        // The rest stay off, each structurally rather than as a default:
+        // `fsr_sig` is a shade-side export this backend does not capture (so
+        // `core.w`/the sig lanes stay 0, and `unpack_gbuf_bytes` drops them
+        // anyway), `nrd_sig`/`sky_ext_skip`/`remod_exact` need a wired
+        // denoiser, and `nrd_rejitter`/`rclamp` live in `cs_nrd_out`, which is
         // not compiled here at all.
         //
         // A POSITIONAL PILE THIS LONG IS A HAZARD, and this call site is the
@@ -1050,8 +1102,9 @@ impl VkTracer {
         // only a Linux build could see. When the next one lands, decide it
         // HERE too — a wrong `false` would be silent where the missing
         // argument was loud.
+        let g = self.gbuf_full;
         let mut cb =
-            self.cb_base.with_frame(p, false, false, false, false, false, false, false, (false, false));
+            self.cb_base.with_frame(p, g, false, g, false, false, false, false, (false, false));
         cb.cloud_grid = if self.cloud_shadow_n == 0 || !p.clouds.enabled {
             [0.0; 4]
         } else {
@@ -1691,6 +1744,8 @@ impl VkTracer {
             &self.accum,
             &self.tbuf,
             &self.info,
+            &self.gbuf,
+            &self.gbuf_ext,
             &self.counters,
             &self.cloud_lod,
             &self.cloud_shadow,

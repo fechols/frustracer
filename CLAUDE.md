@@ -6702,6 +6702,115 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # llvmpipe, with the SDK moved aside (the degrade is the half
                                       # nothing else covers), plus --check-fsr, --check-spirv,
                                       # --check, cargo test and tools/win-cross-check.sh
+                                      # V12 — THE G-BUFFER PACK AND THE PREV-CAMERA MOTION
+                                      # VECTORS (B2, 2026-08-11): the first stage here whose
+                                      # subject is not the picture but the WIRE the vendor stack
+                                      # reads. `--check-gpu`'s M7 / `--check-dxr`'s T4
+                                      # transplanted — same 533x400 odd dims, same 0.02*diag
+                                      # forward dolly, same `unpack_gbuf_bytes`, same
+                                      # `dlss::mv_selftest`, zero new tolerances.
+                                      # TWO FLAGS HAD NEVER RUN ON THIS BACKEND, and the second
+                                      # is the one worth naming: `FLAG_GBUF`, and
+                                      # `FLAG_HAS_PREV` — which means **the cbuffer's four
+                                      # prev-camera rows had never been non-zero here**, a region
+                                      # of the 4608-byte -fvk-use-dx-layout packing no gate had
+                                      # ever read, and one `gbuf_write_hit` dereferences directly
+                                      # (`prev_origin`, `prev_forward`, and `prev_right`/
+                                      # `prev_up` through `project_prev`). The pack stores are
+                                      # the easy half; that block is the new ground.
+                                      # A SECOND TRACER, not a flag on V6's, and for attribution
+                                      # rather than tidiness: every number V6/V7/V8/V9/V11 record
+                                      # stays unmoved BY CONSTRUCTION, and the ODD dims survive
+                                      # (533x400 is what catches a stride assumption; the
+                                      # V-suite's own 800x600 cannot). It shares the uploaded
+                                      # `VkScene`/`VkTextures`, so the cost is one more DXC pass
+                                      # plus the per-pixel buffers — measured, the whole suite
+                                      # goes 22 -> 26.7 s on the procedural scene.
+                                      # BOTH PACK HALVES ARM, and core-only was tried first and
+                                      # does not work: `dlss::mv_selftest` ANDs three arms and
+                                      # the third (`dlss::sky_dir_check`, dlss.rs:573) reads the
+                                      # NORMAL lane, which lives in EXT — `unpack_gbuf_bytes`
+                                      # fills the guide fields with zero when handed `ext: None`,
+                                      # so every sky pixel would read `got = (0,0,0)`, `err = 1.0`
+                                      # against a 5e-3 limit, and the gate would fail for a reason
+                                      # unrelated to the pack. Splitting the function to dodge
+                                      # that would cost the property the whole transplant rests on
+                                      # (the EXACT existing gate, zero new tolerances), so ext
+                                      # arms with core — which is also what M7 does, via
+                                      # `force_gbuf_ext(true)`, for its own reason: the consumer
+                                      # is a CPU readback and not a feed kernel. `fsr_sig` stays
+                                      # OFF (a shade-side export this backend does not capture),
+                                      # so `core.w` and the sig lanes stay 0 — which
+                                      # `unpack_gbuf_bytes` drops anyway.
+                                      # `gbuf_full` is a CONSTRUCTION argument on `VkTracer::new`,
+                                      # the D3D12 shape: it sizes the two buffers AND is what
+                                      # `write_cb` reads to arm `FLAG_GBUF`, so the flag cannot
+                                      # arm over a stride-sized pack. That matters because a
+                                      # storage buffer bound with WHOLE_SIZE has no bounds check
+                                      # and the fallback stand-in (`VkScene::dummy`) is SIXTEEN
+                                      # BYTES against a 72 B/px stride — the flag is memory
+                                      # safety, not an optimization (gfx/frame.rs's own note).
+                                      # The pack is bound in every descriptor variant whether or
+                                      # not it is armed, since an unarmed tracer's pair is
+                                      # stride-sized rather than absent: that costs nothing and
+                                      # removes one way to be unlucky.
+                                      # `unpack_gbuf_bytes` LOST ITS `cfg(windows)`, which it only
+                                      # ever carried because it spelled `gpu::trace::GBUF_STRIDE`
+                                      # — the same constant as `gfx::frame::GBUF_STRIDE` through
+                                      # the glob re-export at gpu/trace.rs:39. Swapping the path
+                                      # is the whole change; a Vulkan-local copy would have been
+                                      # the transcription hazard the derived layout exists to
+                                      # remove, on the one function whose entire job is to agree
+                                      # with the wire.
+                                      # ASSERTS: `dlss::mv_selftest` (all three arms), coverage
+                                      # (every px view_z > 0; sky depth BIT-EQUAL far, never a
+                                      # tolerance), the ext ripple lane (0.0 or WATER_RIPPLE_AMP
+                                      # within 1e-3, sky exactly 0.0), the sky must-fire under
+                                      # `structural`, and an ANTI-VACUITY count of non-zero MVs.
+                                      # That last is not redundant with mv_selftest: a pack that
+                                      # was never written AT ALL reads as zeros and would trip the
+                                      # coverage arm first, reporting "the pack is broken" for
+                                      # what is really "the pack is absent" (the M3d lesson — an
+                                      # operation that never happened compares clean). The two
+                                      # arms measurably separate: tooth 2 below fails
+                                      # `mv_selftest` while the MV count stays at a full frame.
+                                      # MEASURED (RADV, 533x400): view-z<=0 0 | sky-depth-off 0
+                                      # (sky px 61561) | ripple bad 0 | mv non-zero 209097 |
+                                      # mv/depth/matrix OK, with mv_selftest reading median
+                                      # 1.528e-2 against a 1.697e-1 limit, p90 1.421e-1 against
+                                      # 1.697e0, the matrix/ray identity OK and the sky arm
+                                      # 3.443e-4 against 5e-3. Green on procedural,
+                                      # san-miguel-low-poly, rungholt, both FR_VK_RES parities,
+                                      # `--sw-rays` and llvmpipe (which reads 210077 non-zero MVs
+                                      # — the two-intersector class at silhouettes). **RUNGHOLT
+                                      # PROVES THE RIPPLE LANE NON-VACUOUS at water px 1551,
+                                      # against D3D12's own recorded 1552** — one pixel apart on
+                                      # two backends and two intersectors; the procedural and
+                                      # san-miguel poses read 0 water px and gate nothing there.
+                                      # TEETH, two fired: `prev_cam: None` on frame B collapses
+                                      # the plane (median 2.085e0 = 12x over, AND `mv non-zero 0`
+                                      # — both arms, which is what proves FLAG_HAS_PREV is the
+                                      # live path); swapping `prev_right`/`prev_up` in
+                                      # `with_frame` reads median 8.156e0 = 48x over while the MV
+                                      # count stays 213200, i.e. a WRONG pack rather than an
+                                      # absent one. The third — arming FLAG_GBUF over the 16-byte
+                                      # dummy — was DELIBERATELY NOT FIRED and the reason is
+                                      # recorded rather than the result: `robustBufferAccess` is
+                                      # not enabled, so that write is genuinely undefined, and on
+                                      # this box the Vulkan device is the iGPU driving the
+                                      # display. The claim it would test is a spec fact already
+                                      # documented on the D3D12 side; a hang is not worth
+                                      # re-deriving it. Fire it on a machine with a discrete
+                                      # secondary if it is ever wanted.
+                                      # NOT COVERED, said rather than implied: the feed kernel.
+                                      # V12 stops at the pack, exactly as M7 stops before M8 —
+                                      # it never calls a feed and touches no upscaler resource.
+                                      # Touch `VkTracer`'s gbuf pair / `write_cb`'s flag row /
+                                      # `unpack_gbuf_bytes` -> run --check (goldens byte-identical
+                                      # — B2 touches no shading path), cargo test, --check-vk on
+                                      # procedural + san-miguel-low-poly + rungholt, both
+                                      # FR_VK_RES parities, --sw-rays, llvmpipe, --check-spirv and
+                                      # tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
