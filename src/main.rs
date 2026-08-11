@@ -5518,6 +5518,7 @@ fn run_check_gpu(
         };
     let mut false_sky = 0usize;
     let mut overshoot = 0usize;
+    let mut cand_edge = 0usize;
     let mut hybrid_extra = 0usize;
     let mut max_rel_t = 0.0f32;
     let mut culprits: Vec<String> = Vec::new();
@@ -5537,6 +5538,40 @@ fn run_check_gpu(
             }
         }
     }
+
+    // WHICH BUCKET a t-overshoot belongs in, defined ONCE because this function
+    // asks the question TWICE: in the wavefront/reference loop below, and again
+    // in the --spp sub-gate, which re-runs that comparison over this same
+    // `t_start_of` and `edge_mask`. Two hand-kept copies of a predicate that
+    // must agree is exactly the drift that left the Vulkan twin printing a
+    // wrong diagnosis for a milestone (`bc7::should_compress` discipline).
+    //
+    // THE SPLIT. A leaf primary searches (t_start, inf), so when the
+    // reference's OWN hit lies inside that interval no value of t_start could
+    // have hidden it: the inherited bound is innocent BY CONSTRUCTION, and what
+    // is left is two intersector RUNS disagreeing about a grazing cutout edge.
+    // At or below t_start the bound IS the suspect and stays a hard failure —
+    // this is a decomposition, not an allowance bolted onto the old counter.
+    // The interval is OPEN and the test therefore STRICT, which matters only in
+    // a case that cannot occur (t_start comes from an AABB frustum bound and rt
+    // from a triangle intersection, so exact equality is unreachable) — but
+    // acceptance is strictly beyond TMin, so a hit AT t_start is one the bound
+    // would have hidden, and the strict form is the one that says so.
+    //
+    // `non_opaque` is the same derived predicate that drops
+    // GEOMETRY_FLAG_OPAQUE, i.e. it answers exactly "does `trace_closest` take
+    // its `Proceed()` arm", and `--sw-rays` replaces that arm with our own
+    // fixed-order walk — so on an opaque scene, or under that lever, the split
+    // cannot fire at all and every counter below is the pre-split one bitwise.
+    // MEASURED on the Vulkan twin (san-miguel-low-poly --tile 2, 22.5M tris,
+    // RADV): the hardware arm disagrees with the reference at ONE pixel,
+    // FR_ABL=noalpha and --sw-rays both return it to 0.00e0, and FR_ABL=tzero
+    // does not move it — which attributes the phenomenon to the driver's
+    // candidate enumeration rather than to the inherited bound.
+    let cand_loop = gpu::trace::non_opaque(scene) && !gpu::trace::sw_rays();
+    let cand_arm = if cand_loop { "armed" } else { "off" };
+    let cand_edge_px =
+        |i: usize, rt: f32| cand_loop && t_start_of[i].is_finite() && rt > t_start_of[i];
 
     // THE soundness contract, asserted directly instead of by proxy: the region
     // a tile proved empty — frustum ∩ ball(origin, t_start) — must not contain
@@ -5599,10 +5634,17 @@ fn run_check_gpu(
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    overshoot += 1;
+                    // ONE predicate, two call sites — see its definition above.
+                    let (label, bucket) = if cand_edge_px(i, rt) {
+                        cand_edge += 1;
+                        ("cand-edge", "candidate-loop edge, bound innocent")
+                    } else {
+                        overshoot += 1;
+                        ("overshoot", "INSIDE the claimed-empty ball")
+                    };
                     if culprits.len() < 8 {
                         culprits.push(format!(
-                            "overshoot px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            "{label} px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6} — {bucket}",
                             t_start_of[i]
                         ));
                     }
@@ -5659,7 +5701,7 @@ fn run_check_gpu(
     }
     let img_mean = img_sum / (px * 3) as f64;
     eprintln!(
-        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
+        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | cand-edge px {cand_edge} (arm {cand_arm}) | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
     );
     if claim_viol != 0 {
         eprintln!("check-gpu: FAIL inherited-tmin claim violated (t_start past real geometry — THE bug class)");
@@ -5669,11 +5711,6 @@ fn run_check_gpu(
         eprintln!("check-gpu: FAIL wavefront visibility gates (the inherited-tmin bug class)");
         ok = false;
     }
-    if !culprits.is_empty() {
-        for c in &culprits {
-            eprintln!("check-gpu:   {c}");
-        }
-    }
     // The hardware-edge pixels are bounded by the SAME statistical allowance the
     // reference-vs-CPU gate uses — they are the same phenomenon, seen from the
     // other side. A flood of them is a real signal (a broken cut would surface
@@ -5681,6 +5718,28 @@ fn run_check_gpu(
     if edge_skipped as f64 > px as f64 * 5e-4 {
         eprintln!("check-gpu: FAIL {edge_skipped} wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
         ok = false;
+    }
+    // The candidate-loop edge bucket rides that SAME allowance, for the same
+    // reason. WHERE THE TEETH ARE, because the obvious answer is wrong: the
+    // innocence predicate is NOT selective on a passing run — `claim_viol == 0`
+    // already asserts t_start <= min(cpu_t, ref_t) * (1+1e-4), so it holds at
+    // every leaf pixel bar a 1e-4-wide relative band. The split discriminates
+    // only once a claim is ALREADY violated, i.e. in the case it must not
+    // soften. What carries the gate is the ARM (off by construction on an
+    // opaque scene and under `--sw-rays`, hence printed beside the count),
+    // this 0.05% bound (a genuinely bad claim is a property of a whole TILE, so
+    // it arrives as thousands of pixels), `claim-violation` itself, and the
+    // image half below — a cand-edge pixel is NOT added to `edge_mask`, so its
+    // colour is still gated at 1e-2 under an independent 0.05% count.
+    if cand_edge as f64 > px as f64 * 5e-4 {
+        eprintln!("check-gpu: FAIL {cand_edge} candidate-loop edge disagreements above the 0.05% allowance");
+        ok = false;
+    }
+    // Below all four t-bucket verdicts, so a reader meets the FAIL lines
+    // grouped and then the pixels that explain them (the culprits name their
+    // own bucket, so one list serves every verdict above).
+    for c in &culprits {
+        eprintln!("check-gpu:   {c}");
     }
     // The same-seed image A/B, in three parts that between them are strictly
     // stronger than the old `mean || max` pair — and, unlike it, do not assume
@@ -6825,10 +6884,30 @@ fn run_check_gpu(
             // information about multi-sampling), and the image comparison is
             // mean + a bounded hot COUNT rather than an absolute max, which
             // would otherwise be set by a grazing binary occlusion flip.
-            let (mut fs, mut ov, mut he, mut edge) = (0usize, 0usize, 0usize, 0usize);
+            // The overshoot bucket splits here too, through the SAME
+            // `cand_edge_px` the spp=1 loop uses. `t_start_of` is a snapshot
+            // from the structural frame, and it is valid at these frames
+            // because the quadtree is a pure function of (scene, BVH, basis,
+            // rw, rh) and this block re-traces `cam: basis` — spp moves the
+            // samples inside a pixel, never the tiles (the same premise the
+            // `edge_mask` reuse just below already rests on).
+            //
+            // Undecomposed, a tiled cutout run on hardware whose candidate
+            // enumeration differs fails HERE with a diagnosis naming
+            // MULTI-SAMPLING — a worse wrong answer than the spp=1 loop's was,
+            // since nothing about the extra samples is implicated. And this arm
+            // is the likelier one to fire: five probes at five in-pixel sample
+            // positions are five independent draws at the same knife-edge.
+            let (mut fs, mut ov, mut he, mut edge, mut ce) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            // Same diagnostic discipline as the spp=1 culprit list and this
+            // gate's own hot_diag: a failure must NAME its pixels.
+            let mut vis_diag: Vec<String> = Vec::new();
             for i in 0..px {
-                let disagree = match (rt4[i].is_finite(), wt4[i].is_finite()) {
-                    (true, true) => rt4[i] != wt4[i],
+                let (rt, wt) = (rt4[i], wt4[i]);
+                let (x, y) = (i % gw, i / gw);
+                let disagree = match (rt.is_finite(), wt.is_finite()) {
+                    (true, true) => rt != wt,
                     (false, false) => false,
                     _ => true,
                 };
@@ -6836,14 +6915,41 @@ fn run_check_gpu(
                     edge += 1;
                     continue;
                 }
-                match (rt4[i].is_finite(), wt4[i].is_finite()) {
+                match (rt.is_finite(), wt.is_finite()) {
                     (true, true) => {
-                        if (wt4[i] - rt4[i]) / rt4[i].max(1e-6) > 1e-4 {
-                            ov += 1;
+                        let rel = (wt - rt) / rt.max(1e-6);
+                        if rel > 1e-4 {
+                            let (label, bucket) = if cand_edge_px(i, rt) {
+                                ce += 1;
+                                ("cand-edge", "candidate-loop edge, bound innocent")
+                            } else {
+                                ov += 1;
+                                ("overshoot", "INSIDE the claimed-empty ball")
+                            };
+                            if vis_diag.len() < 8 {
+                                vis_diag.push(format!(
+                                    "spp={spp} probe={probe} {label} px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6} — {bucket}",
+                                    t_start_of[i]
+                                ));
+                            }
                         }
                     }
-                    (true, false) => fs += 1,
-                    (false, true) => he += 1,
+                    (true, false) => {
+                        fs += 1;
+                        if vis_diag.len() < 8 {
+                            vis_diag.push(format!(
+                                "spp={spp} probe={probe} false-sky px ({x},{y}): ref t {rt:.6}, wave = sky"
+                            ));
+                        }
+                    }
+                    (false, true) => {
+                        he += 1;
+                        if vis_diag.len() < 8 {
+                            vis_diag.push(format!(
+                                "spp={spp} probe={probe} hybrid-extra px ({x},{y}): ref = sky, wave t {wt:.6}"
+                            ));
+                        }
+                    }
                     (false, false) => {}
                 }
             }
@@ -6885,15 +6991,30 @@ fn run_check_gpu(
             let hot_limit = (px * 3) as f64 * 5e-4;
             let nonfinite = wa4.iter().filter(|v| !v.is_finite()).count();
             eprintln!(
-                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | hw-edge px {edge} | same-seed image mean |d| {mean:.2e} (rel {rel:.2e} of {ref_mag:.3e}) max {mx:.2e} | hot ch {hot}"
+                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | hw-edge px {edge} | cand-edge px {ce} | same-seed image mean |d| {mean:.2e} (rel {rel:.2e} of {ref_mag:.3e}) max {mx:.2e} | hot ch {hot}"
             );
-            if fs != 0 || ov != 0 || he != 0 {
+            let vis_fail = fs != 0 || ov != 0 || he != 0;
+            let ce_fail = ce as f64 > px as f64 * 5e-4;
+            if vis_fail {
                 eprintln!("check-gpu: FAIL spp visibility gates (a multi-sample ray broke the inherited-tmin claim)");
                 ok = false;
             }
             if edge as f64 > px as f64 * 5e-4 {
                 eprintln!("check-gpu: FAIL {edge} spp wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
                 ok = false;
+            }
+            // The spp arm's half of the same split, under the same bound as its
+            // `edge` sibling above — see `cand_edge_px` for where the teeth are.
+            if ce_fail {
+                eprintln!("check-gpu: FAIL {ce} spp candidate-loop edge disagreements above the 0.05% allowance");
+                ok = false;
+            }
+            // ONE dump for both t-bucket failures: they share `vis_diag`, so a
+            // per-fail print would emit the same list twice.
+            if vis_fail || ce_fail {
+                for d in &vis_diag {
+                    eprintln!("check-gpu:   {d}");
+                }
             }
             // 1e-4 relative: ~3.7x the worst fp noise measured across scenes and
             // vendors (2.69e-5 — default 1.95e-5, San Miguel 1.93e-5, stress
@@ -15310,15 +15431,19 @@ fn run_check_vk_wavefront(
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    // WHICH BUCKET. A leaf primary searches [t_start, inf), so
+                    // WHICH BUCKET. A leaf primary searches (t_start, inf), so
                     // when the reference's OWN hit lies inside that interval no
                     // value of t_start could have hidden it: the inherited
                     // bound is innocent BY CONSTRUCTION and what is left is two
                     // intersector RUNS disagreeing about a grazing cutout edge.
-                    // Below t_start the bound IS the suspect and stays hard —
-                    // which is the whole reason this is a decomposition and not
-                    // an allowance bolted onto the old counter.
-                    let innocent = t_start_of[i].is_finite() && rt >= t_start_of[i];
+                    // At or below t_start the bound IS the suspect and stays
+                    // hard — which is the whole reason this is a decomposition
+                    // and not an allowance bolted onto the old counter. The
+                    // interval is OPEN because acceptance is strictly beyond
+                    // TMin, so a hit AT t_start is one the bound would have
+                    // hidden; keep this STRICT in lockstep with the D3D12 twin
+                    // (`run_check_gpu`'s `cand_edge_px`) — one predicate.
+                    let innocent = t_start_of[i].is_finite() && rt > t_start_of[i];
                     let (label, bucket) = if cand_loop && innocent {
                         cand_edge += 1;
                         ("cand-edge", "candidate-loop edge, bound innocent")
