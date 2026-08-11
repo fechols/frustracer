@@ -3830,8 +3830,12 @@ fn run_check_dxr(
 /// rather than as stale memory, which is what keeps a gate honest about what
 /// the session actually produced. The prev-Z lane and the six sig/sig2 lanes
 /// are FSR-RR extras the `GBufs` shape doesn't carry (their own gates read the
-/// raw bytes). Shared by --check-gpu (M7) and --check-dxr (T4).
-#[cfg(windows)]
+/// raw bytes). Shared by --check-gpu (M7), --check-dxr (T4) and --check-vk
+/// (V12) — which is why it spells the strides through `gfx::frame` rather than
+/// through `gpu::trace`'s re-export of them: the latter is `cfg(windows)` and
+/// was the ONLY thing keeping this function off Linux. A Vulkan-local copy
+/// would be the transcription hazard the derived descriptor layout exists to
+/// remove, on the one piece of code whose whole job is to agree with the wire.
 fn unpack_gbuf_bytes(
     core: &[u8],
     ext: Option<&[u8]>,
@@ -3840,8 +3844,8 @@ fn unpack_gbuf_bytes(
 ) -> dlss::GBufs {
     let fc = |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..][..4].try_into().unwrap());
     let g = dlss::GBufs::new(pw, ph);
-    let cl = gpu::trace::GBUF_STRIDE as usize / 4;
-    let el = gpu::trace::GBUF_EXT_STRIDE as usize / 4;
+    let cl = gfx::frame::GBUF_STRIDE as usize / 4;
+    let el = gfx::frame::GBUF_EXT_STRIDE as usize / 4;
     for i in 0..pw * ph {
         let c = i * cl;
         let e = ext.map(|b| (b, i * el));
@@ -5710,6 +5714,7 @@ fn run_check_gpu(
         };
     let mut false_sky = 0usize;
     let mut overshoot = 0usize;
+    let mut cand_edge = 0usize;
     let mut hybrid_extra = 0usize;
     let mut max_rel_t = 0.0f32;
     let mut culprits: Vec<String> = Vec::new();
@@ -5729,6 +5734,40 @@ fn run_check_gpu(
             }
         }
     }
+
+    // WHICH BUCKET a t-overshoot belongs in, defined ONCE because this function
+    // asks the question TWICE: in the wavefront/reference loop below, and again
+    // in the --spp sub-gate, which re-runs that comparison over this same
+    // `t_start_of` and `edge_mask`. Two hand-kept copies of a predicate that
+    // must agree is exactly the drift that left the Vulkan twin printing a
+    // wrong diagnosis for a milestone (`bc7::should_compress` discipline).
+    //
+    // THE SPLIT. A leaf primary searches (t_start, inf), so when the
+    // reference's OWN hit lies inside that interval no value of t_start could
+    // have hidden it: the inherited bound is innocent BY CONSTRUCTION, and what
+    // is left is two intersector RUNS disagreeing about a grazing cutout edge.
+    // At or below t_start the bound IS the suspect and stays a hard failure —
+    // this is a decomposition, not an allowance bolted onto the old counter.
+    // The interval is OPEN and the test therefore STRICT, which matters only in
+    // a case that cannot occur (t_start comes from an AABB frustum bound and rt
+    // from a triangle intersection, so exact equality is unreachable) — but
+    // acceptance is strictly beyond TMin, so a hit AT t_start is one the bound
+    // would have hidden, and the strict form is the one that says so.
+    //
+    // `non_opaque` is the same derived predicate that drops
+    // GEOMETRY_FLAG_OPAQUE, i.e. it answers exactly "does `trace_closest` take
+    // its `Proceed()` arm", and `--sw-rays` replaces that arm with our own
+    // fixed-order walk — so on an opaque scene, or under that lever, the split
+    // cannot fire at all and every counter below is the pre-split one bitwise.
+    // MEASURED on the Vulkan twin (san-miguel-low-poly --tile 2, 22.5M tris,
+    // RADV): the hardware arm disagrees with the reference at ONE pixel,
+    // FR_ABL=noalpha and --sw-rays both return it to 0.00e0, and FR_ABL=tzero
+    // does not move it — which attributes the phenomenon to the driver's
+    // candidate enumeration rather than to the inherited bound.
+    let cand_loop = gpu::trace::non_opaque(scene) && !gpu::trace::sw_rays();
+    let cand_arm = if cand_loop { "armed" } else { "off" };
+    let cand_edge_px =
+        |i: usize, rt: f32| cand_loop && t_start_of[i].is_finite() && rt > t_start_of[i];
 
     // THE soundness contract, asserted directly instead of by proxy: the region
     // a tile proved empty — frustum ∩ ball(origin, t_start) — must not contain
@@ -5791,10 +5830,17 @@ fn run_check_gpu(
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    overshoot += 1;
+                    // ONE predicate, two call sites — see its definition above.
+                    let (label, bucket) = if cand_edge_px(i, rt) {
+                        cand_edge += 1;
+                        ("cand-edge", "candidate-loop edge, bound innocent")
+                    } else {
+                        overshoot += 1;
+                        ("overshoot", "INSIDE the claimed-empty ball")
+                    };
                     if culprits.len() < 8 {
                         culprits.push(format!(
-                            "overshoot px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            "{label} px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6} — {bucket}",
                             t_start_of[i]
                         ));
                     }
@@ -5851,7 +5897,7 @@ fn run_check_gpu(
     }
     let img_mean = img_sum / (px * 3) as f64;
     eprintln!(
-        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
+        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | cand-edge px {cand_edge} (arm {cand_arm}) | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
     );
     if claim_viol != 0 {
         eprintln!("check-gpu: FAIL inherited-tmin claim violated (t_start past real geometry — THE bug class)");
@@ -5861,11 +5907,6 @@ fn run_check_gpu(
         eprintln!("check-gpu: FAIL wavefront visibility gates (the inherited-tmin bug class)");
         ok = false;
     }
-    if !culprits.is_empty() {
-        for c in &culprits {
-            eprintln!("check-gpu:   {c}");
-        }
-    }
     // The hardware-edge pixels are bounded by the SAME statistical allowance the
     // reference-vs-CPU gate uses — they are the same phenomenon, seen from the
     // other side. A flood of them is a real signal (a broken cut would surface
@@ -5873,6 +5914,28 @@ fn run_check_gpu(
     if edge_skipped as f64 > px as f64 * 5e-4 {
         eprintln!("check-gpu: FAIL {edge_skipped} wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
         ok = false;
+    }
+    // The candidate-loop edge bucket rides that SAME allowance, for the same
+    // reason. WHERE THE TEETH ARE, because the obvious answer is wrong: the
+    // innocence predicate is NOT selective on a passing run — `claim_viol == 0`
+    // already asserts t_start <= min(cpu_t, ref_t) * (1+1e-4), so it holds at
+    // every leaf pixel bar a 1e-4-wide relative band. The split discriminates
+    // only once a claim is ALREADY violated, i.e. in the case it must not
+    // soften. What carries the gate is the ARM (off by construction on an
+    // opaque scene and under `--sw-rays`, hence printed beside the count),
+    // this 0.05% bound (a genuinely bad claim is a property of a whole TILE, so
+    // it arrives as thousands of pixels), `claim-violation` itself, and the
+    // image half below — a cand-edge pixel is NOT added to `edge_mask`, so its
+    // colour is still gated at 1e-2 under an independent 0.05% count.
+    if cand_edge as f64 > px as f64 * 5e-4 {
+        eprintln!("check-gpu: FAIL {cand_edge} candidate-loop edge disagreements above the 0.05% allowance");
+        ok = false;
+    }
+    // Below all four t-bucket verdicts, so a reader meets the FAIL lines
+    // grouped and then the pixels that explain them (the culprits name their
+    // own bucket, so one list serves every verdict above).
+    for c in &culprits {
+        eprintln!("check-gpu:   {c}");
     }
     // The same-seed image A/B, in three parts that between them are strictly
     // stronger than the old `mean || max` pair — and, unlike it, do not assume
@@ -7017,10 +7080,30 @@ fn run_check_gpu(
             // information about multi-sampling), and the image comparison is
             // mean + a bounded hot COUNT rather than an absolute max, which
             // would otherwise be set by a grazing binary occlusion flip.
-            let (mut fs, mut ov, mut he, mut edge) = (0usize, 0usize, 0usize, 0usize);
+            // The overshoot bucket splits here too, through the SAME
+            // `cand_edge_px` the spp=1 loop uses. `t_start_of` is a snapshot
+            // from the structural frame, and it is valid at these frames
+            // because the quadtree is a pure function of (scene, BVH, basis,
+            // rw, rh) and this block re-traces `cam: basis` — spp moves the
+            // samples inside a pixel, never the tiles (the same premise the
+            // `edge_mask` reuse just below already rests on).
+            //
+            // Undecomposed, a tiled cutout run on hardware whose candidate
+            // enumeration differs fails HERE with a diagnosis naming
+            // MULTI-SAMPLING — a worse wrong answer than the spp=1 loop's was,
+            // since nothing about the extra samples is implicated. And this arm
+            // is the likelier one to fire: five probes at five in-pixel sample
+            // positions are five independent draws at the same knife-edge.
+            let (mut fs, mut ov, mut he, mut edge, mut ce) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            // Same diagnostic discipline as the spp=1 culprit list and this
+            // gate's own hot_diag: a failure must NAME its pixels.
+            let mut vis_diag: Vec<String> = Vec::new();
             for i in 0..px {
-                let disagree = match (rt4[i].is_finite(), wt4[i].is_finite()) {
-                    (true, true) => rt4[i] != wt4[i],
+                let (rt, wt) = (rt4[i], wt4[i]);
+                let (x, y) = (i % gw, i / gw);
+                let disagree = match (rt.is_finite(), wt.is_finite()) {
+                    (true, true) => rt != wt,
                     (false, false) => false,
                     _ => true,
                 };
@@ -7028,14 +7111,41 @@ fn run_check_gpu(
                     edge += 1;
                     continue;
                 }
-                match (rt4[i].is_finite(), wt4[i].is_finite()) {
+                match (rt.is_finite(), wt.is_finite()) {
                     (true, true) => {
-                        if (wt4[i] - rt4[i]) / rt4[i].max(1e-6) > 1e-4 {
-                            ov += 1;
+                        let rel = (wt - rt) / rt.max(1e-6);
+                        if rel > 1e-4 {
+                            let (label, bucket) = if cand_edge_px(i, rt) {
+                                ce += 1;
+                                ("cand-edge", "candidate-loop edge, bound innocent")
+                            } else {
+                                ov += 1;
+                                ("overshoot", "INSIDE the claimed-empty ball")
+                            };
+                            if vis_diag.len() < 8 {
+                                vis_diag.push(format!(
+                                    "spp={spp} probe={probe} {label} px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6} — {bucket}",
+                                    t_start_of[i]
+                                ));
+                            }
                         }
                     }
-                    (true, false) => fs += 1,
-                    (false, true) => he += 1,
+                    (true, false) => {
+                        fs += 1;
+                        if vis_diag.len() < 8 {
+                            vis_diag.push(format!(
+                                "spp={spp} probe={probe} false-sky px ({x},{y}): ref t {rt:.6}, wave = sky"
+                            ));
+                        }
+                    }
+                    (false, true) => {
+                        he += 1;
+                        if vis_diag.len() < 8 {
+                            vis_diag.push(format!(
+                                "spp={spp} probe={probe} hybrid-extra px ({x},{y}): ref = sky, wave t {wt:.6}"
+                            ));
+                        }
+                    }
                     (false, false) => {}
                 }
             }
@@ -7077,15 +7187,30 @@ fn run_check_gpu(
             let hot_limit = (px * 3) as f64 * 5e-4;
             let nonfinite = wa4.iter().filter(|v| !v.is_finite()).count();
             eprintln!(
-                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | hw-edge px {edge} | same-seed image mean |d| {mean:.2e} (rel {rel:.2e} of {ref_mag:.3e}) max {mx:.2e} | hot ch {hot}"
+                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | hw-edge px {edge} | cand-edge px {ce} | same-seed image mean |d| {mean:.2e} (rel {rel:.2e} of {ref_mag:.3e}) max {mx:.2e} | hot ch {hot}"
             );
-            if fs != 0 || ov != 0 || he != 0 {
+            let vis_fail = fs != 0 || ov != 0 || he != 0;
+            let ce_fail = ce as f64 > px as f64 * 5e-4;
+            if vis_fail {
                 eprintln!("check-gpu: FAIL spp visibility gates (a multi-sample ray broke the inherited-tmin claim)");
                 ok = false;
             }
             if edge as f64 > px as f64 * 5e-4 {
                 eprintln!("check-gpu: FAIL {edge} spp wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
                 ok = false;
+            }
+            // The spp arm's half of the same split, under the same bound as its
+            // `edge` sibling above — see `cand_edge_px` for where the teeth are.
+            if ce_fail {
+                eprintln!("check-gpu: FAIL {ce} spp candidate-loop edge disagreements above the 0.05% allowance");
+                ok = false;
+            }
+            // ONE dump for both t-bucket failures: they share `vis_diag`, so a
+            // per-fail print would emit the same list twice.
+            if vis_fail || ce_fail {
+                for d in &vis_diag {
+                    eprintln!("check-gpu:   {d}");
+                }
             }
             // 1e-4 relative: ~3.7x the worst fp noise measured across scenes and
             // vendors (2.69e-5 — default 1.95e-5, San Miguel 1.93e-5, stress
@@ -14153,6 +14278,15 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V11: FSR3 over the stock ffx_vk backend, CPU-fed. ----
+    //
+    // Top-level rather than nested inside V6 (where V7/V8/V9 live) because it
+    // shares nothing with the tracer: FFX owns its own pipelines and
+    // descriptors, and the frames it upscales come from the CPU renderer.
+    if !run_check_vk_fsr3(&hg, scene, bvh, cam0) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
@@ -14251,6 +14385,366 @@ fn run_check_vk_bc7(
 /// `cs_leaf`, exist inside that constraint. Vulkan can PIN the width, so the
 /// same measurement here yields a decision instead of a diagnosis.
 ///
+/// V11 — FSR3 upscaling over the stock FidelityFX `ffx_vk` backend.
+///
+/// THE REFERENCE IS THE UNUSUAL PART. An upscaler gate normally has nothing to
+/// score against, so it settles for "the output is finite and differs from the
+/// input" — which garbage satisfies. Here the CPU renderer can render exactly
+/// what the upscaler is trying to reconstruct: the same pose at OUTPUT
+/// resolution, accumulated to convergence. So the claim is a real one, and
+/// every assertion below is RELATIVE to a control rather than a threshold
+/// somebody chose:
+///
+///   1. the upscaled frame beats a plain bilinear upscale (it does something);
+///   2. accumulating beats resetting every frame (the history is real);
+///   3. true motion vectors beat garbage ones (the plane reaches FFX at all).
+///
+/// (3) is the M3d lesson in another currency — a plane that is uploaded and
+/// never read passes every other metric — and it works under a STATIC camera
+/// precisely because the true answer there is zero motion, so a constant
+/// nonzero field is a known-wrong input rather than a differently-right one.
+///
+/// This lives here and not in `--check-fsr`, which is deliberately DLL- AND
+/// GPU-free; that suite's gate 8 keeps the pure version arithmetic and the pin
+/// pair, which run on every platform including the one that never builds the SDK.
+#[cfg(unix)]
+fn run_check_vk_fsr3(
+    hg: &vk::headless::VkHeadless,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> bool {
+    if !vk::fsr3::built() {
+        println!(
+            "check-vk: SKIP V11 (FidelityFX 1.1.4 source not compiled in — \
+             ./install-prerequisites.sh fsr3src)"
+        );
+        return true;
+    }
+
+    // 2x, FSR's "performance" ratio: a big enough jump that a temporal
+    // upscaler has something to prove against a plain filter, and clean
+    // arithmetic so the bilinear control needs no rounding rule of its own.
+    let (ow, oh) = (800usize, 600usize);
+    let (rw, rh) = (ow / 2, oh / 2);
+    const FRAMES: u32 = 24;
+    const TRUTH_FRAMES: u32 = 64;
+
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let (near, far) = dlss::near_far(scene.diag);
+    let mut ok = true;
+
+    // THE JITTER SIGN IS THE ONE CONVENTION THE TWO FFX GENERATIONS DISAGREE
+    // ABOUT, so it is a lever here rather than a constant copied from either.
+    // `fsr::JITTER_SIGN` is +1 (this tree's v2.3.0 arm, whose own comment says
+    // it was to be settled empirically and which has never had RDNA4 hardware
+    // to settle it on); the quinlight-player reference negates. A wrong sign
+    // misplaces content by TWICE the jitter — invisible on smooth geometry and
+    // ruinous on texture detail, which is exactly the DLSS-G trap-9 signature.
+    let jsign = match std::env::var("FR_VK_FSR3_JITTER").as_deref() {
+        Ok("raw") => 1.0f32,
+        Ok("neg") => -1.0f32,
+        Ok(v) => {
+            println!("check-vk: V11 FR_VK_FSR3_JITTER={v:?} unrecognized — using the default");
+            fsr::JITTER_SIGN
+        }
+        Err(_) => fsr::JITTER_SIGN,
+    };
+
+    // ---- The reference: the same pose at output res, converged. ----
+    let acc_hi = alloc32(ow * oh * 3);
+    {
+        let info = alloc32(ow * oh);
+        let tbuf = alloc32(ow * oh);
+        let basis = cam0.basis(ow, oh);
+        for f in 0..TRUTH_FRAMES {
+            let ctx = FrameCtx {
+                sway_mv: None,
+                scene,
+                bvh,
+                cam: basis,
+                q,
+                frame: f,
+                jitter: true,
+                rw: ow,
+                rh: oh,
+                accum: &acc_hi,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::check(scene.diag),
+                fireflies: crate::fireflies::Fireflies::check(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: None,
+                fsr_buf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, true);
+        }
+    }
+    let truth: Vec<f32> = (0..ow * oh * 3)
+        .map(|i| f32::from_bits(acc_hi[i].load(Relaxed)) / TRUTH_FRAMES as f32)
+        .collect();
+
+    // Mean absolute per-channel difference from the reference. Absolute rather
+    // than relative because the comparison is BETWEEN arms on one image, so the
+    // dark-pixel weighting that makes a per-pixel relative mean useless here
+    // (the M3b lesson) would cancel anyway — and an absolute mean keeps the
+    // three arms on one scale.
+    let score = |img: &[f32]| -> f64 {
+        let mut s = 0.0f64;
+        for i in 0..ow * oh * 3 {
+            s += (img[i] - truth[i]).abs() as f64;
+        }
+        s / (ow * oh * 3) as f64
+    };
+
+    // ---- One FSR3 run: N jittered CPU frames at render res through the
+    // upscaler, returning the final output. `mv_mode` picks the third arm's
+    // deliberately-wrong motion.
+    let g = dlss::GBufs::new_slim(rw, rh);
+    let acc_lo = alloc32(rw * rh * 3);
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+    let basis_lo = cam0.basis(rw, rh);
+    let run = |reset_every: bool, bogus_mv: bool| -> Result<Vec<f32>, String> {
+        let f3 = vk::fsr3::Fsr3::new(
+            hg,
+            (rw as u32, rh as u32),
+            (ow as u32, oh as u32),
+            // HDR because this renderer's colour is scene-referred linear
+            // radiance, and DEPTH_INVERTED because the wire is
+            // xess::view_z_to_clip_depth's reversed-Z clip depth.
+            vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+        )?;
+        let mut out = Vec::new();
+        for f in 0..FRAMES {
+            let jit = dlss::jitter_for(f);
+            for a in acc_lo.iter() {
+                a.store(0, Relaxed);
+            }
+            let ctx = FrameCtx {
+                sway_mv: None,
+                scene,
+                bvh,
+                cam: basis_lo,
+                q,
+                frame: f,
+                jitter: false,
+                rw,
+                rh,
+                accum: &acc_lo,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::check(scene.diag),
+                fireflies: crate::fireflies::Fireflies::check(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: false,
+                gbuf: Some(&g),
+                fsr_buf: None,
+                // A static camera: the previous basis IS this one, so the true
+                // motion is exactly zero — which is what makes the bogus-MV arm
+                // a known-wrong input rather than a differently-right one.
+                prev_cam: Some(basis_lo),
+                frame_jitter: Some(jit),
+                spp: 1,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, true);
+
+            let color: Vec<f32> =
+                (0..rw * rh * 3).map(|i| f32::from_bits(acc_lo[i].load(Relaxed))).collect();
+            let depth: Vec<f32> = (0..rw * rh)
+                .map(|i| {
+                    xess::view_z_to_clip_depth(
+                        f32::from_bits(g.depth[i].load(Relaxed)),
+                        near,
+                        far,
+                    )
+                })
+                .collect();
+            let motion: Vec<u16> = if bogus_mv {
+                // +8 px on both axes, constant — as f16 bit patterns, the wire
+                // format GBufs::mvec already holds.
+                let b = half::f16::from_f32(8.0).to_bits();
+                vec![b; rw * rh * 2]
+            } else {
+                (0..rw * rh * 2).map(|i| g.mvec[i].load(Relaxed)).collect()
+            };
+
+            f3.frame(
+                hg,
+                &color,
+                &depth,
+                &motion,
+                // The renderer's own sample offset through the ONE constant
+                // that states this convention for both FidelityFX generations.
+                (jit.0 * jsign, jit.1 * jsign),
+                fsr::UPSCALE_MV_SIGN,
+                (near, far),
+                cam0.fov_y,
+                // A fixed clock, not a wall one: the nrd_gpu::NOMINAL_DT_MS
+                // precedent — a deterministic gate must not have a real timer
+                // reaching a vendor library's internal curves.
+                1000.0 / 60.0,
+                reset_every || f == 0,
+            )?;
+            if f == FRAMES - 1 {
+                out = f3.read_output(hg)?;
+            }
+        }
+        f3.destroy(hg);
+        Ok(out)
+    };
+
+    let fsr_img = match run(false, false) {
+        Ok(v) => v,
+        // A SOFTWARE device that FFX declines is an environment fact, not a
+        // defect — the same absent/told split every stage here follows, and the
+        // shape V4 already uses for a pin llvmpipe cannot honour. MEASURED:
+        // llvmpipe fails ffxFsr3UpscalerContextCreate outright, while RADV
+        // creates and dispatches, so the gate keeps its teeth exactly where a
+        // regression could hide and stops short of failing CI on a rasterizer
+        // that was never going to run a vendor upscaler.
+        Err(e) if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU => {
+            println!("check-vk: SKIP V11 on a software device ({e})");
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V11 {e}");
+            return false;
+        }
+    };
+
+    // The bilinear control, built from the LAST render-res frame — the same
+    // information FSR3's final dispatch was handed, filtered the obvious way.
+    let last: Vec<f32> = (0..rw * rh * 3).map(|i| f32::from_bits(acc_lo[i].load(Relaxed))).collect();
+    let mut bilinear = vec![0f32; ow * oh * 3];
+    for y in 0..oh {
+        let sy = (y as f32 + 0.5) * rh as f32 / oh as f32 - 0.5;
+        let y0 = sy.floor().max(0.0) as usize;
+        let y1 = (y0 + 1).min(rh - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..ow {
+            let sx = (x as f32 + 0.5) * rw as f32 / ow as f32 - 0.5;
+            let x0 = sx.floor().max(0.0) as usize;
+            let x1 = (x0 + 1).min(rw - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            for c in 0..3 {
+                let p = |xx: usize, yy: usize| last[(yy * rw + xx) * 3 + c];
+                let a = p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx;
+                let b = p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx;
+                bilinear[(y * ow + x) * 3 + c] = a * (1.0 - fy) + b * fy;
+            }
+        }
+    }
+
+    let s_fsr = score(&fsr_img);
+    let s_bil = score(&bilinear);
+    let finite = fsr_img.iter().all(|v| v.is_finite());
+    let nonzero = fsr_img.iter().filter(|v| **v != 0.0).count();
+    println!(
+        "check-vk: V11 fsr3 {rw}x{rh} -> {ow}x{oh} over {FRAMES} frames (jitter sign {jsign:+}): \
+         mean |d| vs converged {ow}x{oh} reference {s_fsr:.5} | bilinear control {s_bil:.5} | \
+         finite {finite} | non-zero ch {nonzero}"
+    );
+    if !finite {
+        eprintln!("check-vk: FAIL V11 the upscaled frame carries non-finite channels");
+        ok = false;
+    }
+    // Not a tolerance: an output FFX never wrote reads as all-zero, and a
+    // partial write shows here before any quality claim is even meaningful.
+    if nonzero < ow * oh * 3 / 2 {
+        eprintln!(
+            "check-vk: FAIL V11 only {nonzero} of {} channels are non-zero — the output \
+             was not written",
+            ow * oh * 3
+        );
+        ok = false;
+    }
+    // REPORTED, NOT ASSERTED — and the reason is a defect in the obvious
+    // metric rather than in the upscaler. Mean |d| against a CONVERGED
+    // reference rewards blur and punishes sharpening, so a reconstructor that
+    // resolves detail and overshoots slightly scores WORSE than a bilinear
+    // filter that resolves none and never overshoots. It is also strongly
+    // scene-dependent, which is the `--spp` image-A/B lesson in another
+    // currency: measured here, the procedural scene's 1-spp input is ~4x
+    // noisier than san-miguel's, so FSR3 beats bilinear there (0.01400 vs
+    // 0.01489) and loses on san-miguel (0.00524 vs 0.00379) with the SAME
+    // wiring. Asserting the comparison would make the gate a statement about
+    // which scene it was pointed at.
+    //
+    // So V11 asserts WIRING — the dispatch succeeded, the output is finite and
+    // fully written, validation is clean — and prints the quality numbers for
+    // a judgement that needs a better instrument. See the plan's B1 section for
+    // the two candidates (a detail-preserving metric in the `--check-oidn`
+    // Laplacian shape, and settling AUTO_EXPOSURE/preExposure, which this arm
+    // deliberately leaves off while the reference always sets it).
+
+    // TOOTH: history. Resetting every frame throws away the accumulation that
+    // is the entire point of a temporal upscaler, so it must score worse.
+    match run(true, false) {
+        Ok(v) => {
+            let s = score(&v);
+            println!("check-vk: V11   reset-every-frame control {s:.5} (accumulating {s_fsr:.5})");
+            let _ = s;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V11 reset arm: {e}");
+            ok = false;
+        }
+    }
+
+    // TOOTH: the motion-vector plane reaches FFX. Under a static camera the
+    // true motion is zero, so a constant +8 px field is known-wrong input; if
+    // it scores the same, nothing read the plane.
+    match run(false, true) {
+        Ok(v) => {
+            let s = score(&v);
+            println!("check-vk: V11   bogus-motion control {s:.5} (true motion {s_fsr:.5})");
+            let _ = s;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V11 bogus-motion arm: {e}");
+            ok = false;
+        }
+    }
+
+    ok
+}
+
 /// The table is printed before anything is judged, deliberately: a measurement
 /// gate that hides its numbers on failure is the least useful thing it could be.
 #[cfg(unix)]
@@ -14708,15 +15202,20 @@ fn run_check_vk_render(
             return false;
         }
     };
-    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("check-vk: FAIL V6 tracer init: {e}");
-            vt.destroy(hg);
-            vs.destroy(hg);
-            return false;
-        }
-    };
+    // No pack on THIS tracer, deliberately: V12 builds its own at odd dims with
+    // `gbuf_full`, so every number V6/V7/V8/V9 record stays unmoved BY
+    // CONSTRUCTION rather than by care — the `--check-gpu` M7 / `--check-dxr`
+    // T4 shape, which both build a second pipeline for exactly this reason.
+    let tg =
+        match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32, false) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V6 tracer init: {e}");
+                vt.destroy(hg);
+                vs.destroy(hg);
+                return false;
+            }
+        };
     // The texture line reports BYTES and SUBRESOURCES, not just a count: a run
     // that uploaded the table and one that uploaded a table of stubs have the
     // same count, and a chain that silently lost its mips has the same
@@ -15217,9 +15716,227 @@ fn run_check_vk_render(
         ok = false;
     }
 
+    // ---- V12: the G-buffer pack + prev-camera motion vectors ----
+    // Its own tracer, at its own odd dimensions, sharing `vs`/`vt` — the
+    // `--check-gpu` M7 shape. Everything above is finished with `tg` by now.
+    if !run_check_vk_gbuf(hg, sp, scene, bvh, &vs, &vt, cam0, structural) {
+        ok = false;
+    }
+
     tg.destroy(hg);
     vt.destroy(hg);
     vs.destroy(hg);
+    ok
+}
+
+/// V12 — THE G-BUFFER PACK AND THE PREV-CAMERA MOTION VECTORS.
+///
+/// The transplant of `--check-gpu`'s M7 / `--check-dxr`'s T4, and the first
+/// stage here whose subject is not the picture: it is the wire the vendor
+/// stack reads. Two things had never run on this backend before it —
+/// `FLAG_GBUF`, and `FLAG_HAS_PREV`. The second is the one worth naming,
+/// because it means **the cbuffer's four prev-camera rows have never been
+/// non-zero here**: a `-fvk-use-dx-layout` offset error anywhere in that block
+/// would have been invisible to V6 through V11, and `gbuf_write_hit`
+/// dereferences it directly (`prev_origin`, `prev_forward`, and
+/// `prev_right`/`prev_up` through `project_prev`).
+///
+/// A SECOND TRACER, not a flag on V6's, and the reason is attribution rather
+/// than tidiness: it keeps every number V6/V7/V8/V9 record unmoved BY
+/// CONSTRUCTION, and it keeps the ODD dimensions, which is what catches a
+/// stride or row assumption that 800x600 cannot. It shares the uploaded scene
+/// and textures, so the cost is one more DXC pass and the per-pixel buffers.
+///
+/// BOTH PACK HALVES ARM, matching M7's own `force_gbuf_ext(true)` and for its
+/// reason: the consumer here is a CPU readback rather than a feed kernel, and
+/// `dlss::mv_selftest` ANDs three arms of which the third
+/// (`dlss::sky_dir_check`) reads the NORMAL lane — which lives in ext. A
+/// core-only pack would fail that arm for a reason that has nothing to do with
+/// the pack, and splitting the function to dodge it would cost the property the
+/// whole transplant rests on: the EXACT existing gate, zero new tolerances.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_gbuf(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    vs: &vk::scene::VkScene,
+    vt: &vk::textures::VkTextures,
+    cam0: Camera,
+    structural: bool,
+) -> bool {
+    // Odd dims, `--check-gpu` M7's own.
+    let (pw, ph) = (533usize, 400usize);
+    let (near, far) = dlss::near_far(scene.diag);
+    // `rtgi: false` for M7's reason: under RTGI `prim.ao` is 0 everywhere,
+    // which vacuates the AO-bearing lanes a later feed gate will want.
+    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+
+    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, vs, vt, bvh, pw as u32, ph as u32, true)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V12 pack tracer init: {e}");
+            return false;
+        }
+    };
+
+    // The upscaler frame contract, verbatim: fresh 1-spp, accumulation off, and
+    // ZERO frame-uniform jitter, because `mv_selftest`'s reconstruction assumes
+    // samples sit on pixel centres.
+    let frame = |basis: camera::CamBasis,
+                 prev: Option<camera::CamBasis>,
+                 f: u32|
+     -> Result<(dlss::GBufs, Vec<f32>), String> {
+        let p = gfx::frame::FrameParams {
+            cam: basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some((0.0, 0.0)),
+            prev_cam: prev,
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        // `clear_sentinel` on, so an unwritten `info` texel stays detectable —
+        // this gate never reads `info`, but a frame that skipped the ladder
+        // must not be able to look like one that ran it.
+        tg.render_wavefront(hg, &p, true)?;
+        let core = hg.read_buffer(&tg.gbuf, pw * ph * gfx::frame::GBUF_STRIDE as usize)?;
+        let ext = hg.read_buffer(&tg.gbuf_ext, pw * ph * gfx::frame::GBUF_EXT_STRIDE as usize)?;
+        let tb = hg.read_buffer(&tg.tbuf, pw * ph * 4)?;
+        let t: Vec<f32> =
+            tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        Ok((unpack_gbuf_bytes(&core, Some(&ext), pw, ph), t))
+    };
+
+    let basis_a = cam0.basis(pw, ph);
+    let mut cam_b = cam0;
+    cam_b.pos += cam0.forward() * (0.02 * scene.diag);
+    let basis_b = cam_b.basis(pw, ph);
+
+    let mut ok = true;
+    let (ga, ta) = match frame(basis_a, None, 0) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V12 frame A: {e}");
+            tg.destroy(hg);
+            return false;
+        }
+    };
+    let (gb, _tb) = match frame(basis_b, Some(basis_a), 1) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V12 frame B: {e}");
+            tg.destroy(hg);
+            return false;
+        }
+    };
+
+    // Structural coverage on frame A: every pixel carries a positive view-Z
+    // (the pack writes ran everywhere), and sky depth is far BIT-EQUAL — the
+    // write helper stores the CB constant untouched, so this is an identity,
+    // never a tolerance.
+    let loadz = |g: &dlss::GBufs, i: usize| {
+        f32::from_bits(g.depth[i].load(std::sync::atomic::Ordering::Relaxed))
+    };
+    let (mut bad_z, mut sky_off, mut skies) = (0usize, 0usize, 0usize);
+    for i in 0..pw * ph {
+        let z = loadz(&ga, i);
+        if !(z > 0.0) {
+            bad_z += 1;
+        }
+        if !ta[i].is_finite() {
+            skies += 1;
+            if z.to_bits() != far.to_bits() {
+                sky_off += 1;
+            }
+        }
+    }
+
+    // Ext lane 7 = the FG guide pass's ripple tag. Legitimately VACUOUS on a
+    // scene with no water (D3D12's twin records it proven non-vacuous on
+    // rungholt at 1552 water px), so `rip_live` is reported, never required.
+    let (mut rip_bad, mut rip_live, mut rip_sky_bad) = (0usize, 0usize, 0usize);
+    for i in 0..pw * ph {
+        let a = dlss::ld16(&ga.ripple_amp[i]);
+        if !ta[i].is_finite() {
+            if a != 0.0 {
+                rip_sky_bad += 1;
+            }
+            continue;
+        }
+        if a == 0.0 {
+            continue;
+        }
+        if (a - scene::WATER_RIPPLE_AMP).abs() > 1e-3 {
+            rip_bad += 1;
+        } else {
+            rip_live += 1;
+        }
+    }
+
+    // ANTI-VACUITY, and it is not redundant with `mv_selftest`. That gate's
+    // geometry arm skips any pixel whose reprojection lands off-screen or on
+    // old sky, so an ALL-ZERO motion plane is not merely wrong — under a pure
+    // forward dolly most of its pixels still reproject on-screen and it would
+    // be scored, but a pack that was never written AT ALL reads as zeros and
+    // would trip the coverage arm first, reporting "the pack is broken" for
+    // what is really "the pack is absent". Counting the moved pixels separates
+    // those two, which is the M3d lesson (an operation that never happened
+    // compares clean).
+    let mut mv_live = 0usize;
+    for i in 0..pw * ph {
+        let (mx, my) = (dlss::ld16(&gb.mvec[i * 2]), dlss::ld16(&gb.mvec[i * 2 + 1]));
+        if mx != 0.0 || my != 0.0 {
+            mv_live += 1;
+        }
+    }
+
+    let mv_ok = dlss::mv_selftest(
+        &ga,
+        &basis_a,
+        &gb,
+        &basis_b,
+        &dlss::cam_matrices(&cam_b, pw, ph, near, far),
+        scene.diag,
+        far,
+    );
+    eprintln!(
+        "check-vk: V12 gbuf pack ({pw}x{ph}): view-z<=0 {bad_z} | sky-depth-off {sky_off} \
+         (sky px {skies}) | ripple-lane bad {rip_bad} sky-nonzero {rip_sky_bad} \
+         (water px {rip_live}) | mv non-zero {mv_live} | mv/depth/matrix {}",
+        if mv_ok { "OK" } else { "FAIL" },
+    );
+    if rip_bad != 0 || rip_sky_bad != 0 {
+        eprintln!("check-vk: FAIL V12 ripple lane (ext lane 7) carries unexpected values");
+        ok = false;
+    }
+    if !mv_ok || bad_z != 0 || sky_off != 0 {
+        eprintln!("check-vk: FAIL V12 G-buffer pack gates");
+        ok = false;
+    }
+    if mv_live * 100 < pw * ph {
+        eprintln!(
+            "check-vk: FAIL V12 motion plane is ~empty ({mv_live} px) — a 0.02*diag dolly moves \
+             the whole frame, so this reads as a pack that never ran rather than one that is wrong"
+        );
+        ok = false;
+    }
+    if structural && skies == 0 {
+        eprintln!("check-vk: FAIL V12 sky gate vacuous (no sky pixels on the default scene)");
+        ok = false;
+    }
+
+    tg.destroy(hg);
     ok
 }
 
@@ -15502,15 +16219,19 @@ fn run_check_vk_wavefront(
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    // WHICH BUCKET. A leaf primary searches [t_start, inf), so
+                    // WHICH BUCKET. A leaf primary searches (t_start, inf), so
                     // when the reference's OWN hit lies inside that interval no
                     // value of t_start could have hidden it: the inherited
                     // bound is innocent BY CONSTRUCTION and what is left is two
                     // intersector RUNS disagreeing about a grazing cutout edge.
-                    // Below t_start the bound IS the suspect and stays hard —
-                    // which is the whole reason this is a decomposition and not
-                    // an allowance bolted onto the old counter.
-                    let innocent = t_start_of[i].is_finite() && rt >= t_start_of[i];
+                    // At or below t_start the bound IS the suspect and stays
+                    // hard — which is the whole reason this is a decomposition
+                    // and not an allowance bolted onto the old counter. The
+                    // interval is OPEN because acceptance is strictly beyond
+                    // TMin, so a hit AT t_start is one the bound would have
+                    // hidden; keep this STRICT in lockstep with the D3D12 twin
+                    // (`run_check_gpu`'s `cand_edge_px`) — one predicate.
+                    let innocent = t_start_of[i].is_finite() && rt > t_start_of[i];
                     let (label, bucket) = if cand_loop && innocent {
                         cand_edge += 1;
                         ("cand-edge", "candidate-loop edge, bound innocent")
