@@ -780,6 +780,65 @@ cargo run --release -- --xess --oidn-post  # + OIDN post-denoise on the upscaled
 cargo run --release -- --xess --no-adaptive  # XeSS without the adaptive shading rate (uniform per-pixel shading)
 cargo run --release -- --xess --xess-autoexposure  # XeSS computes exposure internally (A/B lever)
 cargo run --release -- --check-fsr    # headless: FSR signal-split/encoding/MV/provider-pick contract self-test (no GPU, no DLL)
+                                      # — plus, since 2026-08-11, gate 8: the SECOND FidelityFX
+                                      # generation (SDK 1.1.4, src/ffx_fsr3.rs). Two FFX
+                                      # generations coexist and do NOT compete: everything else in
+                                      # this file is ffx-api v2.3.0 (signed prebuilt DX12 provider
+                                      # DLLs — FSR4, Ray Regeneration, frame generation), which
+                                      # cannot reach the Vulkan or Metal backends because it has NO
+                                      # Vulkan backend at all (its own readme lists "Vulkan is
+                                      # currently not supported in SDK" under known issues) and v2
+                                      # REMOVED the FfxInterface custom-backend seam, so a Metal
+                                      # implementation is not merely unwritten but unexpressible.
+                                      # v1.1.4 is the last MIT-source generation with a stock
+                                      # first-party ffx_vk AND a seam. Windows keeps v2.3.0.
+                                      # UNLIKE EVERY OTHER SDK HERE IT IS COMPILED FROM SOURCE and
+                                      # statically linked — no DLL, no fn-pointer table, no
+                                      # runtime shed; the degrade is at BUILD time
+                                      # (cfg(ffx_fsr3_src), set by build.rs only when BOTH halves
+                                      # are present). Warn-and-skip, deliberately NOT require_nrd()'s
+                                      # hard fail: NRD is the default denoiser so a tree that cannot
+                                      # produce it renders undenoised silently, while FSR3 here is
+                                      # opt-in and its absence costs a feature, not correctness.
+                                      # TWO HALVES, ONLY ONE FETCHABLE: the SDK source
+                                      # (`install-prerequisites.sh fsr3src` — 4 paths of a 189 MB
+                                      # tarball, ~19 MB, gitignored) and the SPIR-V shader
+                                      # permutations, which are COMMITTED (200 files / ~17 MiB,
+                                      # plain git, SDKs/FidelityFX-SDK-prebuilt/) because the SDK
+                                      # compiles them with FidelityFX_SC.exe, a WINDOWS-ONLY tool,
+                                      # and upstream ships no prebuilt SPIR-V — vendoring the output
+                                      # is what makes FSR3 buildable off Windows at all. They serve
+                                      # BOTH backends: Metal transpiles the same bytes to .metallib
+                                      # at build time, so no Metal shader artifact is committed.
+                                      # shim/ffx_msvc_compat.h is force-included into every SDK TU
+                                      # (`-include`, never a patch — the sources are FETCHED and a
+                                      # patch would silently un-apply on the next fetch): it
+                                      # supplies _countof/wcscpy_s/strcpy_s/sprintf_s/swprintf_s
+                                      # and, load-bearing, RAISES FFX_SDK_DEFAULT_CONTEXT_SIZE from
+                                      # the upstream 128 KB to 1 MB, because that constant is sized
+                                      # against a 2-byte wchar_t and every non-MSVC platform's
+                                      # 4-byte one bloats the private FSR3 context past it.
+                                      # MEASURED: all 7 backend-neutral TUs compile unmodified
+                                      # under clang on macOS with only that header; the blob
+                                      # accessor links 3.4 MB of SPIR-V; libffx_fsr3.a is 4.4 MB.
+                                      # Gate 8 is a PIN PAIR check in nrd.rs's GetLibraryDesc shape
+                                      # — it reads the version out of the headers the objects were
+                                      # COMPILED against and compares it to ffx_fsr3::PIN, so
+                                      # fetching a different FFX_SRC_TAG without moving the PIN
+                                      # fails loudly instead of surfacing as unattributed behaviour
+                                      # — plus a read-back of the context size THROUGH the SDK's own
+                                      # headers, which is what proves the force-include actually
+                                      # reached them rather than trusting that a build flag is still
+                                      # being passed. The pure half (the (major<<22)|(minor<<12)|patch
+                                      # round-trip + field-bleed teeth) runs on EVERY platform
+                                      # including Windows, which never builds the SDK: the packing
+                                      # is a fact about ffx_interface.h, not about the host, and a
+                                      # gate that only ran where the feature is built would stop
+                                      # covering the transcription the moment someone develops on
+                                      # the other OS. Touch shim/ffx_fsr3.* / shim/ffx_msvc_compat.h
+                                      # / build.rs's build_ffx_fsr3 / src/ffx_fsr3.rs → run
+                                      # --check-fsr with the SDK present AND with it moved aside
+                                      # (the degrade is the half nothing else covers)
 cargo run --release -- --fsr          # force-start the upscaler chain at FSR4 + Ray Regeneration
                                       # (K toggles; RDNA4 only — elsewhere the chain falls through
                                       # XeSS to FSR 3.1 upscale-only, cross-vendor; also flips the

@@ -40,8 +40,116 @@ fn require_nrd() {
     }
 }
 
+/// The FidelityFX SDK 1.1.4 core — the backend-neutral half of FSR3 for the
+/// Vulkan and Metal backends. See shim/ffx_fsr3.cpp for why a second, older
+/// FidelityFX generation exists beside the Windows ffx-api v2.3.0 path.
+///
+/// WARN AND SKIP, NEVER PANIC. quinlight-player (where this integration comes
+/// from) panics when the SDK is absent; this tree must not, because a bare
+/// checkout has to build — install-prerequisites.sh's own header states it
+/// ("Building NEVER needs any of this"), and every gate that runs in CI runs
+/// without a single vendor SDK on disk. So this follows the DLSS block's
+/// degrade: one `cargo:warning` naming the missing half, no cfg, and a build
+/// that simply has no FSR3. It is deliberately NOT the `require_nrd()` shape —
+/// NRD hard-fails because it is the DEFAULT denoiser and a tree that cannot
+/// produce it renders undenoised without saying so; FSR3 here is opt-in and its
+/// absence costs a feature, not correctness.
+///
+/// TWO HALVES, BOTH REQUIRED, ONLY ONE FETCHABLE: the SDK source
+/// (`install-prerequisites.sh fsr3src`) and the pre-built SPIR-V permutations,
+/// which are COMMITTED because the SDK compiles them with a Windows-only tool.
+/// They are reported separately so a missing one names the right fix — a
+/// re-fetch or a re-checkout, never both.
+#[cfg(not(windows))]
+fn build_ffx_fsr3() {
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let sdk = manifest.join("SDKs/FidelityFX-SDK/sdk");
+    let shaders = manifest.join("SDKs/FidelityFX-SDK-prebuilt/shaders/vk");
+
+    // The two sentinels build.rs and the installer agree on — one fact, one
+    // place, so a partial install cannot read as complete on either side.
+    let sdk_stamp = sdk.join("CMakeLists.txt");
+    let shader_stamp = shaders.join("ffx_fsr3upscaler_accumulate_pass_permutations.h");
+    println!("cargo:rerun-if-changed={}", sdk_stamp.display());
+    println!("cargo:rerun-if-changed={}", shader_stamp.display());
+    println!("cargo:rerun-if-changed=shim/ffx_fsr3.cpp");
+    println!("cargo:rerun-if-changed=shim/ffx_fsr3.h");
+    println!("cargo:rerun-if-changed=shim/ffx_msvc_compat.h");
+
+    if !sdk_stamp.exists() {
+        println!(
+            "cargo:warning=FidelityFX SDK 1.1.4 source not found at {} — FSR3 disabled \
+             for the Vulkan/Metal backends (./install-prerequisites.sh fsr3src)",
+            sdk.display()
+        );
+        return;
+    }
+    if !shader_stamp.exists() {
+        println!(
+            "cargo:warning=the committed FSR3 SPIR-V permutations are missing from {} — \
+             FSR3 disabled. They ship in this repository (their compiler is Windows-only); \
+             re-check out that directory.",
+            shaders.display()
+        );
+        return;
+    }
+
+    // The backend-NEUTRAL translation units only. `ffx_vk.cpp` (Vulkan) and the
+    // hand-written Metal `FfxInterface` land beside these when their backends
+    // do, because each needs an API's headers that the other platform lacks —
+    // and ffx_vk.cpp additionally needs GCC's vectorizer disabled (an alignment
+    // UB in CreateBackendContextVK that miscompiles into a segfault at -O2+).
+    let src = sdk.join("src");
+    let units = [
+        "components/fsr3upscaler/ffx_fsr3upscaler.cpp",
+        "shared/ffx_assert.cpp",
+        "shared/ffx_message.cpp",
+        "shared/ffx_breadcrumbs_list.cpp",
+        "shared/ffx_object_management.cpp",
+        "backends/shared/ffx_shader_blobs.cpp",
+        "backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp",
+    ];
+
+    let mut b = cc::Build::new();
+    b.cpp(true)
+        .std("c++17")
+        // Third-party source we do not edit, so its warnings are noise we
+        // cannot act on — and `cc` surfaces them as `cargo:warning`, i.e. on
+        // EVERY build, where they would bury the two warnings this function
+        // actually wants read (the missing-half degrades above). The SDK
+        // carries MSVC `#pragma warning` directives clang does not know and
+        // aggregate initializers that trip -Wextra; neither is a defect.
+        .warnings(false)
+        // Force-included rather than patched into the sources: the SDK is
+        // FETCHED, so a local patch would silently un-apply on the next fetch.
+        .flag("-include")
+        .flag(manifest.join("shim/ffx_msvc_compat.h").to_str().unwrap())
+        .define("FFX_FSR3UPSCALER", None)
+        .include(sdk.join("include"))
+        .include(&src)
+        // The SDK's own sources include each other by bare name from these
+        // three directories, and the blob accessor includes the permutation
+        // headers by bare name too — which is what points the last include at
+        // the COMMITTED shaders rather than anywhere under the fetched tree.
+        .include(src.join("shared"))
+        .include(src.join("backends/shared"))
+        .include(src.join("components"))
+        .include(&shaders);
+    for u in units {
+        b.file(src.join(u));
+    }
+    b.file(manifest.join("shim/ffx_fsr3.cpp"));
+    b.compile("ffx_fsr3");
+
+    println!("cargo:rustc-cfg=ffx_fsr3_src");
+}
+
 fn main() {
     require_nrd();
+    // Declared on every platform, not just where it can be set: Windows never
+    // builds this (it upscales through ffx-api v2.3.0), and an undeclared cfg
+    // is a warning wherever the attribute is written.
+    println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_src)");
     #[cfg(windows)]
     {
         // FidelityFX FFI shim: the ffx-api structs (pNext chains,
@@ -150,6 +258,7 @@ fn main() {
     #[cfg(not(windows))]
     {
         println!("cargo:rustc-check-cfg=cfg(dlss_ngx)");
+        build_ffx_fsr3();
 
         // `intel_tex_2` (the ispc BC7 encoder — the `--bc7-cpu` A/B arm) ships
         // PRECOMPILED objects whose C++ exception tables reference
