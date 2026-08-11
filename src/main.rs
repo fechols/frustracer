@@ -12351,7 +12351,7 @@ fn run_check_vk_render(
     // the lever changes, and the layout is what V5 derives.
     if gfx::shaders::sw_rays() {
         println!(
-            "check-vk: SKIP V6/V7/V8 (--sw-rays is armed — its intersector reads the binary \
+            "check-vk: SKIP V6/V7/V8/V9 (--sw-rays is armed — its intersector reads the binary \
              tree at t0 and tri_idx at t1, streams this backend does not bind yet; V5 covers \
              that corpus's layout)"
         );
@@ -12838,6 +12838,11 @@ fn run_check_vk_render(
 
     // ---- V8: the hemisphere bounce tiers ----
     if !run_check_vk_hemi(hg, &tg, scene, bvh, basis, q, gw, gh, structural) {
+        ok = false;
+    }
+
+    // ---- V9: structure replay ----
+    if !run_check_vk_replay(hg, &tg, scene, basis, q, gw, gh, structural) {
         ok = false;
     }
 
@@ -13574,6 +13579,309 @@ fn run_check_vk_hemi(
         }
         if hits == 0 || ctr(gs::CTR_HEMI_RAYS) == 0 {
             fail(&mut ok, "hemi frame must-fires (hit pixels and leaf rays both expected > 0)".into());
+        }
+    }
+    ok
+}
+
+/// V9 — STRUCTURE REPLAY: a bit-equal-basis frame skips the seed and the whole
+/// level ladder and re-dispatches the persisted terminal queues.
+///
+/// The claim is unusually strong for a performance feature, and that is what
+/// makes it gateable at all: the terminal structure is a pure function of
+/// (scene, BVH, basis, rw, rh), while spp/jitter/frame/fb/quality/clouds ride
+/// the cbuffer — so a replay is not an approximation of a fresh trace, it is
+/// BIT-IDENTICAL to one. Every other Vulkan stage is scored against something
+/// (the CPU, the reference kernel, a cosine reference); this one is scored
+/// against itself, exactly.
+///
+/// Four gates, and the last two are what stop the first two passing vacuously:
+///
+/// - **bit-identity** — tbuf, info and accum, byte for byte, against the frame
+///   that produced the structure.
+/// - **exactly-once coverage** — with the sentinel re-flooded, so a replay that
+///   silently covered fewer pixels cannot hide behind the previous frame's
+///   identical `info`. That flood is the reason the sentinel is re-armed here
+///   rather than reusing V7's.
+/// - **the ladder provably did not run** — `CTR_SPLIT`/`CTR_TILE_A`/
+///   `CTR_TILE_B` all 0. Without this, "replay" that quietly re-traced the
+///   whole quadtree would pass bit-identity PERFECTLY, which is the exact
+///   shape of a feature that is wired up and doing nothing.
+/// - **the terminal counts survived** — `CTR_LEAF`/`CTR_SKY`/`CTR_CUT` equal
+///   across the pair, which is the keep-set `cs_seed_replay` exists to
+///   preserve, and the producing frame must have SPLIT at all.
+///
+/// BOTH TEETH ARE EXERCISED, and each catches what the others cannot. A full
+/// trace in the replay slot passes bit-identity, coverage AND the counts —
+/// only the ladder check fires (measured `split 257 tiles 192/0`). Dropping
+/// the keep-set fails four gates, and the interesting half is which two it
+/// does NOT: `tbuf-diff` and `accum-diff` stay 0, because a replay that
+/// dispatched no terminal work leaves those buffers STALE-CORRECT from the
+/// producing frame. That is the M3d lesson in another currency — an operation
+/// that never happened compares clean — and it is the whole reason the
+/// sentinel is re-flooded here (`replay sentinels 480000` is what caught it).
+///
+/// Then the WARM arm, because frame 0 is the easy case: a replay at a jittered
+/// frame 1 must equal a fresh trace at that frame, via the re-produce sequence
+/// (trace f0, trace f1) vs (trace f0, replay f1). That is what proves the
+/// structure is independent of the SHADING state and not merely stable across
+/// two identical frames.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_replay(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: camera::CamBasis,
+    q: Quality,
+    gw: usize,
+    gh: usize,
+    structural: bool,
+) -> bool {
+    use gfx::shaders as gs;
+
+    if tg.wave_shape().is_none() {
+        println!("check-vk: SKIP V9 (structure replay is the ladder's, and --sw-rays takes it)");
+        return true;
+    }
+    let mut ok = true;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V9 {msg}");
+        *ok = false;
+    };
+    let px = gw * gh;
+    let mk = |frame: u32| gfx::frame::FrameParams {
+        cam: basis,
+        frame,
+        accumulate: true,
+        jitter: frame > 0,
+        frame_jitter: None,
+        prev_cam: None,
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+    let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    let read_u32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<u32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    // BIT compare, not approximate: `==` on f32 would call two NaNs unequal and
+    // +0.0 equal to -0.0, and this gate means neither.
+    let bits = |a: &[f32], b: &[f32]| {
+        a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    };
+
+    // The producing frame. Sentinel on, so `info` is a clean coverage record.
+    let p0 = mk(0);
+    if let Err(e) = tg.render_wavefront(hg, &p0, true) {
+        fail(&mut ok, format!("produce dispatch: {e}"));
+        return false;
+    }
+    let (prod_t, prod_info, prod_acc, prod_ctr) = match (
+        read_f32(&tg.tbuf, px),
+        read_u32(&tg.info, px),
+        read_f32(&tg.accum, px * 3),
+        tg.read_counters(hg),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            fail(&mut ok, "produce readback".into());
+            return false;
+        }
+    };
+    // Replay the SAME basis, sentinel on again.
+    if let Err(e) = tg.render_wavefront_replay(hg, &p0, true) {
+        fail(&mut ok, format!("replay dispatch: {e}"));
+        return false;
+    }
+    let (rep_t, rep_info, rep_acc, rep_ctr) = match (
+        read_f32(&tg.tbuf, px),
+        read_u32(&tg.info, px),
+        read_f32(&tg.accum, px * 3),
+        tg.read_counters(hg),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            fail(&mut ok, "replay readback".into());
+            return false;
+        }
+    };
+
+    let td = bits(&prod_t, &rep_t);
+    let idiff = prod_info.iter().zip(&rep_info).filter(|(a, b)| a != b).count();
+    let ad = bits(&prod_acc, &rep_acc);
+    let sentinels = rep_info.iter().filter(|&&i| i == 0xffff_ffff).count();
+    let c = |v: &[u32], i: u32| v.get(i as usize).copied().unwrap_or(0);
+    let (leaf_p, leaf_r) = (c(&prod_ctr, gs::CTR_LEAF), c(&rep_ctr, gs::CTR_LEAF));
+    let (sky_p, sky_r) = (c(&prod_ctr, gs::CTR_SKY), c(&rep_ctr, gs::CTR_SKY));
+    let (cut_p, cut_r) = (c(&prod_ctr, gs::CTR_CUT), c(&rep_ctr, gs::CTR_CUT));
+    let split_p = c(&prod_ctr, gs::CTR_SPLIT);
+    let (split_r, ta_r, tb_r) = (
+        c(&rep_ctr, gs::CTR_SPLIT),
+        c(&rep_ctr, gs::CTR_TILE_A),
+        c(&rep_ctr, gs::CTR_TILE_B),
+    );
+    println!(
+        "check-vk: V9 structure replay (frame 0): tbuf-diff {td} | info-diff {idiff} | \
+         accum-diff {ad} | replay sentinels {sentinels} | leaf {leaf_p}/{leaf_r} \
+         sky {sky_p}/{sky_r} cut {cut_p}/{cut_r} | split produce {split_p} replay {split_r} \
+         tiles {ta_r}/{tb_r}"
+    );
+    if td != 0 || idiff != 0 || ad != 0 {
+        fail(
+            &mut ok,
+            format!("replay not bit-identical to the fresh trace (tbuf {td} info {idiff} accum {ad})"),
+        );
+    }
+    if sentinels != 0 {
+        fail(&mut ok, format!("replay left {sentinels} px unwritten (exactly-once coverage)"));
+    }
+    if leaf_p != leaf_r || sky_p != sky_r || cut_p != cut_r {
+        fail(&mut ok, "replay did not preserve the terminal counts (the keep-set)".into());
+    }
+    if split_r != 0 || ta_r != 0 || tb_r != 0 {
+        fail(
+            &mut ok,
+            format!("replay RAN the ladder (split {split_r} tiles {ta_r}/{tb_r} — expected 0)"),
+        );
+    }
+    if structural && split_p == 0 {
+        fail(&mut ok, "the producing frame never split — the replay proof is vacuous".into());
+    }
+
+    // ---- the warm arm: a jittered frame 1 ----
+    //
+    // (trace f0, trace f1) vs (trace f0, replay f1). Per-pixel results are
+    // queue-order-independent, so the two accumulations must agree BITWISE
+    // even though frame 1 shades at a different jitter than frame 0.
+    let p1 = mk(1);
+    let warm = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
+        tg.render_wavefront(hg, &p0, false)?;
+        tg.render_wavefront(hg, &p1, false)?;
+        let traced = read_f32(&tg.accum, px * 3)?;
+        tg.render_wavefront(hg, &p0, false)?; // re-produce the same structure
+        tg.render_wavefront_replay(hg, &p1, false)?;
+        let replayed = read_f32(&tg.accum, px * 3)?;
+        Ok((traced, replayed))
+    })();
+    match warm {
+        Ok((a, b)) => {
+            let wd = bits(&a, &b);
+            println!("check-vk: V9 structure replay (warm frame 1): accum-diff {wd}");
+            if wd != 0 {
+                fail(&mut ok, format!("warm replay diverged from the fresh trace ({wd} channels)"));
+            }
+        }
+        Err(e) => fail(&mut ok, format!("warm arm: {e}")),
+    }
+
+    // ---- the fb arm: a GI frame replays too ----
+    //
+    // The replay path has its own fb branch (zero the H accumulator, then the
+    // hemisphere wavefront and its compose splat), and without this arm nothing
+    // would run it. It is also the gate that WOULD have caught the missing
+    // per-frame `clear_h` this stage fixed: `hbuf` is written by atomic ADD, so
+    // an unzeroed pair integrates the produce frame's answer twice and the
+    // second accum cannot match the first.
+    if tg.has_hemi() {
+        let pf = gfx::frame::FrameParams {
+            q: Quality { fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 }, ..q },
+            ..mk(0)
+        };
+        let fbarm = (|| -> Result<(Vec<f32>, Vec<f32>, usize, [u32; 4], [u32; 4]), String> {
+            let work = |c: &[u32]| {
+                let g = |i: u32| c.get(i as usize).copied().unwrap_or(0);
+                [g(gs::CTR_HEMI_PT), g(gs::CTR_HEMI_RAYS), g(gs::CTR_HEMI_EMPTY), g(gs::CTR_OVERFLOW)]
+            };
+            tg.render_wavefront(hg, &pf, false)?;
+            let traced = read_f32(&tg.accum, px * 3)?;
+            let w1 = work(&tg.read_counters(hg)?);
+            // THE CONTROL, and it has to come first: two FRESH fb traces at the
+            // same pose. The hemisphere integrator's reproducibility claim
+            // rests on integer atomics in `hbuf`, and if it does not hold
+            // trace-to-trace then a trace-vs-replay difference says nothing
+            // about replay.
+            tg.render_wavefront(hg, &pf, false)?;
+            let control = bits(&traced, &read_f32(&tg.accum, px * 3)?);
+            let w2 = work(&tg.read_counters(hg)?);
+            tg.render_wavefront_replay(hg, &pf, false)?;
+            let replayed = read_f32(&tg.accum, px * 3)?;
+            Ok((traced, replayed, control, w1, w2))
+        })();
+        match fbarm {
+            Ok((a, b, control, w1, w2)) => {
+                let fd = bits(&a, &b);
+                let live = a.iter().filter(|v| **v != 0.0).count();
+                println!(
+                    "check-vk: V9 structure replay (fb GI frame): accum-diff {fd} | \
+                     trace-vs-trace control {control} | lit ch {live}"
+                );
+                // THE CONTROL CHOOSES THE TIER; IT MUST NOT SET THE BAR. That
+                // distinction is the whole design here, and it is measured
+                // rather than reasoned: a scene whose two fresh traces agree
+                // bitwise has a reproducible integrator, so the replay must
+                // agree bitwise too — no tolerance at all — while a scene whose
+                // own frames disagree cannot demand better of the replay. On
+                // this hardware an ALPHA-CUTOUT candidate loop enumerates
+                // candidates in an implementation-defined order that varies
+                // between two IDENTICAL dispatches (san-miguel-low-poly:
+                // control ~190 channels of 1.44M, and `FR_ABL=noalpha` returns
+                // BOTH numbers to exactly 0, which is what attributes it;
+                // rungholt has cutout too and still reads 0, so it is that
+                // scene's foliage inside the GI hemisphere, not cutout as such).
+                //
+                // The relaxed tier's bar is an ABSOLUTE fraction of channels,
+                // NOT "no worse than the control" — because a real defect
+                // inflates both. Measured with the per-frame H clear removed:
+                // fd 1014795 against a control of 1014789, i.e. a
+                // relative-to-control bar would have passed the exact bug this
+                // arm exists to catch, while the absolute bar fails it 705x
+                // over.
+                if control == 0 {
+                    if fd != 0 {
+                        fail(
+                            &mut ok,
+                            format!("fb replay diverged from a REPRODUCIBLE fresh trace ({fd} channels)"),
+                        );
+                    }
+                } else {
+                    let bar = ((px * 3) as f64 * 1e-3) as usize;
+                    if fd > bar {
+                        fail(
+                            &mut ok,
+                            format!(
+                                "fb replay diverged by {fd} channels — past the {bar} bar, and \
+                                 far past this frame's own {control}-channel nondeterminism"
+                            ),
+                        );
+                    }
+                }
+                // What LICENSES that relaxation: the two fresh traces must have
+                // done the same WORK. Identical point/ray/empty-cell counts say
+                // the difference is fp ordering inside the same traversal, not
+                // a different traversal — and a structural divergence here
+                // would be a defect in its own right, whatever the pixels say.
+                if w1 != w2 {
+                    fail(
+                        &mut ok,
+                        format!("two fresh fb traces did different WORK: {w1:?} vs {w2:?}"),
+                    );
+                }
+                if live == 0 {
+                    fail(&mut ok, "fb replay arm rendered nothing (the comparison is vacuous)".into());
+                }
+            }
+            Err(e) => fail(&mut ok, format!("fb arm: {e}")),
         }
     }
     ok

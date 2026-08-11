@@ -4661,12 +4661,12 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
-                                      # M3a's V5, M3b/M3d's V6, M3c's V7, and M3e's V8).
+                                      # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
                                       # against, so a module can be perfectly valid and read the wrong
-                                      # resource. Nine stages: V0 the pure pick/memory logic (runs with no
+                                      # resource. Ten stages: V0 the pure pick/memory logic (runs with no
                                       # Vulkan on the box at all) | V1 loader + instance + device | V2
                                       # compile smoke.hlsl to SPIR-V and build the pipelines | V3 run the
                                       # seed -> prep -> indirect-fill chain and read the results back |
@@ -4677,7 +4677,9 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # WAVEFRONT QUADTREE, scored against V6 — the first EXACT-ZERO gates
                                       # on Vulkan, because two kernels on one device have no excuse |
                                       # V8 the HEMISPHERE BOUNCE TIERS (the H key's AO and GI), the last
-                                      # render-path arm the Vulkan tracer did not have.
+                                      # render-path arm the Vulkan tracer did not have | V9 STRUCTURE
+                                      # REPLAY, the only gate here scored against ITSELF rather than
+                                      # against a reference.
                                       # V3 IS THE POINT: constants reaching a kernel, storage buffers
                                       # bound and written, a GPU-WRITTEN counter turned into dispatch
                                       # arguments by a second kernel, and a third kernel launched from
@@ -5202,6 +5204,78 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # corpus genuinely declares NO acceleration structure, so V5's anti-vacuity
                                       # stands that one shape down under the lever — the expectation follows what the
                                       # units were compiled from, like every other scene-keyed must-fire here.
+                                      # V9 — STRUCTURE REPLAY, and the only gate in this suite scored against
+                                      # ITSELF (M3f, 2026-08-11). A frame whose basis bit-equals the previous
+                                      # producing frame's skips the seed and the WHOLE level ladder and
+                                      # re-dispatches the persisted terminal queues (qleaf/qsky/cut_pool +
+                                      # CTR_LEAF/CTR_SKY/CTR_CUT). Every other stage here is scored against
+                                      # something — the CPU, the reference kernel, a 4096-sample cosine
+                                      # reference — so every bar is statistical; this one's claim is that the
+                                      # terminal structure is a PURE FUNCTION of (scene, BVH, basis, rw, rh)
+                                      # while spp/jitter/frame/fb/quality/clouds all ride the cbuffer, which
+                                      # makes a replay not an approximation of a fresh trace but BIT-IDENTICAL
+                                      # to one. MEASURED (RADV, 800x600): tbuf-diff 0 | info-diff 0 |
+                                      # accum-diff 0 | sentinels 0 | leaf 768/768 sky 4/4 cut 65/65 | split
+                                      # produce 257 replay 0 tiles 0/0, on procedural, san-miguel-low-poly,
+                                      # DamagedHelmet, Sponza, rungholt, vokselia, --stress 200, both
+                                      # FR_VK_RES parities, --no-ftree, --no-wide-levels, and llvmpipe.
+                                      # ONE NEW KERNEL, and it is a different kernel rather than a flag on
+                                      # cs_seed: cs_seed_replay zeroes every counter EXCEPT the three the
+                                      # fills consume (plus CTR_SKY_PX, which is part of the same terminal
+                                      # record). Everything else is a factoring — record_terminal_fills and
+                                      # record_hemi_tail are now SHARED by the full path and the replay, so
+                                      # "replay re-runs only the terminal fills" is a fact about the code
+                                      # rather than a claim about two similar-looking blocks.
+                                      # BOTH TEETH EXERCISED, and each catches what the others cannot.
+                                      # (a) A FULL TRACE in the replay slot passes bit-identity, coverage AND
+                                      # the terminal counts — all four quality gates — and ONLY the
+                                      # ladder-did-not-run check fires (measured split 257 tiles 192/0). That
+                                      # is the anti-vacuity half: a "replay" that quietly re-traced everything
+                                      # is bit-identical BY CONSTRUCTION. (b) Dropping cs_seed_replay's
+                                      # keep-set fails four gates, and the interesting half is which two it
+                                      # does NOT: tbuf-diff and accum-diff stay 0, because a replay that
+                                      # dispatched no terminal work leaves those buffers STALE-CORRECT from
+                                      # the producing frame — the M3d lesson in another currency (an
+                                      # operation that never happened compares clean), and the whole reason
+                                      # the sentinel is re-flooded here rather than reusing V7's.
+                                      # THE BUG IT FOUND ON THE WAY, in the code M3e had just shipped: the
+                                      # Vulkan frame path never dispatched cs_clear_h, so an fb frame
+                                      # integrated on top of whatever the previous fb frame (or probe run)
+                                      # left in the fixed-point H accumulator — hbuf is written by ATOMIC ADD,
+                                      # which is what makes the integrator order-independent and also what
+                                      # makes an unzeroed frame double-count. Invisible to every gate that
+                                      # existed: V8's frame half scores ACCOUNTING (hit-px == hemi-points) and
+                                      # its A/Bs run through run_hemi_probes, which does clear. Found by
+                                      # putting the two paths next to each other to factor them. The fb arm
+                                      # added here is the gate that would have caught it (996888 channels on
+                                      # procedural, 1014795 on smlp).
+                                      # THE fb ARM'S BAR IS CHOSEN BY A CONTROL, and the distinction between
+                                      # choosing the TIER and setting the BAR is the whole design. It renders
+                                      # TWO fresh fb traces first: if they agree bitwise the integrator is
+                                      # reproducible on this scene and the replay must agree bitwise too — no
+                                      # tolerance at all, which is what every scene but one gets. If they do
+                                      # not, the replay cannot be held to better. MEASURED:
+                                      # san-miguel-low-poly reads a ~190-channel control out of 1.44M, and
+                                      # FR_ABL=noalpha returns BOTH that and the replay diff to EXACTLY 0 —
+                                      # which attributes it to the ALPHA-CUTOUT candidate loop, whose
+                                      # candidate enumeration order is implementation-defined and, on this
+                                      # driver, varies between two IDENTICAL dispatches (rungholt has cutout
+                                      # too and still reads 0, so it is that scene's foliage inside the GI
+                                      # hemisphere, not cutout as such). The relaxed tier's bar is an ABSOLUTE
+                                      # fraction of channels and deliberately NOT "no worse than the control",
+                                      # because a real defect inflates BOTH: with clear_h removed the smlp
+                                      # arm reads fd 1014795 against a control of 1014789, so a
+                                      # relative-to-control bar would have PASSED the exact bug the arm exists
+                                      # to catch, while the absolute bar fails it 705x over. What LICENSES
+                                      # the relaxation is a separate assertion: the two fresh traces must have
+                                      # done the same WORK (identical point/ray/empty-cell/overflow counts —
+                                      # measured 341388/2130500/832792/0 both times), i.e. the difference is
+                                      # fp ordering inside one traversal rather than a different traversal.
+                                      # STILL NOT COVERED: the AUTO predicate. D3D12 keeps a last_struct key
+                                      # and selects inside record_frame; this backend has no per-frame driver
+                                      # yet, so that lands with the presenter rather than being written now as
+                                      # a field nothing reads — the caller proves the bit-equality, and V9 is
+                                      # that caller.
                                       # THE FRUSTUM TREE IS THE ONE STREAM THIS FILE UPLOADS: t0 space0 takes
                                       # ftree::FTree::quantized() (the QFNode wire format — the per-processor
                                       # split verdict, not a shortcut: the CPU keeps f32 nodes and the GPU

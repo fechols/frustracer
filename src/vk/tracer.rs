@@ -51,10 +51,17 @@
 //!   covering `COMPUTE|TRANSFER -> COMPUTE|DRAW_INDIRECT` replaces both
 //!   transitions and the UAV barrier between them.
 //!
+//! STRUCTURE REPLAY IS HERE TOO (`render_wavefront_replay`): a bit-equal-basis
+//! frame skips the seed and the whole ladder and re-dispatches the persisted
+//! terminal queues. The one thing it needs that D3D12 does not is nothing at
+//! all — the queues are ordinary buffers with no states to restore — so the
+//! only real work was factoring the terminal fills so both paths run the SAME
+//! code rather than two similar-looking blocks.
+//!
 //! NOT COVERED, and said loudly at the call site rather than silently:
-//! structure replay, and `--sw-rays` (whose LEAF kernel wants the binary tree
-//! at t0 while the ladder holds the wide one — the hemi variants below prove
-//! the mechanism, but the leaf pass would need its own).
+//! `--sw-rays` (whose LEAF kernel wants the binary tree at t0 while the ladder
+//! holds the wide one — the hemi variants below prove the mechanism, but the
+//! leaf pass would need its own, plus a `tri_idx` stream nothing here uploads).
 //!
 //! COMPOSE IS DISPATCHED ONLY UNDER fb, and that is D3D12's rule verbatim
 //! rather than an omission: with fb off the leaf and sky passes splat straight
@@ -138,7 +145,7 @@ struct Wave {
     /// (`ftree::QFNode`), or the binary BVH under `--no-ftree`. The tracer's
     /// software half — RT cores cannot answer a frustum query.
     tree: Buffer,
-    pipes: [vk::Pipeline; 8],
+    pipes: [vk::Pipeline; 9],
     /// Set 0 with u5=qa/u6=qb and the swap; index 1 of each is the SAME set-1
     /// handle the terminal variant holds (the scene/texture set never varies).
     sets_a: Vec<vk::DescriptorSet>,
@@ -243,6 +250,10 @@ const W_LEVEL: usize = 4;
 const W_LEVEL_WIDE: usize = 5;
 const W_LEAF: usize = 6;
 const W_SKY: usize = 7;
+/// The replay seed: zero every counter EXCEPT the three the terminal fills
+/// consume. Not a variant of `cs_seed` — a different kernel with a keep-set,
+/// which is what makes "skip the ladder" expressible at all.
+const W_SEED_REPLAY: usize = 8;
 
 /// `cs_prep`'s "do not zero any counter" sentinel, and the two args slots the
 /// terminal fills use — lockstep with `gpu/trace.rs`'s consts, which are
@@ -287,7 +298,7 @@ impl VkTracer {
         // The ladder. `--sw-rays` is deliberately not covered (module header):
         // its leaf kernel wants the BINARY tree at t0 while the ladder holds
         // the WIDE one there, which is a fourth set variant, not a flag.
-        let wave_units: [(&str, &str, &str); 8] = [
+        let wave_units: [(&str, &str, &str); 9] = [
             (&srcs.wavefront, "cs_seed", "wf-seed"),
             (&srcs.wavefront, "cs_prep", "wf-prep"),
             (&srcs.wavefront, "cs_prep_mul", "wf-prep-mul"),
@@ -296,6 +307,7 @@ impl VkTracer {
             (&srcs.wavefront, "cs_level_wide", "wf-level-wide"),
             (&srcs.leaf, "cs_leaf", "wf-leaf"),
             (&srcs.sky, "cs_sky", "wf-sky"),
+            (&srcs.wavefront, "cs_seed_replay", "wf-seed-replay"),
         ];
         // The hemisphere tiers. `cs_leaf` appears TWICE across the two tables
         // — once from `leaf` and once from `leaf_fb` — which is the point:
@@ -325,7 +337,7 @@ impl VkTracer {
         let mut map = Map::default();
         let all: Vec<&(&str, &str, &str)> = units
             .iter()
-            .chain(wave_units.iter().take(if want_wave { 8 } else { 0 }))
+            .chain(wave_units.iter().take(if want_wave { 9 } else { 0 }))
             .chain(hemi_units.iter().take(if want_hemi { 8 } else { 0 }))
             .collect();
         for (src, entry, tag) in all {
@@ -356,7 +368,7 @@ impl VkTracer {
         let layouts = Layouts::build(vkd, &map, tex_cap, None)?;
 
         let mut pipes = [vk::Pipeline::null(); 4];
-        let mut wpipes = [vk::Pipeline::null(); 8];
+        let mut wpipes = [vk::Pipeline::null(); 9];
         let mut hpipes = [vk::Pipeline::null(); 8];
         {
             let mut built: Vec<vk::Pipeline> = Vec::new();
@@ -1096,6 +1108,7 @@ impl VkTracer {
                     clear_groups.div_ceil(32768),
                 );
             }
+            self.clear_h(d, cmd, fb_mode);
             barrier(d, cmd);
 
             for lvl in 0..w.depth_full {
@@ -1125,9 +1138,80 @@ impl VkTracer {
                 );
             }
 
-            // The terminal fills, under the TERMINAL variant: u5/u6 revert to
-            // the cloud lattice and shadow cache, which is exactly what the
-            // leaf and sky kernels re-declare them as.
+            self.record_terminal_fills(d, cmd, w, fb_mode);
+            self.record_hemi_tail(d, cmd, w, fb_mode, p.q.fb.depth, clear_groups);
+        })
+    }
+
+    /// Structure replay: a frame whose basis bit-equals the previous producing
+    /// frame's re-dispatches the persisted terminal queues and skips the seed
+    /// and the WHOLE level ladder — the ladder is the wavefront's fixed cost,
+    /// and on a parked camera this deletes it (D3D12 measured -43% of the GPU
+    /// frame span there).
+    ///
+    /// Soundness is entirely in one sentence: the terminal structure is a pure
+    /// function of (scene, BVH, basis, rw, rh), while spp/jitter/frame/fb/
+    /// quality/clouds all ride the cbuffer — so a replay frame re-shades from a
+    /// fresh `FrameParams` against a structure that provably still describes
+    /// this view, and the result must be BIT-IDENTICAL to a fresh trace. That
+    /// is a gate, not a hope: V9 compares tbuf/info/accum bitwise.
+    ///
+    /// The queues stay byte-intact between producing frames because only
+    /// `cs_seed` and the ladder ever WRITE them — the leaf/sky passes read,
+    /// the hemi passes rebind u5..u9 to their own transients, and the
+    /// reference/resolve units declare no queues at all.
+    ///
+    /// THE CALLER PROVES THE BIT-EQUALITY. D3D12 keeps a `last_struct` key and
+    /// auto-selects inside `record_frame`; there is no per-frame driver on this
+    /// backend yet, so that predicate lands with the presenter rather than
+    /// being written here as a field nothing reads.
+    pub fn render_wavefront_replay(
+        &self,
+        hg: &VkHeadless,
+        p: &FrameParams,
+        clear_sentinel: bool,
+    ) -> Result<(), String> {
+        let w = self.wave.as_ref().ok_or("this tracer has no wavefront ladder")?;
+        self.write_cb(hg, p)?;
+        let clear_groups = (self.rw * self.rh).div_ceil(256);
+        let fb_mode = fb_mode_of(&p.q);
+
+        hg.run(|d, cmd| unsafe {
+            // The terminal variant throughout: nothing here touches the tile
+            // queues, so the ladder's A/B binds have no work to do.
+            self.bind(d, cmd, &self.sets);
+            self.go(d, cmd, w.pipes[W_SEED_REPLAY], 1, 1);
+            if clear_sentinel {
+                self.go(
+                    d,
+                    cmd,
+                    w.pipes[W_CLEAR_INFO],
+                    clear_groups.min(32768),
+                    clear_groups.div_ceil(32768),
+                );
+            }
+            self.clear_h(d, cmd, fb_mode);
+            barrier(d, cmd);
+            self.record_terminal_fills(d, cmd, w, fb_mode);
+            self.record_hemi_tail(d, cmd, w, fb_mode, p.q.fb.depth, clear_groups);
+        })
+    }
+
+    /// The leaf and sky fills, shared by the full path and the replay — which
+    /// is what makes "replay re-runs ONLY the terminal fills" a fact about the
+    /// code rather than a claim about two similar-looking blocks.
+    ///
+    /// Runs under the TERMINAL variant: u5/u6 revert to the cloud lattice and
+    /// shadow cache, which is exactly what the leaf and sky kernels re-declare
+    /// them as.
+    unsafe fn record_terminal_fills(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        w: &Wave,
+        fb_mode: u32,
+    ) {
+        unsafe {
             self.bind(d, cmd, &self.sets);
             self.push(d, cmd, [gs::CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
             self.go(d, cmd, w.pipes[W_PREP], 1, 1);
@@ -1152,27 +1236,60 @@ impl VkTracer {
             self.push(d, cmd, [gs::CTR_SKY, 0, 0, 0]);
             self.go_indirect(d, cmd, w.pipes[W_SKY], &w.args, ARG_SKY);
             barrier(d, cmd);
+        }
+    }
 
-            if let (Some(h), true) = (&self.hemi, fb_mode > 0) {
-                // Every hit pixel appended a point, so batch over the WORST
-                // CASE; batches past the GPU-side count dispatch zero groups,
-                // which is what lets this be recorded statically with no
-                // readback anywhere.
-                self.record_hemi(d, cmd, h, w, self.rw * self.rh, p.q.fb.depth);
-                // partial + ambW * ambient(H) -> accum: the single splat, and
-                // the ONE pass in the tracer that is per-PIXEL rather than
-                // queue-driven.
-                self.bind(d, cmd, &self.sets);
-                self.go(
-                    d,
-                    cmd,
-                    h.pipes[H_COMPOSE],
-                    clear_groups.min(32768),
-                    clear_groups.div_ceil(32768),
-                );
-                barrier(d, cmd);
-            }
-        })
+    /// Zero the fixed-point H accumulator, once per fb FRAME.
+    ///
+    /// Mandatory rather than tidy, and it was missing from the frame path until
+    /// the replay factoring put the two next to each other: `hbuf` is written
+    /// by ATOMIC ADD (that is what makes the integrator order-independent), so
+    /// an unzeroed frame integrates on top of the previous one's answer — and
+    /// nothing downstream can tell, because compose folds whatever is there
+    /// into `accum` and V8's frame half scores accounting, not radiance.
+    unsafe fn clear_h(&self, d: &ash::Device, cmd: vk::CommandBuffer, fb_mode: u32) {
+        let Some(h) = &self.hemi else { return };
+        if fb_mode == 0 {
+            return;
+        }
+        let g = (self.rw * self.rh * 4).div_ceil(256);
+        unsafe { self.go(d, cmd, h.pipes[H_CLEAR_H], g.min(32768), g.div_ceil(32768)) };
+    }
+
+    /// The hemisphere wavefront plus its one compose splat, shared for the same
+    /// reason. No-op with fb off, which is D3D12's rule verbatim: with no
+    /// bounce tier there is no ambient term to fold in, and compose would
+    /// degenerate to a full-screen buffer-to-buffer copy.
+    unsafe fn record_hemi_tail(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        w: &Wave,
+        fb_mode: u32,
+        fb_depth: u32,
+        clear_groups: u32,
+    ) {
+        let Some(h) = &self.hemi else { return };
+        if fb_mode == 0 {
+            return;
+        }
+        unsafe {
+            // Every hit pixel appended a point, so batch over the WORST CASE;
+            // batches past the GPU-side count dispatch zero groups, which is
+            // what lets this be recorded statically with no readback anywhere.
+            self.record_hemi(d, cmd, h, w, self.rw * self.rh, fb_depth);
+            // partial + ambW * ambient(H) -> accum: the single splat, and the
+            // ONE pass in the tracer that is per-PIXEL rather than queue-driven.
+            self.bind(d, cmd, &self.sets);
+            self.go(
+                d,
+                cmd,
+                h.pipes[H_COMPOSE],
+                clear_groups.min(32768),
+                clear_groups.div_ceil(32768),
+            );
+            barrier(d, cmd);
+        }
     }
 
     /// The hemisphere wavefront over the points in `hemi_pts`, in `HEMI_BATCH`
