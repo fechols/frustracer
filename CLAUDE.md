@@ -4383,15 +4383,16 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # library name, and the module/dep cfg lifted — nothing else; the
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
-                                      # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b).
+                                      # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
                                       # against, so a module can be perfectly valid and read the wrong
-                                      # resource. Four stages: V0 the pure pick/memory logic (runs with no
+                                      # resource. Five stages: V0 the pure pick/memory logic (runs with no
                                       # Vulkan on the box at all) | V1 loader + instance + device | V2
                                       # compile smoke.hlsl to SPIR-V and build the pipelines | V3 run the
-                                      # seed -> prep -> indirect-fill chain and read the results back.
+                                      # seed -> prep -> indirect-fill chain and read the results back |
+                                      # V4 the wave-width table and the subgroup-size decision.
                                       # V3 IS THE POINT: constants reaching a kernel, storage buffers
                                       # bound and written, a GPU-WRITTEN counter turned into dispatch
                                       # arguments by a second kernel, and a third kernel launched from
@@ -4453,24 +4454,73 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # written (a tooth the D3D12 twin does not have). A second pass at
                                       # count 0 pins the empty-queue case every ladder level hits: args
                                       # [0,0,1] and not one word written.
+                                      # V4 TEETH, all four exercised the same way: the PROBE_GROUP define
+                                      # NOT REACHING the shader (the probe-reach class this codebase has
+                                      # shipped repeatedly — every width above 32 then silently compiles
+                                      # at the default 32 and the table answers CONFIDENTLY; caught by an
+                                      # echoed-width check, "kernel echoed group width 32 but was
+                                      # compiled for 64"); a descriptor binding shifted by one; the
+                                      # shader's own PLAUSIBLE-LIE detector (drop WaveIsFirstLane so every
+                                      # lane counts and the reported width stops matching the counted
+                                      # waves — "reports 64 lanes but counted 64 waves, not 1"); and a pin
+                                      # that is silently not applied ("asked for subgroup size 32 and got
+                                      # 64 — the pin was ignored", which correctly does NOT fire at g32,
+                                      # where the pin is unobservable because 32 is what the driver picks
+                                      # anyway). The wave-count check is a CEILING, never exact division:
+                                      # a group NARROWER than the wave is one PARTIAL wave, the very case
+                                      # the probe exists to find.
+                                      # VALIDATION IS ON BY DEFAULT, and it changed BECAUSE of that second
+                                      # tooth: V4 binds a ONE-binding descriptor set, so a layout that
+                                      # disagrees with the module has nothing to desynchronize against and
+                                      # RADV resolved the mismatch to the only slot — the planted shift
+                                      # PASSED unvalidated (V3's four bindings catch the identical bug
+                                      # structurally; one binding cannot). The layer names it exactly, so
+                                      # a correctness gate with that instrument installed and unused is
+                                      # the --gpu-debug lesson repeated. FR_VK_VALIDATION=0 opts out and
+                                      # says so; a missing layer is a loud line and an honestly
+                                      # unvalidated run, reported off the FACT (Vk::validated) rather than
+                                      # the request, since otherwise a weak run and a strong one log
+                                      # identically.
                                       # LEVERS: FR_VK_DEVICE=<index|name-substring> forces the adapter
                                       # (loud; an ambiguous substring is an ERROR rather than first-match,
                                       # since "amd" matching two adapters and quietly taking one is how a
                                       # measurement ends up describing the other device);
-                                      # FR_VK_VALIDATION=1 arms VK_LAYER_KHRONOS_validation +
-                                      # VK_EXT_debug_utils, and the gate FAILS on any ERROR-severity
-                                      # message — validation armed and unread is the same as unarmed, the
-                                      # --gpu-debug lesson spelled for Vulkan. A validation layer that is
-                                      # requested but not installed is LOUD and continues unvalidated.
-                                      # THE SUBGROUP FINDING, printed every run because M2c decides from
-                                      # it: this device's natural subgroupSize is 64, min 32 / max 64,
-                                      # with subgroupSizeControl — so Vulkan can PIN the width via
-                                      # VkPipelineShaderStageRequiredSubgroupSizeCreateInfo, which D3D12
-                                      # cannot (there the driver picks per shader and the caps never
-                                      # predict it — see the FR_WIDTH campaign). Every LEAF_GROUP /
-                                      # SKY_SPLIT constant in this tree was tuned against 32, and the
-                                      # wave64 lane-waste bug that cost -38% is exactly the hazard a pin
-                                      # would remove. llvmpipe reports 8.
+                                      # FR_VK_VALIDATION=0 disarms VK_LAYER_KHRONOS_validation +
+                                      # VK_EXT_debug_utils (armed otherwise), and the gate FAILS on any
+                                      # ERROR-severity message.
+                                      # THE M2c SUBGROUP VERDICT (V4) — waveprobe.hlsl, the D3D12 suite's
+                                      # OWN kernel unmodified, at every group width the tracer dispatches
+                                      # (32 for cs_level*/cs_hemi_*, SKY_GROUP=64, LEAF_GROUP=256), in
+                                      # THREE pipeline arms because the difference between them IS the
+                                      # decision: default (no flags — what a naive port gets), varying
+                                      # (ALLOW_VARYING_SUBGROUP_SIZE — driver picks per shader, the ONLY
+                                      # behavior D3D12 offers, so it is the arm that says what the D3D12
+                                      # numbers would look like here) and pinned
+                                      # (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo — the thing
+                                      # D3D12 cannot do at all). MEASURED on RADV STRIX_HALO: g32 -> 32
+                                      # lanes x 1 wave, g64 -> 64 x 1, g256 -> 64 x 4, default and
+                                      # varying IDENTICAL, every row at 100% lane occupancy.
+                                      # THE VERDICT IS NO PIN, and it INVERTS the expectation the plan was
+                                      # written on: natural subgroupSize is 64, so a 32-thread group
+                                      # looked like a half-empty wave64 — but RADV already narrows to
+                                      # wave32 for a 32-thread workgroup, so the lane-waste class (the
+                                      # D3D12 bug that cost -38% in cs_leaf) DOES NOT REPRODUCE and M3
+                                      # carries no pinning machinery. The reported subgroupSize is a
+                                      # DEVICE property and the compiled width is a PER-PIPELINE choice;
+                                      # only a probe tells them apart, which is the same lesson the
+                                      # D3D12 caps taught. The pin still WORKS and stays gated (g64/g256
+                                      # pinned to 32 return exactly 32 at 2/8 waves), so the lever is
+                                      # there if a real kernel's register pressure ever makes RADV choose
+                                      # differently — waveprobe is trivial BY DESIGN, so it answers "what
+                                      # a kernel of this WIDTH gets" and nothing finer, and the real
+                                      # kernels want an FR_WIDTH-style in-kernel report in M3.
+                                      # llvmpipe: 8 lanes at every width, range [8..8], so the pinned arm
+                                      # is legitimately impossible there and says so in a NOTE instead of
+                                      # failing — the eligibility predicate lives in wave_probe and
+                                      # publishes pin_attempted, so the caller's anti-vacuity check cannot
+                                      # drift from what actually ran (a first draft keyed it off the caps
+                                      # and failed llvmpipe for asking a legal question with an
+                                      # impossible answer).
                                       # VK_EXT_headless_surface is NOT used and the plan that named it was
                                       # wrong: that extension runs the PRESENTATION path without a window,
                                       # and compute needs no surface at all — the harness has one less

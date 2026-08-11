@@ -197,10 +197,25 @@ pub struct DeviceInfo {
     /// picks inside per shader and the caps never predict; Vulkan can PIN it
     /// (`VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`), which is the
     /// M2c decision.
+    ///
+    /// `subgroup_size` is `VkPhysicalDeviceSubgroupProperties::subgroupSize` —
+    /// the width an UNPINNED pipeline gets — and is deliberately a separate
+    /// query from the control range, because the two answer different
+    /// questions and coincide only by accident (they do on RADV, which is
+    /// exactly why filling this from `max_subgroup_size` printed a plausible
+    /// number here for a while).
     pub subgroup_size: u32,
     pub subgroup_min: u32,
     pub subgroup_max: u32,
     pub subgroup_size_control: bool,
+    /// `requiredSubgroupSizeStages` includes COMPUTE — i.e. a compute pipeline
+    /// on this device may pin its width. Probed rather than inferred from the
+    /// feature bit: that bit says the device implements size control, this
+    /// says it implements it for the one stage this renderer has.
+    pub subgroup_pin_compute: bool,
+    /// `maxComputeWorkgroupSubgroups` — the pin's own ceiling, since a group of
+    /// `g` threads pinned to width `w` needs `ceil(g / w)` subgroups.
+    pub max_workgroup_subgroups: u32,
     pub ray_query: bool,
     pub accel_struct: bool,
     pub rt_pipeline: bool,
@@ -242,6 +257,13 @@ pub struct Vk {
     #[allow(dead_code)]
     pub entry: ash::Entry,
     pub instance: ash::Instance,
+    /// The physical device we opened. Held because it is IRRECOVERABLE, not
+    /// because something reads it today: Vulkan has no device -> physical-device
+    /// query, so dropping this would make every later capability read
+    /// (acceleration-structure properties, format support, heap budgets)
+    /// require re-enumerating and re-running the pick — i.e. it could pick a
+    /// different device than the one these handles belong to.
+    #[allow(dead_code)]
     pub phys: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: vk::Queue,
@@ -467,8 +489,11 @@ impl Vk {
     ) -> (DeviceInfo, Option<String>) {
         let mut driver = vk::PhysicalDeviceDriverProperties::default();
         let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-        let mut props2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut driver).push_next(&mut sg);
+        let mut sgp = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut driver)
+            .push_next(&mut sg)
+            .push_next(&mut sgp);
         unsafe { instance.get_physical_device_properties2(p, &mut props2) };
         let props = props2.properties;
 
@@ -492,10 +517,26 @@ impl Vk {
             api: (vk::api_version_major(api), vk::api_version_minor(api), vk::api_version_patch(api)),
             kind: props.device_type,
             vendor_id: props.vendor_id,
-            subgroup_size: sg.max_subgroup_size,
-            subgroup_min: sg.min_subgroup_size,
-            subgroup_max: sg.max_subgroup_size,
+            subgroup_size: sgp.subgroup_size,
+            // A device that reports no control range still HAS a width, so
+            // degrade the range onto it rather than printing [0..0] — a probe
+            // that says "range zero" reads as broken hardware when what it
+            // means is "no size control here".
+            subgroup_min: if sg.min_subgroup_size == 0 {
+                sgp.subgroup_size
+            } else {
+                sg.min_subgroup_size
+            },
+            subgroup_max: if sg.max_subgroup_size == 0 {
+                sgp.subgroup_size
+            } else {
+                sg.max_subgroup_size
+            },
             subgroup_size_control: f13.subgroup_size_control == vk::TRUE,
+            subgroup_pin_compute: sg
+                .required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE),
+            max_workgroup_subgroups: sg.max_compute_workgroup_subgroups,
             ray_query: has_ext(ash::khr::ray_query::NAME),
             accel_struct: has_ext(ash::khr::acceleration_structure::NAME),
             rt_pipeline: has_ext(ash::khr::ray_tracing_pipeline::NAME),
@@ -515,15 +556,13 @@ impl Vk {
         (info, reject)
     }
 
-    /// The `subgroupSize` the driver reports as its natural width. Kept
-    /// separate from the control range because they answer different
-    /// questions: this is what an unpinned pipeline will get, the range is
-    /// what a pinned one may ask for.
+    /// The `subgroupSize` the driver reports as its natural width — what an
+    /// UNPINNED pipeline gets. Kept as a named accessor rather than a bare
+    /// field read because the distinction from the control range is the whole
+    /// M2c question, and a call site that says `natural_subgroup_size()` cannot
+    /// be misread as "the width my kernel got" (which only a probe can answer).
     pub fn natural_subgroup_size(&self) -> u32 {
-        let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
-        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
-        unsafe { self.instance.get_physical_device_properties2(self.phys, &mut p2) };
-        sg.subgroup_size
+        self.info.subgroup_size
     }
 
     pub fn buffer(
@@ -599,6 +638,14 @@ impl Vk {
             self.device.unmap_memory(b.mem);
         }
         Ok(out)
+    }
+
+    /// Validation is ACTUALLY armed — not merely requested. The two differ
+    /// whenever the layer is not installed (`Vk::new` says so and continues),
+    /// and a gate that reports the request instead of the fact would log a
+    /// validated run and an unvalidated one identically.
+    pub fn validated(&self) -> bool {
+        self.debug.is_some()
     }
 
     pub fn line(&self) -> String {

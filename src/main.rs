@@ -11631,9 +11631,20 @@ fn run_check_vk() -> i32 {
     }
 
     // ---- V1: a real device. Absence is a normal condition. ----
-    let validate = std::env::var("FR_VK_VALIDATION").is_ok_and(|v| v != "0");
-    if validate {
-        println!("check-vk: FR_VK_VALIDATION set — arming VK_LAYER_KHRONOS_validation");
+    //
+    // VALIDATION IS ON BY DEFAULT HERE, and that changed after a planted
+    // binding shift PASSED: V4's probe binds a ONE-binding descriptor set, so
+    // a layout that disagrees with the module has nothing to desynchronize
+    // against and RADV resolves it to the only slot (V3's four bindings catch
+    // the same bug structurally; a single binding cannot). The validation layer
+    // names it exactly — "uses descriptor [Set 0, Binding 2000] but the binding
+    // was not declared" — so a correctness gate with that instrument installed
+    // and unused is the `--gpu-debug` lesson repeated: the findings exist and
+    // nobody reads them. `FR_VK_VALIDATION=0` opts out; a missing layer is a
+    // loud line and an honestly unvalidated run.
+    let validate = std::env::var("FR_VK_VALIDATION").map_or(true, |v| v != "0");
+    if !validate {
+        println!("check-vk: FR_VK_VALIDATION=0 — running UNVALIDATED at your own risk");
     }
     let hg = match vk::headless::VkHeadless::new(validate) {
         Ok(h) => h,
@@ -11698,18 +11709,140 @@ fn run_check_vk() -> i32 {
         }
     }
 
+    // ---- V4: the wave-width table, and the pin. ----
+    if !run_check_vk_waves(&hg, &sp) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
     if ve > 0 {
         eprintln!("check-vk: FAIL {ve} validation error(s) — see the vk validation lines above");
         ok = false;
-    } else if validate {
+    } else if hg.vk.validated() {
         println!("check-vk: validation clean");
+    } else {
+        // Say which mode ran, off the FACT rather than the request: a gate
+        // whose strength depends on whether a layer happened to be installed
+        // must report that, or a weak run and a strong one read identically.
+        println!(
+            "check-vk: NOTE validation was NOT armed — descriptor/layout mismatches unchecked"
+        );
     }
 
     println!("CHECK-VK {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// V4 — the wave-width table, printed WHOLE and then judged.
+///
+/// This is where Vulkan stops being a port of D3D12 and starts being better at
+/// one thing. On D3D12 the subgroup width is whatever the driver picked from
+/// register pressure: `WaveLaneCountMin/Max` bound it and never predict it, so
+/// the only instrument is a probe, and there is no lever at all — the whole
+/// `FR_WIDTH` campaign, and the wave64 lane-waste bug that cost -38% in
+/// `cs_leaf`, exist inside that constraint. Vulkan can PIN the width, so the
+/// same measurement here yields a decision instead of a diagnosis.
+///
+/// The table is printed before anything is judged, deliberately: a measurement
+/// gate that hides its numbers on failure is the least useful thing it could be.
+#[cfg(unix)]
+fn run_check_vk_waves(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use vk::headless::{Arm, PIN_TARGET};
+
+    let t = match vk::headless::wave_probe(hg, sp) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V4 {e}");
+            return false;
+        }
+    };
+    for n in &t.notes {
+        println!("check-vk: V4 NOTE {n}");
+    }
+    println!("check-vk: V4 wave-width table (group -> lanes x waves, lanes carrying a thread)");
+    for r in &t.rows {
+        let u = r.utilization();
+        println!(
+            "check-vk: V4   g{:<4} {:<10} {:>3} lanes x {:>2} wave{}  {:>4.0}% used{}",
+            r.group,
+            r.arm.label(),
+            r.lanes,
+            r.waves,
+            if r.waves == 1 { " " } else { "s" },
+            u * 100.0,
+            if u < 0.999 { "   <- HALF-EMPTY" } else { "" }
+        );
+    }
+
+    let mut ok = true;
+    for p in &t.problems {
+        eprintln!("check-vk: FAIL V4 {p}");
+        ok = false;
+    }
+    // Anti-vacuity: a probe that measured nothing must not report success.
+    if t.rows.is_empty() {
+        eprintln!("check-vk: FAIL V4 the wave table is empty — nothing was measured");
+        ok = false;
+    }
+
+    // THE PIN'S OWN TOOTH, and the reason this arm is worth running at all: a
+    // required subgroup size that the driver quietly ignores leaves every
+    // LEAF_GROUP / SKY_SPLIT constant mis-tuned while the table claims the
+    // opposite. Silence is the failure mode; assert the width came back.
+    let pinned: Vec<&vk::headless::WaveRow> =
+        t.rows.iter().filter(|r| matches!(r.arm, Arm::Pinned(_))).collect();
+    for r in &pinned {
+        if let Arm::Pinned(w) = r.arm {
+            if r.lanes != w {
+                eprintln!(
+                    "check-vk: FAIL V4 g{} asked for subgroup size {w} and got {} — the pin was \
+                     ignored",
+                    r.group, r.lanes
+                );
+                ok = false;
+            }
+        }
+    }
+    // Anti-vacuity for the pin, keyed off what the probe ACTUALLY attempted.
+    // Not off the caps: llvmpipe advertises compute size control with range
+    // [8..8], so asking it for 32 is a legal question with an impossible
+    // answer — it says so in a note and skips, which is the honest degrade.
+    if t.pin_attempted && pinned.is_empty() {
+        eprintln!("check-vk: FAIL V4 the pinned arm was attempted and produced no rows");
+        ok = false;
+    }
+
+    // The finding, stated by the run rather than left to be read off the table.
+    let waste: Vec<u32> = t
+        .rows
+        .iter()
+        .filter(|r| r.arm == Arm::Default && r.utilization() < 0.999)
+        .map(|r| r.group)
+        .collect();
+    if waste.is_empty() {
+        println!(
+            "check-vk: V4 every shipping group width fills its subgroups unpinned — no pin needed \
+             on this device"
+        );
+    } else {
+        let list: Vec<String> = waste.iter().map(|g| format!("g{g}")).collect();
+        let fixed = !pinned.is_empty()
+            && pinned.iter().all(|r| r.utilization() >= 0.999 || !waste.contains(&r.group));
+        println!(
+            "check-vk: V4 FINDING {} dispatch{} half-empty subgroups unpinned (natural width {}){}",
+            list.join(", "),
+            if waste.len() == 1 { "es" } else { "" },
+            hg.vk.natural_subgroup_size(),
+            if fixed {
+                format!(" — pinning {PIN_TARGET} fills them; M3 pins those pipelines")
+            } else {
+                String::new()
+            }
+        );
+    }
+    ok
 }
 
 fn run_check_nrd(opts: &Opts) -> i32 {
