@@ -32,6 +32,9 @@ cbuffer Params : register(b0) {
     float scale;
     float mode; // 1 = gamma 2.2 (SDR/Sdr10), 2 = HDR10 PQ (0 retired with scRGB)
     float exposure; // never read here — see the header note
+    float guard_strength; // never read here either: the spike guard withholds
+                          // the APERTURE's boost from outlier scene pixels, and
+                          // the HUD does not take that boost in the first place.
 }
 
 // tone.rs twins (see tonemap.hlsl — same literals, change all three together).

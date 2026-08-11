@@ -218,6 +218,10 @@ opt_fields! {
         pub autoexp: bool,
         /// --exposure-bias in EV (live, display-stage — no reset)
         pub exposure_bias: f32,
+        /// --no-autoexp-spike-guard inverse (DEFAULT ON; live, display-stage)
+        pub autoexp_guard: bool,
+        /// --autoexp-spike-strength, 0..=1 (live, display-stage — no reset)
+        pub autoexp_guard_strength: f32,
         /// --no-clouds inverse (live: frame=0, histories kept)
         pub clouds: bool,
         /// --no-fireflies inverse (live: frame=0, histories kept)
@@ -1210,6 +1214,16 @@ fn apply_with(
             warn("effects.exposure_bias", &v.to_string());
         }
     }
+    if let Some(v) = e.autoexp_guard {
+        opts.autoexp_guard = v;
+    }
+    if let Some(v) = e.autoexp_guard_strength {
+        if v.is_finite() && (0.0..=1.0).contains(&v) {
+            opts.autoexp_guard_strength = v;
+        } else {
+            warn("effects.autoexp_guard_strength", &v.to_string());
+        }
+    }
     if let Some(v) = e.clouds {
         opts.clouds = v;
     }
@@ -1415,6 +1429,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("bloom", "bloom (glare)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.bloom)),
             item!("autoexp", "auto-exposure", "Effects", Live, Toggle { default: true }, acc_bool!(effects.autoexp)),
             item!("exposure_bias", "exposure bias (EV)", "Effects", Live, StepF { min: -8.0, max: 8.0, step: 0.5, default: 0.0 }, acc_f32!(effects.exposure_bias)),
+            item!("autoexp_spike_guard", "auto-exposure spike guard", "Effects", Live, Toggle { default: true }, acc_bool!(effects.autoexp_guard)),
+            item!("autoexp_spike_strength", "spike guard strength", "Effects", Live, StepF { min: 0.0, max: 1.0, step: 0.1, default: 1.0 }, acc_f32!(effects.autoexp_guard_strength)),
             item!("clouds", "volumetric clouds", "Effects", Live, Toggle { default: true }, acc_bool!(effects.clouds)),
             item!("fireflies", "fireflies (night)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.fireflies)),
             item!("fireflies_count", "firefly count", "Effects", Live, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.fireflies_count)),
@@ -1530,6 +1546,8 @@ pub struct LiveView {
     pub bloom: bool,
     pub autoexp: bool,
     pub exposure_bias: f32,
+    pub autoexp_guard: bool,
+    pub autoexp_guard_strength: f32,
     pub clouds: bool,
     pub fireflies: bool,
     pub fireflies_count: u32,
@@ -1562,6 +1580,8 @@ pub enum MenuFx {
     ToggleBloom,
     ToggleAutoExp,
     ExposureBias(f32),
+    ToggleAutoExpGuard,
+    AutoExpGuardStrength(f32),
     ToggleClouds,
     ToggleFireflies,
     FirefliesCount(u32),
@@ -1596,6 +1616,8 @@ pub fn menu_value(item: &MenuItem, s: &Settings, live: &LiveView) -> String {
             "bloom" => onoff(live.bloom),
             "autoexp" => onoff(live.autoexp),
             "exposure_bias" => format!("{:+.1} EV", live.exposure_bias),
+            "autoexp_spike_guard" => onoff(live.autoexp_guard),
+            "autoexp_spike_strength" => format!("{:.1}", live.autoexp_guard_strength),
             "clouds" => onoff(live.clouds),
             "fireflies" => onoff(live.fireflies),
             "fireflies_count" => live.fireflies_count.to_string(),
@@ -1766,6 +1788,8 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "bloom" => |o: &Opts| onoff(o.bloom),
         "autoexp" => |o: &Opts| onoff(o.autoexp),
         "exposure_bias" => |o: &Opts| o.exposure_bias.to_string(),
+        "autoexp_spike_guard" => |o: &Opts| onoff(o.autoexp_guard),
+        "autoexp_spike_strength" => |o: &Opts| o.autoexp_guard_strength.to_string(),
         "clouds" => |o: &Opts| onoff(o.clouds),
         "fireflies" => |o: &Opts| onoff(o.fireflies),
         "fireflies_count" => |o: &Opts| o.fireflies_count.to_string(),
@@ -1956,6 +1980,22 @@ pub fn menu_adjust(item: &MenuItem, dir: i32, s: &mut Settings, live: &LiveView)
                 }
                 (item.set)(s, &format!("{v}"));
                 MenuFx::ExposureBias(v)
+            }
+            "autoexp_spike_guard" => {
+                (item.set)(s, &onoff(!live.autoexp_guard));
+                MenuFx::ToggleAutoExpGuard
+            }
+            "autoexp_spike_strength" => {
+                let (min, max, step) = match &item.control {
+                    Control::StepF { min, max, step, .. } => (*min, *max, *step),
+                    _ => (0.0, 1.0, 0.1),
+                };
+                let v = (live.autoexp_guard_strength + dir as f32 * step).clamp(min, max);
+                if v == live.autoexp_guard_strength {
+                    return MenuFx::None;
+                }
+                (item.set)(s, &format!("{v}"));
+                MenuFx::AutoExpGuardStrength(v)
             }
             "clouds" => {
                 (item.set)(s, &onoff(!live.clouds));

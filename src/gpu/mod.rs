@@ -5928,11 +5928,30 @@ impl GpuContext {
         unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }
             .map_err(|e| format!("readback Map: {e}"))?;
         let mut out = vec![0u32; w * h];
+        let row_at = |y: usize| -> &[[half::f16; 4]] {
+            unsafe { std::slice::from_raw_parts((ptr as *const u8).add(y * pitch) as *const _, w) }
+        };
+        let e = self.tone.exposure;
+        // The spike guard needs a NEIGHBOURHOOD, so the readback is reduced to a
+        // luma plane first. This texture is the very one the tonemap PS binds as
+        // `src`, so the guard here sees exactly what the guard on screen saw —
+        // which is what makes a P capture (and every QA-socket screenshot, the
+        // instrument this feature is measured with) match the frame it was taken
+        // from. Skipped entirely when the guard cannot fire, so a disarmed
+        // screenshot allocates nothing and is bitwise the pre-feature one.
+        let guard = if crate::autoexp::guard_armed(e) {
+            let mut lum = vec![0.0f32; w * h];
+            for y in 0..h {
+                for (x, px) in row_at(y).iter().enumerate() {
+                    lum[y * w + x] = crate::autoexp::luma(px[0].into(), px[1].into(), px[2].into());
+                }
+            }
+            crate::autoexp::guard_plane(&lum, w, h, e)
+        } else {
+            None
+        };
         for y in 0..h {
-            let row: &[[half::f16; 4]] = unsafe {
-                std::slice::from_raw_parts((ptr as *const u8).add(y * pitch) as *const _, w)
-            };
-            for (x, px) in row.iter().enumerate() {
+            for (x, px) in row_at(y).iter().enumerate() {
                 // Screenshots and --check PNGs stay SDR 8-bit regardless of the
                 // session's swapchain: a PNG has nowhere to put a nit. This used
                 // to open-code the curve a third time; it now shares tone::map,
@@ -5942,7 +5961,7 @@ impl GpuContext {
                 // capture what the screen shows (the "two sessions must agree
                 // about what P captures" rule), and 1.0 is bit-inert.
                 let tp = crate::tone::ToneParams {
-                    exposure: self.tone.exposure,
+                    exposure: guard.as_ref().map_or(e, |g| g[y * w + x]),
                     ..crate::tone::ToneParams::SDR
                 };
                 let m = crate::tone::map(c, tp)

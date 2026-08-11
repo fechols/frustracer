@@ -716,6 +716,16 @@ fn main() {
     if opts.exposure_bias != 0.0 {
         eprintln!("exposure-bias: {:+} EV", opts.exposure_bias);
     }
+    autoexp::set_guard(opts.autoexp_guard);
+    autoexp::set_guard_strength(opts.autoexp_guard_strength);
+    // Also default ON — only departures print. Both spellings are worth a line:
+    // OFF restores the flat aperture, and a partial strength is exactly the
+    // sort of setting a later A/B would otherwise forget was live.
+    if !opts.autoexp_guard {
+        eprintln!("autoexp spike-guard: OFF — the aperture boosts outliers with everything else");
+    } else if opts.autoexp_guard_strength != 1.0 {
+        eprintln!("autoexp spike-guard: strength {:.2}", opts.autoexp_guard_strength);
+    }
     scene::set_water(opts.water);
     scene::set_coincident_cull(opts.coincident_cull);
     // One field, BOTH statics — which is what keeps `--no-heightfield
@@ -12653,7 +12663,7 @@ fn run_check_gpu(
                 2.5e-3,
             ),
         ] {
-            match gpu::tonemap::selftest(&mut hg, &src, TW, TH, format, tp) {
+            match gpu::tonemap::selftest(&mut hg, &src, TW, TH, format, tp, (0.0, 0.0, 0.0)) {
                 Ok(got) => {
                     let mut worst = 0.0f32;
                     let mut worst_at = 0.0f32;
@@ -12701,6 +12711,300 @@ fn run_check_gpu(
                 }
             }
         }
+    }
+
+    // --- M12b: the auto-exposure SPIKE GUARD, PS vs autoexp::guard_scale ---
+    // tonemap.hlsl's guard is a term-for-term twin of the Rust oracle, and this
+    // scores it through the REAL PSO on a synthetic frame built to contain both
+    // of the cases the K_MAX conjunction exists to tell apart. The oracle is
+    // `autoexp::guard_plane` itself — the shipped function, not a re-derivation —
+    // so a drift in either direction fails.
+    {
+        const TW: u32 = 64;
+        const TH: u32 = 32;
+        const BASE: f32 = 0.02; // a dark surround: the near-linear regime
+        const HOT: f32 = 1.0;
+        let n = (TW * TH) as usize;
+        let px = |x: usize, y: usize| y * TW as usize + x;
+        // A LONE spike over a dark ring (a stochastic dot — must be exempted),
+        // and a PAIR exactly the ring radius apart, so each sees the other and
+        // `ring_max` comes back hot (a resolved feature — must NOT be exempted).
+        // Same pixel value in both: only the NEIGHBOURHOOD differs, which is the
+        // whole discrimination under test.
+        //
+        // The separation is DERIVED from the live radius rather than hard-coded,
+        // and that is what turns this gate into a probe-REACH test as well: run
+        // it under `FR_AEXP_GUARD_R=1` or `=3` and the oracle's ring moves. If
+        // the injected defines were not reaching the shader it would keep
+        // ringing at the compiled-in default, the two would disagree across the
+        // frame, and arm (2) would fail. A gate whose fixture cannot follow its
+        // own lever can pass while the lever does nothing.
+        // This gate's OWN verdict, folded into the suite's `ok` at the end.
+        // Hanging the success line off the suite-wide flag would suppress it
+        // whenever an EARLIER gate failed, so a failing run could not tell you
+        // whether M12b had even been reached (M12 next door is the pattern).
+        let mut m12b = true;
+        let r = autoexp::guard_params().radius as usize;
+        let (lone, pair_a, pair_b, flat) = (px(16, 16), px(40, 8), px(40 + r, 8), px(32, 20));
+        let mut src = vec![BASE; n * 3];
+        for i in [lone, pair_a, pair_b] {
+            src[i * 3] = HOT;
+            src[i * 3 + 1] = HOT;
+            src[i * 3 + 2] = HOT;
+        }
+
+        // Pin the levers whichever way the session set them (the wide-tiles
+        // save/restore pattern), so `--no-autoexp-spike-guard --check-gpu` still
+        // gates the armed arm.
+        let (sg, ss) = (autoexp::guard(), autoexp::guard_strength());
+        autoexp::set_guard(true);
+
+        // What the shader really reads: the source is a real RGBA16F texture.
+        let q = |v: f32| half::f16::from_f32(v).to_f32();
+        let lum: Vec<f32> = (0..n)
+            .map(|i| autoexp::luma(q(src[i * 3]), q(src[i * 3 + 1]), q(src[i * 3 + 2])))
+            .collect();
+
+        // Three arms differing ONLY in the aperture and the guard strength, so
+        // any divergence is attributable: unboosted / boosted-unguarded /
+        // boosted-guarded, plus a half-strength arm for the nesting pin.
+        let e_hi = 4.0f32;
+        let tp1 = tone::ToneParams::SDR;
+        let tp4 = tone::ToneParams { exposure: e_hi, ..tone::ToneParams::SDR };
+        let tol = 1.0 / 255.0 + 1e-6;
+        const NO_BLOOM: (f32, f32, f32) = (0.0, 0.0, 0.0);
+        let mut run = |strength: f32, tp: tone::ToneParams, bloom: (f32, f32, f32)| {
+            autoexp::set_guard_strength(strength);
+            gpu::tonemap::selftest(&mut hg, &src, TW, TH, gpu::d3d12::SWAPCHAIN_FORMAT, tp, bloom)
+        };
+        match (
+            run(1.0, tp1, NO_BLOOM),
+            run(0.0, tp4, NO_BLOOM),
+            run(1.0, tp4, NO_BLOOM),
+            run(0.5, tp4, NO_BLOOM),
+        ) {
+            (Ok(a_un), Ok(a_off), Ok(a_on), Ok(a_half)) => {
+                // The oracle plane at full strength — the same call the CPU
+                // present arms make.
+                autoexp::set_guard_strength(1.0);
+                // `None` would mean the oracle disagrees with the shader about
+                // whether the guard is armed at all — structurally unreachable
+                // (the lever was just set and e_hi > 1), so it is reported
+                // rather than handled, and the arms below then fail loudly too.
+                let plane = autoexp::guard_plane(&lum, TW as usize, TH as usize, e_hi)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "check-gpu: FAIL M12b oracle guard_plane returned None while armed"
+                        );
+                        m12b = false;
+                        vec![e_hi; n]
+                    });
+
+                // (1) ANTI-VACUITY, both directions. A guard that never fires
+                // and one that fires everywhere both satisfy a one-sided test,
+                // so the discrimination itself is what gets asserted.
+                if !(plane[lone] < e_hi) {
+                    eprintln!(
+                        "check-gpu: FAIL M12b vacuous — the lone spike was not exempted \
+                         (e {} vs {e_hi})",
+                        plane[lone]
+                    );
+                    m12b = false;
+                }
+                for (name, i) in [("paired spike", pair_a), ("flat field", flat)] {
+                    if plane[i].to_bits() != e_hi.to_bits() {
+                        eprintln!(
+                            "check-gpu: FAIL M12b K_MAX shield — {name} must be bitwise \
+                             unguarded, got e {}",
+                            plane[i]
+                        );
+                        m12b = false;
+                    }
+                }
+
+                // (2) The armed PS vs the oracle, per pixel.
+                let mut worst = 0.0f32;
+                for i in 0..n {
+                    let c = glam::Vec3A::new(q(src[i * 3]), q(src[i * 3 + 1]), q(src[i * 3 + 2]));
+                    let want = tone::map(c, tone::ToneParams { exposure: plane[i], ..tp4 });
+                    for ch in 0..3 {
+                        worst = worst.max((a_on[i][ch] - want[ch]).abs());
+                    }
+                }
+                if worst > tol {
+                    eprintln!(
+                        "check-gpu: FAIL M12b guarded PS vs autoexp::guard_scale — \
+                         worst {worst:.2e} > {tol:.2e}"
+                    );
+                    m12b = false;
+                }
+
+                // (3) strength 0 must be the pre-feature stream: identical to a
+                // plain exposure-4 tonemap everywhere.
+                let mut worst_off = 0.0f32;
+                for i in 0..n {
+                    let c = glam::Vec3A::new(q(src[i * 3]), q(src[i * 3 + 1]), q(src[i * 3 + 2]));
+                    let want = tone::map(c, tp4);
+                    for ch in 0..3 {
+                        worst_off = worst_off.max((a_off[i][ch] - want[ch]).abs());
+                    }
+                }
+                if worst_off > tol {
+                    eprintln!(
+                        "check-gpu: FAIL M12b strength 0 is not inert — worst {worst_off:.2e}"
+                    );
+                    m12b = false;
+                }
+
+                // (4) THE SAFETY INVARIANT, on the image rather than on the
+                // formula: a guarded pixel is never brighter than the boosted
+                // frame and never darker than the UNBOOSTED one. This is the
+                // property that bounds a false positive at "looks like
+                // --no-auto-exposure", so it is asserted where a user would see
+                // it. One LSB of slack for the two wires' quantization.
+                let (mut over, mut under) = (0usize, 0usize);
+                for i in 0..n {
+                    for ch in 0..3 {
+                        if a_on[i][ch] > a_off[i][ch] + tol {
+                            over += 1;
+                        }
+                        if a_on[i][ch] + tol < a_un[i][ch] {
+                            under += 1;
+                        }
+                    }
+                }
+                if over > 0 || under > 0 {
+                    eprintln!(
+                        "check-gpu: FAIL M12b invariant — {over} ch brighter than the boosted \
+                         frame, {under} ch darker than the unboosted one"
+                    );
+                    m12b = false;
+                }
+
+                // (5) The arms NEST in strength: half-strength must land between
+                // the off and on arms at the exempted pixel. A guard that
+                // ignored the strength lever passes (2) and (3) and fails here.
+                let (h, lo, hi) = (a_half[lone][0], a_on[lone][0], a_off[lone][0]);
+                if !(h >= lo - tol && h <= hi + tol) || (hi - lo) <= tol {
+                    eprintln!(
+                        "check-gpu: FAIL M12b strength nesting — half {h:.4} not between \
+                         on {lo:.4} and off {hi:.4}"
+                    );
+                    m12b = false;
+                }
+
+                // (6) DETECTION READS PRE-GLARE. Bloom's whole job is spreading
+                // an outlier's energy into its neighbourhood, so a ring measured
+                // AFTER it lets a spike's own halo raise the ring mean and
+                // shield the spike — the guard would quietly stop firing on
+                // exactly the pixels it exists for. Arms (1)-(5) all run with
+                // bloom OFF, where `c0 == c` bitwise, so a shader that sampled
+                // the post-glare colour passes every one of them; this is the
+                // only arm that can tell the two apart.
+                //
+                // No tent is mirrored on the CPU (that is M13's job). Instead
+                // the chosen per-pixel exposure is RECOVERED: both arms below
+                // present the same post-glare colour X, one at `e_px` and one at
+                // `e_hi`, and the SDR curve is invertible — x = -ln(1 - v^2.2) —
+                // so their ratio IS e_px/e_hi whatever the tent did.
+                // Strength 1.0 (the colour IS the tent) and a tent step equal to
+                // the ring radius. Both are needed for the arm to have teeth: at
+                // 0.6 the halo does raise the ring, but the spike stays bright
+                // enough post-glare that a post-glare reading would still exempt
+                // it — measured, and the vacuity NOTE below is what said so.
+                let bloom = (1.0f32, 4.0 / TW as f32, 4.0 / TH as f32);
+                match (run(0.0, tp4, bloom), run(1.0, tp4, bloom)) {
+                    (Ok(b_off), Ok(b_on)) => {
+                        autoexp::set_guard_strength(1.0);
+                        // -> pre-exposure linear, from the unguarded arm. The
+                        // fixture is grey, so channel 0 IS the luma (the Rec.709
+                        // weights sum to 1).
+                        let unmap = |v: f32| -> Option<f32> {
+                            let s = 1.0 - v.powf(2.2);
+                            // Saturated pixels carry no information back through
+                            // the curve; they are skipped rather than clamped
+                            // into a fabricated value.
+                            (s > 1e-3).then(|| -s.ln())
+                        };
+                        let x: Vec<f32> = (0..n)
+                            .map(|i| unmap(b_off[i][0]).map_or(0.0, |t| t / e_hi))
+                            .collect();
+                        // The POST-glare hypothetical, run through the shipped
+                        // ring logic rather than a re-derivation.
+                        let post = autoexp::guard_plane(&x, TW as usize, TH as usize, e_hi)
+                            .unwrap_or_else(|| vec![e_hi; n]);
+                        // TEETH: the arm is only meaningful if the two readings
+                        // actually disagree at the spike. They do because the
+                        // halo reaches the ring (the tent's step IS the ring
+                        // radius) — but if a future bloom change made them agree
+                        // this would silently become a tautology, so it says so.
+                        let gap = (post[lone] - plane[lone]).abs();
+                        if gap <= 0.3 {
+                            println!(
+                                "check-gpu: NOTE M12b pre-glare arm is VACUOUS — the post-glare \
+                                 hypothetical lands at e {:.2} vs the pre-glare {:.2}, so this \
+                                 arm cannot tell them apart (widen the tent)",
+                                post[lone], plane[lone]
+                            );
+                        }
+                        // The recovered e_px must match the PRE-glare oracle.
+                        match (unmap(b_on[lone][0]), unmap(b_off[lone][0])) {
+                            (Some(num), Some(den)) if den > 0.0 => {
+                                let e_rec = e_hi * num / den;
+                                // 8-bit quantization near the top of the curve is
+                                // worth several percent of the recovered value;
+                                // the two hypotheses are a whole `gap` apart, so
+                                // the bound only has to separate them.
+                                if (e_rec - plane[lone]).abs() > 0.15 * e_hi {
+                                    eprintln!(
+                                        "check-gpu: FAIL M12b pre-glare — with bloom on, the \
+                                         recovered exposure at the lone spike is {e_rec:.2}, \
+                                         but the PRE-glare oracle says {:.2} (post-glare would \
+                                         say {:.2}) — the ring is being measured after the halo",
+                                        plane[lone], post[lone]
+                                    );
+                                    m12b = false;
+                                } else if gap > 0.3 {
+                                    println!(
+                                        "check-gpu: M12b pre-glare ring confirmed — recovered e \
+                                         {e_rec:.2} tracks the pre-glare {:.2}, not the \
+                                         post-glare {:.2}",
+                                        plane[lone], post[lone]
+                                    );
+                                }
+                            }
+                            _ => {
+                                eprintln!(
+                                    "check-gpu: FAIL M12b pre-glare — the spike saturated the \
+                                     wire, so no exposure could be recovered (lower HOT or e_hi)"
+                                );
+                                m12b = false;
+                            }
+                        }
+                    }
+                    _ => {
+                        eprintln!("check-gpu: FAIL M12b pre-glare arm could not render");
+                        m12b = false;
+                    }
+                }
+
+                if m12b {
+                    println!(
+                        "check-gpu: M12b spike guard == autoexp::guard_scale (worst {worst:.2e}) \
+                         | lone spike e {:.2} -> presented {lo:.3} vs {hi:.3} unguarded \
+                         | paired spike + flat field bitwise unguarded",
+                        plane[lone]
+                    );
+                }
+            }
+            _ => {
+                eprintln!("check-gpu: FAIL M12b spike-guard selftest could not render an arm");
+                m12b = false;
+            }
+        }
+        autoexp::set_guard(sg);
+        autoexp::set_guard_strength(ss);
+        ok &= m12b;
     }
 
     // --- M13: the glare pyramid, GPU vs CPU ---
@@ -17802,7 +18106,9 @@ fn run_check_nppd(
         let mut present = vec![0u32; rw * rh];
         for (name, data) in [("nppd_before", &input0), ("nppd_after", &out0), ("nppd_dolly", &out2)]
         {
-            render::resolve_hdr(data, &info, false, 1.0, &mut present, rw, rh, rw, rh);
+            // Exposure 1.0 + no guard plane: every headless path presents the
+            // pre-feature image by construction, not by tolerance.
+            render::resolve_hdr(data, &info, false, 1.0, None, &mut present, rw, rh, rw, rh);
             save_png(&format!("{name}.png"), &present, rw, rh);
             eprintln!("wrote {name}.png");
         }
@@ -18348,11 +18654,11 @@ fn run_check_oidn(
 
     if dump {
         let mut present = vec![0u32; rw * rh];
-        render::resolve_hdr(&input, &info, false, 1.0, &mut present, rw, rh, rw, rh);
+        render::resolve_hdr(&input, &info, false, 1.0, None, &mut present, rw, rh, rw, rh);
         save_png("oidn_before.png", &present, rw, rh);
-        render::resolve_hdr(&out, &info, false, 1.0, &mut present, rw, rh, rw, rh);
+        render::resolve_hdr(&out, &info, false, 1.0, None, &mut present, rw, rh, rw, rh);
         save_png("oidn_after.png", &present, rw, rh);
-        render::resolve_hdr(&hist_dolly, &info, false, 1.0, &mut present, rw, rh, rw, rh);
+        render::resolve_hdr(&hist_dolly, &info, false, 1.0, None, &mut present, rw, rh, rw, rh);
         save_png("oidn_hist.png", &present, rw, rh);
         dlss::dump_gbufs(&g, "oidn_gbuf", far);
         eprintln!("wrote oidn_before.png / oidn_after.png / oidn_hist.png / oidn_gbuf_*.png");
@@ -19125,7 +19431,7 @@ fn cine_write_frame(
     if !hdr_frames {
         // Exposure 1.0 — cinematic's own `-exposure` is applied to the LINEAR
         // radiance upstream (the one-write-site rule), never through the curve.
-        render::resolve_hdr(hdr, info, shot.overlay, 1.0, present, rw, rh, rw, rh);
+        render::resolve_hdr(hdr, info, shot.overlay, 1.0, None, present, rw, rh, rw, rh);
         #[cfg(windows)]
         cine_composite_hud(present, shot, fs, rw, rh, mode);
         #[cfg(not(windows))]
@@ -24200,11 +24506,11 @@ fn run_check(
         // fresh (frame stays 0, so accum holds exactly the last frame).
         if hybrid && !hemi_ao && !hemi_gi {
             let mut present = vec![0u32; rw * rh];
-            render::resolve(&accum, &info, 1, false, 1.0, &mut present, rw, rh, rw, rh);
+            render::resolve(&accum, &info, 1, false, 1.0, None, &mut present, rw, rh, rw, rh);
             save_png(&png_main, &present, rw, rh);
         } else if hemi_gi && !share {
             let mut present = vec![0u32; rw * rh];
-            render::resolve(&accum, &info, 1, false, 1.0, &mut present, rw, rh, rw, rh);
+            render::resolve(&accum, &info, 1, false, 1.0, None, &mut present, rw, rh, rw, rh);
             save_png(&png_gi, &present, rw, rh);
         }
     }
@@ -27781,6 +28087,8 @@ fn session(
                 bloom: bloom::enabled(),
                 autoexp: autoexp::enabled(),
                 exposure_bias: autoexp::bias(),
+                autoexp_guard: autoexp::guard(),
+                autoexp_guard_strength: autoexp::guard_strength(),
                 clouds: clouds::enabled(),
                 fireflies: fireflies::enabled(),
                 fireflies_count: fireflies::count(),
@@ -27855,6 +28163,17 @@ fn session(
                                 }
                                 settings::MenuFx::ExposureBias(ev) => {
                                     autoexp::set_bias(ev);
+                                }
+                                settings::MenuFx::ToggleAutoExpGuard => {
+                                    // Display-stage like its parent row: the
+                                    // guard only ever withholds part of the
+                                    // aperture's boost, so nothing upstream of
+                                    // the present funnel can see the flip and
+                                    // no history needs resetting.
+                                    autoexp::set_guard(!autoexp::guard());
+                                }
+                                settings::MenuFx::AutoExpGuardStrength(k) => {
+                                    autoexp::set_guard_strength(k);
                                 }
                                 settings::MenuFx::ToggleClouds => {
                                     // Shading change: plain accumulation only,
@@ -31119,15 +31438,22 @@ impl CpuPresent {
             self.meter = Some(autoexp::meter_accum(&accum[..rw * rh * 3], samples));
         }
         let e = self.tone.exposure;
+        // The spike guard's per-pixel exposure, built from the SAME pre-exposure,
+        // PRE-GLARE source the meter just read (the present loops see the glared
+        // image, and measuring an outlier's ring after bloom has spread its own
+        // halo into it would shield the outlier). `None` on every disarmed
+        // frame, which is what keeps those bit-identical.
+        let g = autoexp::guard_plane_accum(&accum[..rw * rh * 3], samples, rw, rh, e);
+        let g = g.as_deref();
         match self.enc {
             gpu::d3d12::PresentSpace::Sdr10 => render::resolve_sdr10(
-                accum, info, samples, overlay, e, &mut self.wire10, rw, rh, w, h,
+                accum, info, samples, overlay, e, g, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Hdr10 => render::resolve_pq(
-                accum, info, samples, overlay, self.tone, &mut self.wire10, rw, rh, w, h,
+                accum, info, samples, overlay, self.tone, g, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Sdr => {
-                render::resolve(accum, info, samples, overlay, e, &mut self.sdr, rw, rh, w, h)
+                render::resolve(accum, info, samples, overlay, e, g, &mut self.sdr, rw, rh, w, h)
             }
         }
     }
@@ -31147,15 +31473,17 @@ impl CpuPresent {
             self.meter = Some(autoexp::meter_hdr(&src[..rw * rh * 3]));
         }
         let e = self.tone.exposure;
+        let g = autoexp::guard_plane_hdr(&src[..rw * rh * 3], rw, rh, e);
+        let g = g.as_deref();
         match self.enc {
             gpu::d3d12::PresentSpace::Sdr10 => {
-                render::resolve_hdr_sdr10(src, info, overlay, e, &mut self.wire10, rw, rh, w, h)
+                render::resolve_hdr_sdr10(src, info, overlay, e, g, &mut self.wire10, rw, rh, w, h)
             }
             gpu::d3d12::PresentSpace::Hdr10 => render::resolve_hdr_pq(
-                src, info, overlay, self.tone, &mut self.wire10, rw, rh, w, h,
+                src, info, overlay, self.tone, g, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Sdr => {
-                render::resolve_hdr(src, info, overlay, e, &mut self.sdr, rw, rh, w, h)
+                render::resolve_hdr(src, info, overlay, e, g, &mut self.sdr, rw, rh, w, h)
             }
         }
     }
@@ -31179,7 +31507,8 @@ impl CpuPresent {
         h: usize,
     ) {
         let e = self.tone.exposure;
-        render::resolve(accum, info, samples, overlay, e, &mut self.sdr, rw, rh, w, h);
+        let g = autoexp::guard_plane_accum(&accum[..rw * rh * 3], samples, rw, rh, e);
+        render::resolve(accum, info, samples, overlay, e, g.as_deref(), &mut self.sdr, rw, rh, w, h);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -31194,7 +31523,8 @@ impl CpuPresent {
         h: usize,
     ) {
         let e = self.tone.exposure;
-        render::resolve_hdr(src, info, overlay, e, &mut self.sdr, rw, rh, w, h);
+        let g = autoexp::guard_plane_hdr(&src[..rw * rh * 3], rw, rh, e);
+        render::resolve_hdr(src, info, overlay, e, g.as_deref(), &mut self.sdr, rw, rh, w, h);
     }
 
     fn blit(&self, gpu: &mut gpu::GpuContext) -> gpu::d3d12::Result<()> {
