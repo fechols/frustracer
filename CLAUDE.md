@@ -4570,8 +4570,9 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # into the shared core BOUGHT — and compiles every unit to SPIR-V,
                                       # then spirv-val's each module. NOT a spike transcription: a
                                       # hand-mirrored concat would be gating itself.
-                                      # S0 pure (the binding scheme + blob checks; runs with no compiler
-                                      # on disk) | S1 loads libdxcompiler.so | S2 assembles+compiles |
+                                      # S0 pure (the binding scheme + its INVERSE + blob checks + the
+                                      # descriptor reflector's own walk; runs with no compiler on disk) |
+                                      # S1 loads libdxcompiler.so | S2 assembles+compiles |
                                       # S3 validates. S2 and S3 answer DIFFERENT questions and neither
                                       # substitutes: DXC will happily emit a module no driver accepts,
                                       # and spirv-val validates a MODULE, so it can say nothing about two
@@ -4659,16 +4660,19 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # library name, and the module/dep cfg lifted — nothing else; the
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
-                                      # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c).
+                                      # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
+                                      # and M3a's V5).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
                                       # against, so a module can be perfectly valid and read the wrong
-                                      # resource. Five stages: V0 the pure pick/memory logic (runs with no
+                                      # resource. Six stages: V0 the pure pick/memory logic (runs with no
                                       # Vulkan on the box at all) | V1 loader + instance + device | V2
                                       # compile smoke.hlsl to SPIR-V and build the pipelines | V3 run the
                                       # seed -> prep -> indirect-fill chain and read the results back |
-                                      # V4 the wave-width table and the subgroup-size decision.
+                                      # V4 the wave-width table and the subgroup-size decision | V5 the
+                                      # TRACER's own register map, derived from the corpus, with every one
+                                      # of its kernels bound against it.
                                       # V3 IS THE POINT: constants reaching a kernel, storage buffers
                                       # bound and written, a GPU-WRITTEN counter turned into dispatch
                                       # arguments by a second kernel, and a third kernel launched from
@@ -4702,8 +4706,8 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # skipped-and-exited-0 on both, which turns being-told into
                                       # passing — the --fsr4 doctrine violated in the one place nothing
                                       # would have noticed.
-                                      # TWO HARD DEVICE REQUIREMENTS, both inherited from --check-spirv's
-                                      # flag set rather than chosen here: Vulkan 1.3 (the SPIR-V target
+                                      # FIVE HARD DEVICE REQUIREMENTS, none of them chosen here — each is
+                                      # something the corpus already needs. Vulkan 1.3 (the SPIR-V target
                                       # env; a 1.2 device could not consume the modules) and
                                       # scalarBlockLayout (what -fvk-use-dx-layout costs, and therefore
                                       # what ONE Rust CB packer costs). The second is not theoretical
@@ -4711,11 +4715,43 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # stride under DX rules against std430's 16, so the smoke test
                                       # exercises the relaxation it requires. REQUIRED, never preferred:
                                       # a device without it would validate every module and then read the
-                                      # wrong bytes.
+                                      # wrong bytes. M3a added the descriptor-indexing three, and they are
+                                      # requirements in the same sense: runtimeDescriptorArray (texs[] is
+                                      # an unbounded Texture2D array, i.e. OpTypeRuntimeArray on a
+                                      # descriptor), shaderSampledImageArrayNonUniformIndexing (every
+                                      # texture fetch goes through NonUniformResourceIndex), and
+                                      # descriptorBindingPartiallyBound (ONE layout serves every kernel,
+                                      # so most sets are bound with slots the dispatched kernel never
+                                      # touches — without it, binding a set for the sky fill would demand
+                                      # valid descriptors for the hemi queues, the G-buffer pack and the
+                                      # whole texture table). Probed as three separate bits so a device
+                                      # missing one says WHICH.
+                                      # RAY QUERY IS ENABLED-WHEN-PRESENT, not required, and the
+                                      # distinction is --sw-rays: that arm assembles rt_sw.hlsli and
+                                      # traverses our own BVH in the shader, so a device with no ray
+                                      # tracing can still run the tracer. What must not happen is a
+                                      # session silently running the HARDWARE arm with the feature off,
+                                      # which is exactly what shipped in M3a's first draft — the device
+                                      # was created without VK_KHR_ray_query, RADV accepted every module
+                                      # anyway, and 25 validation errors ("SPIR-V Capability RayQueryKHR
+                                      # was declared, but ... rayQuery") is how the enable list was found
+                                      # rather than guessed. The chain is not optional and each link
+                                      # earns its place: ray query needs acceleration structures,
+                                      # acceleration structures need bufferDeviceAddress (their geometry
+                                      # is addressed by device address, not by descriptor) and
+                                      # VK_KHR_deferred_host_operations (a hard dependency of the
+                                      # extension, not of the feature). V5 says so up front on a device
+                                      # without it instead of blaming the corpus with a pile of
+                                      # capability errors. The no-ray-query BRANCH is untested — both
+                                      # ICDs on this box have RT.
                                       # BINDINGS ARE COMPUTED, NEVER WRITTEN DOWN: the descriptor-set
                                       # layout reads vk::spirv::binding_of, the same rule the -fvk-*-shift
                                       # flags are generated from, because a literal is exactly how a
                                       # layout drifts away from the flags its modules were compiled with.
+                                      # reg_of_binding is the INVERSE, and self_test pins the round trip
+                                      # over the whole range in both directions plus the stride between
+                                      # shifts — two independent matches over four constants is precisely
+                                      # the shape that stays correct until someone edits one of them.
                                       # TEETH, all three exercised rather than asserted: a binding
                                       # shifted by ONE fails V3 with `outbuf[0] = 0xeeeeeeee ... (never
                                       # written)` — the buffer is pre-poisoned with a sentinel so a
@@ -4757,13 +4793,75 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # unvalidated run, reported off the FACT (Vk::validated) rather than
                                       # the request, since otherwise a weak run and a strong one log
                                       # identically.
+                                      # V5 — THE TRACER'S REGISTER MAP, DERIVED (M3a, 2026-08-10;
+                                      # src/vk/reflect.rs + src/vk/layout.rs). The first stage that is
+                                      # about the RENDERER rather than about Vulkan. D3D12 gets
+                                      # module-vs-layout agreement from create_root_signature — ~150
+                                      # hand-written lines kept in step with src/shaders/ by care — and
+                                      # what makes that survivable is that a disagreement fails PSO
+                                      # creation LOUDLY. Vulkan gives no such guarantee (M2c's planted
+                                      # shift PASSED unvalidated), so writing that table a second time
+                                      # would be writing the same liability twice in the API where it
+                                      # fails quietly. THE LAYOUT IS THEREFORE NOT WRITTEN AT ALL:
+                                      # vk::reflect walks the compiled SPIR-V for OpVariables carrying
+                                      # DescriptorSet+Binding, classifies each from its pointee type
+                                      # (image Sampled=1/2, sampler, AS, Block vs BufferBlock), unions
+                                      # every unit into a Map, and vk::layout turns THAT into the
+                                      # VkDescriptorSetLayouts. Consequence worth stating: adding a
+                                      # resource to a shader adds it to the layout automatically, and a
+                                      # binding two units disagree about is a hard error at build time
+                                      # instead of a wrong-resource read at run time.
+                                      # THE FAMILY IS THE UNIT, and that is a finding rather than a filing
+                                      # choice: D3D12 has several root signatures and their register maps
+                                      # genuinely CONTRADICT — t0 is `bvh_nodes`, a structured buffer, in
+                                      # the tracer and `b_src_diff`, a Texture2D, in FRD — so one map over
+                                      # the whole corpus would report a conflict and be RIGHT to. V5
+                                      # builds the TRACER family (reference/resolve/wavefront/sky/leaf/
+                                      # leaf_fb/hemi_wave/hemi_leaf/compose/feed/nrd_bridge, both vendor
+                                      # arms x both sway arms, deduped by source); each further family is
+                                      # its own layout, and the conflict detector is what will say so if
+                                      # one is mixed in.
+                                      # THE MAP IS SCENE-DEPENDENT, which is the strongest argument for
+                                      # deriving it: DXC drops resource declarations no entry point
+                                      # references, so the procedural scene yields 46 slots while
+                                      # san-miguel-low-poly yields 49 — uv_tri_mat/mat_cutout/mat_shadow
+                                      # appear only once ALPHA_CUTOUT and TRANS_SHADOW arm. A layout
+                                      # written down from one scene would silently omit bindings another
+                                      # scene's modules use, and M3b's session layout must therefore be
+                                      # derived from the modules THAT session compiled. The slot count in
+                                      # the summary line is what makes the difference visible (the
+                                      # --check-spirv assembled-bytes lesson, in another currency).
+                                      # MEASURED: 26 units -> 46 slots in 2 sets -> 45 compute pipelines
+                                      # bound, validation clean, on RADV AND on llvmpipe — so the whole
+                                      # tracer's kernel set binds on a software Vulkan device too, which
+                                      # is what makes this gateable in CI without a GPU.
+                                      # V5 TEETH: FR_VK_DROP_BINDING=<set>:<binding> OMITS one slot from
+                                      # the derived layout — the only way to test a layout that is derived
+                                      # FROM the shaders, since nothing else can make one wrong — and the
+                                      # run must fail. Exercised on two very different descriptors:
+                                      # 0:1007 (the TLAS) and 1:1010 (the unbounded texs[] array), both
+                                      # exit 1 with the layer naming the variable ("uses descriptor [Set 0,
+                                      # Binding 1007, variable \"tlas\"] but the binding was not declared").
+                                      # THE HONEST LIMIT, measured: with FR_VK_VALIDATION=0 the SAME drop
+                                      # exits 0 — vkCreateComputePipelines accepts it and the driver
+                                      # resolves the missing slot — so V5's teeth are validation-layer
+                                      # teeth, which is the M2c lesson holding at 46 bindings rather than
+                                      # at one, and the reason validation is armed by default. Anti-vacuity
+                                      # beside them: the derived map must contain an acceleration
+                                      # structure, a sampled image, a sampler, a uniform buffer, a storage
+                                      # buffer, a storage image, at least one UNBOUNDED array (a layout
+                                      # that sized texs[] to 1 would truncate every scene's texture table)
+                                      # and >= 30 slots, and at least one pipeline must have been created.
                                       # LEVERS: FR_VK_DEVICE=<index|name-substring> forces the adapter
                                       # (loud; an ambiguous substring is an ERROR rather than first-match,
                                       # since "amd" matching two adapters and quietly taking one is how a
                                       # measurement ends up describing the other device);
                                       # FR_VK_VALIDATION=0 disarms VK_LAYER_KHRONOS_validation +
                                       # VK_EXT_debug_utils (armed otherwise), and the gate FAILS on any
-                                      # ERROR-severity message.
+                                      # ERROR-severity message; FR_VK_MAP=1 prints the derived register map
+                                      # (the D3D12 root signature's Vulkan twin — "what does the tracer
+                                      # actually bind" answerable without reading the shaders);
+                                      # FR_VK_DROP_BINDING=<set>:<binding> is V5's teeth above.
                                       # THE M2c SUBGROUP VERDICT (V4) — waveprobe.hlsl, the D3D12 suite's
                                       # OWN kernel unmodified, at every group width the tracer dispatches
                                       # (32 for cs_level*/cs_hemi_*, SKY_GROUP=64, LEAF_GROUP=256), in
@@ -4802,9 +4900,14 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # and compute needs no surface at all — the harness has one less
                                       # moving part than expected. It becomes relevant when the display
                                       # stage wants gating, not before.
-                                      # NOT scene-keyed (unlike --check-spirv): smoke.hlsl carries no
-                                      # scene-derived defines, so this gate is a pure function of the
-                                      # device. `ash` is the one new dependency — a generated binding, not
+                                      # SCENE-KEYED SINCE V5, and V0-V4 are not: smoke.hlsl and
+                                      # waveprobe.hlsl carry no scene-derived defines, so those stages are
+                                      # a pure function of the device, while V5 assembles the real tracer
+                                      # and therefore inherits every scene-conditional define
+                                      # (ALPHA_CUTOUT/HEIGHTFIELD/TRANS_SHADOW) — which is why its slot
+                                      # count moves with the scene and why `--check-vk
+                                      # san-miguel-low-poly.obj` covers bindings the procedural run cannot
+                                      # reach. `ash` is the one new dependency — a generated binding, not
                                       # a framework (no allocator, no render graph, no policy), and its
                                       # default `loaded` feature dlopens libvulkan.so.1 and resolves every
                                       # entry point by symbol: the same footprint policy as dxc/oidn/xess/

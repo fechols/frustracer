@@ -715,8 +715,11 @@ pub struct Cli {
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
     /// `--check-vk`: bring up a real Vulkan device, run the indirect-dispatch
-    /// smoke chain on it, and probe the compiled subgroup width at every group
-    /// width the tracer dispatches. unix-only today, like the backend it gates.
+    /// smoke chain on it, probe the compiled subgroup width at every group
+    /// width the tracer dispatches, and bind every tracer kernel against the
+    /// descriptor-set layout derived from the corpus's own declarations.
+    /// SCENE-KEYED at that last stage (the tracer's scene-conditional defines
+    /// change which resources exist), unix-only today like the backend it gates.
     pub check_vk: bool,
     pub check_gpu: bool,
     pub check_dxr: bool,
@@ -2491,8 +2494,10 @@ pub fn usage() {
                 eprintln!("  --check-vk    headless (unix): bring up a real Vulkan device and run the indirect-");
                 eprintln!("                dispatch smoke chain on it (constants, storage buffers, a GPU-written");
                 eprintln!("                counter turned into dispatch args, vkCmdDispatchIndirect consuming");
-                eprintln!("                them), then probes the compiled subgroup width at every group width the");
-                eprintln!("                tracer dispatches, unpinned and pinned. FR_VK_DEVICE=<index|name> forces");
+                eprintln!("                them), probes the compiled subgroup width at every group width the tracer");
+                eprintln!("                dispatches (unpinned and pinned), and binds every tracer kernel against");
+                eprintln!("                the descriptor-set layout DERIVED from the compiled modules themselves");
+                eprintln!("                (FR_VK_MAP=1 prints it). FR_VK_DEVICE=<index|name> forces");
                 eprintln!("                the adapter; the Khronos validation layer is ARMED by default and");
                 eprintln!("                FR_VK_VALIDATION=0 disarms it");
                 eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser, OPT-IN since");

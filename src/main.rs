@@ -1142,7 +1142,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk();
+            let code = run_check_vk(&scene);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -11448,6 +11448,41 @@ fn run_check_gpu(
 /// `OnceLock`s, so one process is one configuration. Re-run the gate under
 /// them — the same rule `tools/dump-hlsl.ps1` states for the same reason.
 #[cfg(unix)]
+/// Every compute entry point an assembled unit declares: a `[numthreads(...)]`
+/// attribute followed by the function it decorates.
+///
+/// SCANNED, never listed. A hardcoded table goes stale the first time a kernel
+/// gains an entry, and silently — the gate would pass having compiled less
+/// than it thinks. Deliberately narrow: it must not match the many ordinary
+/// `void foo(` helpers these units paste in, which are not entry points and
+/// fail to compile as one.
+#[cfg(unix)]
+fn compute_entries(src: &str) -> Vec<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if !l.trim_start().starts_with("[numthreads") {
+            continue;
+        }
+        // The attribute may be followed by more attributes or a blank line
+        // before the signature.
+        for l2 in lines.iter().skip(i + 1).take(3) {
+            let t = l2.trim_start();
+            if let Some(rest) = t.strip_prefix("void ") {
+                if let Some(name) = rest.split('(').next() {
+                    let name = name.trim();
+                    if !name.is_empty() && !out.contains(&name.to_string()) {
+                        out.push(name.to_string());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
 fn run_check_spirv(scene: &scene::Scene) -> i32 {
     use gfx::shaders as sh;
     use gfx::vocab::Vendor;
@@ -11459,6 +11494,17 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
         Err(e) => {
             eprintln!("check-spirv: FAIL S0 {e}");
+            ok = false;
+        }
+    }
+    // The reflector is pure SPIR-V and belongs to the same stage: it reads
+    // what a module DECLARES, which is the half of the descriptor story
+    // `spirv-val` cannot see (it validates a module, and knows nothing about
+    // the layout that module will be bound against).
+    match vk::reflect::self_test() {
+        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 reflect: {e}");
             ok = false;
         }
     }
@@ -11607,36 +11653,6 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     push!("hud", sh::HUD_HLSL.to_string(), Shape::Gfx);
     push!("waveviz", sh::WAVEVIZ_HLSL.to_string(), Shape::Gfx);
 
-    // ---- the entry scanner ----
-    // A `[numthreads(...)]` attribute followed by the function it decorates.
-    // Deliberately narrow: it must not match the many ordinary `void foo(`
-    // helpers these units paste in, which are not entry points and fail to
-    // compile as one.
-    fn compute_entries(src: &str) -> Vec<String> {
-        let lines: Vec<&str> = src.lines().collect();
-        let mut out = Vec::new();
-        for (i, l) in lines.iter().enumerate() {
-            if !l.trim_start().starts_with("[numthreads") {
-                continue;
-            }
-            // The attribute may be followed by more attributes or a blank
-            // line before the signature.
-            for l2 in lines.iter().skip(i + 1).take(3) {
-                let t = l2.trim_start();
-                if let Some(rest) = t.strip_prefix("void ") {
-                    if let Some(name) = rest.split('(').next() {
-                        let name = name.trim();
-                        if !name.is_empty() && !out.contains(&name.to_string()) {
-                            out.push(name.to_string());
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        out
-    }
-
     // ---- S3: spirv-val, if the drop is here. ----
     let val = {
         let bundled = std::path::PathBuf::from(concat!(
@@ -11778,7 +11794,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 /// the bare-checkout rule every SDK-dependent gate here follows. It does NOT
 /// degrade on a device that is present and wrong.
 #[cfg(unix)]
-fn run_check_vk() -> i32 {
+fn run_check_vk(scene: &scene::Scene) -> i32 {
     let mut ok = true;
 
     // ---- V0: the pure half. Meaningful on a box with no Vulkan at all. ----
@@ -11871,6 +11887,11 @@ fn run_check_vk() -> i32 {
 
     // ---- V4: the wave-width table, and the pin. ----
     if !run_check_vk_waves(&hg, &sp) {
+        ok = false;
+    }
+
+    // ---- V5: the tracer's register map, derived, and every kernel bound. ----
+    if !run_check_vk_layout(&hg, &sp, scene) {
         ok = false;
     }
 
@@ -12002,6 +12023,248 @@ fn run_check_vk_waves(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> b
             }
         );
     }
+    ok
+}
+
+/// V5 — the tracer's descriptor-set layout, DERIVED from the corpus, and every
+/// one of its kernels bound against it.
+///
+/// This is the first stage that is about the RENDERER rather than about
+/// Vulkan. V2/V3 proved a hand-written four-binding layout works; the tracer
+/// needs sixty-odd bindings across two sets, including an acceleration
+/// structure, an unbounded texture array and two samplers, and the D3D12 side
+/// gets that agreement from `create_root_signature` — 150 hand-written lines
+/// kept in step with `src/shaders/` by care. Writing that twice would be
+/// writing the same liability twice, in the API where it fails quietly, so the
+/// layout here is read back out of the compiled modules (`vk::reflect`) and
+/// this stage is the proof that the reading is USABLE: every kernel creates a
+/// compute pipeline against it, which is exactly where a module meets a layout.
+///
+/// THE FAMILY IS THE UNIT, and that is a finding rather than a filing choice.
+/// D3D12 has several root signatures — the tracer's, FRD's, bloom's, quin's —
+/// and their register maps genuinely CONTRADICT: `t0` is `bvh_nodes`, a
+/// structured buffer, in the tracer and `b_src_diff`, a `Texture2D`, in FRD.
+/// One map over the whole corpus would report that as a conflict and be right
+/// to. So this builds the TRACER family's map; each further family is its own
+/// layout, and the conflict detector is what will say so if one is mixed in.
+#[cfg(unix)]
+fn run_check_vk_layout(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+) -> bool {
+    use gfx::shaders as sh;
+    use gfx::vocab::Vendor;
+    use vk::reflect::{DescKind, Map};
+
+    let mut ok = true;
+
+    // Say it before it becomes 25 validation errors about `RayQueryKHR`. The
+    // shipping assembly uses `rt.hlsli`, so every leaf/hemi/reference/feed
+    // kernel declares ray query; a device without it can still run the tracer
+    // — `--sw-rays` assembles `rt_sw.hlsli` and traverses our own BVH in the
+    // shader — but not THESE modules, and a gate that reported that as a pile
+    // of capability errors would be blaming the corpus for the device.
+    if !hg.vk.info.ray_query || !hg.vk.info.accel_struct {
+        eprintln!(
+            "check-vk: FAIL V5 this device has no ray query, so the shipping (hardware-ray) \
+             assembly cannot be bound here — the --sw-rays arm is what such a device runs"
+        );
+        return false;
+    }
+
+    // Every arm of the tracer family. Both vendors (`cand_defs`) and both sway
+    // arms, deduped by source, because a define that changes the register map
+    // in one arm and not another is exactly what a union is for.
+    let mut units: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut push = |name: String, src: String, units: &mut Vec<(String, String)>| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        if seen.insert(h.finish()) {
+            units.push((name, src));
+        }
+    };
+    for vendor in [Vendor::Nvidia, Vendor::Amd] {
+        for sway in [false, true] {
+            let t = sh::trace_sources(&sh::TraceKeys { scene, vendor, sway_armed: sway });
+            let tag = format!("{vendor:?}{}", if sway { "+sway" } else { "" });
+            for (n, s) in [
+                ("reference", t.reference.clone()),
+                ("resolve", t.resolve.clone()),
+                ("wavefront", t.wavefront.clone()),
+                ("sky", t.sky.clone()),
+                ("leaf", t.leaf.clone()),
+                ("leaf_fb", t.leaf_fb.clone()),
+                ("hemi_wave", t.hemi_wave.clone()),
+                ("hemi_leaf", t.hemi_leaf.clone()),
+                ("compose", t.compose.clone()),
+                ("feed", t.feed.clone()),
+                // Same root signature on D3D12 (NRD_FEED_SET is a heap slice,
+                // not a register space), so it is the same family here.
+                ("nrd_bridge", t.nrd_bridge()),
+            ] {
+                push(format!("{n}[{tag}]"), s, &mut units);
+            }
+        }
+    }
+
+    // ---- reflect every entry point, union the results ----
+    let mut map = Map::default();
+    let mut modules: Vec<(String, String, Vec<u32>)> = Vec::new(); // (unit, entry, words)
+    let mut conflicts: Vec<String> = Vec::new();
+    for (name, src) in &units {
+        let entries = compute_entries(src);
+        if entries.is_empty() {
+            eprintln!("check-vk: FAIL V5 {name}: no [numthreads] entry point found");
+            ok = false;
+            continue;
+        }
+        for e in entries {
+            let what = format!("{name}:{e}");
+            let words = match sp.compile(src, &e, "cs_6_5", &what, false) {
+                Ok(w) => w,
+                Err(err) => {
+                    eprintln!("check-vk: FAIL V5 {err}");
+                    ok = false;
+                    continue;
+                }
+            };
+            match vk::reflect::reflect(&words) {
+                Ok(d) => conflicts.extend(map.add(&what, &d)),
+                Err(err) => {
+                    eprintln!("check-vk: FAIL V5 reflect {what}: {err}");
+                    ok = false;
+                    continue;
+                }
+            }
+            modules.push((name.clone(), e, words));
+        }
+    }
+    for c in &conflicts {
+        eprintln!("check-vk: FAIL V5 register-map conflict: {c}");
+        ok = false;
+    }
+    for c in map.class_violations() {
+        eprintln!("check-vk: FAIL V5 {c}");
+        ok = false;
+    }
+
+    // `FR_VK_MAP=1` — the derived register map itself. The read-only-probe
+    // idiom: this is the D3D12 root signature's Vulkan twin, and "what does
+    // the tracer actually bind" is the first question a green sweep should be
+    // able to answer without reading the shaders.
+    if std::env::var_os("FR_VK_MAP").is_some() {
+        for l in map.lines() {
+            println!("check-vk:   {l}");
+        }
+    }
+
+    // ---- anti-vacuity ----
+    //
+    // A map that reflected nothing would build an empty layout, create every
+    // pipeline against it, and report a clean sweep. So demand the SHAPES that
+    // make this family what it is: the acceleration structure the RayQuery
+    // primitives bind, the unbounded texture table, its samplers, the frame
+    // constant buffer, and both flavours of writable resource. Each is a
+    // different code path through the reflector, so this is coverage as well
+    // as a floor.
+    let kinds: std::collections::HashSet<&'static str> =
+        map.entries.values().map(|e| e.kind.name()).collect();
+    for want in [
+        DescKind::AccelStruct,
+        DescKind::SampledImage,
+        DescKind::Sampler,
+        DescKind::UniformBuffer,
+        DescKind::StorageBuffer,
+        DescKind::StorageImage,
+    ] {
+        if !kinds.contains(want.name()) {
+            eprintln!(
+                "check-vk: FAIL V5 the derived map has no {} — the corpus declares one, so \
+                 this run reflected less than it thinks",
+                want.name()
+            );
+            ok = false;
+        }
+    }
+    let unbounded = map.entries.values().filter(|e| e.count == 0).count();
+    if unbounded == 0 {
+        eprintln!(
+            "check-vk: FAIL V5 no unbounded array in the derived map — texs[] is one, and a \
+             layout that sized it to 1 would truncate every scene's texture table"
+        );
+        ok = false;
+    }
+    if map.entries.len() < 30 {
+        eprintln!(
+            "check-vk: FAIL V5 the derived map has only {} slots — the tracer binds far more",
+            map.entries.len()
+        );
+        ok = false;
+    }
+
+    // ---- build the layouts ----
+    //
+    // The texture table's ceiling comes from the DEVICE, not from a constant:
+    // it is the number that says whether a real scene's table fits, and a
+    // hardcoded one would either waste a limit this device has or exceed one
+    // it does not.
+    let cap = vk::layout::DEFAULT_TEX_CAP.min(hg.vk.info.max_sampled_images);
+    // `FR_VK_DROP_BINDING=set:binding` — the teeth, and the only way to test a
+    // layout that is DERIVED from the shaders: nothing else can make one
+    // wrong. With it set the run MUST fail, which is what proves the pipeline
+    // creations below are checking the layout rather than ignoring it.
+    let drop = std::env::var("FR_VK_DROP_BINDING").ok().and_then(|v| {
+        let (a, b) = v.split_once(':')?;
+        let d = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+        eprintln!("check-vk: FR_VK_DROP_BINDING={v} — set {} binding {} OMITTED from the \
+                   layout; this run MUST fail", d.0, d.1);
+        Some(d)
+    });
+    let layouts = match vk::layout::Layouts::build(&hg.vk, &map, cap, drop) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V5 {e}");
+            return false;
+        }
+    };
+
+    // ---- bind every kernel ----
+    //
+    // `vkCreateComputePipelines` is where a module meets a layout: a binding
+    // the module uses and the layout omits, a descriptor type that disagrees,
+    // or a SPIR-V capability the device lacks all surface here. Nothing is
+    // dispatched — that is M3b, which needs a scene on the GPU — so the
+    // pipelines are created and destroyed, and the CREATION is the assertion.
+    let mut built = 0usize;
+    for (name, entry, words) in &modules {
+        match vk::layout::compute_pipeline(&hg.vk, &layouts, words, entry) {
+            Ok(p) => {
+                built += 1;
+                unsafe { hg.vk.device.destroy_pipeline(p, None) };
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V5 {name}:{entry}: {e}");
+                ok = false;
+            }
+        }
+    }
+    layouts.destroy(&hg.vk);
+
+    if built == 0 {
+        eprintln!("check-vk: FAIL V5 no pipeline was created — this stage proved nothing");
+        ok = false;
+    }
+    let sets = map.entries.keys().map(|&(s, _)| s).collect::<std::collections::HashSet<_>>().len();
+    println!(
+        "check-vk: V5 {} units -> {} slots in {sets} set{} (texs[] capped at {cap}) -> \
+         {built} compute pipelines bound",
+        units.len(),
+        map.entries.len(),
+        if sets == 1 { "" } else { "s" },
+    );
     ok
 }
 

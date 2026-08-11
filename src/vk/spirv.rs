@@ -122,6 +122,38 @@ pub fn binding_of(kind: Reg, reg: u32) -> u32 {
     shift + reg
 }
 
+/// The inverse: which register a Vulkan binding number came from.
+///
+/// It exists because the layout is DERIVED from compiled modules rather than
+/// transcribed (see `vk::reflect`), so the only thing a reflected binding
+/// carries is its number — and reading the register class back out of it is
+/// what lets a gate say "this slot reflects as a storage image but its number
+/// says it is a `t`". Written against the same constants as `binding_of`, and
+/// `self_test` pins the round trip in both directions rather than trusting
+/// that two `match`es stayed in step.
+///
+/// `None` for a binding outside every range, which is itself a finding: with
+/// three orders of magnitude of headroom above the corpus's largest register,
+/// a number out there means a shift moved.
+pub fn reg_of_binding(binding: u32) -> Option<(Reg, u32)> {
+    // Order matters only in that each range must be tested against its own
+    // ceiling; the shifts are 1000 apart and `self_test` proves they stay so.
+    for (kind, shift) in
+        [(Reg::B, SHIFT_B), (Reg::T, SHIFT_T), (Reg::U, SHIFT_U), (Reg::S, SHIFT_S)]
+    {
+        if binding >= shift && binding - shift < SHIFT_STRIDE {
+            return Some((kind, binding - shift));
+        }
+    }
+    None
+}
+
+/// The gap between adjacent shifts — the largest register number any one
+/// class may hold. The corpus's largest is `u32`, so this is three orders of
+/// headroom; it is a named constant because `reg_of_binding` needs a ceiling
+/// and picking one per call site is how the two halves drift.
+pub const SHIFT_STRIDE: u32 = 1000;
+
 /// The `-fvk-*-shift` flags, generated from the constants above so the
 /// compiler and the layout builder cannot disagree. `all` applies the shift
 /// in every space, which is what makes space0 and space1 follow one rule.
@@ -502,6 +534,34 @@ pub fn self_test() -> std::result::Result<(), String> {
                 return Err(format!("binding {b} collides: {prev:?} and {:?}", (k, r)));
             }
         }
+    }
+
+    // The inverse must undo the map EXACTLY, over the same range. Two
+    // independent `match`es over four constants is precisely the shape that
+    // stays correct until someone edits one of them, and the failure is
+    // silent: a layout built from a mis-inverted binding is a wrong-resource
+    // read with a valid module and a happy `spirv-val`.
+    for k in kinds {
+        for r in 0..512u32 {
+            match reg_of_binding(binding_of(k, r)) {
+                Some((k2, r2)) if k2 == k && r2 == r => {}
+                other => {
+                    return Err(format!("reg_of_binding(binding_of({k:?},{r})) = {other:?}"))
+                }
+            }
+        }
+    }
+    // The shifts must stay a stride apart, or the ranges overlap and the
+    // inverse silently attributes a register to the wrong class.
+    for (a, b) in [(SHIFT_B, SHIFT_T), (SHIFT_T, SHIFT_U), (SHIFT_U, SHIFT_S)] {
+        if b - a != SHIFT_STRIDE {
+            return Err(format!("shifts {a} and {b} are not SHIFT_STRIDE apart"));
+        }
+    }
+    // Above the last range there is nothing to attribute a binding to, and
+    // saying so is what makes a moved shift a finding rather than a misread.
+    if reg_of_binding(SHIFT_S + SHIFT_STRIDE).is_some() {
+        return Err("a binding past every range was attributed to a register".into());
     }
 
     // The flags must be GENERATED from the same constants — a hand-typed

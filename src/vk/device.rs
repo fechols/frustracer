@@ -219,6 +219,22 @@ pub struct DeviceInfo {
     pub ray_query: bool,
     pub accel_struct: bool,
     pub rt_pipeline: bool,
+    /// The descriptor-indexing half the corpus needs, and needs UNCONDITIONALLY
+    /// — these are not features a session opts into. `texs[]` (`t10, space1`)
+    /// is an unbounded `Texture2D` array, which is `OpTypeRuntimeArray` on a
+    /// descriptor; every sample through it goes through
+    /// `NonUniformResourceIndex`, which becomes a `NonUniform` decoration; and
+    /// one pipeline layout serving every kernel means most sets are bound with
+    /// slots the dispatched kernel never touches. Probed as three separate
+    /// bits rather than one because a device missing one of them should say
+    /// which.
+    pub runtime_descriptor_array: bool,
+    pub nonuniform_sampled_image: bool,
+    pub partially_bound: bool,
+    /// `maxPerStageDescriptorSampledImages` — the ceiling on the texture
+    /// table's layout entry, since SPIR-V gives an unbounded array no length
+    /// and Vulkan demands one.
+    pub max_sampled_images: u32,
 }
 
 impl DeviceInfo {
@@ -464,15 +480,61 @@ impl Vk {
 
         // Enable only what is required plus what is free and already probed.
         // scalarBlockLayout is the load-bearing one (module header).
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default().scalar_block_layout(true);
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+            .scalar_block_layout(true)
+            // The three the corpus cannot run without; `probe` has already
+            // rejected a device missing any of them, so enabling them here
+            // cannot fail — but they must be enabled EXPLICITLY, because an
+            // available-and-unenabled feature is a validation error at
+            // pipeline creation, not a silent default.
+            .runtime_descriptor_array(true)
+            .shader_sampled_image_array_non_uniform_indexing(true)
+            .descriptor_binding_partially_bound(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
         if info.subgroup_size_control {
             f13 = f13.subgroup_size_control(true).compute_full_subgroups(true);
         }
-        let dci = vk::DeviceCreateInfo::default()
+
+        // RAY QUERY, and the chain it drags in. `rt.hlsli` is the tracer's
+        // default intersector, so every leaf, hemi, reference and feed kernel
+        // declares `RayQueryKHR` and `SPV_KHR_ray_query`; a device created
+        // without them accepts those modules on RADV and reports a validation
+        // ERROR, which is how this list was found rather than guessed.
+        //
+        // The dependency chain is not optional and each link earns its place:
+        // ray query needs acceleration structures, acceleration structures
+        // need `bufferDeviceAddress` (their geometry is addressed by device
+        // address, not by descriptor) and `VK_KHR_deferred_host_operations`
+        // (declared even though nothing here defers a build — it is a hard
+        // dependency of the extension, not of the feature).
+        //
+        // ENABLED WHEN PRESENT rather than required, deliberately: `--sw-rays`
+        // assembles `rt_sw.hlsli` instead and traverses our own BVH in the
+        // shader, so a device without ray tracing can still run the tracer.
+        // What must not happen is a session that silently runs the hardware
+        // arm with the feature off — hence the flag on `DeviceInfo`, which the
+        // gates key their own expectations off.
+        let mut exts: Vec<*const std::ffi::c_char> = Vec::new();
+        let mut fas = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut frq = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+        let rt = info.ray_query && info.accel_struct;
+        if rt {
+            exts.push(ash::khr::deferred_host_operations::NAME.as_ptr());
+            exts.push(ash::khr::acceleration_structure::NAME.as_ptr());
+            exts.push(ash::khr::ray_query::NAME.as_ptr());
+            fas = fas.acceleration_structure(true);
+            frq = frq.ray_query(true);
+            f12 = f12.buffer_device_address(true);
+        }
+
+        let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
+            .enabled_extension_names(&exts)
             .push_next(&mut f12)
             .push_next(&mut f13);
+        if rt {
+            dci = dci.push_next(&mut fas).push_next(&mut frq);
+        }
         let device = unsafe { instance.create_device(phys, &dci, None) }
             .map_err(|e| format!("vkCreateDevice on {}: {e}", info.name))?;
         let queue = unsafe { device.get_device_queue(qfam, 0) };
@@ -540,6 +602,11 @@ impl Vk {
             ray_query: has_ext(ash::khr::ray_query::NAME),
             accel_struct: has_ext(ash::khr::acceleration_structure::NAME),
             rt_pipeline: has_ext(ash::khr::ray_tracing_pipeline::NAME),
+            runtime_descriptor_array: f12.runtime_descriptor_array == vk::TRUE,
+            nonuniform_sampled_image: f12.shader_sampled_image_array_non_uniform_indexing
+                == vk::TRUE,
+            partially_bound: f12.descriptor_binding_partially_bound == vk::TRUE,
+            max_sampled_images: props.limits.max_per_stage_descriptor_sampled_images,
         };
 
         // Hard requirements, each traceable to a decision already made.
@@ -550,6 +617,20 @@ impl Vk {
             ))
         } else if f12.scalar_block_layout != vk::TRUE {
             Some("lacks scalarBlockLayout, which -fvk-use-dx-layout requires".to_string())
+        } else if !info.runtime_descriptor_array {
+            Some("lacks runtimeDescriptorArray, which the texs[] table requires".to_string())
+        } else if !info.nonuniform_sampled_image {
+            Some(
+                "lacks shaderSampledImageArrayNonUniformIndexing, which every \
+                 NonUniformResourceIndex texture fetch requires"
+                    .to_string(),
+            )
+        } else if !info.partially_bound {
+            Some(
+                "lacks descriptorBindingPartiallyBound, which one-layout-for-every-kernel \
+                 requires"
+                    .to_string(),
+            )
         } else {
             None
         };
