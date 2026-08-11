@@ -128,6 +128,15 @@
                                // ext consumer reads sky texels full-screen
                                // and the derivation vetoes. Lockstep with
                                // trace.rs::FLAG_SKY_EXT_SKIP.
+#define FLAG_NRD_REJITTER 8388608u // cs_nrd_out applies NRD's own
+                               // NRD_SG_ReJitter Jacobian to the denoiser
+                               // DELTA — the micro-detail a spatial blur
+                               // averaged away, restored from the local BRDF
+                               // ratio. Read by the bridge unit ONLY (the one
+                               // unit that joins NVIDIA's NRD.hlsli); every
+                               // other kernel ignores it. Runtime, so the N8
+                               // gate can A/B both arms on one PSO. Lockstep
+                               // with trace.rs::FLAG_NRD_REJITTER.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w

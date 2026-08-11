@@ -706,6 +706,76 @@ pub const COMPOSE_HLSL: &str = include_str!("../shaders/compose.hlsl");
 pub const FEED_HLSL: &str = include_str!("../shaders/feed.hlsl");
 pub const NPPD_HLSL: &str = include_str!("../shaders/nppd.hlsl");
 pub const NRD_BRIDGE_HLSL: &str = include_str!("../shaders/nrd_bridge.hlsl");
+
+/// NVIDIA's own `NRD.hlsli`, read STRAIGHT OUT OF THE SUBMODULE at build time.
+///
+/// THIS IS NOT A PASTE, AND THE DISTINCTION IS THE WHOLE LICENSE POSTURE.
+/// Nothing of NVIDIA's is committed to this repository: `SDKs/NRD-src` is a URL
+/// and a SHA, so the header arrives in each user's own checkout from NVIDIA's
+/// own repository — exactly the acquisition the submodule already establishes
+/// for the DLL. `include_str!` then reads it from THERE. The clean-room cargo
+/// test below stays valid as written because it scans the files WE author
+/// (`OURS`), and it gains a companion pin that this string is byte-equal to the
+/// submodule file save for the one substituted line — i.e. proof that we
+/// include rather than transcribe. The reimplemented math in `nrd::oracle` and
+/// `nrd_bridge.hlsl` is NOT retired by this and must not be: those are the CPU
+/// twins the N0/N2 gates gate against, and replacing them with the header would
+/// leave the gates comparing NVIDIA's code to itself.
+///
+/// WHAT WE ACTUALLY USE OUT OF IT: `NRD_SG_ReJitter` and the private helpers it
+/// needs. See `cs_nrd_out` for why the SG *resolve* half is deliberately not
+/// used (a convention mismatch, not an oversight).
+const NRD_HLSLI_RAW: &str = include_str!("../../SDKs/NRD-src/Shaders/NRD.hlsli");
+
+/// The line `NRD.hlsli` opens with, and the ONE thing we rewrite.
+const NRD_CONFIG_INCLUDE: &str = "#include \"NRDConfig.hlsli\"";
+
+/// `NRD.hlsli` prepared for OUR assembly. Two mechanical facts force the one
+/// substitution, and neither is a modification of NVIDIA's logic:
+///
+///  1. This tree has NO `#include` machinery at all — every unit is a string
+///     concatenation, and DXC would fail to open the file.
+///  2. `NRDConfig.hlsli` is not in NVIDIA's tree; CMake WRITES it at configure
+///     time, and `install-prerequisites.bat` configures TWICE (the perf arm
+///     rewrites it with `REBLUR_PERFORMANCE_MODE 1`). Including whatever the
+///     last configure happened to leave would make our shader's encoding a
+///     function of installer ordering.
+///
+/// So we state the two encodings ourselves — and they are not a guess: they are
+/// the exact pair `Nrd::new`'s `GetLibraryDesc` gate REFUSES to run without
+/// (normalEncoding 2 = R10G10B10A2, roughnessEncoding 1 = LINEAR), so a DLL
+/// built against different ones sheds loudly at load rather than silently
+/// disagreeing with this header. The remaining `NRD_SUPPORTS_*` switches only
+/// guard NRD's own internal passes, which we never compile.
+pub fn nrd_header() -> String {
+    NRD_HLSLI_RAW.replacen(
+        NRD_CONFIG_INCLUDE,
+        // Lockstep with nrd.rs's GetLibraryDesc gate.
+        "#define NRD_NORMAL_ENCODING 2\n#define NRD_ROUGHNESS_ENCODING 1",
+        1,
+    )
+}
+
+/// NVIDIA's header followed by our bridge — the ONE place the two are joined,
+/// and a function rather than an inlined pair because there are TWO assemblies
+/// that need it: `TraceSources::nrd_bridge` (the wavefront) and `DxrGpu::new`
+/// (the same unit at that pipeline's cs_6_3 floor). They differ only in their
+/// preludes, so sharing the tail is what keeps "NVIDIA source reaches exactly
+/// one join site" a fact the test below can check instead of a convention two
+/// files have to remember — the wavefront-only first draft compiled fine and
+/// broke `--check-dxr` on an undeclared identifier.
+///
+/// COST, stated rather than measured: ~1200 lines of header now join BOTH
+/// bridge assemblies at every denoiser session's construction — FRD's
+/// included, since the bridge is engine-blind and the PSOs are built before
+/// the engine is known. It is all inline functions behind dead-code
+/// elimination, so the DXIL should not grow, but the DXC parse is real. If a
+/// session's startup ever needs the time back, the lever is to compile the
+/// bridge WITHOUT the header when `--no-nrd` is on the command line — the
+/// engine is knowable there, unlike at PSO time.
+pub fn nrd_bridge_tail() -> String {
+    [nrd_header().as_str(), NRD_BRIDGE_HLSL].join("\n")
+}
 pub const WAVEPROBE_HLSL: &str = include_str!("../shaders/waveprobe.hlsl");
 pub const WORKGRAPH_HLSL: &str = include_str!("../shaders/workgraph.hlsl");
 
@@ -1408,8 +1478,13 @@ impl TraceSources {
     ///
     /// `abl_defs` FIRST — the probe-reach rule; see `feed`'s assembly for the
     /// measurement that established it.
+    /// `nrd_bridge_tail` carries NVIDIA's header ahead of our bridge, so the
+    /// bridge can call `NRD_SG_ReJitter`. The bridge is the ONLY unit that
+    /// gets it — FRD's units, the tracer, and the DXR ray libraries never see
+    /// NVIDIA's header, which is what keeps "NRD source reaches exactly one
+    /// compile unit" a checkable statement rather than a habit.
     pub fn nrd_bridge(&self) -> String {
-        [abl_defs().as_str(), &self.spp, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, NRD_BRIDGE_HLSL]
+        [abl_defs().as_str(), &self.spp, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, &nrd_bridge_tail()]
             .join("\n")
     }
 
@@ -2469,6 +2544,19 @@ mod nrd_clean_room_tests {
             .join("\n")
     }
 
+    /// THE SG FAMILY IS DELIBERATELY ABSENT FROM THE LIST BELOW, and the gap
+    /// is worth stating because it is not the same shape as the rest. Since
+    /// `nrd_header` joins NVIDIA's own header ahead of the bridge, the bridge
+    /// legitimately CALLS `NRD_SG_ReJitter` / `REBLUR_BackEnd_UnpackSh` /
+    /// `_NRD_GetSpecularDominantDirection` — and a call and a definition share
+    /// a name, so listing them would fail on correct code while a paste of,
+    /// say, `_NRD_ComputeBrdfs`' BODY into our file would still slip past a
+    /// name test. What actually guards that half is the companion pin
+    /// (`nrd_header_is_included_verbatim_but_for_the_config_line`): the header
+    /// text we compile is byte-equal to the submodule's, so there is nothing
+    /// to gain by transcribing any of it. The list stays the PACK family,
+    /// where the never-paste rule is load-bearing because the N0/N2 gates
+    /// score our reimplementation against nrd::oracle's CPU twins.
     #[test]
     fn no_nrd_shader_source_pasted_into_ours() {
         // NVIDIA's public entry points (NRD.hlsli) — the names a paste of the
@@ -2515,5 +2603,99 @@ mod nrd_clean_room_tests {
         // runs, shown failing on planted code.
         let pasted = code_only("float4 v = NRD_FrontEnd_PackNormalAndRoughness(n, r);");
         assert!(pasted.contains("NRD_FrontEnd_PackNormalAndRoughness"));
+    }
+
+    /// THE COMPANION PIN: we INCLUDE NVIDIA's header, we do not TRANSCRIBE it.
+    /// The test above proves no NRD source is in our files; this one proves the
+    /// string we hand the compiler is the submodule's own file, byte for byte,
+    /// save for the single documented substitution. Together they make "NVIDIA
+    /// code arrives only from NVIDIA's repository" checkable rather than a
+    /// habit — the property the whole submodule posture rests on.
+    #[test]
+    fn nrd_header_is_included_verbatim_but_for_the_config_line() {
+        let raw = super::NRD_HLSLI_RAW;
+        let out = super::nrd_header();
+        // Exactly one substitution: the include line is gone, and putting it
+        // back reproduces the file bit for bit.
+        assert!(raw.contains(super::NRD_CONFIG_INCLUDE), "NRD.hlsli no longer includes its config");
+        assert!(!out.contains(super::NRD_CONFIG_INCLUDE), "the config include survived");
+        assert_eq!(raw.matches(super::NRD_CONFIG_INCLUDE).count(), 1);
+        // Everything else is untouched: same length delta as the one splice,
+        // and the same content on both sides of it.
+        let (pre, post) = raw.split_once(super::NRD_CONFIG_INCLUDE).unwrap();
+        assert!(out.starts_with(pre) && out.ends_with(post));
+        // The encodings we substitute are the ones nrd.rs REFUSES to run
+        // without — a drift here is a shader silently disagreeing with the DLL.
+        assert!(out.contains("#define NRD_NORMAL_ENCODING 2"));
+        assert!(out.contains("#define NRD_ROUGHNESS_ENCODING 1"));
+        // Anti-vacuity: the functions the bridge actually calls are present.
+        for f in ["NRD_SG_ReJitter", "REBLUR_BackEnd_UnpackSh", "_NRD_GetSpecularDominantDirection"]
+        {
+            assert!(out.contains(f), "NRD.hlsli is missing {f} — the bridge calls it");
+        }
+    }
+
+    /// The header reaches EXACTLY ONE compile unit, checked at the ASSEMBLY
+    /// layer rather than trusted. A stray `nrd_header()` join into another unit
+    /// would be invisible at runtime — unreferenced HLSL compiles away — while
+    /// quietly widening what we ship NVIDIA's source into.
+    ///
+    /// This scans THIS MODULE's own text. Slicing at the first `#[cfg(test)]`
+    /// does NOT work — there are several test modules and one of them precedes
+    /// the definition — so instead every occurrence is classified: prose (a
+    /// doc comment), a test's own `super::` reference, the definition, or a
+    /// call. There must be exactly one call, and it must be inside
+    /// `nrd_bridge_tail` — the shared join both assemblies go through.
+    #[test]
+    fn nrd_header_joins_only_the_bridge_unit() {
+        let me = include_str!("shaders.rs");
+        // Stop before THIS function: its own body quotes the marker, and a
+        // scanner that matches itself reports a defect that is only its own
+        // reflection (this cost one iteration to learn).
+        let end = me.find("fn nrd_header_joins_only_the_bridge_unit").unwrap();
+        let mut calls: Vec<&str> = Vec::new();
+        let mut saw_def = false;
+        for l in me[..end].lines() {
+            if !l.contains("nrd_header(") {
+                continue;
+            }
+            let t = l.trim_start();
+            if t.starts_with("///") || t.starts_with("//") || l.contains("super::nrd_header(") {
+                continue; // prose, or the sibling test reaching in
+            }
+            if l.contains("pub fn nrd_header()") {
+                saw_def = true;
+                continue;
+            }
+            calls.push(l);
+        }
+        assert!(saw_def, "shaders.rs: nrd_header's definition vanished — the scan is vacuous");
+        assert_eq!(
+            calls.len(),
+            1,
+            "nrd_header is joined into {} units, expected the bridge alone: {calls:?}",
+            calls.len()
+        );
+        assert!(
+            calls[0].contains("nrd_header().as_str()"),
+            "the one call site is not nrd_bridge_tail's join: {:?}",
+            calls[0]
+        );
+        // Anti-vacuity: the two assemblies the shared tail exists for must
+        // still be here, and BOTH must reach it through the tail rather than
+        // re-joining the header themselves. The DXR half lives in another
+        // file, which is exactly why it needs checking — the first draft
+        // wired only the wavefront and broke `--check-dxr` at compile time.
+        assert!(me.contains("pub fn nrd_bridge(&self)"));
+        assert!(me.contains("&nrd_bridge_tail()"), "the wavefront assembly lost the tail");
+        let dxr = include_str!("../gpu/dxr.rs");
+        assert!(
+            dxr.contains("nrd_bridge_tail()"),
+            "dxr.rs assembles the NRD bridge without the shared tail"
+        );
+        assert!(
+            !dxr.contains("NRD_BRIDGE_HLSL"),
+            "dxr.rs joins the bridge source directly — it must go through nrd_bridge_tail"
+        );
     }
 }

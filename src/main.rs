@@ -702,10 +702,9 @@ fn main() {
         eprintln!("rtgi: OFF — flat SH×AO ambient (the pre-RTGI renderer)");
     }
     autoexp::set_enabled(opts.autoexp);
-    // DEFAULT OFF (RTGI lights enclosures for real) — only arming prints,
-    // the lever-line convention.
-    if opts.autoexp {
-        eprintln!("auto-exposure: ON — display-stage aperture eases toward mid-grey");
+    // DEFAULT ON — only a DEPARTURE prints, the lever-line convention.
+    if !opts.autoexp {
+        eprintln!("auto-exposure: OFF — exposure holds at 1.0 (the pre-feature look)");
     }
     autoexp::set_bias(opts.exposure_bias);
     if opts.exposure_bias != 0.0 {
@@ -7799,8 +7798,14 @@ fn run_check_gpu(
                     // ENGINE guide dummies at 18/19 — the same pl[10]/pl[9]
                     // the N3 reference feed's engine set names, so the folded
                     // pack and cs_feed_xess write identical values there.
+                    // NRD-side arm (true) even though the "denoiser" here is a
+                    // passthrough over gate-owned planes: it makes N3's
+                    // byte-diff-0 exercise the re-jitter path a shipping NRD
+                    // session takes, which is the only place the delta form's
+                    // `0.0 * j == 0.0` claim is checked against real bytes.
                     if let Err(e) = ptg.wire_nrd_feed(
                         &hg.device,
+                        true,
                         &[
                             (16, &pl[0], fmts[0].0),
                             (17, &pl[1], fmts[1].0),
@@ -8089,6 +8094,7 @@ fn run_check_gpu(
                         // 16/18/19, the ENGINE's planes everywhere else.
                         if let Err(e) = ptg.wire_nrd_feed(
                             &hg.device,
+                            false, // FRD — never the NRD re-jitter (nrd_rejitter's engine term)
                             &[
                                 (16, &pl[0], fmts[0].0),
                                 (17, fg.plane_in_nr(), fmts[1].0),
@@ -8254,6 +8260,7 @@ fn run_check_gpu(
                         Ok(mut ng) => {
                             let wired = ptg.wire_nrd_feed(
                                 &hg.device,
+                                true,  // NRD — the re-jitter arm N8 then A/Bs
                                 &[
                                     (16, &pl[0], fmts[0].0),
                                     (17, ng.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
@@ -8356,6 +8363,157 @@ fn run_check_gpu(
                                     Ok(v) => frames.push(v),
                                     Err(e) => {
                                         eprintln!("check-gpu: FAIL N4 color readback: {e}");
+                                        return 1;
+                                    }
+                                }
+                            }
+                            // --- N8: the SG RE-JITTER arms (FLAG_NRD_REJITTER).
+                            //
+                            // Re-runs ONLY cs_nrd_out over the converged
+                            // frame's planes, twice, with the flag forced
+                            // both ways — no re-trace, no second ReBLUR pass,
+                            // so the two arms differ in exactly one bit of the
+                            // CB and nothing else. That is what makes the
+                            // "differs" assertion attributable.
+                            //
+                            // THE ANTI-VACUITY IS THE POINT. N3's byte-diff 0
+                            // is satisfied both by "the delta form correctly
+                            // multiplies an exact zero" and by "the block
+                            // never executed", and those are the two outcomes
+                            // a wiring bug sits between. Here the arms MUST
+                            // differ on a real denoised frame, and the
+                            // Jacobian's own clamp bounds by how much: j is
+                            // confined to [1/A, A] with A = NRD's
+                            // NRD_REJITTER_AMPLITUDE, so the re-jittered
+                            // departure from `base` can be at most A times the
+                            // plain one, per pixel.
+                            if !n4_fail {
+                                let p8 = gpu::trace::FrameParams {
+                                    sway_prev_time: None,
+                                    cam: basis_b,
+                                    frame: 108,
+                                    accumulate: false,
+                                    jitter: false,
+                                    frame_jitter: Some((0.0, 0.0)),
+                                    prev_cam: Some(basis_b),
+                                    q: uq,
+                                    verify: false,
+                                    spp: 1,
+                                    probe_sample: 0,
+                                    clouds: crate::clouds::Clouds::check(scene.diag),
+                                    fireflies: crate::fireflies::Fireflies::check(scene),
+                                    sway_time: check_sway,
+                                    replay: false,
+                                };
+                                let mut arms: Vec<Vec<u8>> = Vec::new();
+                                let mut n8_fail = false;
+                                for on in [false, true] {
+                                    ptg.force_nrd_rejitter(Some(on));
+                                    ptg.write_cb(0, &p8);
+                                    let mut r = Ok(());
+                                    let sub = hg.run(|l| r = ptg.record_nrd_out(l, 0));
+                                    if sub.is_err() || r.is_err() {
+                                        eprintln!("check-gpu: FAIL N8 nrd-out record");
+                                        n8_fail = true;
+                                        break;
+                                    }
+                                    match rb!(0, 8) {
+                                        Ok(v) => arms.push(v),
+                                        Err(e) => {
+                                            eprintln!("check-gpu: FAIL N8 readback: {e}");
+                                            n8_fail = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                ptg.force_nrd_rejitter(None);
+                                if !n8_fail {
+                                    let h = |b: &[u8], i: usize, l: usize| {
+                                        half::f16::from_bits(u16::from_le_bytes(
+                                            b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                                        ))
+                                        .to_f32()
+                                    };
+                                    let base_l = |i: usize| -> f32 {
+                                        let f = |c: usize| {
+                                            f32::from_le_bytes(
+                                                input0[(i * 3 + c) * 4..][..4].try_into().unwrap(),
+                                            )
+                                        };
+                                        (f(0) + f(1) + f(2)) / 3.0
+                                    };
+                                    let npx = pw * ph;
+                                    let (mut moved, mut worst) = (0usize, 0f32);
+                                    let (mut zero_delta, mut zero_moved) = (0usize, 0usize);
+                                    let mut finite = true;
+                                    for i in 0..npx {
+                                        let (a, b) = (
+                                            (h(&arms[0], i, 0) + h(&arms[0], i, 1) + h(&arms[0], i, 2))
+                                                / 3.0,
+                                            (h(&arms[1], i, 0) + h(&arms[1], i, 1) + h(&arms[1], i, 2))
+                                                / 3.0,
+                                        );
+                                        if !b.is_finite() {
+                                            finite = false;
+                                        }
+                                        let d = (a - b).abs();
+                                        if d > 1e-4 {
+                                            moved += 1;
+                                            worst = worst.max(d);
+                                        }
+                                        // Zero-delta pixels, REPORTED and not
+                                        // gated. The tempting reading — "the
+                                        // denoiser changed nothing here, so
+                                        // both arms must be `base`" — is not a
+                                        // theorem, for the same cancellation
+                                        // reason as the amplitude bound below:
+                                        // `a == base` can mean D and S are each
+                                        // zero (in which case the arms DO
+                                        // agree) or that they cancelled (in
+                                        // which case the Jacobian legitimately
+                                        // separates them). Measured 0 movers
+                                        // here, which says the population is
+                                        // the former — worth watching, not
+                                        // worth failing on.
+                                        if (a - base_l(i)).abs() <= f32::EPSILON {
+                                            zero_delta += 1;
+                                            if d > 1e-4 {
+                                                zero_moved += 1;
+                                            }
+                                        }
+                                    }
+                                    // NOT GATED, AND THE REASON IS WORTH
+                                    // RECORDING: the obvious assertion here —
+                                    // that the re-jittered departure from
+                                    // `base` is at most NRD_REJITTER_AMPLITUDE
+                                    // times the plain one — is NOT implied by
+                                    // the math, and the first draft failed on
+                                    // 542 px for exactly that reason. The
+                                    // composite is `jx·D + jy·S` over two
+                                    // independently-corrected lobes; where D
+                                    // and S nearly cancel, the unjittered sum
+                                    // is ~0 while the jittered one is not, so
+                                    // the RATIO is unbounded even though each
+                                    // TERM is clamped. Bounding it honestly
+                                    // would mean reading the four NRD planes
+                                    // plus kd/f0 back here to reconstruct D and
+                                    // S separately — a per-term gate, not a
+                                    // composite one, and the clamp it would
+                                    // check is inside NVIDIA's own function.
+                                    println!(
+                                        "check-gpu: nrd N8 re-jitter — moved {moved}/{npx} \
+                                         (worst {worst:.4}) | zero-delta px {zero_delta} \
+                                         (moved {zero_moved})"
+                                    );
+                                    let mut bad = Vec::new();
+                                    if !finite {
+                                        bad.push("non-finite");
+                                    }
+                                    if moved == 0 {
+                                        bad.push("arms identical (the block never ran)");
+                                    }
+                                    if !bad.is_empty() {
+                                        eprintln!("check-gpu: FAIL N8 nrd re-jitter: {}", bad.join(", "));
                                         return 1;
                                     }
                                 }
@@ -8494,6 +8652,7 @@ fn run_check_gpu(
                         fg.force_stab.set(Some(0.0));
                         if let Err(e) = ptg.wire_nrd_feed(
                             &hg.device,
+                            false, // FRD — never the NRD re-jitter (nrd_rejitter's engine term)
                             &[
                                 (16, &pl[0], fmts[0].0),
                                 (17, fg.plane_in_nr(), fmts[1].0),
@@ -9896,6 +10055,7 @@ fn run_check_gpu(
                         // its own NrdGpu's, since dropped).
                         if let Err(e) = ptg.wire_nrd_feed(
                             &hg.device,
+                            true,  // NRD
                             &[
                                 (16, &pl[0], fmts[0].0),
                                 (17, &pl[1], fmts[1].0),
@@ -15422,9 +15582,24 @@ fn run_cinematic_gpu(
                                         rh as u32,
                                         opts.gpu_debug,
                                         &trio,
-                                        &mut |m| match &mut a {
-                                            CineArm::Wave(tg) => tg.wire_nrd_feed(&dev, m),
-                                            CineArm::Dxr(dg) => dg.wire_nrd_feed(&dev, m),
+                                        &mut |m| {
+                                            // The session rule (nrd_rejitter's
+                                            // engine term): a capture's FRD arm
+                                            // must not inherit NRD's Jacobian
+                                            // either, or the two engines' shots
+                                            // stop being comparable.
+                                            let is_nrd = matches!(
+                                                dn_kind(opts),
+                                                Some(gpu::DnKind::Nrd(_))
+                                            );
+                                            match &mut a {
+                                                CineArm::Wave(tg) => {
+                                                    tg.wire_nrd_feed(&dev, is_nrd, m)
+                                                }
+                                                CineArm::Dxr(dg) => {
+                                                    dg.wire_nrd_feed(&dev, is_nrd, m)
+                                                }
+                                            }
                                         },
                                     )
                                 });
@@ -16285,6 +16460,7 @@ fn run_frd_lab(
     // the smear metrics under stab are exactly what a lab re-run measures.
     if let Err(e) = ptg.wire_nrd_feed(
         &hg.device,
+        false, // FRD — never the NRD re-jitter
         &[
             (16, &pl[0], fmts[0].0),
             (17, fg.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
@@ -18424,8 +18600,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     // Auto-exposure self-test — the controller (convergence/clamps/deadband/
     // dt-clamp/determinism) and the CPU meters, pure math; it saves and
-    // restores the process levers, so a `--no-auto-exposure --check` still
-    // proves the on arm and the run's own lever state survives.
+    // restores the process levers, so both arms are proven whichever way the
+    // session's lever sits and the run's own lever state survives.
     let autoexp_ok = match autoexp::self_test() {
         Ok(()) => true,
         Err(e) => {

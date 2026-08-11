@@ -3352,6 +3352,36 @@ pub const FLAG_NRD_GI: u32 = 2097152;
 /// trace_common.hlsli's FLAG_SKY_EXT_SKIP.
 pub const FLAG_SKY_EXT_SKIP: u32 = 4194304;
 
+/// `cs_nrd_out` applies NVIDIA's `NRD_SG_ReJitter` Jacobian to the denoiser
+/// DELTA (bit 23 — the SG campaign, 2026-08-10). Runtime rather than a compile
+/// define ON PURPOSE: the N8 gate must A/B both arms inside one process, and
+/// an env-keyed `OnceLock` define cannot flip (the `force_sky_ext_skip`
+/// lesson). Armed when an NRD bridge is wired and `FR_NRD_REJITTER` is not
+/// `off`; consumed by the bridge unit alone. Lockstep with
+/// trace_common.hlsli's FLAG_NRD_REJITTER.
+pub const FLAG_NRD_REJITTER: u32 = 8388608;
+
+/// `FR_NRD_REJITTER=off` — the A/B arm for the ReJitter micro-detail
+/// restoration (loud on departure, the FR_NRD_BARRIER idiom). Default ON: the
+/// pass exists to put back exactly the texel-scale contrast a converged
+/// history's narrow blur removes, which is the parked-camera class the user
+/// reported. `on` spells the default.
+pub(crate) fn nrd_rejitter_lever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FR_NRD_REJITTER") {
+        Err(_) => true,
+        Ok(v) if v == "off" => {
+            eprintln!("nrd: FR_NRD_REJITTER=off — no SG re-jitter (the A/B arm)");
+            false
+        }
+        Ok(v) if v == "on" => true, // the default, spelled explicitly
+        Ok(v) => {
+            eprintln!("nrd: FR_NRD_REJITTER={v:?} unrecognized (legal: on, off) — on");
+            true
+        }
+    })
+}
+
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
 /// untextured since the untextured arm (shade.hlsli's post-match detail
@@ -4157,6 +4187,7 @@ impl FrameCb {
         gbuf_ext: bool,
         nrd_sig: bool,
         sky_ext_skip: bool,
+        nrd_rejitter: bool,
     ) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
@@ -4184,6 +4215,10 @@ impl FrameCb {
             // all, so it requires the GBUF flag by construction (the branch
             // sits behind gbuf_write_sky's own FLAG_GBUF/FLAG_GBUF_EXT gates).
             | ((gbuf_full && sky_ext_skip) as u32 * FLAG_SKY_EXT_SKIP)
+            // ReJitter reads the ext plane's normals (center + 4 neighbours),
+            // so it requires the ext flag by construction — the same shape
+            // the sig/GI terms above use.
+            | ((gbuf_full && (gbuf_ext || fsr_sig) && nrd_rejitter) as u32 * FLAG_NRD_REJITTER)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
             | (p.clouds.enabled as u32 * FLAG_CLOUDS)
             // count > 0 already folds in the session enable + the night fade
@@ -4621,6 +4656,13 @@ pub struct TraceGpu {
     /// See `sky_ext_skip` — the armed-skip gate's hook (the `force_nrd_sig`
     /// Option-override shape: Some beats the derivation, None restores it).
     force_sky_ext_skip: std::cell::Cell<Option<bool>>,
+    /// See `nrd_rejitter` — the N8 gate's hook, same Option-override shape.
+    force_nrd_rejitter: std::cell::Cell<Option<bool>>,
+    /// The wired denoiser is NRD, not FRD (`wire_nrd_feed`'s `dn_is_nrd`).
+    /// The bridge kernels are shared by both engines, so `nrd_wired` alone
+    /// cannot answer "is NVIDIA's denoiser behind these planes" — and exactly
+    /// one consumer needs to (`nrd_rejitter`).
+    nrd_engine: bool,
     gbuf_full: bool,
     uav_heap: ID3D12DescriptorHeap,
     /// GPU handle of the RP_SCENE_TEX table's first descriptor (heap slot
@@ -5131,6 +5173,8 @@ impl TraceGpu {
             force_fsr_sig: std::cell::Cell::new(false),
             force_nrd_sig: std::cell::Cell::new(None),
             force_sky_ext_skip: std::cell::Cell::new(None),
+            force_nrd_rejitter: std::cell::Cell::new(None),
+            nrd_engine: false,
             gbuf_full,
             uav_heap,
             tex_table,
@@ -5169,6 +5213,7 @@ impl TraceGpu {
             self.gbuf_ext_needed(),
             self.nrd_sig(),
             self.sky_ext_skip(),
+            self.nrd_rejitter(),
         );
         cb.cloud_grid = self.cloud_grid_row(p);
         cb.split = self.split.get().cb_row();
@@ -5301,6 +5346,36 @@ impl TraceGpu {
 
     pub fn force_sky_ext_skip(&self, v: Option<bool>) {
         self.force_sky_ext_skip.set(v);
+    }
+
+    /// Whether `cs_nrd_out` applies the ReJitter Jacobian this frame
+    /// (FLAG_NRD_REJITTER). Wiring-derived like `nrd_sig` — the bridge is the
+    /// only consumer, so an unwired session must never set the bit — AND
+    /// lever-gated. The override is the N8 gate's hook (`force_nrd_sig`'s
+    /// Option shape, for the same reason: the two arms have to be recorded by
+    /// one process against one PSO, or the A/B measures a recompile).
+    ///
+    /// IT ALSO REQUIRES THE NRD ENGINE, and that term is the one thing here
+    /// that does NOT follow `nrd_sig`'s shape — deliberately. `nrd_wired` is
+    /// non-empty under FRD too (one bridge, two engines: `arm_denoiser_for`
+    /// wires both arms through `wire_nrd_feed`, and `cs_nrd_out` is shared),
+    /// so a wiring-only predicate would hand FRD's deltas NVIDIA's Jacobian
+    /// with nothing in the code, the lever name, or the docs saying so. Two
+    /// costs, either sufficient: the F4-F7 bands recorded in CLAUDE.md were
+    /// measured without it, and FRD is the A/B ORACLE this migration is being
+    /// judged against — an oracle that shares a post-process with the arm
+    /// under test is not one. Whether FRD *wants* the same correction is a
+    /// real and separate question (the Jacobian is engine-agnostic in nature:
+    /// any spatial denoiser averages the same local BRDF variation away); it
+    /// needs its own measurement and its own name, not inheritance.
+    pub fn nrd_rejitter(&self) -> bool {
+        self.force_nrd_rejitter
+            .get()
+            .unwrap_or(self.nrd_engine && !self.nrd_wired.is_empty() && nrd_rejitter_lever())
+    }
+
+    pub fn force_nrd_rejitter(&self, v: Option<bool>) {
+        self.force_nrd_rejitter.set(v);
     }
 
     /// The `nrd_sig` half of the dual-GPU mirror (the `force_fsr_sig` shape):
@@ -6280,12 +6355,23 @@ impl TraceGpu {
     /// engine feed sets (0..2) are untouched; NRD is a bridge, never a
     /// FeedKind, so `fsr_sig()`/`record_feed` semantics cannot be perturbed
     /// by wiring it.
+    ///
+    /// `dn_is_nrd` NAMES THE ENGINE BEHIND THE PLANES, and it is a parameter
+    /// rather than a derivation because nothing here can tell: `NrdRes` is two
+    /// PSOs and the bridge is deliberately engine-blind (FrdGpu carries
+    /// NrdGpu's exact plane contract, which is why `arm_denoiser_for` wires
+    /// BOTH arms through this one call). Only `nrd_rejitter` needs the
+    /// distinction — see it for why FRD must not silently inherit an
+    /// NRD-shaped post-process — and making every caller declare is what
+    /// keeps that from being a fact one call site has to remember.
     pub fn wire_nrd_feed(
         &mut self,
         device: &ID3D12Device,
+        dn_is_nrd: bool,
         targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
     ) -> Result<()> {
         self.nrd_wired = wire_feed_targets(device, &self.uav_heap, NRD_FEED_SET, targets)?;
+        self.nrd_engine = dn_is_nrd;
         // u16 = the engine's color plane: record_nrd_out brackets its write
         // with NPSR↔UA transitions (the plane rests NON_PIXEL_SHADER_RESOURCE
         // — the upscaler-eval contract every other writer honors through
@@ -6308,6 +6394,7 @@ impl TraceGpu {
     /// record_nrd_* stops being called.
     pub fn clear_nrd_wired(&mut self) {
         self.nrd_wired.clear();
+        self.nrd_engine = false;
         self.nrd_color = None;
         self.nrd_guides.clear();
     }

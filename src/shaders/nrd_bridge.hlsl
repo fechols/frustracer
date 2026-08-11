@@ -13,6 +13,16 @@
 // One formula, three sites: nrd.rs::oracle (the CPU twins the N0/N2 gates
 // pin), cs_nrd_pack, cs_nrd_out. Change all three together.
 //
+// NRD.hlsli IS NEVERTHELESS AVAILABLE TO THIS UNIT — and the two statements do
+// not conflict, because the mechanisms are different. gfx::shaders::nrd_header
+// `include_str!`s NVIDIA's header out of the SUBMODULE at build time and joins
+// it ahead of this file; nothing of theirs is committed here, and this is the
+// only unit that gets it. So `NRD_SG_ReJitter` below is THEIR code running as
+// theirs, while the pack math above stays OURS — deliberately, because the
+// N0/N2 gates score the shader against nrd::oracle's CPU twins, and swapping
+// the shader side to NVIDIA's would leave those gates comparing NVIDIA's code
+// against itself. Do not "unify" them.
+//
 // THE DELTA-FORM RECOMPOSE is the correctness spine:
 //     color' = accum + (D_out − D_in)·kd + (S_out − S_in)·f0
 // with kd = gbuf_ext.alb.xyz (the EXACT f32 factor shade multiplied its
@@ -103,6 +113,65 @@ float nrd_norm_hit_dist(float hit_dist, float view_z, float rough) {
 // strict IEEE mode (the quin.hlsl finite1 lesson). Semantics equal the Rust
 // oracle's is_finite (exponent all-ones = Inf or NaN).
 bool nrd_finite1(float v) { return ((asuint(v) >> 23) & 0xFFu) != 0xFFu; }
+
+// THE RE-JITTER TAP (FLAG_NRD_REJITTER, 2026-08-10). NVIDIA's own
+// `NRD_SG_ReJitter` — reachable because this unit, and ONLY this unit, joins
+// NRD.hlsli straight out of the submodule (gfx::shaders::nrd_header). It
+// returns a float2 Jacobian in [1/NRD_REJITTER_AMPLITUDE, NRD_REJITTER_
+// AMPLITUDE] = the ratio of the BRDF at THIS pixel's normal to the mean BRDF
+// over its 4 neighbours: exactly the texel-scale variation a spatial blur
+// averaged away, which is the parked-camera "detail flattens as it converges"
+// class. A pure multiplier, so it composes with our recompose without any
+// convention change — unlike the SG RESOLVE half, see cs_nrd_out.
+//
+// THE DIRECTIONS ARE ANALYTIC, and that bounds what this can do. ReJitter
+// needs the diffuse and specular DOMINANT LIGHT directions; NRD's own pipeline
+// carries them in the SH1 planes, packed from the actual sampled ray. We do
+// not export ray directions (see the SG note in cs_nrd_out), so we hand it the
+// analytic pair: N for the cosine lobe, and NVIDIA's own
+// `_NRD_GetSpecularDominantDirection` for GGX. Both are smooth functions of
+// (N, V, roughness) — which is what the Jacobian wants, since it measures how
+// the BRDF responds to the NORMAL varying across the neighbourhood.
+//
+// BUT THE SUBSTITUTION IS NOT NEUTRAL, AND THE DIFFUSE HALF IS ONE-SIDED.
+// `_NRD_ComputeBrdfs` weights by `saturate(dot(N_tap, Ld))`, so handing it
+// Ld = N_center evaluates the CENTER at dot(N,N) = 1 — the maximum of that
+// factor — while every neighbour evaluates at dot(N_nb, N_c) <= 1. The diffuse
+// Jacobian is therefore biased ABOVE 1 wherever normals vary: it sharpens, and
+// essentially never attenuates, up to NRD's own 2.0 clamp. (The specular half
+// is anchored the same way — Ls is derived FROM the center N, so the center
+// sits at its lobe's peak — though ReJitter's `lerp(V, Ls, roughness)` step
+// muddies it.) A true dominant LIGHT direction is generally not N, which is
+// what makes NVIDIA's own Jacobian two-sided. So read this as "amplify the
+// denoiser delta where normals vary", not as NVIDIA's symmetric restoration —
+// and read the measured +5.2% Laplacian / +0.2% mean the same way: contrast
+// AND level move together, which is the signature of a one-sided multiplier.
+// THE FOLLOW-ON, if the default is kept: the sun direction is already in the
+// CB and is a far better diffuse-dominant proxy for this content than N, and
+// it restores two-sidedness for free. Measure it before adopting — the
+// analytic pair is the CHEAP form, and the reason to prefer it is that it
+// cannot be wrong about a direction it never claimed to know.
+//
+// `c1` is handed UNIT length rather than `direction * c0`: ReJitter consumes
+// only `_NRD_SG_ExtractDirection`, which normalizes, so the two agree exactly
+// for c0 > 0 — and the unit form stays well-defined at c0 == 0 (a black pixel),
+// where `direction * c0` is the zero vector and the extraction degenerates.
+struct RejitterTaps {
+    float z, ze, zw, zn, zs;
+    float3 n, ne, nw, nn, ns;
+};
+
+// Neighbour fetch, edge-clamped. Reads BOTH planes: viewZ from GBufCore (always
+// written) and the world normal from GBufExt — which under FLAG_SKY_EXT_SKIP is
+// UNWRITTEN at sky texels, so the caller must reject out-of-range neighbours
+// BEFORE trusting a normal. That is not merely defensive: stale ext bytes are
+// exactly what the armed check-gpu NaN-sentinel gate proves stay unread.
+void nrd_tap(uint2 p, int dx, int dy, out float z, out float3 n) {
+    int2 q = int2(clamp(int(p.x) + dx, 0, int(rw) - 1), clamp(int(p.y) + dy, 0, int(rh) - 1));
+    uint qi = uint(q.y) * rw + uint(q.x);
+    z = gbuf[qi].core.z;
+    n = gbuf_ext[qi].nr.xyz;
+}
 
 float3 nrd_sanitize(float3 c) {
     if (!(nrd_finite1(c.x) && nrd_finite1(c.y) && nrd_finite1(c.z))) {
@@ -197,9 +266,79 @@ void cs_nrd_out(uint3 id : SV_DispatchThreadID) {
     float3 s_out = nrd_ycocg_inv(nrd_out_spec[id.xy].xyz);
     float3 kd = g.alb.xyz;
     float3 f0 = max(sqrt_wire3(g.spec.xyz), float3(1e-4, 1e-4, 1e-4));
+
+    // RE-JITTER — the micro-detail a converged history's narrow blur averaged
+    // away, restored from NVIDIA's own local-BRDF Jacobian (see nrd_tap).
+    //
+    // WHY THE JACOBIAN MULTIPLIES THE DELTA AND NOT THE OUTPUT. NRD's own
+    // Composition example writes `resolved * rejitter * materialFactor`,
+    // because THERE the denoised value REPLACES the raw one. Our recompose is
+    // additive against the raw frame: `base` already carries this pixel's own
+    // shading at its own normal, i.e. the true per-pixel BRDF response is
+    // already in it, and the only denoiser-produced quantity is the DELTA. So
+    // the smeared part is the delta and the correction belongs there. It also
+    // makes the N3 control arm hold BY CONSTRUCTION rather than by tolerance:
+    // a passthrough denoiser gives an exactly-0.0 delta, and 0.0 times a finite
+    // clamped Jacobian is 0.0, so `base` comes back bitwise.
+    //
+    // WHY THERE IS NO `NRD_SG_ResolveDiffuse`/`ResolveSpecular` HERE, and this
+    // is a convention mismatch rather than an omission: those functions take
+    // INCIDENT radiance from the dominant direction and INTEGRATE a BRDF to
+    // produce the outgoing term (`_NRD_DiffuseTerm`/`_NRD_GeometryTerm` are
+    // applied inside them). The lanes we pack are already BRDF-integrated,
+    // albedo-demodulated OUTGOING lobes — shade's own `direct_d`/`direct_s`
+    // plus the AO·sky and reflection folds — so resolving them would apply the
+    // BRDF a second time. Using the resolve would mean re-cutting the pack to
+    // carry incident radiance and dropping the delta-form spine with it; that
+    // is a G-buffer project, not a back-end swap.
+    float2 j = float2(1.0, 1.0);
+    if (flags & FLAG_NRD_REJITTER) {
+        RejitterTaps t;
+        t.z = c.core.z;
+        t.n = g.nr.xyz;
+        nrd_tap(id.xy, 1, 0, t.ze, t.ne);
+        nrd_tap(id.xy, -1, 0, t.zw, t.nw);
+        nrd_tap(id.xy, 0, 1, t.zn, t.nn);
+        nrd_tap(id.xy, 0, -1, t.zs, t.ns);
+        // Reject BEFORE reading a neighbour normal into the math. A neighbour
+        // past denoisingRange (sky, or the [0.999·far, far) band) may have an
+        // UNWRITTEN ext record under FLAG_SKY_EXT_SKIP, so its normal can be
+        // any bytes at all. NRD's own Z test would disarm the Jacobian for
+        // exactly these pixels anyway — `isSymmetrical` needs all four
+        // neighbours inside the threshold, and an out-of-range Z is orders
+        // past it — so pre-testing changes no result, it only keeps stale
+        // bytes out of an arithmetic expression (the armed NaN-sentinel gate's
+        // "unread BY CONSTRUCTION" contract).
+        float lim = 0.999 * CAM_FAR;
+        bool ok = t.ze < lim && t.zw < lim && t.zn < lim && t.zs < lim;
+        if (ok) {
+            float3 V = -ray_dir(float(id.x) + 0.5, float(id.y) + 0.5);
+            float rough = g.nr.w;
+            float NoV = abs(dot(t.n, V));
+            float3 Ld = t.n;
+            float3 Ls = _NRD_GetSpecularDominantDirection(
+                t.n, V, _NRD_GetSpecularDominantFactor(NoV, rough));
+            // sh0 IS DELIBERATELY ZERO, and that is a statement about the
+            // function rather than a shortcut: ReJitter touches its two SGs
+            // ONLY through `_NRD_SG_ExtractDirection`, so c0/chroma/
+            // normHitDist are dead and the DENOISED RADIANCE NEVER ENTERS the
+            // Jacobian — it is a pure function of (N, V, roughness) and the
+            // four neighbours' (N, Z). Passing the real OUT planes here would
+            // compile to the same thing and read as though the denoised value
+            // mattered. Still built through NVIDIA's own constructor rather
+            // than by assigning their struct's fields, which keeps the
+            // clean-room posture (we call their code, we do not restate it).
+            NRD_SG dsg = REBLUR_BackEnd_UnpackSh(float4(0.0, 0.0, 0.0, 0.0), Ld);
+            NRD_SG ssg = REBLUR_BackEnd_UnpackSh(float4(0.0, 0.0, 0.0, 0.0), Ls);
+            j = NRD_SG_ReJitter(dsg, ssg, V, rough,
+                                t.z, t.ze, t.zw, t.zn, t.zs,
+                                t.n, t.ne, t.nw, t.nn, t.ns);
+        }
+    }
+
     // precise: the deltas must stay literal subtractions — a passthrough's
     // exact 0.0 (identical loads) times anything is 0.0, and base + 0.0 is
     // base bitwise, which is what the N3 byte gate rests on.
-    precise float3 col = base + (d_out - d_in) * kd + (s_out - s_in) * f0;
+    precise float3 col = base + (d_out - d_in) * j.x * kd + (s_out - s_in) * j.y * f0;
     nrd_color_out[id.xy] = float4(clamp(col, 0.0, NRD_FP16_MAX_B), 1.0);
 }

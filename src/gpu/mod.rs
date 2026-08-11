@@ -2770,7 +2770,7 @@ impl GpuContext {
                 return Err("the denoiser and --nppd both claim the pre-upscale color slot".into());
             }
             if let Err(e) = self.arm_denoiser_for(&dev, dxc, dn, rw, rh, debug, &mut |t| {
-                tg.wire_nrd_feed(&dev, t)
+                tg.wire_nrd_feed(&dev, matches!(dn, DnKind::Nrd(_)), t)
             })
             {
                 let hint = match dn {
@@ -3436,7 +3436,7 @@ impl GpuContext {
         // block, one shared engine instance — see init_trace's call site).
         if let Some(dn) = dn {
             if let Err(e) = self.arm_denoiser_for(&dev, dxc, dn, rw, rh, debug, &mut |t| {
-                d.wire_nrd_feed(&dev, t)
+                d.wire_nrd_feed(&dev, matches!(dn, DnKind::Nrd(_)), t)
             })
             {
                 let (tag, hint) = match dn {

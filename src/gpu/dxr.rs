@@ -511,6 +511,9 @@ pub struct DxrGpu {
     /// See `sky_ext_skip` — the armed-skip gate's hook (the force_nrd_sig
     /// Option-override shape).
     force_sky_ext_skip: std::cell::Cell<Option<bool>>,
+    /// The wired denoiser is NRD, not FRD (`wire_nrd_feed`'s `dn_is_nrd` —
+    /// the TraceGpu twin's field, same reason).
+    nrd_engine: bool,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -1039,12 +1042,10 @@ impl DxrGpu {
             if !abl.is_empty() {
                 parts.push(abl.as_str());
             }
-            parts.extend([
-                sd,
-                trace::TRACE_COMMON_HLSLI,
-                trace::FSR_WIRE_HLSLI,
-                trace::NRD_BRIDGE_HLSL,
-            ]);
+            // The tail (NVIDIA's NRD.hlsli + our bridge) comes from the ONE
+            // shared assembler, never re-joined here — see nrd_bridge_tail.
+            let tail = crate::gfx::shaders::nrd_bridge_tail();
+            parts.extend([sd, trace::TRACE_COMMON_HLSLI, trace::FSR_WIRE_HLSLI, tail.as_str()]);
             let nrd_src = parts.join("\n");
             let pso = |src: &str, entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                 trace::compute_pso(
@@ -1687,6 +1688,7 @@ impl DxrGpu {
             force_fsr_sig: std::cell::Cell::new(false),
             force_nrd_sig: std::cell::Cell::new(None),
             force_sky_ext_skip: std::cell::Cell::new(None),
+            nrd_engine: false,
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
@@ -1793,6 +1795,23 @@ impl DxrGpu {
         self.force_sky_ext_skip.set(v);
     }
 
+    /// The `TraceGpu::nrd_rejitter` twin (FLAG_NRD_REJITTER) — the bridge unit
+    /// is shared, so a DXR-fed NRD session must arm it identically or the two
+    /// pipelines would denoise to different images from the same planes. That
+    /// includes the ENGINE term: read the TraceGpu original for why FRD must
+    /// not inherit this.
+    ///
+    /// NO `force_*` OVERRIDE HERE, unlike the `force_nrd_sig`/
+    /// `force_sky_ext_skip` twins beside it: N8 is a check-gpu gate and there
+    /// is nothing on the DXR side to drive one, so the hook would be dead code
+    /// claiming to be a gate hook. The math it would test is the same TEXT
+    /// either way (one nrd_bridge.hlsl, two root-signature objects), so N8 on
+    /// the wavefront covers it; add the Cell back if check-dxr ever grows its
+    /// own arm.
+    pub fn nrd_rejitter(&self) -> bool {
+        self.nrd_engine && !self.nrd_wired.is_empty() && trace::nrd_rejitter_lever()
+    }
+
     /// The band `record_frame` will dispatch — gates only, and deliberately
     /// not the same claim as `set_band` returning true: this is the value the
     /// DISPATCH_RAYS_DESC height is actually derived from.
@@ -1891,6 +1910,7 @@ impl DxrGpu {
             self.gbuf_ext_needed(),
             self.nrd_sig(),
             self.sky_ext_skip(),
+            self.nrd_rejitter(),
         );
         // Sway MVs: arm the flag + the ring-slot base, and stash the clock
         // pair for record_frame's dmv fill — one predicate (sway_mv_pair +
@@ -1938,13 +1958,18 @@ impl DxrGpu {
     /// The trace.rs wire_nrd_feed twin: point descriptor set NRD_FEED_SET at
     /// the frame's NRD planes (never a FeedKind — fsr_sig()/record_feed
     /// semantics cannot be perturbed by wiring it).
+    /// `dn_is_nrd`: the TraceGpu twin's rule — the bridge is engine-blind, so
+    /// only the caller knows whether NRD or FRD sits behind these planes, and
+    /// `nrd_rejitter` is the one consumer that must not guess.
     pub fn wire_nrd_feed(
         &mut self,
         device: &ID3D12Device,
+        dn_is_nrd: bool,
         targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
     ) -> Result<()> {
         self.nrd_wired =
             trace::wire_feed_targets(device, &self.uav_heap, trace::NRD_FEED_SET, targets)?;
+        self.nrd_engine = dn_is_nrd;
         // u16 = the engine's color plane (rests NPSR; record_nrd_out's
         // transition target — the TraceGpu twin's rule).
         self.nrd_color = targets.iter().find(|t| t.0 == 16).map(|t| t.1.clone());
@@ -1962,6 +1987,7 @@ impl DxrGpu {
     /// fsr_sig's/gbuf_ext_needed's nrd terms).
     pub fn clear_nrd_wired(&mut self) {
         self.nrd_wired.clear();
+        self.nrd_engine = false;
         self.nrd_color = None;
         self.nrd_guides.clear();
     }

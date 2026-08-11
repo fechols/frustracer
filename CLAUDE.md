@@ -1787,6 +1787,212 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # deliberately SHORT on the low-roughness visor and long
                                       # on the rough shell, which is that lever doing exactly
                                       # what it claims.
+                                      # THE SG / DIRECTIONAL-RADIANCE CAMPAIGN
+                                      # (2026-08-10) — and its headline is a
+                                      # NEGATIVE result that should stop anyone
+                                      # re-attempting the obvious version.
+                                      # NVIDIA's NRD.hlsli is now READABLE by
+                                      # one compile unit: gfx::shaders::
+                                      # nrd_bridge_tail `include_str!`s it
+                                      # STRAIGHT OUT OF THE SUBMODULE and joins
+                                      # it ahead of nrd_bridge.hlsl (both
+                                      # assemblies — the wavefront's
+                                      # TraceSources::nrd_bridge and DxrGpu's
+                                      # own cs_6_3 build — go through that ONE
+                                      # tail; a wavefront-only first draft
+                                      # compiled clean and broke --check-dxr on
+                                      # an undeclared identifier, which is why
+                                      # the cargo pin now reads dxr.rs too).
+                                      # THIS IS NOT A PASTE: nothing of
+                                      # NVIDIA's is committed here, the header
+                                      # arrives from NVIDIA's own repository in
+                                      # each checkout, and the ONE line we
+                                      # rewrite is `#include "NRDConfig.hlsli"`
+                                      # — mandatory, because this tree has no
+                                      # #include machinery at all AND that file
+                                      # is CMake-GENERATED (install-
+                                      # prerequisites configures twice, the
+                                      # perf arm rewriting it, so including
+                                      # whatever the last configure left would
+                                      # make our encoding a function of
+                                      # installer ordering). We state the pair
+                                      # ourselves and they are the exact ones
+                                      # nrd.rs's GetLibraryDesc gate REFUSES to
+                                      # run without (2 / 1), so a mismatched
+                                      # DLL sheds loudly instead of silently
+                                      # disagreeing. The reimplemented pack
+                                      # math STAYS ours and must not be
+                                      # "unified" with the header — N0/N2 score
+                                      # the shader against nrd::oracle's CPU
+                                      # twins, and swapping the shader side to
+                                      # NVIDIA's would leave those gates
+                                      # comparing NVIDIA's code to itself.
+                                      # WHAT WE DID NOT BUILD, with the source
+                                      # evidence: (1) REBLUR_DIFFUSE_SPECULAR
+                                      # _SH's radiance output is IDENTICAL to
+                                      # the non-SH denoiser's. The SH1 plane is
+                                      # a strict PASSENGER in every pass that
+                                      # touches it — TemporalAccumulation lerps
+                                      # it by the SAME diff/specNonLinear
+                                      # AccumSpeed and scales it by the SAME
+                                      # GetLumaScale the RADIANCE channel
+                                      # derived, HistoryFix and the spatial
+                                      # filter accumulate it under the SAME w,
+                                      # TemporalStabilization the same again.
+                                      # NOTHING in REBLUR derives a weight FROM
+                                      # SH. So the mode switch costs 4 in + 4
+                                      # out planes and bandwidth in 5 passes
+                                      # and changes the denoised radiance by
+                                      # exactly nothing; its whole value is
+                                      # what the APPLICATION does with the
+                                      # direction at the back end. (2) And the
+                                      # back end we cannot use is the RESOLVE:
+                                      # NRD_SG_ResolveDiffuse/Specular take
+                                      # INCIDENT radiance from the dominant
+                                      # direction and INTEGRATE a BRDF
+                                      # (_NRD_DiffuseTerm / _NRD_GeometryTerm
+                                      # are applied inside them), while our
+                                      # lanes are already BRDF-integrated,
+                                      # albedo-demodulated OUTGOING lobes — so
+                                      # resolving would apply the BRDF twice.
+                                      # Using it means re-cutting the pack to
+                                      # carry incident radiance and dropping
+                                      # the delta-form spine with it: a
+                                      # G-buffer project (the Phase-4 class),
+                                      # not a back-end swap. CONSEQUENCE: SH
+                                      # mode is worth wiring only once REAL
+                                      # per-ray directions exist to put in it
+                                      # (the RTGI bounce direction weighted by
+                                      # bounce radiance, the reflection ray
+                                      # direction) — which is the same
+                                      # G-buffer change, so the two land
+                                      # together or not at all.
+                                      # WHAT SHIPPED: the RE-JITTER
+                                      # (FLAG_NRD_REJITTER, bit 23, default ON,
+                                      # FR_NRD_REJITTER=off is the A/B arm) —
+                                      # NVIDIA's own NRD_SG_ReJitter, which
+                                      # needs NO extra planes and NO mode
+                                      # change, returning a float2 Jacobian
+                                      # clamped to [1/A, A] = the ratio of the
+                                      # BRDF at this pixel's normal to the mean
+                                      # over its 4 neighbours, i.e. exactly the
+                                      # texel-scale variation a spatial blur
+                                      # averaged away. THE DIRECTIONS ARE
+                                      # ANALYTIC and that bounds it: N for the
+                                      # cosine lobe, NVIDIA's own
+                                      # _NRD_GetSpecularDominantDirection for
+                                      # GGX — which is what the Jacobian wants
+                                      # (it measures the BRDF's response to the
+                                      # NORMAL varying across the
+                                      # neighbourhood) but means the specular
+                                      # term cannot know a particular pixel's
+                                      # reflection ray went elsewhere. AND THE
+                                      # SUBSTITUTION IS NOT NEUTRAL — the
+                                      # DIFFUSE half is ONE-SIDED:
+                                      # _NRD_ComputeBrdfs weights by
+                                      # saturate(dot(N_tap, Ld)), so Ld = the
+                                      # CENTER normal evaluates the center at
+                                      # dot(N,N) = 1, the maximum, while every
+                                      # neighbour sits at dot(N_nb, N_c) <= 1.
+                                      # The diffuse Jacobian is therefore
+                                      # biased ABOVE 1 wherever normals vary
+                                      # (specular is anchored the same way, Ls
+                                      # being derived FROM the center N, though
+                                      # ReJitter's lerp(V, Ls, roughness) step
+                                      # muddies it): it SHARPENS and
+                                      # essentially never attenuates, up to the
+                                      # 2.0 clamp. A true dominant LIGHT
+                                      # direction is generally not N, which is
+                                      # what makes NVIDIA's own Jacobian
+                                      # two-sided — so read this as "amplify
+                                      # the delta where normals vary", and read
+                                      # the +5.2% Laplacian / +0.2% mean below
+                                      # the same way (contrast AND level moving
+                                      # together is the signature of a
+                                      # one-sided multiplier, not of a
+                                      # symmetric restoration). FOLLOW-ON if
+                                      # the default is kept: the sun direction
+                                      # is already in the CB and is a far
+                                      # better diffuse-dominant proxy for this
+                                      # content than N, restoring two-sidedness
+                                      # for free — measure before adopting, the
+                                      # analytic pair's virtue being that it
+                                      # cannot be wrong about a direction it
+                                      # never claimed to know. THE
+                                      # JACOBIAN MULTIPLIES THE DELTA, not the
+                                      # output as NVIDIA's own Composition
+                                      # example does, and the reason is that
+                                      # OUR recompose is additive against a raw
+                                      # base: `base` already carries this
+                                      # pixel's own shading at its own normal,
+                                      # so the only denoiser-produced quantity
+                                      # — the only thing that got smeared — is
+                                      # the delta. It also makes N3 hold BY
+                                      # CONSTRUCTION rather than by tolerance
+                                      # (a passthrough's exact-0.0 delta times
+                                      # a finite clamped Jacobian is 0.0).
+                                      # Neighbour taps reject on viewZ BEFORE
+                                      # reading a neighbour normal — under
+                                      # FLAG_SKY_EXT_SKIP an out-of-range
+                                      # neighbour's ext record is UNWRITTEN, and
+                                      # NRD's own Z test would disarm those
+                                      # pixels anyway, so pre-testing changes no
+                                      # result and keeps stale bytes out of an
+                                      # arithmetic expression (the armed
+                                      # NaN-sentinel contract). IT IS NRD-ONLY
+                                      # BY AN EXPLICIT ENGINE TERM, and that is
+                                      # the one place the arming does NOT
+                                      # follow nrd_sig's wiring-derived shape:
+                                      # `nrd_wired` is non-empty under FRD too
+                                      # (one bridge, two engines —
+                                      # arm_denoiser_for wires BOTH arms
+                                      # through wire_nrd_feed and cs_nrd_out is
+                                      # shared), so a wiring-only predicate
+                                      # handed FRD's deltas NVIDIA's Jacobian
+                                      # with nothing in the code, the lever
+                                      # name, or these notes saying so — it
+                                      # shipped that way in the first draft and
+                                      # the review caught it. Two costs, either
+                                      # sufficient: the F4-F7 bands recorded
+                                      # here were measured without it, and FRD
+                                      # is the A/B ORACLE this whole migration
+                                      # is judged against — an oracle sharing a
+                                      # post-process with the arm under test is
+                                      # not one (N8 measures the perturbation
+                                      # at 18209/213200 px, so the
+                                      # contamination was not academic).
+                                      # wire_nrd_feed therefore takes a
+                                      # `dn_is_nrd` PARAMETER on both tracers
+                                      # (10 call sites, each declaring; nothing
+                                      # inside can derive it — NrdRes is two
+                                      # PSOs and the bridge is deliberately
+                                      # engine-blind). Whether FRD WANTS the
+                                      # same correction is a real and separate
+                                      # question — the Jacobian is
+                                      # engine-agnostic in nature, any spatial
+                                      # denoiser averages the same local BRDF
+                                      # variation away — and it needs its own
+                                      # measurement and its own name, never
+                                      # inheritance. MEASURED at the
+                                      # bistro terrace pose, PARKED and
+                                      # pose-registered (one pose, two arms —
+                                      # unlike the still-vs-moving harness,
+                                      # whose `drive` displaces the camera and
+                                      # whose crops are therefore NOT
+                                      # comparable): Laplacian +5.2% (0.6774 ->
+                                      # 0.7125 — detail restored, the intended
+                                      # direction), 0.51% of px past 2/255, and
+                                      # the luma distribution UNMOVED at every
+                                      # percentile (mean 10.356 -> 10.377, p10/
+                                      # p50/p90 identical to 2 dp). SO IT IS NOT
+                                      # THE FIX FOR THE PARKED-CAMERA DARKENING
+                                      # — it restores contrast, not level; the
+                                      # darkening remains open. Single-run cost
+                                      # observation: parked frame-to-frame
+                                      # mean|d| 0.172 -> 0.192, small in
+                                      # absolute terms (both ~0.2/255) but a
+                                      # real trade, so the default wants a feel
+                                      # test.
                                       # Gates: --check-nrd (N0
                                       # DLL-free math twins + N1 instance/dispatch contract,
                                       # absent-DLL = loud skip exit 0); --check-gpu N2
@@ -1801,7 +2007,55 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # ao_occluded is structurally 0 there), N6 (the RTGI
                                       # fold A/B), N7 (the sky-ext-skip NaN-sentinel proof,
                                       # both GPU suites — plus N2's own sky-constant arm with
-                                      # its n2-sky must-fire). Touch nrd.rs /
+                                      # its n2-sky must-fire), N8 (the RE-JITTER
+                                      # arms — DXR has none, deliberately: the
+                                      # bridge is one TEXT compiled against two
+                                      # root-signature objects, so a second
+                                      # arm would re-measure identical math,
+                                      # and DxrGpu therefore carries no
+                                      # force_nrd_rejitter hook at all rather
+                                      # than dead code claiming to be one;
+                                      # the N2/N3 wiring passes dn_is_nrd=true
+                                      # so N3's byte-diff-0 EXERCISES the
+                                      # armed re-jitter path — that is where
+                                      # the delta form's `0.0 * j == 0.0` is
+                                      # checked against real bytes:
+                                      # cs_nrd_out re-run TWICE over the
+                                      # converged frame's planes with
+                                      # force_nrd_rejitter flipped — no
+                                      # re-trace, no second ReBLUR pass, so the
+                                      # arms differ in one CB bit and the
+                                      # verdict is attributable. THE
+                                      # ANTI-VACUITY IS THE POINT: N3's
+                                      # byte-diff 0 is satisfied BOTH by "the
+                                      # delta form correctly multiplies an exact
+                                      # zero" AND by "the block never ran", and
+                                      # a wiring bug sits between them —
+                                      # measured 18209/213200 px moved. TWO
+                                      # ASSERTIONS WERE DELIBERATELY NOT MADE,
+                                      # because neither is implied: the obvious
+                                      # amplitude bound (the re-jittered
+                                      # departure from base being at most A×
+                                      # the plain one) FAILED on 542 px in its
+                                      # first draft and was RIGHT to — the
+                                      # composite is jx·D + jy·S over two
+                                      # independently-corrected lobes, so where
+                                      # D and S nearly cancel the ratio is
+                                      # unbounded even though each TERM is
+                                      # clamped; and the zero-delta implication
+                                      # falls to the same cancellation (a==base
+                                      # can mean D=−S). Bounding either honestly
+                                      # needs the four NRD planes plus kd/f0 read
+                                      # back to reconstruct D and S separately —
+                                      # a per-term gate, checking a clamp that
+                                      # lives inside NVIDIA's own function.
+                                      # Both are REPORTED). Two cargo pins ride
+                                      # along: NRD.hlsli is byte-equal to the
+                                      # submodule file save the one substituted
+                                      # line (we INCLUDE, never transcribe), and
+                                      # nrd_header is joined at exactly ONE site
+                                      # — nrd_bridge_tail — with dxr.rs checked
+                                      # for going through it. Touch nrd.rs /
                                       # nrd_gpu.rs / nrd_bridge.hlsl / the transmit_q_t twins /
                                       # the sig.w pack lane / record_*_nrd / gbuf_write_sky's
                                       # skip branch / the four presenter
@@ -2472,16 +2726,22 @@ cargo run --release -- --no-bloom     # A/B lever: no glare. Bloom (`src/bloom.r
                                       # WIRING gate (f16 + hardware bilinear will never match f32
                                       # exactly, but a bad weight/barrier/slot/pitch moves the halo
                                       # by tens of percent). Never widen those limits to pass a port
-cargo run --release -- --auto-exposure  # ARM the adaptive aperture (src/autoexp.rs +
-                                      # gpu/autoexp.rs + shaders/autoexp.hlsl — DEFAULT OFF
-                                      # since 2026-08-08, the user's call reverting the SAME
-                                      # DAY's default-ON: with RTGI on by default the enclosures
-                                      # that motivated it light themselves, so the default
-                                      # aperture holds at exactly 1.0 plus any --exposure-bias;
-                                      # --no-auto-exposure spells the default, and the compiled
+cargo run --release -- --no-auto-exposure  # KILL the adaptive aperture (src/autoexp.rs +
+                                      # gpu/autoexp.rs + shaders/autoexp.hlsl — DEFAULT ON
+                                      # since 2026-08-10, the user's call; THREE MOVES: ON for
+                                      # one day, OFF on 2026-08-08 (with RTGI on by default the
+                                      # enclosures that motivated it light themselves, so the
+                                      # aperture was holding near 1.0 and paying for nothing),
+                                      # ON again now — AFTER the same-day EV_MAX rein-in to
+                                      # +2.0, which is what makes an armed session a bounded 4x
+                                      # rather than the 32x that washed genuinely dark scenes
+                                      # into dusk. --no-auto-exposure holds exposure at exactly
+                                      # 1.0 plus any --exposure-bias (the pre-feature look),
+                                      # --auto-exposure spells the default, and the compiled
                                       # default is DUPLICATED in autoexp.rs's ENABLED
                                       # initializer + cli.rs defaults() + settings.rs's menu-row
-                                      # Toggle default — flip all three in lockstep).
+                                      # Toggle default — flip all three in lockstep; only a
+                                      # DEPARTURE prints a lever line).
                                       # Armed, auto-exposure is a DISPLAY-STAGE controller in the bloom
                                       # discipline: meters read the PRE-glare, PRE-exposure
                                       # linear tonemap source (GPU-tonemapped arms: a two-level
@@ -2491,8 +2751,24 @@ cargo run --release -- --auto-exposure  # ARM the adaptive aperture (src/autoexp
                                       # stall; CPU-presented arms: autoexp::meter_accum/meter_hdr
                                       # inside CpuPresent::resolve[_hdr], same-frame), and
                                       # session()'s ONE controller tick per frame eases a clamped
-                                      # EV (EV_MIN −2 .. EV_MAX +5, deadband 0.15 EV, tau 1 s;
-                                      # ask = TARGET_LOG2 − measured, mid-grey log2 0.18) into
+                                      # EV (EV_MIN −2 .. EV_MAX +2, deadband 0.15 EV, tau 1 s;
+                                      # ask = TARGET_LOG2 − measured, mid-grey log2 0.18 —
+                                      # EV_MAX went 3 → 5 → 3 → 2 across 2026-08-10: +5 is a 32×
+                                      # aperture that washes a genuinely dark scene into dusk, and
+                                      # PARKING ON THE CLAMP IS THE DESIGN — night is meant to read
+                                      # dark, with --exposure-bias the per-session escape. The last
+                                      # move answers a FIREFLY report (XeSS+NRD, dark emissive
+                                      # scenes) and is a PARTIAL lever by construction: the aperture
+                                      # decides where the frame sits on the tonemap, and 32× sat in
+                                      # the SATURATING region where an outlier and its surround
+                                      # compress together (noise laundered by the rolloff) while
+                                      # lower apertures sit in the near-LINEAR region and preserve
+                                      # contrast — so narrowing damps MODERATE outliers and makes
+                                      # SATURATING ones MORE salient (the dot pins white while the
+                                      # background darkens). The fireflies are 1-spp RTGI-bounce
+                                      # variance on small emitters; the source-level fix is
+                                      # upscaler_defaults' dn_fold early-out, which leaves an
+                                      # XeSS+NRD session without the deterministic cluster NEE) into
                                       # tone::ToneParams::exposure — a linear PRE-CURVE multiply
                                       # that the tonemap PS and tone::shape (and the CPU
                                       # present_px family, which threads it) BRANCH around at
