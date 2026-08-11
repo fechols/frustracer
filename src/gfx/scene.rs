@@ -29,6 +29,37 @@ pub fn shadow_aabb(scene: &Scene) -> ([f32; 3], [f32; 3]) {
     ([amn.x, amn.y, amn.z], [amx.x, amx.y, amx.z])
 }
 
+/// `bvh.rs::Node` packed for `StructuredBuffer<BvhNode>` (frustum.hlsli).
+///
+/// The frustum ladder's own tree — the software half of the tracer, since RT
+/// cores cannot answer a frustum query. Here for `GpuMat`'s reason: it is a
+/// `#[repr(C)]` mirror of an HLSL struct, and one mirror per HLSL struct is
+/// the rule. Note the field ORDER carries meaning the names do not — the
+/// `left_first`/`count` pair rides in the two float3 tails' padding lanes, so
+/// a reordering that looks cosmetic changes the stride.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuBvhNode {
+    pub mn: [f32; 3],
+    pub left_first: u32,
+    pub mx: [f32; 3],
+    pub count: u32,
+}
+
+/// One node in that wire format. PER NODE, not per tree, deliberately: D3D12
+/// streams the array through a staging ring (a materialized `Vec` is hundreds
+/// of megabytes at 100M triangles) while Vulkan has no ring yet and collects
+/// one, so the shared thing is the FIELD MAPPING — which is what a stride skew
+/// would break — and each backend keeps its own iteration.
+pub fn gpu_bvh_node(n: &crate::bvh::BvhNode) -> GpuBvhNode {
+    GpuBvhNode {
+        mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
+        left_first: n.left_first,
+        mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
+        count: n.count,
+    }
+}
+
 /// `scene.rs::Material` packed for `StructuredBuffer<Mat>` (shade.hlsli).
 /// 108 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
 /// garbage, so the two must move in the same commit.

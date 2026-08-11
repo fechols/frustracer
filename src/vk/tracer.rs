@@ -1,13 +1,47 @@
-//! The reference tracer on Vulkan: `cs_reference` rendering into `accum`, and
-//! `cs_resolve` turning that into an RGBA16F image.
+//! The tracer on Vulkan: the reference kernel (`cs_reference` into `accum`,
+//! `cs_resolve` into an RGBA16F image) and the WAVEFRONT QUADTREE beside it —
+//! seed, the indirect level ladder, and the leaf + sky terminal fills.
 //!
-//! This is the smallest thing that can be WRONG in an interesting way. The
-//! wavefront ladder (M3c) adds queues and indirect dispatch on top, but every
-//! one of those kernels reads the same streams through the same layout and
-//! shades through the same `shade.hlsli` — so if a stream is bound at the
-//! wrong slot, a material stride is skewed, the TLAS is built from the wrong
-//! addresses, or the cbuffer packs differently under `-fvk-use-dx-layout`,
-//! this is where it shows, as a picture that disagrees with the CPU.
+//! The reference kernel is the smallest thing that can be WRONG in an
+//! interesting way, which is why it landed first: every kernel here reads the
+//! same streams through the same layout and shades through the same
+//! `shade.hlsli`, so if a stream is bound at the wrong slot, a material stride
+//! is skewed, the TLAS is built from the wrong addresses, or the cbuffer packs
+//! differently under `-fvk-use-dx-layout`, it shows there as a picture that
+//! disagrees with the CPU. Having proven that, the ladder can be scored
+//! GPU-vs-GPU against it — which is what lets the quadtree's soundness gates
+//! demand EXACT agreement rather than a statistical bar.
+//!
+//! THREE THINGS THE LADDER SPELLS DIFFERENTLY FROM D3D12, and only three:
+//!
+//! - **The ping-pong is a descriptor SET, not a rebound root UAV.** `qin`/
+//!   `qout` (u5/u6) swap every level; D3D12 rewrites two root descriptors,
+//!   which Vulkan has no equivalent of. So set 0 is allocated THREE times off
+//!   one layout — A (u5=qa, u6=qb), B (the swap), and TERMINAL (u5=cloud_lod,
+//!   u6=cloud_shadow, the registers' second meaning once the ladder has
+//!   drained) — and a level binds the variant its parity names. Three writes
+//!   at init, one `vkCmdBindDescriptorSets` per level, no per-dispatch
+//!   descriptor traffic.
+//! - **Per-dispatch push constants become `vkCmdUpdateBuffer`.** `b1` is a
+//!   uniform buffer here (DXC has no flag to promote a cbuffer to push
+//!   constants, and `[[vk::push_constant]]` would be an HLSL edit), and the
+//!   ladder rewrites it twice per level — which a host write cannot do,
+//!   since every host write in a `run()` closure happens before the submit.
+//!   An inline transfer update does it at the right point in the stream, and
+//!   costs nothing extra: a barrier already sits between every pair of
+//!   dispatches. (A dynamic-offset UBO ring is the other shape; it would make
+//!   the DERIVED layout special-case one binding, which is worse.)
+//! - **There are no resource STATES.** D3D12's `args` transitions
+//!   UNORDERED_ACCESS <-> INDIRECT_ARGUMENT around every `ExecuteIndirect`;
+//!   Vulkan needs only the execution/memory edge, so one global barrier
+//!   covering `COMPUTE|TRANSFER -> COMPUTE|DRAW_INDIRECT` replaces both
+//!   transitions and the UAV barrier between them.
+//!
+//! NOT COVERED, and said loudly at the call site rather than silently: hemi
+//! (`fb_mode > 0` — the H tiers), compose (which fb OFF does not dispatch at
+//! all, by design), structure replay, and `--sw-rays` (whose leaf kernel wants
+//! the BINARY tree at t0 while the ladder holds the WIDE one there, i.e. a
+//! fourth set variant).
 //!
 //! WHY THE CLOUD CACHES ARE BUILT AND DISPATCHED HERE. `cs_reference` reads
 //! the amortized sky lattice (`--sky-lod`, default 4) and the slab-space
@@ -32,11 +66,66 @@ use crate::vk::scene::VkScene;
 use crate::vk::spirv::{binding_of, Reg, Spirv};
 use crate::vk::textures::VkTextures;
 
+/// Bytes of a `#[repr(C)]` slice — a reinterpret, not a copy.
+fn bytes_of<T>(v: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// The binary BVH in `gfx::scene`'s wire format — the `--no-ftree` arm's t0
+/// stream. Eager because this backend has no staging ring yet; the field
+/// mapping itself is shared with D3D12 (`gpu_bvh_node`).
+fn nodes_wire(bvh: &crate::bvh::Bvh) -> Vec<crate::gfx::scene::GpuBvhNode> {
+    bvh.nodes.iter().map(crate::gfx::scene::gpu_bvh_node).collect()
+}
+
+/// A host-visible buffer with `bytes` already in it. The frustum tree is the
+/// one stream this file uploads, and it goes the way `vk::scene` sends the
+/// rest — mapped, no staging. The staging ring is a throughput question and
+/// lands with the rest of them.
+fn host_buf(
+    vkd: &crate::vk::device::Vk,
+    bytes: &[u8],
+    usage: vk::BufferUsageFlags,
+) -> Result<Buffer, String> {
+    let b = vkd.buffer(bytes.len().max(4) as u64, usage, true)?;
+    vkd.write(&b, bytes)?;
+    Ok(b)
+}
+
 /// One GPU image, plus what it takes to bind and read it.
 struct Image {
     img: vk::Image,
     view: vk::ImageView,
     mem: vk::DeviceMemory,
+}
+
+/// The wavefront quadtree's own half: the queues, the indirect args, the
+/// frustum structure, the ladder kernels, and the two ping-pong descriptor
+/// sets. Separate from the reference tracer's fields because it is genuinely
+/// optional — `--sw-rays` is not covered (see the module header) and a device
+/// or scene that cannot run it should still get V6.
+struct Wave {
+    /// Ping-pong tile queues. Level `d` reads `d % 2 == 0 ? qa : qb`.
+    qa: Buffer,
+    qb: Buffer,
+    qleaf: Buffer,
+    qsky: Buffer,
+    cut_pool: Buffer,
+    /// 16 slots of `VkDispatchIndirectCommand` — same 12-byte layout D3D12's
+    /// dispatch command signature consumes, written by `cs_prep`/`cs_prep_mul`.
+    args: Buffer,
+    /// t0 space0: the 8-wide frustum tree in its QUANTIZED wire format
+    /// (`ftree::QFNode`), or the binary BVH under `--no-ftree`. The tracer's
+    /// software half — RT cores cannot answer a frustum query.
+    tree: Buffer,
+    pipes: [vk::Pipeline; 8],
+    /// Set 0 with u5=qa/u6=qb and the swap; index 1 of each is the SAME set-1
+    /// handle the terminal variant holds (the scene/texture set never varies).
+    sets_a: Vec<vk::DescriptorSet>,
+    sets_b: Vec<vk::DescriptorSet>,
+    depth_full: u32,
+    pub cap_leaf: u32,
+    pub cap_sky: u32,
 }
 
 pub struct VkTracer {
@@ -57,6 +146,7 @@ pub struct VkTracer {
     sets: Vec<vk::DescriptorSet>,
     layouts: Layouts,
     pipes: [vk::Pipeline; 4], // reference, resolve, sky_lod, cloud_shadow
+    wave: Option<Wave>,
     cb_base: FrameCb,
     scene_aabb: ([f32; 3], [f32; 3]),
     sky_lod_k: u32,
@@ -71,6 +161,22 @@ const P_RESOLVE: usize = 1;
 const P_SKY_LOD: usize = 2;
 const P_CLOUD_SHADOW: usize = 3;
 
+const W_SEED: usize = 0;
+const W_PREP: usize = 1;
+const W_PREP_MUL: usize = 2;
+const W_CLEAR_INFO: usize = 3;
+const W_LEVEL: usize = 4;
+const W_LEVEL_WIDE: usize = 5;
+const W_LEAF: usize = 6;
+const W_SKY: usize = 7;
+
+/// `cs_prep`'s "do not zero any counter" sentinel, and the two args slots the
+/// terminal fills use — lockstep with `gpu/trace.rs`'s consts, which are
+/// `#[cfg(windows)]`-only.
+const NO_RESET: u32 = 0xffff_ffff;
+const ARG_LEAF: u32 = 14;
+const ARG_SKY: u32 = 15;
+
 impl VkTracer {
     pub fn new(
         hg: &VkHeadless,
@@ -78,6 +184,7 @@ impl VkTracer {
         scene: &Scene,
         vs: &VkScene,
         vt: &VkTextures,
+        bvh: &crate::bvh::Bvh,
         rw: u32,
         rh: u32,
     ) -> Result<VkTracer, String> {
@@ -103,13 +210,31 @@ impl VkTracer {
             (&srcs.sky, "cs_sky_lod", "sky-lod"),
             (&srcs.sky, "cs_cloud_shadow", "cloud-shadow"),
         ];
+        // The ladder. `--sw-rays` is deliberately not covered (module header):
+        // its leaf kernel wants the BINARY tree at t0 while the ladder holds
+        // the WIDE one there, which is a fourth set variant, not a flag.
+        let wave_units: [(&str, &str, &str); 8] = [
+            (&srcs.wavefront, "cs_seed", "wf-seed"),
+            (&srcs.wavefront, "cs_prep", "wf-prep"),
+            (&srcs.wavefront, "cs_prep_mul", "wf-prep-mul"),
+            (&srcs.wavefront, "cs_clear_info", "wf-clear-info"),
+            (&srcs.wavefront, "cs_level", "wf-level"),
+            (&srcs.wavefront, "cs_level_wide", "wf-level-wide"),
+            (&srcs.leaf, "cs_leaf", "wf-leaf"),
+            (&srcs.sky, "cs_sky", "wf-sky"),
+        ];
+        let want_wave = !gs::sw_rays();
 
         // Compile first, reflect the compiled words, THEN build the layout —
         // the M3a order, and the reason there is no register table in this
-        // file. Deduped by source so the two sky entries compile once.
+        // file. The map unions BOTH halves, which is what makes the ladder's
+        // extra streams (t0's frustum tree, the queues at u5..u9) appear in
+        // the layout without anything here listing them.
         let mut words: Vec<Vec<u32>> = Vec::new();
         let mut map = Map::default();
-        for (src, entry, tag) in units.iter() {
+        let all: Vec<&(&str, &str, &str)> =
+            units.iter().chain(wave_units.iter().take(if want_wave { 8 } else { 0 })).collect();
+        for (src, entry, tag) in all {
             let w = sp.compile(src, entry, "cs_6_5", tag, false)?;
             let descs = crate::vk::reflect::reflect(&w)?;
             let conflicts = map.add(tag, &descs);
@@ -137,16 +262,32 @@ impl VkTracer {
         let layouts = Layouts::build(vkd, &map, tex_cap, None)?;
 
         let mut pipes = [vk::Pipeline::null(); 4];
-        for (i, (_, entry, _)) in units.iter().enumerate() {
-            match layout::compute_pipeline(vkd, &layouts, &words[i], entry) {
-                Ok(p) => pipes[i] = p,
-                Err(e) => {
-                    for p in pipes.iter().filter(|p| **p != vk::Pipeline::null()) {
-                        unsafe { d.destroy_pipeline(*p, None) };
-                    }
-                    layouts.destroy(vkd);
-                    return Err(format!("{entry}: {e}"));
+        let mut wpipes = [vk::Pipeline::null(); 8];
+        {
+            let mut built: Vec<vk::Pipeline> = Vec::new();
+            let mut make = |i: usize, entry: &str| -> Result<vk::Pipeline, String> {
+                let p = layout::compute_pipeline(vkd, &layouts, &words[i], entry)
+                    .map_err(|e| format!("{entry}: {e}"))?;
+                built.push(p);
+                Ok(p)
+            };
+            let r = (|| -> Result<(), String> {
+                for (i, (_, entry, _)) in units.iter().enumerate() {
+                    pipes[i] = make(i, entry)?;
                 }
+                if want_wave {
+                    for (j, (_, entry, _)) in wave_units.iter().enumerate() {
+                        wpipes[j] = make(units.len() + j, entry)?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = r {
+                for p in &built {
+                    unsafe { d.destroy_pipeline(*p, None) };
+                }
+                layouts.destroy(vkd);
+                return Err(e);
             }
         }
 
@@ -175,7 +316,67 @@ impl VkTracer {
         };
         let cloud_shadow = vkd.buffer(csn * csn * 4, sb, false)?;
         let frame_cb = vkd.buffer(CB_STRIDE as u64, ub, true)?;
-        let push = vkd.buffer(16, ub, true)?;
+        // TRANSFER_DST as well as host-visible: the reference path writes this
+        // once from the host before its submit, while the ladder rewrites it
+        // INSIDE the stream with `vkCmdUpdateBuffer` (module header). Both
+        // spellings need to be legal on the one buffer.
+        let push = vkd.buffer(16, ub | vk::BufferUsageFlags::TRANSFER_DST, true)?;
+
+        // The ladder's queues, sized to the structural worst case exactly as
+        // `TraceGpu::new` sizes them, so `CTR_OVERFLOW` can be gated at 0: at
+        // depth d there are at most 4^d rects, internal tiles live at depth
+        // < D, every terminal contains at least one depth-D path cell, and a
+        // split allocates one cut slot.
+        let mut cb_base = FrameCb::base(scene, rw, rh);
+        let dd = gs::depth_full(rw, rh);
+        let mut wave = if want_wave {
+            if dd > 11 {
+                return Err(format!("{rw}x{rh} needs quadtree depth {dd} > 11 indirect-arg slots"));
+            }
+            let cap_tile = if dd >= 1 { 1u64 << (2 * (dd - 1)) } else { 1 };
+            let cap_leaf = 1u64 << (2 * dd);
+            let cap_cut = ((1u64 << (2 * dd)) - 1) / 3 + 1;
+            // The kernels read every one of these off the cbuffer, so a
+            // buffer sized here and a cap written there must be the same
+            // number — hence one place computing both.
+            cb_base.set_caps(
+                cap_tile as u32,
+                cap_leaf as u32,
+                cap_leaf as u32,
+                cap_cut as u32,
+                0,
+                0,
+                0,
+            );
+            // t0: the frustum structure the ladder descends. FTREE is the
+            // default, and its wire format is the QUANTIZED one — the
+            // per-processor split verdict `ftree.rs` documents, not a
+            // shortcut: the CPU keeps f32 nodes, the GPU trades decode ALU for
+            // -56% tree bandwidth and the decoded boxes still CONTAIN the true
+            // ones, so every prune stays conservative.
+            let tree = if srcs.ftree_on {
+                host_buf(vkd, bytes_of(&crate::ftree::FTree::build(bvh).quantized()), sb)?
+            } else {
+                host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?
+            };
+            Some(Wave {
+                qa: vkd.buffer(cap_tile * 24, sb, false)?,
+                qb: vkd.buffer(cap_tile * 24, sb, false)?,
+                qleaf: vkd.buffer(cap_leaf * gs::LEAF_REC_BYTES, sb, false)?,
+                qsky: vkd.buffer(cap_leaf * 16, sb, false)?,
+                cut_pool: vkd.buffer(cap_cut * 256, sb, false)?,
+                args: vkd.buffer(16 * 12, sb | vk::BufferUsageFlags::INDIRECT_BUFFER, false)?,
+                tree,
+                pipes: wpipes,
+                sets_a: Vec::new(),
+                sets_b: Vec::new(),
+                depth_full: dd,
+                cap_leaf: cap_leaf as u32,
+                cap_sky: cap_leaf as u32,
+            })
+        } else {
+            None
+        };
 
         let hdr = create_image(vkd, rw, rh)?;
         let samp = |aniso: f32| -> Result<vk::Sampler, String> {
@@ -208,11 +409,24 @@ impl VkTracer {
         let samp_lin = samp(1.0)?;
         let samp_aniso = samp(aniso)?;
 
-        // The pool is sized FROM THE MAP, like everything else here.
+        // THREE allocations of set 0 when the ladder is live — one per
+        // `qin`/`qout` meaning of u5/u6 (see the module header). Set 1 is
+        // allocated once and shared by all three, because nothing in it
+        // varies: the ping-pong is entirely a set-0 property.
+        let mut want_layouts = layouts.sets.clone();
+        if wave.is_some() {
+            want_layouts.push(layouts.sets[0]);
+            want_layouts.push(layouts.sets[0]);
+        }
+
+        // The pool is sized FROM THE MAP, like everything else here — times
+        // the number of set-0 copies, which is the only reason a count here is
+        // not simply the map's own.
+        let copies = want_layouts.len() as u32;
         let mut counts: std::collections::BTreeMap<vk::DescriptorType, u32> = Default::default();
         for e in map.entries.values() {
             let n = if e.count == 0 { tex_cap } else { e.count };
-            *counts.entry(layout::desc_type(e.kind)).or_default() += n;
+            *counts.entry(layout::desc_type(e.kind)).or_default() += n * copies;
         }
         let sizes: Vec<vk::DescriptorPoolSize> = counts
             .iter()
@@ -221,20 +435,26 @@ impl VkTracer {
         let pool = unsafe {
             d.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(layouts.sets.len() as u32)
+                    .max_sets(copies)
                     .pool_sizes(&sizes),
                 None,
             )
         }
         .map_err(|e| format!("vkCreateDescriptorPool: {e}"))?;
-        let sets = unsafe {
+        let all_sets = unsafe {
             d.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
-                    .set_layouts(&layouts.sets),
+                    .set_layouts(&want_layouts),
             )
         }
         .map_err(|e| format!("vkAllocateDescriptorSets: {e}"))?;
+        let sets = all_sets[..layouts.sets.len()].to_vec();
+        if let Some(w) = &mut wave {
+            let n = layouts.sets.len();
+            w.sets_a = std::iter::once(all_sets[n]).chain(sets[1..].iter().copied()).collect();
+            w.sets_b = std::iter::once(all_sets[n + 1]).chain(sets[1..].iter().copied()).collect();
+        }
 
         let t = VkTracer {
             rw,
@@ -254,7 +474,8 @@ impl VkTracer {
             sets,
             layouts,
             pipes,
-            cb_base: FrameCb::base(scene, rw, rh),
+            wave,
+            cb_base,
             scene_aabb: crate::gfx::scene::shadow_aabb(scene),
             sky_lod_k: srcs.sky_lod,
             cloud_shadow_n: srcs.cloud_shadow_n,
@@ -274,7 +495,43 @@ impl VkTracer {
     /// cannot be stood in for by a buffer, so the feed targets (which the
     /// reference and resolve units do not declare at all) stay unwritten and
     /// ride the flag.
+    /// Every set-0 variant, plus the shared set 1 and the texture table.
+    ///
+    /// The variants differ ONLY in what u5/u6 mean (see the module header), so
+    /// this hands `write_variant` the pair and lets it write the rest
+    /// identically — the alternative, a "wavefront descriptor writer" beside
+    /// this one, would be two tables of the same 22 streams to keep in step.
     fn write_descriptors(&self, hg: &VkHeadless, vs: &VkScene, vt: &VkTextures) {
+        let drop = std::env::var("FR_VK_DROP_STREAM").ok();
+        if let Some(name) = &drop {
+            eprintln!(
+                "check-vk: FR_VK_DROP_STREAM={name} — that stream is bound to the ZERO \
+                 dummy; this run MUST fail"
+            );
+        }
+        // The TERMINAL variant, which is also the only one a reference-kernel
+        // frame ever binds: u5/u6 hold the cloud lattice and the slab-space
+        // shadow cache, the registers' second meaning.
+        self.write_variant(hg, vs, &self.sets, &self.cloud_lod, &self.cloud_shadow, &drop);
+        if let Some(w) = &self.wave {
+            self.write_variant(hg, vs, &w.sets_a, &w.qa, &w.qb, &drop);
+            self.write_variant(hg, vs, &w.sets_b, &w.qb, &w.qa, &drop);
+        }
+        // `FR_VK_DROP_STREAM=texs` is the whole-run lever; `bind_textures` is
+        // also what V6's own anti-vacuity probe calls, so the two share one
+        // write path and cannot disagree about what "dropped" means.
+        self.bind_textures(hg, vt, drop.as_deref() == Some("texs"));
+    }
+
+    fn write_variant(
+        &self,
+        hg: &VkHeadless,
+        vs: &VkScene,
+        sets: &[vk::DescriptorSet],
+        q5: &Buffer,
+        q6: &Buffer,
+        drop: &Option<String>,
+    ) {
         let d = &hg.vk.device;
         let b = |buf: &Buffer| [vk::DescriptorBufferInfo::default().buffer(buf.buf).range(vk::WHOLE_SIZE)];
 
@@ -288,14 +545,7 @@ impl VkTracer {
         // stage caught on its first run (`blas_tri` on the dummy shaded the
         // whole frame as triangle 0, and the visibility gate saw nothing).
         // The teeth are the radiance A/B's, not a claim about this file.
-        let drop = std::env::var("FR_VK_DROP_STREAM").ok();
-        if let Some(name) = &drop {
-            eprintln!(
-                "check-vk: FR_VK_DROP_STREAM={name} — that stream is bound to the ZERO \
-                 dummy; this run MUST fail"
-            );
-        }
-        let bufs: Vec<(u32, Reg, u32, &Buffer)> = vec![
+        let mut bufs: Vec<(u32, Reg, u32, &Buffer)> = vec![
             (0, Reg::B, 0, &self.frame_cb),
             (0, Reg::B, 1, &self.push),
             (0, Reg::T, 2, &vs.positions),
@@ -307,8 +557,10 @@ impl VkTracer {
             (0, Reg::U, 1, &self.tbuf),
             (0, Reg::U, 2, &self.info),
             (0, Reg::U, 3, &self.counters),
-            (0, Reg::U, 5, &self.cloud_lod),
-            (0, Reg::U, 6, &self.cloud_shadow),
+            // u5/u6 — the DUAL-MEANING pair. Terminal: cloud lattice + shadow
+            // cache. Ladder: this level's qin/qout.
+            (0, Reg::U, 5, q5),
+            (0, Reg::U, 6, q6),
             (1, Reg::T, 0, &vs.uv_buf),
             (1, Reg::T, 1, &vs.indices),
             (1, Reg::T, 2, &vs.tri_mat),
@@ -321,6 +573,19 @@ impl VkTracer {
             (1, Reg::T, 7, &vs.blas_tri),
             (1, Reg::T, 8, &vs.chunk_base),
         ];
+        if let Some(w) = &self.wave {
+            // The ladder's own streams. t0 is the FRUSTUM structure — the
+            // software half RT cores cannot serve — and t1 is `tri_idx`,
+            // declared only under `--sw-rays` and so normally absent from the
+            // map entirely (it falls through to the dummy if it is not).
+            bufs.extend_from_slice(&[
+                (0, Reg::T, 0, &w.tree),
+                (0, Reg::U, 4, &w.args),
+                (0, Reg::U, 7, &w.qleaf),
+                (0, Reg::U, 8, &w.qsky),
+                (0, Reg::U, 9, &w.cut_pool),
+            ]);
+        }
         let mut infos: Vec<[vk::DescriptorBufferInfo; 1]> = Vec::new();
         let mut plan: Vec<(u32, u32, vk::DescriptorType)> = Vec::new();
         for (&(set, binding), e) in &self.map.entries {
@@ -355,7 +620,7 @@ impl VkTracer {
             .zip(infos.iter())
             .map(|(&(set, binding, ty), info)| {
                 vk::WriteDescriptorSet::default()
-                    .dst_set(self.sets[set as usize])
+                    .dst_set(sets[set as usize])
                     .dst_binding(binding)
                     .descriptor_type(ty)
                     .buffer_info(info)
@@ -367,7 +632,7 @@ impl VkTracer {
         let mut asw = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(&accels);
         let mut w_as = vk::WriteDescriptorSet::default()
-            .dst_set(self.sets[0])
+            .dst_set(sets[0])
             .dst_binding(binding_of(Reg::T, 7))
             .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
             .push_next(&mut asw);
@@ -379,7 +644,7 @@ impl VkTracer {
             .image_layout(vk::ImageLayout::GENERAL)];
         writes.push(
             vk::WriteDescriptorSet::default()
-                .dst_set(self.sets[0])
+                .dst_set(sets[0])
                 .dst_binding(binding_of(Reg::U, 14))
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&ii),
@@ -393,7 +658,7 @@ impl VkTracer {
             if self.map.entries.contains_key(&(1, binding_of(Reg::S, *reg))) {
                 writes.push(
                     vk::WriteDescriptorSet::default()
-                        .dst_set(self.sets[1])
+                        .dst_set(sets[1])
                         .dst_binding(binding_of(Reg::S, *reg))
                         .descriptor_type(vk::DescriptorType::SAMPLER)
                         .image_info(&si[i]),
@@ -401,11 +666,6 @@ impl VkTracer {
             }
         }
         unsafe { d.update_descriptor_sets(&writes, &[]) };
-
-        // `FR_VK_DROP_STREAM=texs` is the whole-run lever; `bind_textures` is
-        // also what V6's own anti-vacuity probe calls, so the two share one
-        // write path and cannot disagree about what "dropped" means.
-        self.bind_textures(hg, vt, drop.as_deref() == Some("texs"));
     }
 
     /// Write (or rewrite) the `texs[]` array.
@@ -462,10 +722,15 @@ impl VkTracer {
         };
     }
 
-    /// One frame: the two cache fills, the reference dispatch, then resolve.
-    /// The whole thing is one submit — the `HeadlessGpu::run` contract.
-    pub fn render(&self, hg: &VkHeadless, p: &FrameParams, samples: u32) -> Result<(), String> {
-        let vkd = &hg.vk;
+    /// The quadtree depth the ladder runs, and the terminal-queue capacities —
+    /// the numbers the accounting gate needs to read the queues back. `None`
+    /// under `--sw-rays`, which needs a fourth set variant (module header).
+    pub fn wave_shape(&self) -> Option<(u32, u32, u32)> {
+        self.wave.as_ref().map(|w| (w.depth_full, w.cap_leaf, w.cap_sky))
+    }
+
+    /// The per-frame cbuffer, written host-side before the submit.
+    fn write_cb(&self, hg: &VkHeadless, p: &FrameParams) -> Result<(), String> {
         let mut cb = self.cb_base.with_frame(p, false, false, false, false, false, false);
         cb.cloud_grid = if self.cloud_shadow_n == 0 || !p.clouds.enabled {
             [0.0; 4]
@@ -477,7 +742,39 @@ impl VkTracer {
                 self.cloud_shadow_n,
             )
         };
-        vkd.write(&self.frame_cb, cb.bytes())?;
+        hg.vk.write(&self.frame_cb, cb.bytes())
+    }
+
+    /// The two per-frame cloud caches, recorded under whichever set has
+    /// `cloud_lod`/`cloud_shadow` at u5/u6 — i.e. the TERMINAL variant, never
+    /// a ladder one. Shared by the reference frame and the wavefront's
+    /// terminal fills, which is what keeps their dispatch shapes identical.
+    unsafe fn record_cloud_caches(&self, d: &ash::Device, cmd: vk::CommandBuffer) {
+        let sky_pts = ((self.rw / self.sky_lod_k) + 2) * ((self.rh / self.sky_lod_k) + 2);
+        let sky_groups = sky_pts.div_ceil(64);
+        let csn_groups =
+            (crate::clouds::CLOUD_SHADOW_MAX * crate::clouds::CLOUD_SHADOW_MAX).div_ceil(64);
+        unsafe {
+            if self.cloud_shadow_n > 0 {
+                d.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipes[P_CLOUD_SHADOW],
+                );
+                d.cmd_dispatch(cmd, csn_groups.min(32768), csn_groups.div_ceil(32768), 1);
+            }
+            if self.sky_lod_k > 1 {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipes[P_SKY_LOD]);
+                d.cmd_dispatch(cmd, sky_groups.min(32768), sky_groups.div_ceil(32768), 1);
+            }
+        }
+    }
+
+    /// One frame: the two cache fills, the reference dispatch, then resolve.
+    /// The whole thing is one submit — the `HeadlessGpu::run` contract.
+    pub fn render(&self, hg: &VkHeadless, p: &FrameParams, samples: u32) -> Result<(), String> {
+        let vkd = &hg.vk;
+        self.write_cb(hg, p)?;
         // `cbuffer Push : register(b1)` is 4 dwords; only the first is read
         // here (`inv_samples`), but the whole row is written so a slot is
         // never left holding the previous frame's bytes.
@@ -488,12 +785,6 @@ impl VkTracer {
 
         let gx = self.rw.div_ceil(8);
         let gy = self.rh.div_ceil(8);
-        let sky_pts = ((self.rw / self.sky_lod_k) + 2) * ((self.rh / self.sky_lod_k) + 2);
-        let sky_groups = sky_pts.div_ceil(64);
-        let csn_groups =
-            (crate::clouds::CLOUD_SHADOW_MAX * crate::clouds::CLOUD_SHADOW_MAX).div_ceil(64);
-        let k = self.sky_lod_k;
-        let csn = self.cloud_shadow_n;
 
         hg.run(|d, cmd| unsafe {
             d.cmd_bind_descriptor_sets(
@@ -546,18 +837,7 @@ impl VkTracer {
                 &[],
             );
 
-            if csn > 0 {
-                d.cmd_bind_pipeline(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.pipes[P_CLOUD_SHADOW],
-                );
-                d.cmd_dispatch(cmd, csn_groups.min(32768), csn_groups.div_ceil(32768), 1);
-            }
-            if k > 1 {
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipes[P_SKY_LOD]);
-                d.cmd_dispatch(cmd, sky_groups.min(32768), sky_groups.div_ceil(32768), 1);
-            }
+            self.record_cloud_caches(d, cmd);
             barrier(d, cmd);
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipes[P_REFERENCE]);
             d.cmd_dispatch(cmd, gx, gy, 1);
@@ -566,6 +846,156 @@ impl VkTracer {
             d.cmd_dispatch(cmd, gx, gy, 1);
             barrier(d, cmd);
         })
+    }
+
+    /// ONE WAVEFRONT QUADTREE FRAME: seed -> depth_full x (prep-args -> level)
+    /// -> leaf + sky fills. `record_wavefront`'s peer, minus the arms this
+    /// stage does not cover (module header): no hemi, no compose (fb OFF makes
+    /// the leaf/sky passes splat straight into `accum`, so compose would be a
+    /// buffer-to-buffer copy — D3D12 skips it for the same reason), no replay.
+    ///
+    /// `clear_sentinel` floods `info` with `0xffffffff` first, which is what
+    /// makes the exactly-once coverage gate possible: a pixel no terminal
+    /// record covered still reads the sentinel afterwards.
+    ///
+    /// STATICALLY RECORDED, exactly as on D3D12 — every scheduling decision
+    /// after the seed is a GPU-written counter feeding `vkCmdDispatchIndirect`,
+    /// so an empty level dispatches zero groups rather than being skipped by
+    /// the CPU. That is the property the whole design rests on and the reason
+    /// there is no readback anywhere in here.
+    pub fn render_wavefront(
+        &self,
+        hg: &VkHeadless,
+        p: &FrameParams,
+        clear_sentinel: bool,
+    ) -> Result<(), String> {
+        let w = self.wave.as_ref().ok_or("this tracer has no wavefront ladder")?;
+        self.write_cb(hg, p)?;
+
+        let px = self.rw * self.rh;
+        let clear_groups = px.div_ceil(256);
+        let wide_on = gs::WIDE_LEVELS_ON.load(std::sync::atomic::Ordering::Relaxed);
+        let wide_n = gs::wide_levels();
+
+        hg.run(|d, cmd| unsafe {
+            let bind = |sets: &[vk::DescriptorSet]| {
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.layouts.pipeline,
+                    0,
+                    sets,
+                    &[],
+                );
+            };
+            // `cbuffer Push : register(b1)`, rewritten IN THE STREAM (module
+            // header). It carries its OWN barriers, both of them, and that is
+            // the whole reason it is a closure rather than three lines at each
+            // site: a per-dispatch constant block needs a WRITE-AFTER-READ
+            // edge as well as the obvious read-after-write one, and the WAR
+            // edge is the one that is easy to omit and invisible when you do.
+            //
+            // Omitting it cost the entire ladder past level 0 on the first
+            // run, silently: the transfer is free to execute ahead of the
+            // dispatch it textually follows, so `cs_prep` read the NEXT
+            // level's `push3`, wrote its indirect args to the wrong slot, and
+            // every level after the first dispatched zero groups. Nothing
+            // faulted, validation was clean, and the frame simply came back
+            // with one split and no terminals.
+            let push = |v: [u32; 4]| {
+                barrier(d, cmd); // WAR: the last dispatch must be done READING b1
+                let mut b = [0u8; 16];
+                for (i, x) in v.iter().enumerate() {
+                    b[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+                }
+                d.cmd_update_buffer(cmd, self.push.buf, 0, &b);
+                barrier(d, cmd); // RAW: and the next one must SEE the write
+            };
+            let go = |pipe: vk::Pipeline, gx: u32, gy: u32| {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+                d.cmd_dispatch(cmd, gx, gy, 1);
+            };
+            let go_indirect = |pipe: vk::Pipeline, slot: u32| {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+                d.cmd_dispatch_indirect(cmd, w.args.buf, u64::from(slot) * 12);
+            };
+
+            // Level 0 consumes queue A, so the seed must enqueue its root
+            // THERE — bind the A variant before anything runs.
+            bind(&w.sets_a);
+            // push0 = 0: this backend has no work-graph arm, so the seed
+            // always enqueues its own root. Written rather than inherited —
+            // the buffer holds whatever the last frame left.
+            push([0, 0, 0, 0]);
+            go(w.pipes[W_SEED], 1, 1);
+            if clear_sentinel {
+                go(w.pipes[W_CLEAR_INFO], clear_groups.min(32768), clear_groups.div_ceil(32768));
+            }
+            barrier(d, cmd);
+
+            for lvl in 0..w.depth_full {
+                let (in_ctr, out_ctr) = if lvl % 2 == 0 {
+                    (gs::CTR_TILE_A, gs::CTR_TILE_B)
+                } else {
+                    (gs::CTR_TILE_B, gs::CTR_TILE_A)
+                };
+                // Shallow levels take the wave-cooperative kernel: ONE GROUP
+                // per tile instead of one thread per tile (see WIDE_LEVELS —
+                // level 0 is a single tile, so the serial ladder runs one lane
+                // over the whole BVH there).
+                let wide = wide_on && lvl < wide_n;
+                // prep and the level kernel it feeds run under the SAME set:
+                // prep touches only `counters` and `args`, which every variant
+                // holds identically, so the parity bind covers both.
+                bind(if lvl % 2 == 0 { &w.sets_a } else { &w.sets_b });
+                push([in_ctr, out_ctr, if wide { 1 } else { 32 }, lvl]);
+                go(w.pipes[W_PREP], 1, 1);
+                push([in_ctr, out_ctr, 0, 0]);
+                go_indirect(w.pipes[if wide { W_LEVEL_WIDE } else { W_LEVEL }], lvl);
+            }
+
+            // The terminal fills, under the TERMINAL variant: u5/u6 revert to
+            // the cloud lattice and shadow cache, which is exactly what the
+            // leaf and sky kernels re-declare them as.
+            bind(&self.sets);
+            push([gs::CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
+            go(w.pipes[W_PREP], 1, 1);
+            // Sky takes the MULTIPLYING prep: SKY_SPLIT groups share each
+            // record, so one huge proven-empty rect cannot serialize on a
+            // single group (that shape was ~70% of the tracer's frame once).
+            push([gs::CTR_SKY, NO_RESET, gs::SKY_SPLIT, ARG_SKY]);
+            go(w.pipes[W_PREP_MUL], 1, 1);
+            // Both cloud caches, ahead of BOTH consumers — `cs_sky` on the
+            // proven-empty rects and `cs_leaf`'s own miss branch.
+            self.record_cloud_caches(d, cmd);
+            push([gs::CTR_LEAF, 0, 0, 0]);
+            go_indirect(w.pipes[W_LEAF], ARG_LEAF);
+            push([gs::CTR_SKY, 0, 0, 0]);
+            go_indirect(w.pipes[W_SKY], ARG_SKY);
+            barrier(d, cmd);
+        })
+    }
+
+    /// The terminal queues, as raw u32 — the accounting gate's input.
+    /// `LeafRec` is `LEAF_REC_BYTES`, `SkyRec` is 16.
+    pub fn read_queues(
+        &self,
+        hg: &VkHeadless,
+        n_leaf: usize,
+        n_sky: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>), String> {
+        let w = self.wave.as_ref().ok_or("this tracer has no wavefront ladder")?;
+        let u32s = |b: Vec<u8>| -> Vec<u32> {
+            b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        };
+        // Clamped: on overflow the counters keep incrementing past the record
+        // writes, and the point is to reach the CTR_OVERFLOW failure with a
+        // diagnostic rather than to die reading out of bounds here.
+        let nl = n_leaf.min(w.cap_leaf as usize) * (gs::LEAF_REC_BYTES / 4) as usize;
+        let ns = n_sky.min(w.cap_sky as usize) * 4;
+        let leaf = if nl == 0 { Vec::new() } else { u32s(hg.read_buffer(&w.qleaf, nl * 4)?) };
+        let sky = if ns == 0 { Vec::new() } else { u32s(hg.read_buffer(&w.qsky, ns * 4)?) };
+        Ok((leaf, sky))
     }
 
     /// The resolved RGBA16F image, decoded to f32 RGB — the `read_hdr_output`
@@ -614,8 +1044,8 @@ impl VkTracer {
         let d = &vkd.device;
         unsafe {
             let _ = d.device_wait_idle();
-            for p in self.pipes {
-                d.destroy_pipeline(p, None);
+            for p in self.pipes.iter().chain(self.wave.iter().flat_map(|w| w.pipes.iter())) {
+                d.destroy_pipeline(*p, None);
             }
             d.destroy_descriptor_pool(self.pool, None);
             d.destroy_sampler(self.samp_lin, None);
@@ -637,18 +1067,46 @@ impl VkTracer {
         ] {
             vkd.free_buffer(b);
         }
+        if let Some(w) = &self.wave {
+            for b in [&w.qa, &w.qb, &w.qleaf, &w.qsky, &w.cut_pool, &w.args, &w.tree] {
+                vkd.free_buffer(b);
+            }
+        }
     }
 }
 
+/// The one memory edge every pass here needs, in one place.
+///
+/// This replaces THREE D3D12 constructs at once: the UAV barrier, and the
+/// `args` buffer's UNORDERED_ACCESS <-> INDIRECT_ARGUMENT transition pair
+/// around every `ExecuteIndirect`. Vulkan has no resource states, so what is
+/// left is the execution/memory dependency — and making it global rather than
+/// per-buffer is deliberate: the ladder's dependency graph is
+/// "everything before this dispatch, then this dispatch", every stage of it,
+/// so per-resource barriers would be a longer statement of the same thing with
+/// somewhere for a missing edge to hide.
+///
+/// `TRANSFER` is on BOTH sides because the ladder rewrites `b1` with
+/// `vkCmdUpdateBuffer` between dispatches; `DRAW_INDIRECT` is the stage that
+/// reads `args`, which is the one place a compute-only pipeline still touches
+/// a graphics-sounding stage bit.
 fn barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
     let mb = vk::MemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::UNIFORM_READ
+                | vk::AccessFlags::INDIRECT_COMMAND_READ
+                | vk::AccessFlags::TRANSFER_WRITE,
+        );
     unsafe {
         d.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::TRANSFER
+                | vk::PipelineStageFlags::DRAW_INDIRECT,
             vk::DependencyFlags::empty(),
             &[mb],
             &[],

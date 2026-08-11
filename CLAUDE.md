@@ -4661,19 +4661,21 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
-                                      # and M3a's V5).
+                                      # M3a's V5, M3b/M3d's V6, and M3c's V7).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
                                       # against, so a module can be perfectly valid and read the wrong
-                                      # resource. Seven stages: V0 the pure pick/memory logic (runs with no
+                                      # resource. Eight stages: V0 the pure pick/memory logic (runs with no
                                       # Vulkan on the box at all) | V1 loader + instance + device | V2
                                       # compile smoke.hlsl to SPIR-V and build the pipelines | V3 run the
                                       # seed -> prep -> indirect-fill chain and read the results back |
                                       # V4 the wave-width table and the subgroup-size decision | V5 the
                                       # TRACER's own register map, derived from the corpus, with every one
                                       # of its kernels bound against it | V6 the reference kernel actually
-                                      # RENDERING a frame, scored against the CPU plain reference.
+                                      # RENDERING a frame, scored against the CPU plain reference | V7 the
+                                      # WAVEFRONT QUADTREE, scored against V6 — the first EXACT-ZERO gates
+                                      # on Vulkan, because two kernels on one device have no excuse.
                                       # V3 IS THE POINT: constants reaching a kernel, storage buffers
                                       # bound and written, a GPU-WRITTEN counter turned into dispatch
                                       # arguments by a second kernel, and a third kernel launched from
@@ -4867,7 +4869,12 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # FR_VK_AB_DUMP=1 writes the two converged images + the CPU t buffer
                                       # as raw f32 (vk-ab-{cpu,gpu,t}.f32) for spatial attribution — the
                                       # FR_CHECK_AB_DUMP idiom, and what turned "the shading is 11% dark"
-                                      # into "every pixel is shading as triangle 0" in one scanline print.
+                                      # into "every pixel is shading as triangle 0" in one scanline print;
+                                      # FR_VK_RES=WxH moves the V6/V7 gate frame (default 800x600) — and
+                                      # V7's drained-queue check is PARITY-SELECTED, so
+                                      # **FR_VK_RES=400x300 is what covers its other arm** (see V7);
+                                      # FR_VK_CTRS=1 dumps V7's raw counter block, which is how the b1
+                                      # write-after-read hazard below was found.
                                       # V6 — THE REFERENCE KERNEL RENDERING (M3b, 2026-08-10;
                                       # src/vk/scene.rs + src/vk/tracer.rs). V5 proved every tracer kernel
                                       # BINDS; this is the first stage that proves one of them is RIGHT,
@@ -4986,14 +4993,129 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # famous for its foliage). It becomes a real must-fire in M3c; the
                                       # readback and the per-frame vkCmdFillBuffer zero exist now so that
                                       # gate inherits a working instrument.
-                                      # MEASURED (RADV, 400x300, 16 frames): san-miguel-low-poly 5.6M tris
-                                      # / 313 textures / 2973 subresources / 511.5 MB -> 0.007% with
-                                      # class-mismatch 0; DamagedHelmet 0.081%, Sponza.gltf 0.008%,
-                                      # vokselia 0.015%, rungholt + stress + procedural all green; the
-                                      # helmet re-run on llvmpipe reads 0.129%.
-                                      # WHAT V6 STILL SKIPS, LOUDLY: a device with no ray query. The
-                                      # remaining M3b/M3d boundaries are staging uploads, the real
-                                      # --blas-split, and BC7.
+                                      # MEASURED (RADV, the 800x600 gate frame, 16 frames): san-miguel-low-poly
+                                      # 5.6M tris / 313 textures / 2973 subresources / 511.5 MB -> 0.006% with
+                                      # class-mismatch 0; Sponza.gltf 0.007%, rungholt 0.007%, DamagedHelmet
+                                      # 0.020%, stress + procedural green. (The M3d readings were taken at the
+                                      # then-default 400x300 and are superseded, not contradicted: smlp read
+                                      # 0.007% there, the helmet 0.081%.)
+                                      # WHAT V6 STILL SKIPS, LOUDLY: a device with no ray query. The remaining
+                                      # M3b/M3d boundaries are staging uploads, the real --blas-split, and BC7.
+                                      # V7 — THE WAVEFRONT QUADTREE, and the first EXACT-ZERO gates on
+                                      # Vulkan (M3c, 2026-08-11; the ladder half of src/vk/tracer.rs). V6's
+                                      # bars are all statistical, and unavoidably so: it is scored against the
+                                      # CPU, hardware watertight intersection is not moller_trumbore, and the
+                                      # RNG streams differ by design. V7 is scored against the VULKAN
+                                      # REFERENCE KERNEL — which V6 just proved renders the CPU's picture — and
+                                      # two kernels on one device running the same rays through the same
+                                      # shade.hlsli have no such excuse. That is the whole reason the ladder
+                                      # lands AFTER the reference kernel rather than instead of it.
+                                      # MEASURED (RADV STRIX_HALO, the 800x600 gate frame): claim-violation 0 |
+                                      # false-sky 0 | tmin-overshoot 0 | hybrid-extra 0 | max rel t err 0.00e0,
+                                      # and the same-seed image A/B reads **EXACT 0.00e0 with 0 hot channels**
+                                      # on procedural, DamagedHelmet, Sponza and vokselia — i.e. the wavefront
+                                      # and the reference produce a BIT-IDENTICAL accum buffer. The two scenes
+                                      # that arm the candidate loops read 7.47e-9 (san-miguel-lp, max 4.65e-3)
+                                      # and 3.25e-9 (rungholt, 1 hw-edge px), both with 0 hot channels: an
+                                      # alpha/tint candidate loop legitimately sees a grazing edge differently
+                                      # at TMin=t_start than at TMin=0, which is the documented two-intersector
+                                      # class. Worth stating plainly because the D3D12 note predicts otherwise:
+                                      # NVIDIA reads bit-exact there and **AMD was recorded as re-origining the
+                                      # ray at TMin, landing 1-2 ulp away — that does NOT reproduce on RADV via
+                                      # Vulkan on opaque scenes.** The gate is still written as a bounded HOT
+                                      # COUNT with the edge pixels excluded from the max, because it must hold
+                                      # on the hardware that does.
+                                      # THE STRUCTURE MATCHES D3D12 EXACTLY, which is a stronger statement than
+                                      # any of the tolerances: at 800x600 both suites report `leaves 768 |
+                                      # sky-tiles 4 | splits 257 | blocked 256 | cuts 65 | overflow 0`. Same
+                                      # quadtree, two backends, two intersectors. That agreement is why the
+                                      # gate frame moved to --check-gpu's own resolution (M3b/M3d ran at
+                                      # 400x300) — it also costs nothing, since the wall clock here is DXC
+                                      # compiling the corpus and not the CPU reference (smlp 22.1 s at 400x300
+                                      # vs 21.7 s at 800x600), and it is what makes the transmissive must-fire
+                                      # fire at all: at 400x300 ZERO shadow rays cross San Miguel's glass.
+                                      # THE GATES, each transplanted from --check-gpu at its own strength:
+                                      # claim-violation (THE soundness contract, asserted DIRECTLY rather than
+                                      # by proxy — the leaf queue's inherited t_start against the EARLIEST t
+                                      # either intersector reports, the most pessimistic ground truth
+                                      # available); exactly-once coverage + queue accounting (leaf and sky
+                                      # rects must PARTITION the screen, no pixel may keep the 0xffffffff
+                                      # sentinel cs_clear_info flooded, both tile queues must have drained, and
+                                      # CTR_OVERFLOW must be 0 — the queues are sized to the structural worst
+                                      # case, so an overflow is a sizing bug and never a scene); false-sky /
+                                      # tmin-overshoot / hybrid-extra; the LeafRec frontier-handle cookie/token
+                                      # ABI audit; and anti-vacuity both ways (a ladder that emitted no sky
+                                      # tile proved no empty space, which is the quadtree's entire product).
+                                      # THE DRAINED-QUEUE CHECK IS PARITY-SELECTED and that is not incidental:
+                                      # cs_prep zeroes only the OUT counter, so the last level's IN counter
+                                      # legitimately still holds the tiles it consumed, and WHICH queue must be
+                                      # empty follows depth_full % 2. The default 800x600 gives depth 5 (odd);
+                                      # **FR_VK_RES=400x300 gives 4 and is what covers the other arm.** The
+                                      # D3D12 twin has the identical expression and its own note about a bug an
+                                      # odd depth hid — a parity-selected gate is half a gate until both
+                                      # parities have run, so run both. RUN THE EVEN ARM ON THE PROCEDURAL
+                                      # SCENE: at 400x300 San Miguel's glass is crossed by ZERO shadow rays, so
+                                      # that pairing FAILS on the transmissive must-fire rather than on
+                                      # anything about parity — which is the caveat below, seen from the
+                                      # resolution side.
+                                      # THE COUNTER MUST-FIRES M3d COULD ONLY REPORT ARE REAL HERE, which was
+                                      # half the point of the stage: cs_leaf pastes ctr.hlsli, so HAVE_COUNTERS
+                                      # is finally defined in a kernel that runs, and CTR_ALPHA_REJ /
+                                      # CTR_TRANS_PASS / CTR_HEIGHT_REJ / CTR_RTGI_RAYS become assertions in
+                                      # BOTH directions (a masked scene that rejects nothing has dead cutout
+                                      # code; an opaque scene that rejects anything means ALPHA_CUTOUT did not
+                                      # compile out). Measured: rungholt 5427 cutout / 14752 tint, smlp 1353 /
+                                      # 13, Sponza 4, procedural 0/0 with 341393 RTGI bounce rays. Same --cam
+                                      # caveat as --check-gpu's twins — a pose containing no masked geometry
+                                      # trips the must-fire, and San Miguel's 13 tint crossings out of 480000
+                                      # px is exactly how close that is.
+                                      # THREE THINGS THE LADDER SPELLS DIFFERENTLY FROM D3D12, and only three.
+                                      # (1) THE PING-PONG IS A DESCRIPTOR SET. qin/qout (u5/u6) swap every
+                                      # level and Vulkan has no rebound root UAV, so set 0 is allocated THREE
+                                      # times off ONE layout — A (u5=qa, u6=qb), B (the swap), and TERMINAL
+                                      # (u5=cloud_lod, u6=cloud_shadow, the registers' second meaning once the
+                                      # ladder has drained) — and a level binds the variant its parity names.
+                                      # Set 1 is allocated once and shared: the ping-pong is entirely a set-0
+                                      # property. Three writes at init, one vkCmdBindDescriptorSets per level,
+                                      # zero per-dispatch descriptor traffic. (2) PER-DISPATCH PUSH CONSTANTS
+                                      # BECOME vkCmdUpdateBuffer. b1 is a uniform buffer here (DXC has no flag
+                                      # to promote a cbuffer to push constants, and [[vk::push_constant]] would
+                                      # be an HLSL edit) and the ladder rewrites it twice per level, which a
+                                      # host write cannot do — every host write inside a run() closure happens
+                                      # before the submit. An inline transfer update lands at the right point
+                                      # in the stream and costs nothing extra, since a barrier already sits
+                                      # between every pair of dispatches. (The dynamic-offset UBO ring is the
+                                      # other shape and was rejected: it would make the DERIVED layout
+                                      # special-case one binding.) (3) THERE ARE NO RESOURCE STATES — one
+                                      # global barrier covering COMPUTE|TRANSFER -> COMPUTE|DRAW_INDIRECT
+                                      # replaces D3D12's UAV barrier AND the args buffer's
+                                      # UNORDERED_ACCESS<->INDIRECT_ARGUMENT transition pair.
+                                      # THE BUG THAT COST THE LADDER, and it is (2)'s fault: a per-dispatch
+                                      # constant block needs a WRITE-AFTER-READ edge as well as the obvious
+                                      # read-after-write one, and the WAR edge is the one that is easy to omit
+                                      # and invisible when you do. The transfer is free to execute ahead of the
+                                      # dispatch it textually FOLLOWS, so cs_prep read the NEXT level's push3,
+                                      # wrote its indirect args to the wrong slot, and every level after the
+                                      # first dispatched zero groups. Nothing faulted, validation was clean,
+                                      # and the frame came back with one split and no terminals — found by
+                                      # FR_VK_CTRS=1 showing BOTH tile counters at 0 beside a split count of 1.
+                                      # The push helper carries both barriers itself now, which is why it is a
+                                      # closure rather than three lines at each of its nine call sites.
+                                      # NOT COVERED, and said loudly rather than silently: hemi (fb_mode > 0 —
+                                      # the H tiers), compose (which fb OFF does not dispatch at all, by
+                                      # design: leaf/sky splat straight into accum through accum_splat, and
+                                      # D3D12 skips it for the same reason), structure replay, and --sw-rays,
+                                      # whose leaf kernel wants the BINARY tree at t0 while the ladder holds
+                                      # the WIDE one there — a fourth set variant, not a flag, so V7 SKIPs with
+                                      # that sentence when the lever is armed.
+                                      # THE FRUSTUM TREE IS THE ONE STREAM THIS FILE UPLOADS: t0 space0 takes
+                                      # ftree::FTree::quantized() (the QFNode wire format — the per-processor
+                                      # split verdict, not a shortcut: the CPU keeps f32 nodes and the GPU
+                                      # trades decode ALU for -56% tree bandwidth, with decoded boxes still
+                                      # CONTAINING the true ones so every prune stays conservative) or
+                                      # gfx::scene::gpu_bvh_nodes under --no-ftree. GpuBvhNode moved to
+                                      # gfx::scene beside GpuMat for GpuMat's reason — one #[repr(C)] mirror
+                                      # per HLSL struct, read by both backends.
                                       # THE CLOUD CACHES ARE BUILT AND DISPATCHED HERE, not levered off:
                                       # cs_reference reads the amortized sky lattice (--sky-lod, default 4)
                                       # and the slab-space cloud-shadow cache (--cloud-shadow, default 16)

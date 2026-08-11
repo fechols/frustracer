@@ -1120,20 +1120,11 @@ pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
 // (frustum kernels, M3), and the DXR BLAS/TLAS (every actual ray).
 // ---------------------------------------------------------------------------
 
-/// bvh.rs::BvhNode packed to 32 bytes for StructuredBuffer<BvhNode>.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GpuBvhNode {
-    mn: [f32; 3],
-    left_first: u32,
-    mx: [f32; 3],
-    count: u32,
-}
-
-/// The material wire format moved to `gfx::scene` (one mirror of
-/// shade.hlsli's `Mat`, read by both backends); re-exported so this file's
-/// `size_of::<GpuMat>()` accounting reads as it always did.
-use crate::gfx::scene::GpuMat;
+/// The material and BVH-node wire formats moved to `gfx::scene` (one mirror
+/// each of shade.hlsli's `Mat` and frustum.hlsli's `BvhNode`, read by both
+/// backends); re-exported so this file's `size_of::<GpuMat>()` accounting and
+/// its `GpuBvhNode { .. }` literal read as they always did.
+use crate::gfx::scene::{GpuBvhNode, GpuMat};
 
 /// Bytes of reusable staging streamed per blocking submit — bounds the
 /// upload's transient commit to one chunk instead of a full second copy of
@@ -1200,12 +1191,7 @@ impl SwTreesGpu {
             sub,
             &ring,
             &bvh.nodes,
-            |n| GpuBvhNode {
-                mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
-                left_first: n.left_first,
-                mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
-                count: n.count,
-            },
+            crate::gfx::scene::gpu_bvh_node,
             srv,
         )?;
         let tri_idx = stream_buffer(device, sub, &ring, &bvh.tri_idx, |t| *t, srv)?;

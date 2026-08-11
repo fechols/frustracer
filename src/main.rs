@@ -12302,8 +12302,17 @@ fn run_check_vk_render(
     bvh: &bvh::Bvh,
     cam0: Camera,
 ) -> bool {
-    const VK_RENDER_W: usize = 400;
-    const VK_RENDER_H: usize = 300;
+    // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
+    // frame its D3D12 twin does, so the two suites' quadtree structures are
+    // directly comparable rather than merely similar (both read
+    // `leaves 768 | sky-tiles 4 | splits 257 | blocked 256 | cuts 65`, which
+    // is a cross-backend agreement no summary statistic could give). It also
+    // costs nothing — the wall clock here is DXC compiling the corpus, not the
+    // CPU reference: san-miguel-low-poly measured 22.1 s at 400x300 and 21.7 s
+    // here, i.e. inside the noise. And it fires the transmissive must-fire,
+    // which at 400x300 sees ZERO shadow rays crossing San Miguel's glass.
+    const VK_RENDER_W: usize = 800;
+    const VK_RENDER_H: usize = 600;
     // Accumulated frames on each side of the radiance A/B. The RNG streams
     // differ by design, so this is variance reduction, not agreement: too few
     // and the bar measures noise. `FR_VK_AB_FRAMES` overrides it, which is the
@@ -12321,7 +12330,25 @@ fn run_check_vk_render(
         println!("check-vk: SKIP V6 (no ray query on this device — the shipping tracer needs it)");
         return true;
     }
-    let (gw, gh) = (VK_RENDER_W, VK_RENDER_H);
+    // `FR_VK_RES=WxH`. Two uses, both real: a perf probe wants a shipping
+    // resolution, and V7's drained-queue check is PARITY-SELECTED — `cs_prep`
+    // zeroes only the OUT counter, so which tile queue must be empty at the
+    // end depends on `depth_full % 2`, and the depth follows
+    // `max(rw, rh) / LEAF_TILE`. The default 800x600 gives depth 5 (odd);
+    // **`FR_VK_RES=400x300` gives 4 and is what covers the other arm.** The
+    // D3D12 twin has the identical expression and its own note about a bug an
+    // odd depth hid at exactly this resolution — a parity-selected gate is
+    // half a gate until both parities have run.
+    let (gw, gh) = match std::env::var("FR_VK_RES").ok().and_then(|v| {
+        let (a, b) = v.split_once(['x', 'X'])?;
+        Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+    }) {
+        Some((w, h)) if w > 0 && h > 0 => {
+            println!("check-vk: FR_VK_RES={w}x{h} (default {VK_RENDER_W}x{VK_RENDER_H})");
+            (w, h)
+        }
+        _ => (VK_RENDER_W, VK_RENDER_H),
+    };
     let vs = match vk::scene::VkScene::new(hg, scene) {
         Ok(s) => s,
         Err(e) => {
@@ -12337,7 +12364,7 @@ fn run_check_vk_render(
             return false;
         }
     };
-    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, gw as u32, gh as u32) {
+    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("check-vk: FAIL V6 tracer init: {e}");
@@ -12450,6 +12477,12 @@ fn run_check_vk_render(
     let cpu_t: Vec<f32> = tbuf.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
     let (mut n_hit, mut n_sky, mut class_mismatch, mut t_viol) = (0usize, 0usize, 0usize, 0usize);
     let mut max_rel = 0.0f32;
+    // Pixels where the CPU and the hardware already disagree — the
+    // two-intersector grazing-edge set. V7 excludes them from its own
+    // wavefront-vs-reference MAX for the reason `--check-gpu` does: the
+    // reference's `t` is not ground truth there, so a difference at one of
+    // them measures two surfaces rather than the quadtree.
+    let mut edge_mask = vec![false; px];
     for i in 0..px {
         let (ct, gt) = (cpu_t[i], gpu_t[i]);
         match (ct.is_finite(), gt.is_finite()) {
@@ -12459,10 +12492,14 @@ fn run_check_vk_render(
                 max_rel = max_rel.max(rel);
                 if rel > 1e-3 {
                     t_viol += 1;
+                    edge_mask[i] = true;
                 }
             }
             (false, false) => n_sky += 1,
-            _ => class_mismatch += 1,
+            _ => {
+                class_mismatch += 1;
+                edge_mask[i] = true;
+            }
         }
     }
     println!(
@@ -12766,9 +12803,382 @@ fn run_check_vk_render(
     // ~0 to 0.129% once the LOD term stopped being dead — just not past the
     // bar. Do not "fix" that by tightening one; fix it, if it matters, with a
     // pose that makes those streams determine the answer.
+
+    // ---- V7: the wavefront quadtree, scored against the kernel above ----
+    if !run_check_vk_wavefront(hg, &tg, scene, &params(0), &cpu_t, &edge_mask, gw, gh) {
+        ok = false;
+    }
+
     tg.destroy(hg);
     vt.destroy(hg);
     vs.destroy(hg);
+    ok
+}
+
+/// V7 — the WAVEFRONT QUADTREE, and the first EXACT-ZERO gates on Vulkan.
+///
+/// Everything before this is scored against the CPU, so every bar is
+/// statistical: hardware watertight intersection is not `moller_trumbore` and
+/// the RNG streams differ by design. This stage is scored against the VULKAN
+/// REFERENCE KERNEL, which V6 just proved renders the same picture the CPU
+/// does — and two kernels on one device running the same rays through the same
+/// `shade.hlsli` have no such excuse. So the gates here are the transplanted
+/// `--check-gpu` family, at its own strength:
+///
+/// - **claim-violation** — THE soundness contract, asserted directly. A tile's
+///   inherited `t_start` claims that frustum ∩ ball(origin, t_start) is empty;
+///   this reads the claim out of the leaf queue and checks it against the
+///   EARLIEST `t` either intersector reports, which is the most pessimistic
+///   ground truth available. Exact zero.
+/// - **exactly-once coverage + queue accounting** — the leaf and sky rects
+///   must PARTITION the screen (areas sum to `rw*rh`), no pixel may be left
+///   holding the sentinel, both tile queues must have drained, and
+///   `CTR_OVERFLOW` must be 0 (the queues are sized to the structural worst
+///   case, so an overflow is a sizing bug, never a scene). Exact zero.
+/// - **false-sky / tmin-overshoot / hybrid-extra** — the bug class the whole
+///   quadtree exists inside: a tile that proves empty space it does not own
+///   shows up as a pixel the ladder calls sky and the reference does not.
+/// - **the same-seed image A/B**, and **the counter must-fires M3d could not
+///   make**: `cs_leaf` binds `counters`, so `HAVE_COUNTERS` is finally defined
+///   in a kernel that runs here and `CTR_ALPHA_REJ`/`CTR_TRANS_PASS` become
+///   real assertions on the scenes that arm them.
+///
+/// NOT EXACT ON THIS HARDWARE, and it is worth knowing which way: AMD's RT
+/// hardware RE-ORIGINS the ray at TMin, so one ray at TMin=0 (the reference)
+/// and at TMin=t_start (a leaf primary) can return `t` 1-2 ulp apart and, at a
+/// grazing shared edge, accept different geometry outright. NVIDIA does not,
+/// and reads bit-identical on D3D12. So the image A/B is a bounded HOT COUNT
+/// rather than an absolute limit, and the edge pixels are excluded from the
+/// max — exactly as `--check-gpu` handles the same phenomenon from the other
+/// side. `claim_viol` is what guards the contract at them.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_wavefront(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    p: &gfx::frame::FrameParams,
+    cpu_t: &[f32],
+    edge_mask: &[bool],
+    gw: usize,
+    gh: usize,
+) -> bool {
+    use gfx::shaders as gs;
+
+    let Some((depth_full, cap_leaf, cap_sky)) = tg.wave_shape() else {
+        println!(
+            "check-vk: SKIP V7 (--sw-rays is armed — its leaf kernel wants the BINARY tree at \
+             t0 while the ladder holds the WIDE one there, which is a fourth descriptor-set \
+             variant, not a flag)"
+        );
+        return true;
+    };
+    let px = gw * gh;
+    let mut ok = true;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V7 {msg}");
+        *ok = false;
+    };
+    let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    let read_u32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<u32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+
+    // The REFERENCE arm first, at the same pose and frame index, so `accum`
+    // and `tbuf` hold a clean oracle. (They currently hold the texture
+    // anti-vacuity probe's flat-texture frames, which is why this re-renders
+    // rather than reusing V6's readback.)
+    if let Err(e) = tg.render(hg, p, 1) {
+        fail(&mut ok, format!("reference re-run: {e}"));
+        return false;
+    }
+    let (ref_t, ref_acc) = match (read_f32(&tg.tbuf, px), read_f32(&tg.accum, px * 3)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            fail(&mut ok, "reference readback".into());
+            return false;
+        }
+    };
+
+    if let Err(e) = tg.render_wavefront(hg, p, true) {
+        fail(&mut ok, format!("wavefront dispatch: {e}"));
+        return false;
+    }
+    let (wave_t, wave_info, wave_acc, ctrs) = match (
+        read_f32(&tg.tbuf, px),
+        read_u32(&tg.info, px),
+        read_f32(&tg.accum, px * 3),
+        tg.read_counters(hg),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            fail(&mut ok, "wavefront readback".into());
+            return false;
+        }
+    };
+    let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+    // The RAW counter block. Kept because it is how the b1 write-after-read
+    // hazard was found: the frame line reports the handful of counters the
+    // gates read, and what said "level 0 ran and nothing after it" was seeing
+    // BOTH tile counters sitting at 0 beside a split count of 1.
+    if std::env::var_os("FR_VK_CTRS").is_some() {
+        eprintln!("check-vk: V7 counters (index = CTR_*) {ctrs:?}");
+    }
+    let (n_leaf, n_sky) = (ctr(gs::CTR_LEAF) as usize, ctr(gs::CTR_SKY) as usize);
+    println!(
+        "check-vk: V7 wavefront frame (depth {depth_full}, caps leaf {cap_leaf} sky {cap_sky}): \
+         leaves {n_leaf} | sky-tiles {n_sky} | splits {} | blocked {} | cuts {} (fallback {}) | \
+         overflow {}",
+        ctr(gs::CTR_SPLIT),
+        ctr(gs::CTR_BLOCKED),
+        ctr(gs::CTR_CUT),
+        ctr(gs::CTR_CUT_FALLBACK),
+        ctr(gs::CTR_OVERFLOW),
+    );
+
+    // ---- queue accounting + exactly-once coverage ----
+    let (leaf_recs, sky_recs) = match tg.read_queues(hg, n_leaf, n_sky) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, format!("queue readback: {e}"));
+            return false;
+        }
+    };
+    const LEAF_REC_U32S: usize = (gs::LEAF_REC_BYTES / 4) as usize;
+    let rect_px = |xy0: u32, xy1: u32| -> u64 {
+        let (x0, y0) = (xy0 & 0xffff, xy0 >> 16);
+        let (x1, y1) = (xy1 & 0xffff, xy1 >> 16);
+        u64::from(x1 - x0) * u64::from(y1 - y0)
+    };
+    let mut covered: u64 = 0;
+    let mut malformed = 0usize;
+    // The inherited t_start per pixel, scattered from the leaf queue once (a
+    // per-pixel scan of the rects would be O(px * n_leaf)). NaN = not a leaf
+    // pixel — sky rects carry no claim.
+    let mut t_start_of = vec![f32::NAN; px];
+    for r in 0..n_leaf.min(leaf_recs.len() / LEAF_REC_U32S) {
+        let base = r * LEAF_REC_U32S;
+        let (xy0, xy1) = (leaf_recs[base], leaf_recs[base + 1]);
+        covered += rect_px(xy0, xy1);
+        let ts = f32::from_bits(leaf_recs[base + 2]);
+        let (x0, y0) = ((xy0 & 0xffff) as usize, (xy0 >> 16) as usize);
+        let (x1, y1) = ((xy1 & 0xffff) as usize, (xy1 >> 16) as usize);
+        for y in y0..y1.min(gh) {
+            for x in x0..x1.min(gw) {
+                t_start_of[y * gw + x] = ts;
+            }
+        }
+        // The opaque traversal-frontier handle, audited CPU-side only: the
+        // shader call site never interprets either word, it hands them to the
+        // provider unchanged.
+        let (token, cookie) = (leaf_recs[base + 4], leaf_recs[base + 5]);
+        if cookie != gs::FRONTIER_COOKIE_V1
+            || (token != gs::FRONTIER_ROOT_TOKEN && (token >> 6) >= ctr(gs::CTR_CUT))
+        {
+            malformed += 1;
+        }
+    }
+    for r in 0..n_sky.min(sky_recs.len() / 4) {
+        covered += rect_px(sky_recs[r * 4], sky_recs[r * 4 + 1]);
+    }
+    let sentinels = wave_info.iter().filter(|&&i| i == 0xffff_ffff).count();
+    // The last level consumed one tile queue and must have appended nothing
+    // into the other. WHICH one is a parity question — `cs_prep` zeroes only
+    // the OUT counter, so the last level's IN counter legitimately still holds
+    // the tiles it consumed. `FR_VK_RES=800x600` runs the other parity.
+    let dangling =
+        if depth_full % 2 == 0 { ctr(gs::CTR_TILE_A) } else { ctr(gs::CTR_TILE_B) };
+    if ctr(gs::CTR_OVERFLOW) != 0 {
+        fail(&mut ok, "queue overflow (the queues are sized to the structural worst case)".into());
+    }
+    if dangling != 0 {
+        fail(&mut ok, format!("{dangling} tile records left after the last level"));
+    }
+    if covered != px as u64 {
+        fail(&mut ok, format!("leaf+sky rects cover {covered} px, the screen has {px}"));
+    }
+    if sentinels != 0 {
+        fail(&mut ok, format!("{sentinels} px never written (exactly-once coverage)"));
+    }
+    if malformed != 0 {
+        fail(&mut ok, format!("{malformed} LeafRec frontier handles have an invalid cookie/token"));
+    }
+    // Anti-vacuity: a ladder that emitted no sky tile proved no empty space,
+    // which is the quadtree's entire product.
+    if n_leaf == 0 || n_sky == 0 {
+        fail(
+            &mut ok,
+            format!("the ladder produced {n_leaf} leaf and {n_sky} sky records — nothing is scored"),
+        );
+    }
+
+    // ---- the exact-zero pixel gates ----
+    let mut claim_viol = 0usize;
+    let mut culprits: Vec<String> = Vec::new();
+    for i in 0..px {
+        let ts = t_start_of[i];
+        if !ts.is_finite() {
+            continue;
+        }
+        let truth = match (cpu_t[i].is_finite(), ref_t[i].is_finite()) {
+            (true, true) => cpu_t[i].min(ref_t[i]),
+            (true, false) => cpu_t[i],
+            (false, true) => ref_t[i],
+            (false, false) => continue, // both say sky: no geometry to overshoot
+        };
+        if ts > truth * (1.0 + 1e-4) {
+            claim_viol += 1;
+            if culprits.len() < 8 {
+                culprits.push(format!(
+                    "CLAIM VIOLATION px ({},{}): t_start {ts:.6} > nearest hit {truth:.6} \
+                     (cpu {:.6} | gpu-ref {:.6})",
+                    i % gw,
+                    i / gw,
+                    cpu_t[i],
+                    ref_t[i]
+                ));
+            }
+        }
+    }
+    let (mut false_sky, mut overshoot, mut extra, mut edge_skipped) = (0usize, 0usize, 0usize, 0usize);
+    let mut max_rel_t = 0.0f32;
+    for i in 0..px {
+        let (rt, wt) = (ref_t[i], wave_t[i]);
+        let disagree = match (rt.is_finite(), wt.is_finite()) {
+            (true, true) => rt != wt,
+            (false, false) => false,
+            _ => true,
+        };
+        if edge_mask[i] && disagree {
+            edge_skipped += 1;
+            continue;
+        }
+        match (rt.is_finite(), wt.is_finite()) {
+            (true, true) => {
+                let rel = (wt - rt) / rt.max(1e-6);
+                max_rel_t = max_rel_t.max(rel.abs());
+                if rel > 1e-4 {
+                    overshoot += 1;
+                    if culprits.len() < 8 {
+                        culprits.push(format!(
+                            "overshoot px ({},{}): ref t {rt:.6} -> wave t {wt:.6} \
+                             (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            i % gw,
+                            i / gw,
+                            t_start_of[i]
+                        ));
+                    }
+                }
+            }
+            (true, false) => {
+                false_sky += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!(
+                        "false-sky px ({},{}): ref t {rt:.6}, wave = sky",
+                        i % gw,
+                        i / gw
+                    ));
+                }
+            }
+            (false, true) => {
+                extra += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!(
+                        "hybrid-extra px ({},{}): ref = sky, wave t {wt:.6}",
+                        i % gw,
+                        i / gw
+                    ));
+                }
+            }
+            (false, false) => {}
+        }
+    }
+    // Same-seed same-shading image A/B: identical hits => identical RNG
+    // streams => near-identical color, cross-kernel fp aside.
+    let (mut img_sum, mut img_max, mut img_hot, mut nonfinite) = (0.0f64, 0.0f32, 0usize, 0usize);
+    for i in 0..px * 3 {
+        if !wave_acc[i].is_finite() {
+            nonfinite += 1;
+            continue;
+        }
+        let d = (wave_acc[i] - ref_acc[i]).abs();
+        img_sum += f64::from(d);
+        if !edge_mask[i / 3] {
+            img_max = img_max.max(d);
+            if d > 1e-2 {
+                img_hot += 1;
+            }
+        }
+    }
+    let img_mean = img_sum / (px * 3) as f64;
+    println!(
+        "check-vk: V7 wavefront vs reference ({px} px): claim-violation {claim_viol} | \
+         false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | \
+         hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | \
+         same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
+    );
+    for c in &culprits {
+        eprintln!("check-vk:   {c}");
+    }
+    if claim_viol != 0 {
+        fail(&mut ok, "inherited-tmin claim violated (t_start past real geometry — THE bug class)".into());
+    }
+    if false_sky != 0 || overshoot != 0 || extra != 0 {
+        fail(&mut ok, "wavefront visibility gates (the inherited-tmin bug class)".into());
+    }
+    if nonfinite != 0 {
+        fail(&mut ok, format!("{nonfinite} non-finite channel(s) in the wavefront image"));
+    }
+    // The hardware-edge pixels ride the SAME 0.05% allowance the CPU-vs-GPU
+    // comparison uses — they are one phenomenon seen from two sides. A flood
+    // is a real signal (a broken cut surfaces as mass disagreement); one or
+    // two is grazing-edge fp.
+    if edge_skipped as f64 > px as f64 * 5e-4 {
+        fail(
+            &mut ok,
+            format!("{edge_skipped} wavefront/reference disagreements above the 0.05% edge allowance"),
+        );
+    }
+    if img_mean > 1e-5 {
+        fail(&mut ok, format!("same-seed image mean |d| {img_mean:.2e} > 1e-5"));
+    }
+    if img_hot as f64 > px as f64 * 3.0 * 5e-4 {
+        fail(&mut ok, format!("{img_hot} channels past 1e-2 — above the two-intersector allowance"));
+    }
+
+    // ---- the per-scene must-fires M3d could only report ----
+    //
+    // `cs_leaf` pastes `ctr.hlsli`, so `HAVE_COUNTERS` is defined and
+    // `rt.hlsli`'s cutout/relief/tint tallies finally have somewhere to land.
+    // Both directions matter: a masked scene that rejects nothing has dead
+    // cutout code, and an opaque scene that rejects anything means
+    // `ALPHA_CUTOUT` did not compile out. Same `--cam` caveat as `--check-gpu`:
+    // a pose containing no masked geometry would trip the must-fire.
+    let arm = |ok: &mut bool, name: &str, armed: bool, n: u32| {
+        if armed {
+            println!("check-vk: V7 {name}: {n}");
+            if n == 0 {
+                eprintln!("check-vk: FAIL V7 {name} is 0 on a scene that arms it (the path must fire)");
+                *ok = false;
+            }
+        } else if n != 0 {
+            eprintln!("check-vk: FAIL V7 {n} {name} on a scene that does not arm it (it must compile out)");
+            *ok = false;
+        }
+    };
+    arm(&mut ok, "alpha-cutout rejections", scene.any_alpha, ctr(gs::CTR_ALPHA_REJ));
+    arm(&mut ok, "tinted-shadow crossings", scene.any_transmissive, ctr(gs::CTR_TRANS_PASS));
+    arm(
+        &mut ok,
+        "relief-march rejections",
+        scene.any_height && bvh::height_on(),
+        ctr(gs::CTR_HEIGHT_REJ),
+    );
+    arm(&mut ok, "rtgi bounce rays", shade::rtgi_enabled(), ctr(gs::CTR_RTGI_RAYS));
     ok
 }
 
