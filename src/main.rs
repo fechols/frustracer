@@ -771,22 +771,26 @@ fn main() {
             );
         }
     }
-    // The knobs that live on the backend. They are set here, before any
-    // scene load or device construction, and read by kernel assembly — so
-    // they follow the backend module until the shader assembly itself moves
-    // to `gfx`. Off Windows there is no backend to configure yet; `Opts`
-    // still carries every value, so nothing is lost but the store.
+    // The knobs the SHADER ASSEMBLY reads. These are portable — the statics
+    // moved to `gfx::shaders` with the assembly itself — and the store must be
+    // too, because both Vulkan gates assemble the same corpus: a `#[cfg]` here
+    // would leave `--check-spirv --no-sky-lod` and `--check-vk
+    // --no-cloud-shadow` compiling the DEFAULT configuration while their loud
+    // lines claimed otherwise. That is exactly what shipped after M1 (the
+    // statics moved, three stores did not), and `--check-vk --sw-rays` found
+    // it by running the ladder it had just announced it would skip.
+    gfx::shaders::set_cloud_shadow(opts.cloud_shadow);
+    gfx::shaders::set_sky_lod(opts.sky_lod);
+    // --waveviz wins over the FR_WAVEVIZ env alias; both land before any
+    // GPU construction (Passes::new + both tracers' kernel assemblies read it).
+    match if opts.waveviz != 0 { opts.waveviz } else { gfx::shaders::waveviz_env() } {
+        0 => {}
+        m => gfx::shaders::set_waveviz(m),
+    }
+    // The knobs that live on the D3D12 BACKEND — the DXR pipeline's own modes
+    // and the two profilers. Nothing off Windows has them to configure.
     #[cfg(windows)]
     {
-        gpu::trace::set_cloud_shadow(opts.cloud_shadow);
-        gpu::trace::set_sky_lod(opts.sky_lod);
-        // --waveviz wins over the FR_WAVEVIZ env alias; both land before any
-        // GPU construction (Passes::new + both tracers' kernel assemblies read
-        // it).
-        match if opts.waveviz != 0 { opts.waveviz } else { gpu::trace::waveviz_env() } {
-            0 => {}
-            m => gpu::trace::set_waveviz(m),
-        }
         gpu::dxr::set_inline_mode(opts.dxr_inline);
         // --dxr-sbt: parse-time only (no vendor policy, so no run_window
         // re-store) — and it MUST land before any SceneGpu upload, which bakes
@@ -815,8 +819,7 @@ fn main() {
     // leaf primaries consume it through rt_sw.hlsli. Only a departure from
     // the default prints (the blas-split lever-line rule).
     if opts.sw_rays {
-        #[cfg(windows)]
-        gpu::trace::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
+        gfx::shaders::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
         if opts.cut_rays {
             eprintln!(
                 "gpu: --continuation-rays — software prototype: each terminal beam \
@@ -900,8 +903,7 @@ fn main() {
         eprintln!("ftree: --ftree-tiles — the tile recursion runs on the 8-wide frustum tree");
     }
     if !opts.wide_levels {
-        #[cfg(windows)]
-        gpu::trace::WIDE_LEVELS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        gfx::shaders::WIDE_LEVELS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "gpu: --no-wide-levels — every quadtree level runs one thread per tile \
              (the pre-cooperative ladder)"
@@ -1142,7 +1144,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk(&scene, &bvh, cam0);
+            let code = run_check_vk(&scene, &bvh, cam0, structural);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -11794,7 +11796,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 /// the bare-checkout rule every SDK-dependent gate here follows. It does NOT
 /// degrade on a device that is present and wrong.
 #[cfg(unix)]
-fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
+fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
     let mut ok = true;
 
     // ---- V0: the pure half. Meaningful on a box with no Vulkan at all. ----
@@ -11896,7 +11898,7 @@ fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
     }
 
     // ---- V6: the reference kernel rendering, scored against the CPU. ----
-    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0) {
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural) {
         ok = false;
     }
 
@@ -12177,6 +12179,13 @@ fn run_check_vk_layout(
     // as a floor.
     let kinds: std::collections::HashSet<&'static str> =
         map.entries.values().map(|e| e.kind.name()).collect();
+    // ...except the acceleration structure under `--sw-rays`, where the corpus
+    // genuinely declares none: that lever swaps every RayQuery body for
+    // `rt_sw.hlsli`'s software traversal of our own BVH, so demanding a TLAS
+    // would be asserting against a different configuration than the one being
+    // reflected. This is the shape of every scene-keyed must-fire here — the
+    // expectation follows what the units were compiled from.
+    let want_as = !gfx::shaders::sw_rays();
     for want in [
         DescKind::AccelStruct,
         DescKind::SampledImage,
@@ -12185,6 +12194,9 @@ fn run_check_vk_layout(
         DescKind::StorageBuffer,
         DescKind::StorageImage,
     ] {
+        if matches!(want, DescKind::AccelStruct) && !want_as {
+            continue;
+        }
         if !kinds.contains(want.name()) {
             eprintln!(
                 "check-vk: FAIL V5 the derived map has no {} — the corpus declares one, so \
@@ -12301,6 +12313,7 @@ fn run_check_vk_render(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
     cam0: Camera,
+    structural: bool,
 ) -> bool {
     // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
     // frame its D3D12 twin does, so the two suites' quadtree structures are
@@ -12328,6 +12341,20 @@ fn run_check_vk_render(
 
     if !hg.vk.info.ray_query || !hg.vk.info.accel_struct {
         println!("check-vk: SKIP V6 (no ray query on this device — the shipping tracer needs it)");
+        return true;
+    }
+    // `--sw-rays` swaps every RayQuery body for `rt_sw.hlsli`'s traversal of
+    // OUR BVH, which reads the binary tree at t0 and `tri_idx` at t1. This
+    // backend uploads the binary tree only for the hemi passes and `tri_idx`
+    // not at all, so a render here would bind dummies and produce a confident
+    // wrong picture. V5 above still covers that corpus — it is the LAYOUT that
+    // the lever changes, and the layout is what V5 derives.
+    if gfx::shaders::sw_rays() {
+        println!(
+            "check-vk: SKIP V6/V7/V8 (--sw-rays is armed — its intersector reads the binary \
+             tree at t0 and tri_idx at t1, streams this backend does not bind yet; V5 covers \
+             that corpus's layout)"
+        );
         return true;
     }
     // `FR_VK_RES=WxH`. Two uses, both real: a perf probe wants a shipping
@@ -12809,6 +12836,11 @@ fn run_check_vk_render(
         ok = false;
     }
 
+    // ---- V8: the hemisphere bounce tiers ----
+    if !run_check_vk_hemi(hg, &tg, scene, bvh, basis, q, gw, gh, structural) {
+        ok = false;
+    }
+
     tg.destroy(hg);
     vt.destroy(hg);
     vs.destroy(hg);
@@ -13179,6 +13211,371 @@ fn run_check_vk_wavefront(
         ctr(gs::CTR_HEIGHT_REJ),
     );
     arm(&mut ok, "rtgi bounce rays", shade::rtgi_enabled(), ctr(gs::CTR_RTGI_RAYS));
+    ok
+}
+
+/// V8 — the HEMISPHERE BOUNCE TIERS (the H key's AO and GI), the last
+/// render-path arm the Vulkan tracer did not have.
+///
+/// Two halves, and they answer different questions. The PROBE half runs only
+/// the hemisphere passes over a CPU-generated point set, so both sides
+/// integrate at the exact same `(o, n)`:
+///
+/// - **psa-viol** — every point's projected solid angle must account to
+///   exactly pi. That is the integrator's own partition-of-unity: empty cells
+///   contribute analytically and leaf cells by sampling, and if the two
+///   together do not tile the hemisphere the estimate is wrong by whatever is
+///   missing, silently and in a way no image comparison localizes. Exact zero
+///   against a 1e-3 bound, and it rides `FLAG_VERIFY` in `H.w`.
+/// - **false-empty** — an empty-cell claim re-validated with six real
+///   RayQuery rays through the claimed-empty region. This is the hemisphere's
+///   spelling of the false-sky bug: a cell that proves emptiness it does not
+///   own drops occlusion on the floor. Exact zero.
+/// - **tmin-overshoot** — a leaf ray inherits `tc` from its own apex's tmin
+///   chain (NEVER the primary tile's), and a tmin=0 reference ray must not hit
+///   strictly inside the claimed ball. Exact zero.
+/// - the A/Bs, which are statistical BY CONSTRUCTION and stay at the CPU
+///   suite's own tolerances: AO against a 4096-sample cosine reference gates
+///   the SIGNED mean too, because that estimator is unbiased and a bias is the
+///   failure a mean-absolute bar cannot see; GI runs the same depth-1
+///   `BOUNCE_Q` policy on both sides so the comparison isolates integrator
+///   error from policy.
+///
+/// The FRAME half then runs one real wavefront frame with GI on, which is the
+/// only thing that exercises the pieces the probe path bypasses: `cs_leaf`'s fb
+/// arm appending one shading point per hit pixel (gated exactly, `pts == hits`
+/// — an accounting identity, not a tolerance), the batch loop draining them,
+/// and `cs_compose` turning `partial + ambw * ambient(H)` into finite radiance.
+///
+/// NOT covered here, and it is a real gap rather than an oversight: the CPU
+/// suite's `cut-miss` counter, which re-traverses from the root to prove a
+/// cut-seeded query saw everything the full tree would. That instrument lives
+/// in `hemi::VerifyCounters` and has no GPU counterpart on either backend.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_hemi(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    basis: camera::CamBasis,
+    q: Quality,
+    gw: usize,
+    gh: usize,
+    structural: bool,
+) -> bool {
+    use gfx::shaders as gs;
+
+    if !tg.has_hemi() {
+        println!(
+            "check-vk: SKIP V8 (the hemisphere tiers ride the ladder, which --sw-rays takes \
+             with it)"
+        );
+        return true;
+    }
+    let mut ok = true;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V8 {msg}");
+        *ok = false;
+    };
+
+    // The probe set: center rays through a coprime stride, `surface_point`ed
+    // so the apex and normal are EXACTLY what the CPU reference will use.
+    // Same construction as `--check-gpu`'s, which is what makes the two
+    // suites' numbers comparable rather than merely similar.
+    let mut probes: Vec<Vec3A> = Vec::new();
+    let mut normals: Vec<Vec3A> = Vec::new();
+    {
+        let mut vls = stats::LocalStats::default();
+        let mut y = 7usize;
+        while y < gh && probes.len() < 512 {
+            let mut x = 11usize;
+            while x < gw && probes.len() < 512 {
+                let ray = bvh::Ray::new(basis.origin, basis.ray_dir(x as f32 + 0.5, y as f32 + 0.5));
+                if let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
+                    let (o, n) = shade::surface_point(scene, &ray, &h);
+                    probes.push(o);
+                    normals.push(n);
+                }
+                x += 53;
+            }
+            y += 41;
+        }
+    }
+    let pts: Vec<(Vec3A, Vec3A)> =
+        probes.iter().copied().zip(normals.iter().copied()).collect();
+    if pts.is_empty() {
+        println!("check-vk: SKIP V8 (this pose has no geometry to place probes on)");
+        return true;
+    }
+    println!("check-vk: V8 hemi probe set: {} points", pts.len());
+
+    for (mode_name, fb) in [
+        ("AO", shade::FrustumBounce { ao: true, gi: false, depth: 3 }),
+        ("GI", shade::FrustumBounce { ao: false, gi: true, depth: 3 }),
+    ] {
+        // Multi-seed: the CB `frame` seeds the Arvo draws, so each pass is an
+        // independent estimate accumulating into the SAME H. The verify
+        // counters are kept across them (see `cs_seed_probes`), so the
+        // exact-zero gates below observe every seed's rays; PSA therefore
+        // totals SEEDS * pi rather than pi.
+        const SEEDS: u32 = 8;
+        let hq = Quality { fb, ..q };
+        let mut dispatch_ok = true;
+        for s in 0..SEEDS {
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: s,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q: hq,
+                verify: true,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            if let Err(e) = tg.run_hemi_probes(hg, &p, &pts, s == 0) {
+                fail(&mut ok, format!("hemi {mode_name} probes: {e}"));
+                dispatch_ok = false;
+                break;
+            }
+        }
+        if !dispatch_ok {
+            continue;
+        }
+        let (h, ctrs) = match (tg.read_hbuf(hg, pts.len()), tg.read_counters(hg)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                fail(&mut ok, format!("hemi {mode_name} readback"));
+                continue;
+            }
+        };
+        let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+
+        const FIXED: f64 = 262144.0;
+        let seeds_f = f64::from(SEEDS);
+        let mut psa_viol = 0usize;
+        let mut max_psa_err = 0.0f64;
+        for i in 0..pts.len() {
+            let acc = f64::from(h[i * 4 + 3]) / FIXED / seeds_f;
+            let err = (acc - std::f64::consts::PI).abs();
+            max_psa_err = max_psa_err.max(err);
+            if err > 1e-3 {
+                psa_viol += 1;
+            }
+        }
+        let (fe, tm) = (ctr(gs::CTR_V_FALSE_EMPTY), ctr(gs::CTR_V_TMIN));
+        println!(
+            "check-vk: V8 hemi {mode_name} gates ({} probes x {SEEDS} seeds): psa-viol \
+             {psa_viol} (max err {max_psa_err:.2e}) | false-empty {fe} | tmin-overshoot {tm} | \
+             empty-cells {} | leaf-rays {} | overflow {}",
+            pts.len(),
+            ctr(gs::CTR_HEMI_EMPTY),
+            ctr(gs::CTR_HEMI_RAYS),
+            ctr(gs::CTR_OVERFLOW),
+        );
+        if psa_viol != 0 || fe != 0 || tm != 0 {
+            fail(&mut ok, format!("hemi {mode_name} exact-zero gates"));
+        }
+        if ctr(gs::CTR_OVERFLOW) != 0 {
+            fail(&mut ok, format!("hemi {mode_name} queue overflow (a sizing bug, never a scene)"));
+        }
+        // ANTI-VACUITY, and it is doing real work: every gate above is
+        // satisfied by a run that integrated NOTHING. Leaf rays are the
+        // universal half — the sampled tier fires on any scene, and it is what
+        // a mis-parity'd batch loses (the root writing a queue nothing reads
+        // reads exactly as `leaf-rays 0`).
+        if ctr(gs::CTR_HEMI_RAYS) == 0 {
+            fail(&mut ok, format!("hemi {mode_name} leaf rays 0 — the sampled tier never fired"));
+        }
+        // The ANALYTIC half is scene-dependent and follows the suite's own
+        // structural convention, because a real scene can legitimately have no
+        // cell it can prove empty. MEASURED, and it is not hypothetical:
+        // DamagedHelmet at its default pose reads `empty-cells 0` here, and
+        // `--check`'s CPU estimator reads `0.0 cells empty, 64.0 rays` per
+        // point at the same pose — while this run's 80384 rays over 8 seeds
+        // and 157 probes is 64.0 per probe EXACTLY. That per-point agreement
+        // with the CPU is a stronger statement than the must-fire would have
+        // been, and it is why the gate is skipped rather than relaxed.
+        if structural && ctr(gs::CTR_HEMI_EMPTY) == 0 {
+            fail(
+                &mut ok,
+                format!("hemi {mode_name} empty cells 0 — the analytic tier never fired"),
+            );
+        }
+
+        // ---- the A/B against a CPU reference at the same points ----
+        const REF_N: u32 = 4096;
+        let mut rng = fastrand::Rng::with_seed(0x1234_5678);
+        let mut vls = stats::LocalStats::default();
+        let sun = render::sun_dir(scene);
+        if mode_name == "AO" {
+            let (mut sum_abs, mut sum_signed) = (0.0f64, 0.0f64);
+            for (i, &(o, n)) in pts.iter().enumerate() {
+                let gpu_ao = f64::from(h[i * 4]) / FIXED / seeds_f / std::f64::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut open = 0.0f64;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    // `transmittance`, in lockstep with the estimator: tinted
+                    // shadows fold glass to its gray tint, and an opaque scene
+                    // keeps the old 0/1 counts exactly.
+                    let tp = bvh.transmittance(
+                        scene,
+                        &bvh::Ray::new(o, d),
+                        0.0,
+                        scene.ao_radius,
+                        &mut vls.ray_nodes,
+                    );
+                    open += f64::from((tp.x + tp.y + tp.z) / 3.0);
+                }
+                let cpu_ao = open / f64::from(REF_N);
+                sum_abs += (gpu_ao - cpu_ao).abs();
+                sum_signed += gpu_ao - cpu_ao;
+            }
+            let mean_abs = sum_abs / pts.len() as f64;
+            let mean_signed = sum_signed / pts.len() as f64;
+            println!(
+                "check-vk: V8 hemi AO A/B vs {REF_N}-sample cosine reference: mean |d| \
+                 {mean_abs:.4} (limit 0.02) | signed mean {mean_signed:+.4} (limit +/-0.005)"
+            );
+            if mean_abs >= 0.02 || mean_signed.abs() >= 0.005 {
+                fail(&mut ok, "hemi AO A/B (bias or error above the CPU-suite tolerances)".into());
+            }
+        } else {
+            let mut sum_rel = 0.0f64;
+            for (i, &(o, n)) in pts.iter().enumerate() {
+                let gpu_gi = Vec3A::new(
+                    h[i * 4] as f32 / FIXED as f32,
+                    h[i * 4 + 1] as f32 / FIXED as f32,
+                    h[i * 4 + 2] as f32 / FIXED as f32,
+                ) / SEEDS as f32
+                    / std::f32::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut sum = Vec3A::ZERO;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    let ray = bvh::Ray::new(o, d);
+                    sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes)
+                    {
+                        // GATHER, not radiance: this reference must integrate
+                        // the same sky `hemi.rs` does, or the A/B is comparing
+                        // two different functions. Same sky_scale and night
+                        // sources as the hemi leaf miss (night carries the star
+                        // field's smooth mean).
+                        None => sky::gather(d, sun, scene.sky_scale, scene.night),
+                        Some(hh) => shade::shade(
+                            scene,
+                            bvh,
+                            &ray,
+                            &hh,
+                            None,
+                            &hemi::BOUNCE_Q,
+                            &mut rng,
+                            sun,
+                            &clouds::Clouds::check(scene.diag),
+                            // The same bounce cone `hemi.rs`'s leaf shades use —
+                            // both arms have to sample textures alike.
+                            shade::Cone::bounce(),
+                            1,
+                            &mut vls,
+                            None,
+                            shade::VisCtl::Off,
+                            None,
+                            // Fireflies and emissive NEE both excluded, like the
+                            // hemi leaf shades this gates: the gather IS the
+                            // emissive transport.
+                            None,
+                            None,
+                        ),
+                    };
+                }
+                let cpu_gi = sum / REF_N as f32;
+                sum_rel += f64::from((gpu_gi - cpu_gi).length()) / f64::from(cpu_gi.length().max(1e-6));
+            }
+            let mean_rel = sum_rel / pts.len() as f64;
+            println!(
+                "check-vk: V8 hemi GI A/B vs {REF_N}-sample BOUNCE_Q reference: mean rel {:.2}% \
+                 (limit 5%)",
+                mean_rel * 100.0
+            );
+            if mean_rel >= 0.05 {
+                fail(&mut ok, "hemi GI A/B (above the CPU-suite 5% tolerance)".into());
+            }
+        }
+    }
+
+    // ---- the frame half: one real GI frame through the whole pipeline ----
+    //
+    // This is what the probe path cannot reach. `cs_leaf`'s fb arm appends the
+    // shading points, the batch loop drains them, and compose folds H into
+    // accum — and the point count against the hit count is an exact ACCOUNTING
+    // identity, so it catches an append that silently drops or doubles.
+    {
+        let p = gfx::frame::FrameParams {
+            cam: basis,
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            prev_cam: None,
+            q: Quality { fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 }, ..q },
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        let px = gw * gh;
+        if let Err(e) = tg.render_wavefront(hg, &p, false) {
+            fail(&mut ok, format!("hemi frame dispatch: {e}"));
+            return ok;
+        }
+        let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+            let v = hg.read_buffer(b, n * 4)?;
+            Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        };
+        let (acc, t_w, ctrs) =
+            match (read_f32(&tg.accum, px * 3), read_f32(&tg.tbuf, px), tg.read_counters(hg)) {
+                (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                _ => {
+                    fail(&mut ok, "hemi frame readback".into());
+                    return ok;
+                }
+            };
+        let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+        let hits = t_w.iter().filter(|t| t.is_finite()).count();
+        let n_pts = ctr(gs::CTR_HEMI_PT) as usize;
+        let nonfinite = acc.iter().filter(|v| !v.is_finite()).count();
+        println!(
+            "check-vk: V8 hemi GI frame: hit-px {hits} | hemi-points {n_pts} | hemi-rays {} | \
+             empty-cells {} | overflow {} | non-finite {nonfinite}",
+            ctr(gs::CTR_HEMI_RAYS),
+            ctr(gs::CTR_HEMI_EMPTY),
+            ctr(gs::CTR_OVERFLOW),
+        );
+        if n_pts != hits {
+            fail(
+                &mut ok,
+                format!("hemi point count {n_pts} != hit pixels {hits} (the leaf-pass append)"),
+            );
+        }
+        if ctr(gs::CTR_OVERFLOW) != 0 || nonfinite != 0 {
+            fail(&mut ok, "hemi frame overflow / non-finite radiance".into());
+        }
+        if hits == 0 || ctr(gs::CTR_HEMI_RAYS) == 0 {
+            fail(&mut ok, "hemi frame must-fires (hit pixels and leaf rays both expected > 0)".into());
+        }
+    }
     ok
 }
 

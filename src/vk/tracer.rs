@@ -1,6 +1,8 @@
 //! The tracer on Vulkan: the reference kernel (`cs_reference` into `accum`,
-//! `cs_resolve` into an RGBA16F image) and the WAVEFRONT QUADTREE beside it —
-//! seed, the indirect level ladder, and the leaf + sky terminal fills.
+//! `cs_resolve` into an RGBA16F image), the WAVEFRONT QUADTREE beside it —
+//! seed, the indirect level ladder, and the leaf + sky terminal fills — and the
+//! HEMISPHERE BOUNCE TIERS the H key cycles (`fb_mode > 0`: the batched hemi
+//! wavefront and the one compose splat it feeds).
 //!
 //! The reference kernel is the smallest thing that can be WRONG in an
 //! interesting way, which is why it landed first: every kernel here reads the
@@ -16,12 +18,24 @@
 //!
 //! - **The ping-pong is a descriptor SET, not a rebound root UAV.** `qin`/
 //!   `qout` (u5/u6) swap every level; D3D12 rewrites two root descriptors,
-//!   which Vulkan has no equivalent of. So set 0 is allocated THREE times off
-//!   one layout — A (u5=qa, u6=qb), B (the swap), and TERMINAL (u5=cloud_lod,
-//!   u6=cloud_shadow, the registers' second meaning once the ladder has
-//!   drained) — and a level binds the variant its parity names. Three writes
-//!   at init, one `vkCmdBindDescriptorSets` per level, no per-dispatch
-//!   descriptor traffic.
+//!   which Vulkan has no equivalent of. So set 0 is allocated FIVE times off
+//!   one layout — LADDER A (u5=qa, u6=qb), LADDER B (the swap), TERMINAL
+//!   (u5=cloud_lod, u6=cloud_shadow, the registers' second meaning once the
+//!   ladder has drained), and HEMI A/B, which swap the hemi cell queues AND
+//!   move three more slots at once: u7 to the hemi leaf queue, u9 to the hemi
+//!   cut pool, and t0 back to the BINARY BVH, because the hemi kernels compile
+//!   `frustum.hlsli`'s binary `bound_query` deliberately (short queries lose on
+//!   the wide tree — measured +35% there against -54% on the tile path). A pass
+//!   binds the variant its parity names; one `vkCmdBindDescriptorSets` per
+//!   dispatch group, no per-dispatch descriptor traffic.
+//!
+//!   THE HEMI UNITS RE-DECLARE u5/u6/u7/u9 AS DIFFERENT STRUCTS — `HemiCellRec`
+//!   queues where the ladder has `TileRec` ones — and that is NOT a conflict
+//!   for the derived map, which keys on descriptor KIND (both are storage
+//!   buffers) rather than on the HLSL type. Which is the whole reason the
+//!   variants are a per-`(set, register)` OVERRIDE table over one shared base
+//!   rather than a second layout: the layout genuinely is the same, and only
+//!   the resource behind five of its slots changes.
 //! - **Per-dispatch push constants become `vkCmdUpdateBuffer`.** `b1` is a
 //!   uniform buffer here (DXC has no flag to promote a cbuffer to push
 //!   constants, and `[[vk::push_constant]]` would be an HLSL edit), and the
@@ -37,11 +51,15 @@
 //!   covering `COMPUTE|TRANSFER -> COMPUTE|DRAW_INDIRECT` replaces both
 //!   transitions and the UAV barrier between them.
 //!
-//! NOT COVERED, and said loudly at the call site rather than silently: hemi
-//! (`fb_mode > 0` — the H tiers), compose (which fb OFF does not dispatch at
-//! all, by design), structure replay, and `--sw-rays` (whose leaf kernel wants
-//! the BINARY tree at t0 while the ladder holds the WIDE one there, i.e. a
-//! fourth set variant).
+//! NOT COVERED, and said loudly at the call site rather than silently:
+//! structure replay, and `--sw-rays` (whose LEAF kernel wants the binary tree
+//! at t0 while the ladder holds the wide one — the hemi variants below prove
+//! the mechanism, but the leaf pass would need its own).
+//!
+//! COMPOSE IS DISPATCHED ONLY UNDER fb, and that is D3D12's rule verbatim
+//! rather than an omission: with fb off the leaf and sky passes splat straight
+//! into `accum` through `queues.hlsli::accum_splat`, so a compose would be a
+//! buffer-to-buffer copy of a full screen.
 //!
 //! WHY THE CLOUD CACHES ARE BUILT AND DISPATCHED HERE. `cs_reference` reads
 //! the amortized sky lattice (`--sky-lod`, default 4) and the slab-space
@@ -55,7 +73,9 @@
 
 use ash::vk;
 
-use crate::gfx::frame::{FrameCb, FrameParams, CB_STRIDE};
+use crate::gfx::frame::{
+    fb_mode_of, FrameCb, FrameParams, CB_STRIDE, HEMI_BATCH, HEMI_MAX_DEPTH,
+};
 use crate::gfx::shaders as gs;
 use crate::scene::Scene;
 use crate::vk::device::Buffer;
@@ -128,6 +148,59 @@ struct Wave {
     pub cap_sky: u32,
 }
 
+/// The hemisphere bounce tiers' own half: the batch-transient cell queues and
+/// cut pool, the per-pixel planes the leaf/compose pair passes radiance
+/// through, the shading-point queue, the BINARY tree these kernels descend, and
+/// two more set-0 variants.
+///
+/// Separate from `Wave` because it is optional for a different reason: the
+/// queues are sized to ONE BATCH of the worst-case cell fan-out
+/// (`HEMI_BATCH * 4^(HEMI_MAX_DEPTH-1)` = 1,048,576 records), which is ~290 MB
+/// of buffers that a device or a run with no interest in fb should not be
+/// asked for. That batch reset IS the memory bound — the whole reason the
+/// wavefront is batched at all.
+struct Hemi {
+    /// Cell ping-pong. The ROOT pass writes `hqout`, so it runs under the ODD
+    /// variant (u6 = hq_a) and level 0 then reads hq_a as `hqin`.
+    hq_a: Buffer,
+    hq_b: Buffer,
+    hq_leaf: Buffer,
+    cut: Buffer,
+    /// u10/u11: the leaf pass's ambient-free color and its `kd` weight — what
+    /// makes compose a pure weight x mass multiply (`compose.hlsl`'s header).
+    partial: Buffer,
+    ambw: Buffer,
+    /// u12: the FIXED-POINT accumulator. Integer atomics are order-independent,
+    /// which is what makes a queue-driven integrator reproducible run to run.
+    hbuf: Buffer,
+    /// u13: the shading points. Host-visible because the probe path writes it
+    /// from the CPU; the frame path has `cs_leaf` append into it instead.
+    pts: Buffer,
+    /// t0 for these passes only — see the module header on why the hemi
+    /// kernels want the binary tree while the ladder holds the wide one.
+    binary: Buffer,
+    pipes: [vk::Pipeline; 8],
+    sets_a: Vec<vk::DescriptorSet>,
+    sets_b: Vec<vk::DescriptorSet>,
+}
+
+const H_ROOT: usize = 0;
+const H_CELL: usize = 1;
+const H_LEAF: usize = 2;
+const H_COMPOSE: usize = 3;
+const H_PREP_BATCH: usize = 4;
+const H_SEED_PROBES: usize = 5;
+const H_CLEAR_H: usize = 6;
+/// `cs_leaf` from `TraceSources::leaf_fb` — the SAME kernel with the hemi arm
+/// compiled IN. Two PSOs from one source is a register-pressure decision
+/// (`LEAF_NO_FB`), not a feature flag, and it has to be honored here or an fb
+/// frame's leaf pass would append no shading points at all.
+const H_LEAF_FB: usize = 7;
+
+const ARG_HEMI_ROOT: u32 = 11;
+const ARG_HEMI_CELL: u32 = 12;
+const ARG_HEMI_LEAF: u32 = 13;
+
 pub struct VkTracer {
     pub rw: u32,
     pub rh: u32,
@@ -147,6 +220,7 @@ pub struct VkTracer {
     layouts: Layouts,
     pipes: [vk::Pipeline; 4], // reference, resolve, sky_lod, cloud_shadow
     wave: Option<Wave>,
+    hemi: Option<Hemi>,
     cb_base: FrameCb,
     scene_aabb: ([f32; 3], [f32; 3]),
     sky_lod_k: u32,
@@ -223,17 +297,37 @@ impl VkTracer {
             (&srcs.leaf, "cs_leaf", "wf-leaf"),
             (&srcs.sky, "cs_sky", "wf-sky"),
         ];
+        // The hemisphere tiers. `cs_leaf` appears TWICE across the two tables
+        // — once from `leaf` and once from `leaf_fb` — which is the point:
+        // they are two PSOs from one source and the fb frame needs the second.
+        let hemi_units: [(&str, &str, &str); 8] = [
+            (&srcs.hemi_wave, "cs_hemi_root", "hemi-root"),
+            (&srcs.hemi_wave, "cs_hemi_cell", "hemi-cell"),
+            (&srcs.hemi_leaf, "cs_hemi_leaf", "hemi-leaf"),
+            (&srcs.compose, "cs_compose", "compose"),
+            (&srcs.wavefront, "cs_prep_batch", "wf-prep-batch"),
+            (&srcs.wavefront, "cs_seed_probes", "wf-seed-probes"),
+            (&srcs.wavefront, "cs_clear_h", "wf-clear-h"),
+            (&srcs.leaf_fb, "cs_leaf", "wf-leaf-fb"),
+        ];
         let want_wave = !gs::sw_rays();
+        // fb rides on the ladder: `cs_leaf` is what appends the shading points,
+        // and compose reads the planes the leaf pass filled.
+        let want_hemi = want_wave;
 
         // Compile first, reflect the compiled words, THEN build the layout —
         // the M3a order, and the reason there is no register table in this
-        // file. The map unions BOTH halves, which is what makes the ladder's
-        // extra streams (t0's frustum tree, the queues at u5..u9) appear in
-        // the layout without anything here listing them.
+        // file. The map unions ALL THREE halves, which is what makes the
+        // ladder's extra streams (t0's frustum tree, the queues at u5..u9) and
+        // the hemi ones (u10..u13) appear in the layout without anything here
+        // listing them.
         let mut words: Vec<Vec<u32>> = Vec::new();
         let mut map = Map::default();
-        let all: Vec<&(&str, &str, &str)> =
-            units.iter().chain(wave_units.iter().take(if want_wave { 8 } else { 0 })).collect();
+        let all: Vec<&(&str, &str, &str)> = units
+            .iter()
+            .chain(wave_units.iter().take(if want_wave { 8 } else { 0 }))
+            .chain(hemi_units.iter().take(if want_hemi { 8 } else { 0 }))
+            .collect();
         for (src, entry, tag) in all {
             let w = sp.compile(src, entry, "cs_6_5", tag, false)?;
             let descs = crate::vk::reflect::reflect(&w)?;
@@ -263,6 +357,7 @@ impl VkTracer {
 
         let mut pipes = [vk::Pipeline::null(); 4];
         let mut wpipes = [vk::Pipeline::null(); 8];
+        let mut hpipes = [vk::Pipeline::null(); 8];
         {
             let mut built: Vec<vk::Pipeline> = Vec::new();
             let mut make = |i: usize, entry: &str| -> Result<vk::Pipeline, String> {
@@ -278,6 +373,12 @@ impl VkTracer {
                 if want_wave {
                     for (j, (_, entry, _)) in wave_units.iter().enumerate() {
                         wpipes[j] = make(units.len() + j, entry)?;
+                    }
+                }
+                if want_hemi {
+                    let base = units.len() + wave_units.len();
+                    for (j, (_, entry, _)) in hemi_units.iter().enumerate() {
+                        hpipes[j] = make(base + j, entry)?;
                     }
                 }
                 Ok(())
@@ -329,6 +430,12 @@ impl VkTracer {
         // split allocates one cut slot.
         let mut cb_base = FrameCb::base(scene, rw, rh);
         let dd = gs::depth_full(rw, rh);
+        // ONE batch's worth of cells and cut slots. `cs_prep_batch` zeroes the
+        // hemi counters per batch, so these bound the memory however many
+        // shading points a frame produces.
+        let cap_hemi_cell = u64::from(HEMI_BATCH) * (1u64 << (2 * (HEMI_MAX_DEPTH - 1)));
+        let cap_hemi_cut =
+            u64::from(HEMI_BATCH) * (((1u64 << (2 * (HEMI_MAX_DEPTH - 1))) - 1) / 3 + 1);
         let mut wave = if want_wave {
             if dd > 11 {
                 return Err(format!("{rw}x{rh} needs quadtree depth {dd} > 11 indirect-arg slots"));
@@ -338,15 +445,17 @@ impl VkTracer {
             let cap_cut = ((1u64 << (2 * dd)) - 1) / 3 + 1;
             // The kernels read every one of these off the cbuffer, so a
             // buffer sized here and a cap written there must be the same
-            // number — hence one place computing both.
+            // number — hence one place computing both. The hemi three are the
+            // SAME arithmetic one structure out: at most one depth-D cell per
+            // batched point, and one cut slot per interior split.
             cb_base.set_caps(
                 cap_tile as u32,
                 cap_leaf as u32,
                 cap_leaf as u32,
                 cap_cut as u32,
-                0,
-                0,
-                0,
+                if want_hemi { cap_hemi_cell as u32 } else { 0 },
+                if want_hemi { cap_hemi_cell as u32 } else { 0 },
+                if want_hemi { cap_hemi_cut as u32 } else { 0 },
             );
             // t0: the frustum structure the ladder descends. FTREE is the
             // default, and its wire format is the QUANTIZED one — the
@@ -373,6 +482,34 @@ impl VkTracer {
                 depth_full: dd,
                 cap_leaf: cap_leaf as u32,
                 cap_sky: cap_leaf as u32,
+            })
+        } else {
+            None
+        };
+
+        let mut hemi = if want_hemi {
+            Some(Hemi {
+                hq_a: vkd.buffer(cap_hemi_cell * 64, sb, false)?,
+                hq_b: vkd.buffer(cap_hemi_cell * 64, sb, false)?,
+                hq_leaf: vkd.buffer(cap_hemi_cell * 64, sb, false)?,
+                cut: vkd.buffer(cap_hemi_cut * 256, sb, false)?,
+                partial: vkd.buffer(px * 12, sb, false)?,
+                ambw: vkd.buffer(px * 12, sb, false)?,
+                hbuf: vkd.buffer(px * 16, sb, false)?,
+                // Host-visible: the probe path writes the shading points from
+                // the CPU (`run_hemi_probes`), which is the same no-staging
+                // choice `vk::scene` makes for every other stream. A frame's
+                // `cs_leaf` appends into it device-side, which host-visible
+                // memory serves perfectly well.
+                pts: vkd.buffer(px * 32, sb, true)?,
+                // The binary BVH, uploaded IN ADDITION to the wide tree when
+                // FTREE is on. Not a duplicate of the same thing: the ladder
+                // descends the 8-wide structure and the hemi kernels compile
+                // the binary `bound_query`, so both are live in one frame.
+                binary: host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?,
+                pipes: hpipes,
+                sets_a: Vec::new(),
+                sets_b: Vec::new(),
             })
         } else {
             None
@@ -409,13 +546,13 @@ impl VkTracer {
         let samp_lin = samp(1.0)?;
         let samp_aniso = samp(aniso)?;
 
-        // THREE allocations of set 0 when the ladder is live — one per
-        // `qin`/`qout` meaning of u5/u6 (see the module header). Set 1 is
-        // allocated once and shared by all three, because nothing in it
-        // varies: the ping-pong is entirely a set-0 property.
+        // FIVE allocations of set 0 with everything live — the two ladder
+        // parities, the two hemi parities, and the terminal meaning of u5/u6
+        // (see the module header). Set 1 is allocated ONCE and shared by all
+        // five, because nothing in it varies: every variant is a set-0
+        // property.
         let mut want_layouts = layouts.sets.clone();
-        if wave.is_some() {
-            want_layouts.push(layouts.sets[0]);
+        for _ in 0..(2 * wave.is_some() as usize + 2 * hemi.is_some() as usize) {
             want_layouts.push(layouts.sets[0]);
         }
 
@@ -450,10 +587,19 @@ impl VkTracer {
         }
         .map_err(|e| format!("vkAllocateDescriptorSets: {e}"))?;
         let sets = all_sets[..layouts.sets.len()].to_vec();
+        // Each variant is [its own set 0] ++ [the shared tail].
+        let mut next = layouts.sets.len();
+        let variant = |i: usize| -> Vec<vk::DescriptorSet> {
+            std::iter::once(all_sets[i]).chain(sets[1..].iter().copied()).collect()
+        };
         if let Some(w) = &mut wave {
-            let n = layouts.sets.len();
-            w.sets_a = std::iter::once(all_sets[n]).chain(sets[1..].iter().copied()).collect();
-            w.sets_b = std::iter::once(all_sets[n + 1]).chain(sets[1..].iter().copied()).collect();
+            w.sets_a = variant(next);
+            w.sets_b = variant(next + 1);
+            next += 2;
+        }
+        if let Some(h) = &mut hemi {
+            h.sets_a = variant(next);
+            h.sets_b = variant(next + 1);
         }
 
         let t = VkTracer {
@@ -475,6 +621,7 @@ impl VkTracer {
             layouts,
             pipes,
             wave,
+            hemi,
             cb_base,
             scene_aabb: crate::gfx::scene::shadow_aabb(scene),
             sky_lod_k: srcs.sky_lod,
@@ -497,10 +644,12 @@ impl VkTracer {
     /// ride the flag.
     /// Every set-0 variant, plus the shared set 1 and the texture table.
     ///
-    /// The variants differ ONLY in what u5/u6 mean (see the module header), so
-    /// this hands `write_variant` the pair and lets it write the rest
-    /// identically — the alternative, a "wavefront descriptor writer" beside
-    /// this one, would be two tables of the same 22 streams to keep in step.
+    /// The variants differ only in WHICH RESOURCE sits behind a handful of
+    /// registers (see the module header), so this hands `write_variant` an
+    /// OVERRIDE list and lets it write the other ~25 streams identically. The
+    /// alternative — a "wavefront writer" and a "hemi writer" beside this one —
+    /// would be three tables of the same streams to keep in step, which is the
+    /// transcription hazard the derived layout exists to remove.
     fn write_descriptors(&self, hg: &VkHeadless, vs: &VkScene, vt: &VkTextures) {
         let drop = std::env::var("FR_VK_DROP_STREAM").ok();
         if let Some(name) = &drop {
@@ -512,10 +661,46 @@ impl VkTracer {
         // The TERMINAL variant, which is also the only one a reference-kernel
         // frame ever binds: u5/u6 hold the cloud lattice and the slab-space
         // shadow cache, the registers' second meaning.
-        self.write_variant(hg, vs, &self.sets, &self.cloud_lod, &self.cloud_shadow, &drop);
+        self.write_variant(
+            hg,
+            vs,
+            &self.sets,
+            &[(Reg::U, 5, &self.cloud_lod), (Reg::U, 6, &self.cloud_shadow)],
+            &drop,
+        );
         if let Some(w) = &self.wave {
-            self.write_variant(hg, vs, &w.sets_a, &w.qa, &w.qb, &drop);
-            self.write_variant(hg, vs, &w.sets_b, &w.qb, &w.qa, &drop);
+            self.write_variant(hg, vs, &w.sets_a, &[(Reg::U, 5, &w.qa), (Reg::U, 6, &w.qb)], &drop);
+            self.write_variant(hg, vs, &w.sets_b, &[(Reg::U, 5, &w.qb), (Reg::U, 6, &w.qa)], &drop);
+        }
+        if let Some(h) = &self.hemi {
+            // FIVE moved slots, not two: the cell ping-pong, the hemi leaf
+            // queue and cut pool at u7/u9, and t0 back to the binary tree.
+            self.write_variant(
+                hg,
+                vs,
+                &h.sets_a,
+                &[
+                    (Reg::T, 0, &h.binary),
+                    (Reg::U, 5, &h.hq_a),
+                    (Reg::U, 6, &h.hq_b),
+                    (Reg::U, 7, &h.hq_leaf),
+                    (Reg::U, 9, &h.cut),
+                ],
+                &drop,
+            );
+            self.write_variant(
+                hg,
+                vs,
+                &h.sets_b,
+                &[
+                    (Reg::T, 0, &h.binary),
+                    (Reg::U, 5, &h.hq_b),
+                    (Reg::U, 6, &h.hq_a),
+                    (Reg::U, 7, &h.hq_leaf),
+                    (Reg::U, 9, &h.cut),
+                ],
+                &drop,
+            );
         }
         // `FR_VK_DROP_STREAM=texs` is the whole-run lever; `bind_textures` is
         // also what V6's own anti-vacuity probe calls, so the two share one
@@ -528,8 +713,7 @@ impl VkTracer {
         hg: &VkHeadless,
         vs: &VkScene,
         sets: &[vk::DescriptorSet],
-        q5: &Buffer,
-        q6: &Buffer,
+        over: &[(Reg, u32, &Buffer)],
         drop: &Option<String>,
     ) {
         let d = &hg.vk.device;
@@ -545,7 +729,13 @@ impl VkTracer {
         // stage caught on its first run (`blas_tri` on the dummy shaded the
         // whole frame as triangle 0, and the visibility gate saw nothing).
         // The teeth are the radiance A/B's, not a claim about this file.
-        let mut bufs: Vec<(u32, Reg, u32, &Buffer)> = vec![
+        //
+        // THE OVERRIDES GO FIRST and the lookup takes the FIRST match, which
+        // is what makes a variant a diff over one shared base rather than a
+        // second table.
+        let mut bufs: Vec<(u32, Reg, u32, &Buffer)> =
+            over.iter().map(|&(r, n, b)| (0u32, r, n, b)).collect();
+        bufs.extend_from_slice(&[
             (0, Reg::B, 0, &self.frame_cb),
             (0, Reg::B, 1, &self.push),
             (0, Reg::T, 2, &vs.positions),
@@ -557,10 +747,6 @@ impl VkTracer {
             (0, Reg::U, 1, &self.tbuf),
             (0, Reg::U, 2, &self.info),
             (0, Reg::U, 3, &self.counters),
-            // u5/u6 — the DUAL-MEANING pair. Terminal: cloud lattice + shadow
-            // cache. Ladder: this level's qin/qout.
-            (0, Reg::U, 5, q5),
-            (0, Reg::U, 6, q6),
             (1, Reg::T, 0, &vs.uv_buf),
             (1, Reg::T, 1, &vs.indices),
             (1, Reg::T, 2, &vs.tri_mat),
@@ -572,7 +758,18 @@ impl VkTracer {
             // spare: `tri_of` indexes every stream through them.
             (1, Reg::T, 7, &vs.blas_tri),
             (1, Reg::T, 8, &vs.chunk_base),
-        ];
+        ]);
+        if let Some(h) = &self.hemi {
+            // The per-pixel planes and the shading-point queue. These do NOT
+            // vary by variant — only the queues behind u5..u9 and the tree at
+            // t0 do — so they belong in the base beside everything else.
+            bufs.extend_from_slice(&[
+                (0, Reg::U, 10, &h.partial),
+                (0, Reg::U, 11, &h.ambw),
+                (0, Reg::U, 12, &h.hbuf),
+                (0, Reg::U, 13, &h.pts),
+            ]);
+        }
         if let Some(w) = &self.wave {
             // The ladder's own streams. t0 is the FRUSTUM structure — the
             // software half RT cores cannot serve — and t1 is `tri_idx`,
@@ -876,60 +1073,28 @@ impl VkTracer {
         let clear_groups = px.div_ceil(256);
         let wide_on = gs::WIDE_LEVELS_ON.load(std::sync::atomic::Ordering::Relaxed);
         let wide_n = gs::wide_levels();
+        // Read from the SAME function that writes the cbuffer's `fb_mode`, so
+        // the kernels this records and the constant they branch on cannot
+        // disagree about which tier is running.
+        let fb_mode = fb_mode_of(&p.q);
 
         hg.run(|d, cmd| unsafe {
-            let bind = |sets: &[vk::DescriptorSet]| {
-                d.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.layouts.pipeline,
-                    0,
-                    sets,
-                    &[],
-                );
-            };
-            // `cbuffer Push : register(b1)`, rewritten IN THE STREAM (module
-            // header). It carries its OWN barriers, both of them, and that is
-            // the whole reason it is a closure rather than three lines at each
-            // site: a per-dispatch constant block needs a WRITE-AFTER-READ
-            // edge as well as the obvious read-after-write one, and the WAR
-            // edge is the one that is easy to omit and invisible when you do.
-            //
-            // Omitting it cost the entire ladder past level 0 on the first
-            // run, silently: the transfer is free to execute ahead of the
-            // dispatch it textually follows, so `cs_prep` read the NEXT
-            // level's `push3`, wrote its indirect args to the wrong slot, and
-            // every level after the first dispatched zero groups. Nothing
-            // faulted, validation was clean, and the frame simply came back
-            // with one split and no terminals.
-            let push = |v: [u32; 4]| {
-                barrier(d, cmd); // WAR: the last dispatch must be done READING b1
-                let mut b = [0u8; 16];
-                for (i, x) in v.iter().enumerate() {
-                    b[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
-                }
-                d.cmd_update_buffer(cmd, self.push.buf, 0, &b);
-                barrier(d, cmd); // RAW: and the next one must SEE the write
-            };
-            let go = |pipe: vk::Pipeline, gx: u32, gy: u32| {
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
-                d.cmd_dispatch(cmd, gx, gy, 1);
-            };
-            let go_indirect = |pipe: vk::Pipeline, slot: u32| {
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
-                d.cmd_dispatch_indirect(cmd, w.args.buf, u64::from(slot) * 12);
-            };
-
             // Level 0 consumes queue A, so the seed must enqueue its root
             // THERE — bind the A variant before anything runs.
-            bind(&w.sets_a);
+            self.bind(d, cmd, &w.sets_a);
             // push0 = 0: this backend has no work-graph arm, so the seed
             // always enqueues its own root. Written rather than inherited —
             // the buffer holds whatever the last frame left.
-            push([0, 0, 0, 0]);
-            go(w.pipes[W_SEED], 1, 1);
+            self.push(d, cmd, [0, 0, 0, 0]);
+            self.go(d, cmd, w.pipes[W_SEED], 1, 1);
             if clear_sentinel {
-                go(w.pipes[W_CLEAR_INFO], clear_groups.min(32768), clear_groups.div_ceil(32768));
+                self.go(
+                    d,
+                    cmd,
+                    w.pipes[W_CLEAR_INFO],
+                    clear_groups.min(32768),
+                    clear_groups.div_ceil(32768),
+                );
             }
             barrier(d, cmd);
 
@@ -947,33 +1112,267 @@ impl VkTracer {
                 // prep and the level kernel it feeds run under the SAME set:
                 // prep touches only `counters` and `args`, which every variant
                 // holds identically, so the parity bind covers both.
-                bind(if lvl % 2 == 0 { &w.sets_a } else { &w.sets_b });
-                push([in_ctr, out_ctr, if wide { 1 } else { 32 }, lvl]);
-                go(w.pipes[W_PREP], 1, 1);
-                push([in_ctr, out_ctr, 0, 0]);
-                go_indirect(w.pipes[if wide { W_LEVEL_WIDE } else { W_LEVEL }], lvl);
+                self.bind(d, cmd, if lvl % 2 == 0 { &w.sets_a } else { &w.sets_b });
+                self.push(d, cmd, [in_ctr, out_ctr, if wide { 1 } else { 32 }, lvl]);
+                self.go(d, cmd, w.pipes[W_PREP], 1, 1);
+                self.push(d, cmd, [in_ctr, out_ctr, 0, 0]);
+                self.go_indirect(
+                    d,
+                    cmd,
+                    w.pipes[if wide { W_LEVEL_WIDE } else { W_LEVEL }],
+                    &w.args,
+                    lvl,
+                );
             }
 
             // The terminal fills, under the TERMINAL variant: u5/u6 revert to
             // the cloud lattice and shadow cache, which is exactly what the
             // leaf and sky kernels re-declare them as.
-            bind(&self.sets);
-            push([gs::CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
-            go(w.pipes[W_PREP], 1, 1);
+            self.bind(d, cmd, &self.sets);
+            self.push(d, cmd, [gs::CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
+            self.go(d, cmd, w.pipes[W_PREP], 1, 1);
             // Sky takes the MULTIPLYING prep: SKY_SPLIT groups share each
             // record, so one huge proven-empty rect cannot serialize on a
             // single group (that shape was ~70% of the tracer's frame once).
-            push([gs::CTR_SKY, NO_RESET, gs::SKY_SPLIT, ARG_SKY]);
-            go(w.pipes[W_PREP_MUL], 1, 1);
+            self.push(d, cmd, [gs::CTR_SKY, NO_RESET, gs::SKY_SPLIT, ARG_SKY]);
+            self.go(d, cmd, w.pipes[W_PREP_MUL], 1, 1);
             // Both cloud caches, ahead of BOTH consumers — `cs_sky` on the
             // proven-empty rects and `cs_leaf`'s own miss branch.
             self.record_cloud_caches(d, cmd);
-            push([gs::CTR_LEAF, 0, 0, 0]);
-            go_indirect(w.pipes[W_LEAF], ARG_LEAF);
-            push([gs::CTR_SKY, 0, 0, 0]);
-            go_indirect(w.pipes[W_SKY], ARG_SKY);
+            self.push(d, cmd, [gs::CTR_LEAF, 0, 0, 0]);
+            // fb frames take the OTHER leaf PSO — same source, hemi arm
+            // compiled IN — because that arm is what appends the shading points
+            // the hemisphere passes below consume. Sharing one PSO here would
+            // leave the hemi queue empty and every gate below vacuous.
+            let leaf_pipe = match (&self.hemi, fb_mode > 0) {
+                (Some(h), true) => h.pipes[H_LEAF_FB],
+                _ => w.pipes[W_LEAF],
+            };
+            self.go_indirect(d, cmd, leaf_pipe, &w.args, ARG_LEAF);
+            self.push(d, cmd, [gs::CTR_SKY, 0, 0, 0]);
+            self.go_indirect(d, cmd, w.pipes[W_SKY], &w.args, ARG_SKY);
+            barrier(d, cmd);
+
+            if let (Some(h), true) = (&self.hemi, fb_mode > 0) {
+                // Every hit pixel appended a point, so batch over the WORST
+                // CASE; batches past the GPU-side count dispatch zero groups,
+                // which is what lets this be recorded statically with no
+                // readback anywhere.
+                self.record_hemi(d, cmd, h, w, self.rw * self.rh, p.q.fb.depth);
+                // partial + ambW * ambient(H) -> accum: the single splat, and
+                // the ONE pass in the tracer that is per-PIXEL rather than
+                // queue-driven.
+                self.bind(d, cmd, &self.sets);
+                self.go(
+                    d,
+                    cmd,
+                    h.pipes[H_COMPOSE],
+                    clear_groups.min(32768),
+                    clear_groups.div_ceil(32768),
+                );
+                barrier(d, cmd);
+            }
+        })
+    }
+
+    /// The hemisphere wavefront over the points in `hemi_pts`, in `HEMI_BATCH`
+    /// slices — `record_hemi`'s peer. Each batch resets the transient cell
+    /// queues and cut pool (`cs_prep_batch`), and THAT reset is what bounds the
+    /// memory: the caps size one batch, not one frame.
+    ///
+    /// The parity dance is one step off the ladder's, deliberately: the ROOT
+    /// pass writes `hqout`, so it runs under the ODD variant (u6 = hq_a) and
+    /// level 0 then reads hq_a as `hqin` under the EVEN one. Getting that
+    /// backwards costs the whole batch silently — the root's output lands in a
+    /// queue nothing reads.
+    unsafe fn record_hemi(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        h: &Hemi,
+        w: &Wave,
+        max_points: u32,
+        fb_depth: u32,
+    ) {
+        let n_batches = max_points.div_ceil(HEMI_BATCH);
+        let levels = fb_depth.clamp(2, HEMI_MAX_DEPTH) - 1;
+        unsafe {
+            for b in 0..n_batches {
+                let base = b * HEMI_BATCH;
+                self.bind(d, cmd, &h.sets_b);
+                // Batch prep: the root pass's args PLUS the batch-scoped
+                // counter reset — one kernel, because the reset has to happen
+                // before anything in the batch enqueues.
+                self.push(d, cmd, [gs::CTR_HEMI_PT, base, 32, ARG_HEMI_ROOT]);
+                self.go(d, cmd, h.pipes[H_PREP_BATCH], 1, 1);
+                self.push(d, cmd, [base, gs::CTR_HEMI_A, 0, 0]);
+                self.go_indirect(d, cmd, h.pipes[H_ROOT], &w.args, ARG_HEMI_ROOT);
+
+                for l in 0..levels {
+                    let (in_ctr, out_ctr) = if l % 2 == 0 {
+                        (gs::CTR_HEMI_A, gs::CTR_HEMI_B)
+                    } else {
+                        (gs::CTR_HEMI_B, gs::CTR_HEMI_A)
+                    };
+                    self.bind(d, cmd, if l % 2 == 0 { &h.sets_a } else { &h.sets_b });
+                    self.push(d, cmd, [in_ctr, out_ctr, 32, ARG_HEMI_CELL]);
+                    self.go(d, cmd, w.pipes[W_PREP], 1, 1);
+                    self.push(d, cmd, [in_ctr, out_ctr, 0, 0]);
+                    self.go_indirect(d, cmd, h.pipes[H_CELL], &w.args, ARG_HEMI_CELL);
+                }
+
+                // Leaf rays: FOUR threads per leaf cell (one stratified Arvo
+                // ray per midpoint sub-cell), so 8 records per 32-wide group.
+                self.push(d, cmd, [gs::CTR_HEMI_LEAF, NO_RESET, 8, ARG_HEMI_LEAF]);
+                self.go(d, cmd, w.pipes[W_PREP], 1, 1);
+                self.push(d, cmd, [0, 0, 0, 0]);
+                self.go_indirect(d, cmd, h.pipes[H_LEAF], &w.args, ARG_HEMI_LEAF);
+            }
+        }
+    }
+
+    /// `vkCmdBindDescriptorSets` for one set-0 variant plus the shared tail.
+    unsafe fn bind(&self, d: &ash::Device, cmd: vk::CommandBuffer, sets: &[vk::DescriptorSet]) {
+        unsafe {
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.layouts.pipeline,
+                0,
+                sets,
+                &[],
+            );
+        }
+    }
+
+    /// `cbuffer Push : register(b1)`, rewritten IN THE STREAM (module header).
+    ///
+    /// IT CARRIES ITS OWN BARRIERS, BOTH OF THEM, and that is the whole reason
+    /// it is one function rather than three lines at each of its two dozen call
+    /// sites: a per-dispatch constant block needs a WRITE-AFTER-READ edge as
+    /// well as the obvious read-after-write one, and the WAR edge is the one
+    /// that is easy to omit and invisible when you do.
+    ///
+    /// Omitting it cost the entire ladder past level 0 on the first run,
+    /// silently: the transfer is free to execute ahead of the dispatch it
+    /// textually FOLLOWS, so `cs_prep` read the NEXT level's `push3`, wrote its
+    /// indirect args to the wrong slot, and every level after the first
+    /// dispatched zero groups. Nothing faulted, validation was clean, and the
+    /// frame simply came back with one split and no terminals.
+    unsafe fn push(&self, d: &ash::Device, cmd: vk::CommandBuffer, v: [u32; 4]) {
+        unsafe {
+            barrier(d, cmd); // WAR: the last dispatch must be done READING b1
+            let mut b = [0u8; 16];
+            for (i, x) in v.iter().enumerate() {
+                b[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+            }
+            d.cmd_update_buffer(cmd, self.push.buf, 0, &b);
+            barrier(d, cmd); // RAW: and the next one must SEE the write
+        }
+    }
+
+    unsafe fn go(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        pipe: vk::Pipeline,
+        gx: u32,
+        gy: u32,
+    ) {
+        unsafe {
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            d.cmd_dispatch(cmd, gx, gy, 1);
+        }
+    }
+
+    unsafe fn go_indirect(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        pipe: vk::Pipeline,
+        args: &Buffer,
+        slot: u32,
+    ) {
+        unsafe {
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            d.cmd_dispatch_indirect(cmd, args.buf, u64::from(slot) * 12);
+        }
+    }
+
+    /// The `--check-vk` probe path: upload a CPU-generated shading-point set and
+    /// run ONLY the hemisphere passes over it — `run_hemi_probes`' peer.
+    ///
+    /// Both sides of the A/B then integrate at the EXACT same `(o, n)`, which is
+    /// what makes a statistical comparison against a CPU cosine reference mean
+    /// anything. The CB `frame` seeds the Arvo draws, so calling again with
+    /// `clear = false` and a different frame ACCUMULATES another independent
+    /// estimate into H — and `cs_seed_probes` keeps the verify counters across
+    /// those passes deliberately, so the exact-zero gates observe every seed's
+    /// rays rather than only the last seed's.
+    pub fn run_hemi_probes(
+        &self,
+        hg: &VkHeadless,
+        p: &FrameParams,
+        probes: &[(glam::Vec3A, glam::Vec3A)],
+        clear: bool,
+    ) -> Result<(), String> {
+        let h = self.hemi.as_ref().ok_or("this tracer has no hemisphere tiers")?;
+        let w = self.wave.as_ref().ok_or("this tracer has no wavefront ladder")?;
+        if probes.len() > (self.rw * self.rh) as usize {
+            return Err(format!("{} probes exceeds the hbuf/pts capacity", probes.len()));
+        }
+        self.write_cb(hg, p)?;
+
+        // `HemiPointRec` — o | pixel | n | pad. `pixel` is the probe INDEX, so
+        // probe i's estimate lands at hbuf[i].
+        let mut bytes = Vec::with_capacity(probes.len() * 32);
+        for (i, (o, n)) in probes.iter().enumerate() {
+            for v in [o.x, o.y, o.z] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes.extend_from_slice(&(i as u32).to_le_bytes());
+            for v in [n.x, n.y, n.z] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        hg.vk.write(&h.pts, &bytes)?;
+
+        let n = probes.len() as u32;
+        let clear_groups = (self.rw * self.rh * 4).div_ceil(256);
+        hg.run(|d, cmd| unsafe {
+            // Any variant would serve these two — they touch `counters` and
+            // `hbuf`, which every variant holds identically — but binding the
+            // one the batch loop starts under keeps the stream readable.
+            self.bind(d, cmd, &h.sets_b);
+            self.push(d, cmd, [n, u32::from(clear), 0, 0]);
+            self.go(d, cmd, h.pipes[H_SEED_PROBES], 1, 1);
+            if clear {
+                self.go(
+                    d,
+                    cmd,
+                    h.pipes[H_CLEAR_H],
+                    clear_groups.min(32768),
+                    clear_groups.div_ceil(32768),
+                );
+            }
+            barrier(d, cmd);
+            self.record_hemi(d, cmd, h, w, n, p.q.fb.depth);
             barrier(d, cmd);
         })
+    }
+
+    /// The fixed-point H accumulator, as raw u32 — 4 per point (`x|y|z|psa`).
+    pub fn read_hbuf(&self, hg: &VkHeadless, n_points: usize) -> Result<Vec<u32>, String> {
+        let h = self.hemi.as_ref().ok_or("this tracer has no hemisphere tiers")?;
+        let b = hg.read_buffer(&h.hbuf, n_points * 4 * 4)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+
+    /// Are the hemisphere tiers live? (`--sw-rays` takes the ladder, and so
+    /// these, with it.)
+    pub fn has_hemi(&self) -> bool {
+        self.hemi.is_some()
     }
 
     /// The terminal queues, as raw u32 — the accounting gate's input.
@@ -1044,7 +1443,12 @@ impl VkTracer {
         let d = &vkd.device;
         unsafe {
             let _ = d.device_wait_idle();
-            for p in self.pipes.iter().chain(self.wave.iter().flat_map(|w| w.pipes.iter())) {
+            for p in self
+                .pipes
+                .iter()
+                .chain(self.wave.iter().flat_map(|w| w.pipes.iter()))
+                .chain(self.hemi.iter().flat_map(|h| h.pipes.iter()))
+            {
                 d.destroy_pipeline(*p, None);
             }
             d.destroy_descriptor_pool(self.pool, None);
@@ -1069,6 +1473,21 @@ impl VkTracer {
         }
         if let Some(w) = &self.wave {
             for b in [&w.qa, &w.qb, &w.qleaf, &w.qsky, &w.cut_pool, &w.args, &w.tree] {
+                vkd.free_buffer(b);
+            }
+        }
+        if let Some(h) = &self.hemi {
+            for b in [
+                &h.hq_a,
+                &h.hq_b,
+                &h.hq_leaf,
+                &h.cut,
+                &h.partial,
+                &h.ambw,
+                &h.hbuf,
+                &h.pts,
+                &h.binary,
+            ] {
                 vkd.free_buffer(b);
             }
         }

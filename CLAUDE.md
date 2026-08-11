@@ -4622,8 +4622,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 46/77. Measured 7255601 B procedural
-                                      # vs 7256745 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 46/77. Measured 7332616 B procedural
+                                      # vs 7333760 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
                                       # keying reaches. (A first draft printed 2-decimal MB and read
                                       # identical across all three: an instrument at the wrong
@@ -4661,12 +4661,12 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
-                                      # M3a's V5, M3b/M3d's V6, and M3c's V7).
+                                      # M3a's V5, M3b/M3d's V6, M3c's V7, and M3e's V8).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
                                       # against, so a module can be perfectly valid and read the wrong
-                                      # resource. Eight stages: V0 the pure pick/memory logic (runs with no
+                                      # resource. Nine stages: V0 the pure pick/memory logic (runs with no
                                       # Vulkan on the box at all) | V1 loader + instance + device | V2
                                       # compile smoke.hlsl to SPIR-V and build the pipelines | V3 run the
                                       # seed -> prep -> indirect-fill chain and read the results back |
@@ -4675,7 +4675,9 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # of its kernels bound against it | V6 the reference kernel actually
                                       # RENDERING a frame, scored against the CPU plain reference | V7 the
                                       # WAVEFRONT QUADTREE, scored against V6 — the first EXACT-ZERO gates
-                                      # on Vulkan, because two kernels on one device have no excuse.
+                                      # on Vulkan, because two kernels on one device have no excuse |
+                                      # V8 the HEMISPHERE BOUNCE TIERS (the H key's AO and GI), the last
+                                      # render-path arm the Vulkan tracer did not have.
                                       # V3 IS THE POINT: constants reaching a kernel, storage buffers
                                       # bound and written, a GPU-WRITTEN counter turned into dispatch
                                       # arguments by a second kernel, and a third kernel launched from
@@ -5071,13 +5073,15 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # px is exactly how close that is.
                                       # THREE THINGS THE LADDER SPELLS DIFFERENTLY FROM D3D12, and only three.
                                       # (1) THE PING-PONG IS A DESCRIPTOR SET. qin/qout (u5/u6) swap every
-                                      # level and Vulkan has no rebound root UAV, so set 0 is allocated THREE
-                                      # times off ONE layout — A (u5=qa, u6=qb), B (the swap), and TERMINAL
-                                      # (u5=cloud_lod, u6=cloud_shadow, the registers' second meaning once the
-                                      # ladder has drained) — and a level binds the variant its parity names.
-                                      # Set 1 is allocated once and shared: the ping-pong is entirely a set-0
-                                      # property. Three writes at init, one vkCmdBindDescriptorSets per level,
-                                      # zero per-dispatch descriptor traffic. (2) PER-DISPATCH PUSH CONSTANTS
+                                      # level and Vulkan has no rebound root UAV, so set 0 is allocated
+                                      # SEVERAL times off ONE layout — LADDER A (u5=qa, u6=qb), LADDER B (the
+                                      # swap), and TERMINAL (u5=cloud_lod, u6=cloud_shadow, the registers'
+                                      # second meaning once the ladder has drained) — and a pass binds the
+                                      # variant its parity names. V8 adds two more of the same shape (see
+                                      # below), for five. Set 1 is allocated once and shared by all of them:
+                                      # every variant is a set-0 property. A handful of writes at init, one
+                                      # vkCmdBindDescriptorSets per dispatch group, zero per-dispatch
+                                      # descriptor traffic. (2) PER-DISPATCH PUSH CONSTANTS
                                       # BECOME vkCmdUpdateBuffer. b1 is a uniform buffer here (DXC has no flag
                                       # to promote a cbuffer to push constants, and [[vk::push_constant]] would
                                       # be an HLSL edit) and the ladder rewrites it twice per level, which a
@@ -5099,15 +5103,105 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # first dispatched zero groups. Nothing faulted, validation was clean,
                                       # and the frame came back with one split and no terminals — found by
                                       # FR_VK_CTRS=1 showing BOTH tile counters at 0 beside a split count of 1.
-                                      # The push helper carries both barriers itself now, which is why it is a
-                                      # closure rather than three lines at each of its nine call sites.
-                                      # NOT COVERED, and said loudly rather than silently: hemi (fb_mode > 0 —
-                                      # the H tiers), compose (which fb OFF does not dispatch at all, by
-                                      # design: leaf/sky splat straight into accum through accum_splat, and
-                                      # D3D12 skips it for the same reason), structure replay, and --sw-rays,
-                                      # whose leaf kernel wants the BINARY tree at t0 while the ladder holds
-                                      # the WIDE one there — a fourth set variant, not a flag, so V7 SKIPs with
-                                      # that sentence when the lever is armed.
+                                      # The push helper carries both barriers itself now, which is why it is
+                                      # one function rather than three lines at each of its two dozen call
+                                      # sites.
+                                      # NOT COVERED, and said loudly rather than silently: structure replay,
+                                      # and --sw-rays, whose LEAF kernel wants the BINARY tree at t0 while the
+                                      # ladder holds the WIDE one there (V8's hemi variants prove that
+                                      # mechanism, but the leaf pass would need its own, and this backend
+                                      # binds no tri_idx at all) — so V6/V7/V8 SKIP with that sentence when
+                                      # the lever is armed, V5 still covering that corpus's layout. COMPOSE is
+                                      # dispatched under fb ONLY, and that is D3D12's rule verbatim rather
+                                      # than an omission: with fb off the leaf and sky passes splat straight
+                                      # into accum through accum_splat, so a compose would be a
+                                      # buffer-to-buffer copy of a full screen.
+                                      # V8 — THE HEMISPHERE BOUNCE TIERS, the last render-path arm the Vulkan
+                                      # tracer did not have (M3e, 2026-08-11). The H key's AO and GI: the batched
+                                      # hemi wavefront (root -> cell levels -> leaf rays) and the one cs_compose splat
+                                      # it feeds. Two halves, answering different questions.
+                                      # THE PROBE HALF runs ONLY the hemisphere passes over a CPU-generated point set
+                                      # (run_hemi_probes, the D3D12 peer's twin), so both sides integrate at the EXACT
+                                      # same (o, n) and a statistical comparison against a 4096-sample CPU reference
+                                      # means something. Its exact-zero gates: **psa-viol** — every point's projected
+                                      # solid angle must account to pi, which is the integrator's own
+                                      # partition-of-unity (empty cells contribute analytically, leaf cells by
+                                      # sampling, and if the two do not tile the hemisphere the estimate is wrong by
+                                      # whatever is missing, silently and in a way no image comparison localizes);
+                                      # **false-empty** — an empty-cell claim re-validated with six real RayQuery rays,
+                                      # i.e. the hemisphere's spelling of the false-sky bug; **tmin-overshoot** — a
+                                      # leaf ray inherits tc from its OWN apex's tmin chain (never the primary tile's)
+                                      # and a tmin=0 reference ray must not hit strictly inside the claimed ball.
+                                      # THE FRAME HALF then runs one real wavefront frame with GI on, which is the only
+                                      # thing that exercises what the probe path bypasses: cs_leaf's fb arm appending
+                                      # one shading point per hit pixel, the batch loop draining them, and cs_compose
+                                      # turning partial + ambw*ambient(H) into finite radiance. `pts == hits` is an
+                                      # exact ACCOUNTING identity, not a tolerance — it catches an append that drops or
+                                      # doubles.
+                                      # MEASURED (RADV STRIX_HALO, 800x600, 157 probes x 8 seeds): psa-viol 0 with max
+                                      # err 2.42e-5 | false-empty 0 | tmin-overshoot 0 | overflow 0, on every scene;
+                                      # AO vs a 4096-sample cosine reference mean |d| 0.0067 procedural / 0.0018 smlp
+                                      # / 0.0018 rungholt / 0.0017 vokselia (limit 0.02) with the SIGNED mean inside
+                                      # +/-0.0005 (limit 0.005 — that estimator is unbiased, and a bias is the failure
+                                      # a mean-absolute bar cannot see); GI vs the same depth-1 BOUNCE_Q policy on both
+                                      # sides 3.02% / 0.97% / 1.13% / 1.11% (limit 5%). The GI frame reads
+                                      # hit-px == hemi-points EXACTLY on every scene (341393 procedural, 341388 smlp).
+                                      # AND ON llvmpipe THE FIXED-POINT ACCUMULATOR IS BIT-IDENTICAL TO RADV's:
+                                      # DamagedHelmet reads the same psa max err 2.42e-5, the same leaf-rays 80384,
+                                      # the same hemi-rays 5466520, the same AO 0.0069/+0.0005 and GI 2.15%. That is
+                                      # hemi.hlsli's own design claim — integer atomics are order-independent, so a
+                                      # queue-driven integrator is reproducible — measured across two wholly
+                                      # independent Vulkan implementations rather than asserted.
+                                      # TEETH, exercised rather than claimed: flipping the ROOT pass onto the wrong
+                                      # descriptor parity (the one mistake the parity dance invites — the root writes
+                                      # hqout, so it runs under the ODD variant and level 0 reads hq_a as hqin under
+                                      # the EVEN one) fails FIVE gates at once — psa-viol 157/157 at max err 3.14
+                                      # (the whole hemisphere unaccounted, because leaf cells contribute the PSA and
+                                      # there were none), leaf-rays 0, AO mean |d| 0.586, GI 100%, and the frame
+                                      # must-fire.
+                                      # THE ANTI-VACUITY IS SPLIT, and the split is a measurement rather than a
+                                      # preference. `leaf-rays > 0` is UNCONDITIONAL: the sampled tier fires on any
+                                      # scene, and it is exactly what a mis-parity'd batch loses. `empty-cells > 0` —
+                                      # the ANALYTIC tier — rides the suite's own `structural` predicate, because a
+                                      # real scene can legitimately have no cell it can prove empty: DamagedHelmet at
+                                      # its default pose reads empty-cells 0 HERE, and --check's CPU estimator reads
+                                      # "0.0 cells empty, 64.0 rays" per point at the same pose, while this run's
+                                      # 80384 rays over 8 seeds and 157 probes is 64.0 per probe EXACTLY. That
+                                      # per-point agreement with the CPU is a stronger statement than the must-fire
+                                      # would have been, which is why the gate is skipped there rather than relaxed.
+                                      # NOT COVERED, and it is a real gap rather than an oversight: the CPU suite's
+                                      # `cut-miss` counter, which re-traverses from the root to prove a cut-seeded
+                                      # query saw everything the full tree would. That instrument lives in
+                                      # hemi::VerifyCounters and has no GPU counterpart on EITHER backend.
+                                      # WHAT M3e SPELLS DIFFERENTLY: two more set-0 variants, and they move FIVE slots
+                                      # rather than the ladder's two — the cell ping-pong at u5/u6, the hemi leaf queue
+                                      # at u7, the hemi cut pool at u9, and t0 back to the BINARY BVH, because the hemi
+                                      # kernels compile frustum.hlsli's binary bound_query deliberately (short queries
+                                      # lose on the wide tree: measured +35% there against -54% on the tile path). So
+                                      # the binary tree is uploaded IN ADDITION to the wide one and both are live in
+                                      # one frame. THE HEMI UNITS RE-DECLARE u5/u6/u7/u9 AS DIFFERENT STRUCTS —
+                                      # HemiCellRec queues where the ladder has TileRec ones — and that is NOT a
+                                      # conflict for the derived map, which keys on descriptor KIND (both are storage
+                                      # buffers) rather than on the HLSL type: which is precisely why the variants are
+                                      # a per-(set, register) OVERRIDE table over one shared base rather than a second
+                                      # layout. The queues are sized to ONE BATCH of the worst-case fan-out
+                                      # (HEMI_BATCH * 4^(HEMI_MAX_DEPTH-1) = 1,048,576 records, ~290 MB), and that
+                                      # batch reset IS the memory bound — the reason the wavefront is batched at all.
+                                      # THE LEVER-REACH BUG M3e FOUND, and it is this codebase's own recurring class:
+                                      # --sw-rays, --no-sky-lod, --no-cloud-shadow and --no-wide-levels printed their
+                                      # loud lines on Linux and ARMED NOTHING. M1 moved SW_RAYS / WIDE_LEVELS_ON /
+                                      # set_cloud_shadow / set_sky_lod / set_waveviz into gfx::shaders with the shader
+                                      # assembly, but their stores in main's lever block stayed behind #[cfg(windows)]
+                                      # — so both Vulkan gates assembled the DEFAULT corpus while announcing otherwise.
+                                      # Found by running --check-vk --sw-rays and watching the ladder it had just said
+                                      # it would skip. The stores are portable now, and the arms they unlock are real
+                                      # new coverage: --no-wide-levels (the SERIAL ladder — same structure, same
+                                      # exact-zero image A/B, so the BFS/DFS order-independence claim holds on Vulkan
+                                      # too) and --no-ftree (the binary-tree ladder, the other side of the t0 upload's
+                                      # if/else) both PASS at 0.00e0. The one consequence worth stating: --sw-rays'
+                                      # corpus genuinely declares NO acceleration structure, so V5's anti-vacuity
+                                      # stands that one shape down under the lever — the expectation follows what the
+                                      # units were compiled from, like every other scene-keyed must-fire here.
                                       # THE FRUSTUM TREE IS THE ONE STREAM THIS FILE UPLOADS: t0 space0 takes
                                       # ftree::FTree::quantized() (the QFNode wire format — the per-processor
                                       # split verdict, not a shortcut: the CPU keeps f32 nodes and the GPU
