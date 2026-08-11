@@ -5627,7 +5627,10 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # sentinel cs_clear_info flooded, both tile queues must have drained, and
                                       # CTR_OVERFLOW must be 0 — the queues are sized to the structural worst
                                       # case, so an overflow is a sizing bug and never a scene); false-sky /
-                                      # tmin-overshoot / hybrid-extra; the LeafRec frontier-handle cookie/token
+                                      # tmin-overshoot / hybrid-extra (the overshoot bucket is SPLIT by
+                                      # whether the inherited bound could explain the miss at all — see the
+                                      # M3k block below for the decomposition and its teeth); the LeafRec
+                                      # frontier-handle cookie/token
                                       # ABI audit; and anti-vacuity both ways (a ladder that emitted no sky
                                       # tile proved no empty space, which is the quadtree's entire product).
                                       # THE DRAINED-QUEUE CHECK IS PARITY-SELECTED and that is not incidental:
@@ -6244,6 +6247,80 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # yet, so that lands with the presenter rather than being written now as
                                       # a field nothing reads — the caller proves the bit-equality, and V9 is
                                       # that caller.
+                                      # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
+                                      # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
+                                      # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
+                                      # confirmed at small scale and nothing more. `--check-vk
+                                      # san-miguel-low-poly.obj --tile 2` is 22.5M tris, and the whole stack
+                                      # carries it: 718 chunks, blas 2803 MB compacted from 3400, **scratch
+                                      # 7 MB** (the number the insurance is about — one BLAS at this size is
+                                      # the 1891 MB class that removed an Intel device under D3D12), 2317.9 MB
+                                      # staged in 52 submits, 313 textures / 405.6 MB with BC7 live, and every
+                                      # V6/V8/V9/V10 gate green — radiance 0.006%, hemi AO 0.0023 / GI 1.10%,
+                                      # replay tbuf/info/accum 0. THE VERTEX-GATHER ARM RAN FOR THE FIRST TIME
+                                      # ON THIS BACKEND (`1 chunk(s) vertex-gathered — id range over the
+                                      # 16777216 ceiling`): untiled San Miguel has ~2.8M vertices, so no chunk
+                                      # can clear the ceiling and only a tiled or world-scale scene reaches the
+                                      # arm at all — the M3h coverage lesson (reach is a property of which
+                                      # scene somebody ran) with no lever to fix it, since this one needs the
+                                      # geometry.
+                                      # AND V7's tmin-overshoot FAILED AT 1 PIXEL, which turned out to be the
+                                      # GATE's defect and not the renderer's. The attribution chain, each arm
+                                      # a run rather than an argument: deterministic (3/3 byte-identical);
+                                      # the CPU tracer's own verify at the SAME scale reads max rel t err
+                                      # 0.00e0; the CPU and the GPU reference AGREE at the pixel, so the
+                                      # wavefront is the odd one out; `FR_ABL=tzero` (leaf primaries trace
+                                      # from 0, making the two calls literally identical arguments) changes
+                                      # NOTHING — so it is not the inherited bound; `FR_ABL=nocandtmin` and
+                                      # `notrans` change nothing either; `FR_ABL=noalpha` returns it to
+                                      # **EXACTLY 0.00e0 with 0 hot channels**; and `--sw-rays` — our own
+                                      # fixed-order walk — also reads **0.00e0**. So it is the ALPHA-CUTOUT
+                                      # candidate loop, and it is the DRIVER's enumeration rather than ours.
+                                      # (`--no-blas-split` does not fix it, it only flips the sign: 1.69e-3
+                                      # nearer instead of farther, which is the tell that the partition
+                                      # perturbs the same knife-edge rather than causing it.) Note the tzero
+                                      # arm is only worth anything because the define was PROVEN to arrive —
+                                      # `--check-spirv` assembled bytes move 7680159 -> 7553627 — the
+                                      # probe-reach rule, and this file's own instrument for it.
+                                      # THE FIX IS A DECOMPOSITION, NOT AN ALLOWANCE, and that distinction is
+                                      # the whole point: a leaf primary searches [t_start, inf), so when the
+                                      # reference's OWN hit lies inside that interval NO value of t_start
+                                      # could have hidden it — the inherited bound is innocent BY
+                                      # CONSTRUCTION (here t_start 7.79 against hits at 16.54/16.62), and
+                                      # what remains is two intersector RUNS disagreeing. Those pixels are
+                                      # counted as `cand-edge` under the same 0.05% allowance the two
+                                      # siblings in the same function already carry (the IMAGE half of this
+                                      # very gate was passing throughout — `img_hot` and `img_mean` have had
+                                      # that allowance since M3c; only the `t` half was absolute). Pixels
+                                      # BELOW t_start stay in `tmin-overshoot` at exact zero, so the counter
+                                      # now measures what its name says, and the culprit line stops printing
+                                      # "the inherited-tmin bug class" over a pixel the bound cannot explain
+                                      # — the wrong-diagnosis class this tree names in its own QA commit.
+                                      # TEETH, and they are where the argument lives: `cand-edge` is EXACTLY
+                                      # ZERO wherever the phenomenon provably cannot occur — an opaque scene
+                                      # compiles no `Proceed()` arm (`gfx::shaders::non_opaque`, the same
+                                      # derived predicate that drops GEOMETRY_FLAG_OPAQUE) and `--sw-rays`
+                                      # walks our own tree, both measured 0.00e0 — which is most of the
+                                      # suite; `claim-violation` is untouched at exact zero and is the
+                                      # INVARIANT rather than this consequence form; and a genuinely bad
+                                      # claim is a property of a whole TILE, so it arrives as thousands of
+                                      # pixels against a bound of 240. The split itself is gated by
+                                      # inverting the innocence predicate, which routes the same pixel back
+                                      # to the hard bucket and FAILS the run — a tooth for the routing, not
+                                      # merely for the bound. The bound is deliberately loose against what
+                                      # was measured (1 px of 480000 = 2e-6, 240x under) because it must
+                                      # hold on hardware whose enumeration differs more than RADV's.
+                                      # NOTE THE OPPOSITE ATTRIBUTION one milestone earlier, because the two
+                                      # look alike and are not: M3f/M3g's fb-replay divergence SURVIVES
+                                      # --sw-rays (same rays, shaded differently — mechanism still open, in
+                                      # the shared HLSL), while this one VANISHES under it. Same lever, same
+                                      # scene, opposite verdicts — which is exactly why the lever is the
+                                      # instrument and a plausible story is not.
+                                      # OWED: the D3D12 twin has the identical predicate and no measurement,
+                                      # so `--check-gpu san-miguel-low-poly.obj --tile 2 --prefer-amd` joins
+                                      # the Windows run's list. It was deliberately NOT changed here — a gate
+                                      # edit on a platform this box cannot run is worse than a divergence
+                                      # that is written down.
                                       # THE FRUSTUM TREE IS THE ONE STREAM THIS FILE UPLOADS: t0 space0 takes
                                       # ftree::FTree::quantized() (the QFNode wire format — the per-processor
                                       # split verdict, not a shortcut: the CPU keeps f32 nodes and the GPU
@@ -6310,7 +6387,12 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # STAGES WANT THE SAME SCENE — a textured one — where before V5
                                       # wanted coverage and V6 skipped exactly those; run the pair on
                                       # san-miguel AND on the procedural default, since the teeth table
-                                      # above shows they catch different drops.
+                                      # above shows they catch different drops. AND ADD `--tile 2` TO THE
+                                      # LIST (M3k): `--check-vk` never loads the world, so `--tile` is the
+                                      # only lever that reaches world-class scale here — it is what put
+                                      # 22.5M tris, a 2803 MB BLAS and the vertex-GATHER arm through the
+                                      # backend for the first time, and every one of those is a code path
+                                      # no untiled scene can reach.
                                       # `ash` is the one new dependency — a generated binding, not
                                       # a framework (no allocator, no render graph, no policy), and its
                                       # default `loaded` feature dlopens libvulkan.so.1 and resolves every

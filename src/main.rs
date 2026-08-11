@@ -14873,6 +14873,20 @@ fn run_check_vk_wavefront(
         }
     }
     let (mut false_sky, mut overshoot, mut extra, mut edge_skipped) = (0usize, 0usize, 0usize, 0usize);
+    // The candidate-loop edge bucket. `tmin-overshoot` is the CONSEQUENCE form
+    // of the inherited-bound contract (`claim-violation` above is the invariant
+    // itself), and a consequence has other causes — so the split below is what
+    // makes the counter measure the thing its name says.
+    //
+    // `non_opaque` is the same derived predicate that drops
+    // GEOMETRY_FLAG_OPAQUE, i.e. it answers exactly "does `trace_closest` take
+    // its `Proceed()` arm", and `--sw-rays` replaces that arm with our own
+    // fixed-order walk. MEASURED on san-miguel-low-poly --tile 2 (22.5M tris,
+    // RADV): the hardware arm disagrees with the reference at ONE pixel and our
+    // software arm reproduces it BITWISE (0.00e0), which is what attributes the
+    // phenomenon to the driver's enumeration rather than to anything here.
+    let cand_loop = gs::non_opaque(scene) && !gs::sw_rays();
+    let mut cand_edge = 0usize;
     let mut max_rel_t = 0.0f32;
     for i in 0..px {
         let (rt, wt) = (ref_t[i], wave_t[i]);
@@ -14890,11 +14904,26 @@ fn run_check_vk_wavefront(
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    overshoot += 1;
+                    // WHICH BUCKET. A leaf primary searches [t_start, inf), so
+                    // when the reference's OWN hit lies inside that interval no
+                    // value of t_start could have hidden it: the inherited
+                    // bound is innocent BY CONSTRUCTION and what is left is two
+                    // intersector RUNS disagreeing about a grazing cutout edge.
+                    // Below t_start the bound IS the suspect and stays hard —
+                    // which is the whole reason this is a decomposition and not
+                    // an allowance bolted onto the old counter.
+                    let innocent = t_start_of[i].is_finite() && rt >= t_start_of[i];
+                    let (label, bucket) = if cand_loop && innocent {
+                        cand_edge += 1;
+                        ("cand-edge", "candidate-loop edge, bound innocent")
+                    } else {
+                        overshoot += 1;
+                        ("overshoot", "INSIDE the claimed-empty ball")
+                    };
                     if culprits.len() < 8 {
                         culprits.push(format!(
-                            "overshoot px ({},{}): ref t {rt:.6} -> wave t {wt:.6} \
-                             (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            "{label} px ({},{}): ref t {rt:.6} -> wave t {wt:.6} \
+                             (rel +{rel:.3e}) | inherited t_start {:.6} — {bucket}",
                             i % gw,
                             i / gw,
                             t_start_of[i]
@@ -14946,7 +14975,7 @@ fn run_check_vk_wavefront(
     println!(
         "check-vk: V7 wavefront vs reference ({px} px): claim-violation {claim_viol} | \
          false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | \
-         hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | \
+         hw-edge px {edge_skipped} | cand-edge px {cand_edge} | max rel t err {max_rel_t:.2e} | \
          same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
     );
     for c in &culprits {
@@ -14957,6 +14986,22 @@ fn run_check_vk_wavefront(
     }
     if false_sky != 0 || overshoot != 0 || extra != 0 {
         fail(&mut ok, "wavefront visibility gates (the inherited-tmin bug class)".into());
+    }
+    // The candidate-loop edge bucket rides the same 0.05% allowance as its two
+    // siblings below, and is EXACTLY ZERO wherever the phenomenon provably
+    // cannot occur: an opaque scene compiles no `Proceed()` arm, and
+    // `--sw-rays` walks our own tree in a fixed order (both measured 0.00e0).
+    // Those two arms are where the teeth live, together with `claim-violation`
+    // — a genuinely bad claim is a property of a whole TILE, so it arrives as
+    // thousands of pixels, not as the one this bound tolerates. The bound is
+    // deliberately loose against what was measured (1 px of 480000 = 2e-6, so
+    // 240x under) because it has to hold on hardware whose enumeration differs
+    // more than RADV's, not because one pixel is the expected magnitude.
+    if cand_edge as f64 > px as f64 * 5e-4 {
+        fail(
+            &mut ok,
+            format!("{cand_edge} candidate-loop edge disagreements above the 0.05% allowance"),
+        );
     }
     if nonfinite != 0 {
         fail(&mut ok, format!("{nonfinite} non-finite channel(s) in the wavefront image"));
