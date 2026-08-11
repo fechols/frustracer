@@ -771,22 +771,26 @@ fn main() {
             );
         }
     }
-    // The knobs that live on the backend. They are set here, before any
-    // scene load or device construction, and read by kernel assembly — so
-    // they follow the backend module until the shader assembly itself moves
-    // to `gfx`. Off Windows there is no backend to configure yet; `Opts`
-    // still carries every value, so nothing is lost but the store.
+    // The knobs the SHADER ASSEMBLY reads. These are portable — the statics
+    // moved to `gfx::shaders` with the assembly itself — and the store must be
+    // too, because both Vulkan gates assemble the same corpus: a `#[cfg]` here
+    // would leave `--check-spirv --no-sky-lod` and `--check-vk
+    // --no-cloud-shadow` compiling the DEFAULT configuration while their loud
+    // lines claimed otherwise. That is exactly what shipped after M1 (the
+    // statics moved, three stores did not), and `--check-vk --sw-rays` found
+    // it by running the ladder it had just announced it would skip.
+    gfx::shaders::set_cloud_shadow(opts.cloud_shadow);
+    gfx::shaders::set_sky_lod(opts.sky_lod);
+    // --waveviz wins over the FR_WAVEVIZ env alias; both land before any
+    // GPU construction (Passes::new + both tracers' kernel assemblies read it).
+    match if opts.waveviz != 0 { opts.waveviz } else { gfx::shaders::waveviz_env() } {
+        0 => {}
+        m => gfx::shaders::set_waveviz(m),
+    }
+    // The knobs that live on the D3D12 BACKEND — the DXR pipeline's own modes
+    // and the two profilers. Nothing off Windows has them to configure.
     #[cfg(windows)]
     {
-        gpu::trace::set_cloud_shadow(opts.cloud_shadow);
-        gpu::trace::set_sky_lod(opts.sky_lod);
-        // --waveviz wins over the FR_WAVEVIZ env alias; both land before any
-        // GPU construction (Passes::new + both tracers' kernel assemblies read
-        // it).
-        match if opts.waveviz != 0 { opts.waveviz } else { gpu::trace::waveviz_env() } {
-            0 => {}
-            m => gpu::trace::set_waveviz(m),
-        }
         gpu::dxr::set_inline_mode(opts.dxr_inline);
         // --dxr-sbt: parse-time only (no vendor policy, so no run_window
         // re-store) — and it MUST land before any SceneGpu upload, which bakes
@@ -815,8 +819,7 @@ fn main() {
     // leaf primaries consume it through rt_sw.hlsli. Only a departure from
     // the default prints (the blas-split lever-line rule).
     if opts.sw_rays {
-        #[cfg(windows)]
-        gpu::trace::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
+        gfx::shaders::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
         if opts.cut_rays {
             eprintln!(
                 "gpu: --continuation-rays — software prototype: each terminal beam \
@@ -900,8 +903,7 @@ fn main() {
         eprintln!("ftree: --ftree-tiles — the tile recursion runs on the 8-wide frustum tree");
     }
     if !opts.wide_levels {
-        #[cfg(windows)]
-        gpu::trace::WIDE_LEVELS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        gfx::shaders::WIDE_LEVELS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "gpu: --no-wide-levels — every quadtree level runs one thread per tile \
              (the pre-cooperative ladder)"
@@ -1142,7 +1144,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk();
+            let code = run_check_vk(&scene, &bvh, cam0, structural);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -13029,6 +13031,41 @@ fn run_check_gpu(
 /// `OnceLock`s, so one process is one configuration. Re-run the gate under
 /// them — the same rule `tools/dump-hlsl.ps1` states for the same reason.
 #[cfg(unix)]
+/// Every compute entry point an assembled unit declares: a `[numthreads(...)]`
+/// attribute followed by the function it decorates.
+///
+/// SCANNED, never listed. A hardcoded table goes stale the first time a kernel
+/// gains an entry, and silently — the gate would pass having compiled less
+/// than it thinks. Deliberately narrow: it must not match the many ordinary
+/// `void foo(` helpers these units paste in, which are not entry points and
+/// fail to compile as one.
+#[cfg(unix)]
+fn compute_entries(src: &str) -> Vec<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if !l.trim_start().starts_with("[numthreads") {
+            continue;
+        }
+        // The attribute may be followed by more attributes or a blank line
+        // before the signature.
+        for l2 in lines.iter().skip(i + 1).take(3) {
+            let t = l2.trim_start();
+            if let Some(rest) = t.strip_prefix("void ") {
+                if let Some(name) = rest.split('(').next() {
+                    let name = name.trim();
+                    if !name.is_empty() && !out.contains(&name.to_string()) {
+                        out.push(name.to_string());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
 fn run_check_spirv(scene: &scene::Scene) -> i32 {
     use gfx::shaders as sh;
     use gfx::vocab::Vendor;
@@ -13040,6 +13077,17 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
         Err(e) => {
             eprintln!("check-spirv: FAIL S0 {e}");
+            ok = false;
+        }
+    }
+    // The reflector is pure SPIR-V and belongs to the same stage: it reads
+    // what a module DECLARES, which is the half of the descriptor story
+    // `spirv-val` cannot see (it validates a module, and knows nothing about
+    // the layout that module will be bound against).
+    match vk::reflect::self_test() {
+        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 reflect: {e}");
             ok = false;
         }
     }
@@ -13188,36 +13236,6 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     push!("hud", sh::HUD_HLSL.to_string(), Shape::Gfx);
     push!("waveviz", sh::WAVEVIZ_HLSL.to_string(), Shape::Gfx);
 
-    // ---- the entry scanner ----
-    // A `[numthreads(...)]` attribute followed by the function it decorates.
-    // Deliberately narrow: it must not match the many ordinary `void foo(`
-    // helpers these units paste in, which are not entry points and fail to
-    // compile as one.
-    fn compute_entries(src: &str) -> Vec<String> {
-        let lines: Vec<&str> = src.lines().collect();
-        let mut out = Vec::new();
-        for (i, l) in lines.iter().enumerate() {
-            if !l.trim_start().starts_with("[numthreads") {
-                continue;
-            }
-            // The attribute may be followed by more attributes or a blank
-            // line before the signature.
-            for l2 in lines.iter().skip(i + 1).take(3) {
-                let t = l2.trim_start();
-                if let Some(rest) = t.strip_prefix("void ") {
-                    if let Some(name) = rest.split('(').next() {
-                        let name = name.trim();
-                        if !name.is_empty() && !out.contains(&name.to_string()) {
-                            out.push(name.to_string());
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        out
-    }
-
     // ---- S3: spirv-val, if the drop is here. ----
     let val = {
         let bundled = std::path::PathBuf::from(concat!(
@@ -13359,7 +13377,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 /// the bare-checkout rule every SDK-dependent gate here follows. It does NOT
 /// degrade on a device that is present and wrong.
 #[cfg(unix)]
-fn run_check_vk() -> i32 {
+fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
     let mut ok = true;
 
     // ---- V0: the pure half. Meaningful on a box with no Vulkan at all. ----
@@ -13372,9 +13390,20 @@ fn run_check_vk() -> i32 {
     }
 
     // ---- V1: a real device. Absence is a normal condition. ----
-    let validate = std::env::var("FR_VK_VALIDATION").is_ok_and(|v| v != "0");
-    if validate {
-        println!("check-vk: FR_VK_VALIDATION set — arming VK_LAYER_KHRONOS_validation");
+    //
+    // VALIDATION IS ON BY DEFAULT HERE, and that changed after a planted
+    // binding shift PASSED: V4's probe binds a ONE-binding descriptor set, so
+    // a layout that disagrees with the module has nothing to desynchronize
+    // against and RADV resolves it to the only slot (V3's four bindings catch
+    // the same bug structurally; a single binding cannot). The validation layer
+    // names it exactly — "uses descriptor [Set 0, Binding 2000] but the binding
+    // was not declared" — so a correctness gate with that instrument installed
+    // and unused is the `--gpu-debug` lesson repeated: the findings exist and
+    // nobody reads them. `FR_VK_VALIDATION=0` opts out; a missing layer is a
+    // loud line and an honestly unvalidated run.
+    let validate = std::env::var("FR_VK_VALIDATION").map_or(true, |v| v != "0");
+    if !validate {
+        println!("check-vk: FR_VK_VALIDATION=0 — running UNVALIDATED at your own risk");
     }
     let hg = match vk::headless::VkHeadless::new(validate) {
         Ok(h) => h,
@@ -13439,18 +13468,2004 @@ fn run_check_vk() -> i32 {
         }
     }
 
+    // ---- V4: the wave-width table, and the pin. ----
+    if !run_check_vk_waves(&hg, &sp) {
+        ok = false;
+    }
+
+    // ---- V5: the tracer's register map, derived, and every kernel bound. ----
+    if !run_check_vk_layout(&hg, &sp, scene) {
+        ok = false;
+    }
+
+    // ---- V6: the reference kernel rendering, scored against the CPU. ----
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
     if ve > 0 {
         eprintln!("check-vk: FAIL {ve} validation error(s) — see the vk validation lines above");
         ok = false;
-    } else if validate {
+    } else if hg.vk.validated() {
         println!("check-vk: validation clean");
+    } else {
+        // Say which mode ran, off the FACT rather than the request: a gate
+        // whose strength depends on whether a layer happened to be installed
+        // must report that, or a weak run and a strong one read identically.
+        println!(
+            "check-vk: NOTE validation was NOT armed — descriptor/layout mismatches unchecked"
+        );
     }
 
     println!("CHECK-VK {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// V4 — the wave-width table, printed WHOLE and then judged.
+///
+/// This is where Vulkan stops being a port of D3D12 and starts being better at
+/// one thing. On D3D12 the subgroup width is whatever the driver picked from
+/// register pressure: `WaveLaneCountMin/Max` bound it and never predict it, so
+/// the only instrument is a probe, and there is no lever at all — the whole
+/// `FR_WIDTH` campaign, and the wave64 lane-waste bug that cost -38% in
+/// `cs_leaf`, exist inside that constraint. Vulkan can PIN the width, so the
+/// same measurement here yields a decision instead of a diagnosis.
+///
+/// The table is printed before anything is judged, deliberately: a measurement
+/// gate that hides its numbers on failure is the least useful thing it could be.
+#[cfg(unix)]
+fn run_check_vk_waves(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use vk::headless::{Arm, PIN_TARGET};
+
+    let t = match vk::headless::wave_probe(hg, sp) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V4 {e}");
+            return false;
+        }
+    };
+    for n in &t.notes {
+        println!("check-vk: V4 NOTE {n}");
+    }
+    println!("check-vk: V4 wave-width table (group -> lanes x waves, lanes carrying a thread)");
+    for r in &t.rows {
+        let u = r.utilization();
+        println!(
+            "check-vk: V4   g{:<4} {:<10} {:>3} lanes x {:>2} wave{}  {:>4.0}% used{}",
+            r.group,
+            r.arm.label(),
+            r.lanes,
+            r.waves,
+            if r.waves == 1 { " " } else { "s" },
+            u * 100.0,
+            if u < 0.999 { "   <- HALF-EMPTY" } else { "" }
+        );
+    }
+
+    let mut ok = true;
+    for p in &t.problems {
+        eprintln!("check-vk: FAIL V4 {p}");
+        ok = false;
+    }
+    // Anti-vacuity: a probe that measured nothing must not report success.
+    if t.rows.is_empty() {
+        eprintln!("check-vk: FAIL V4 the wave table is empty — nothing was measured");
+        ok = false;
+    }
+
+    // THE PIN'S OWN TOOTH, and the reason this arm is worth running at all: a
+    // required subgroup size that the driver quietly ignores leaves every
+    // LEAF_GROUP / SKY_SPLIT constant mis-tuned while the table claims the
+    // opposite. Silence is the failure mode; assert the width came back.
+    let pinned: Vec<&vk::headless::WaveRow> =
+        t.rows.iter().filter(|r| matches!(r.arm, Arm::Pinned(_))).collect();
+    for r in &pinned {
+        if let Arm::Pinned(w) = r.arm {
+            if r.lanes != w {
+                eprintln!(
+                    "check-vk: FAIL V4 g{} asked for subgroup size {w} and got {} — the pin was \
+                     ignored",
+                    r.group, r.lanes
+                );
+                ok = false;
+            }
+        }
+    }
+    // Anti-vacuity for the pin, keyed off what the probe ACTUALLY attempted.
+    // Not off the caps: llvmpipe advertises compute size control with range
+    // [8..8], so asking it for 32 is a legal question with an impossible
+    // answer — it says so in a note and skips, which is the honest degrade.
+    if t.pin_attempted && pinned.is_empty() {
+        eprintln!("check-vk: FAIL V4 the pinned arm was attempted and produced no rows");
+        ok = false;
+    }
+
+    // The finding, stated by the run rather than left to be read off the table.
+    let waste: Vec<u32> = t
+        .rows
+        .iter()
+        .filter(|r| r.arm == Arm::Default && r.utilization() < 0.999)
+        .map(|r| r.group)
+        .collect();
+    if waste.is_empty() {
+        println!(
+            "check-vk: V4 every shipping group width fills its subgroups unpinned — no pin needed \
+             on this device"
+        );
+    } else {
+        let list: Vec<String> = waste.iter().map(|g| format!("g{g}")).collect();
+        let fixed = !pinned.is_empty()
+            && pinned.iter().all(|r| r.utilization() >= 0.999 || !waste.contains(&r.group));
+        println!(
+            "check-vk: V4 FINDING {} dispatch{} half-empty subgroups unpinned (natural width {}){}",
+            list.join(", "),
+            if waste.len() == 1 { "es" } else { "" },
+            hg.vk.natural_subgroup_size(),
+            if fixed {
+                format!(" — pinning {PIN_TARGET} fills them; M3 pins those pipelines")
+            } else {
+                String::new()
+            }
+        );
+    }
+    ok
+}
+
+/// V5 — the tracer's descriptor-set layout, DERIVED from the corpus, and every
+/// one of its kernels bound against it.
+///
+/// This is the first stage that is about the RENDERER rather than about
+/// Vulkan. V2/V3 proved a hand-written four-binding layout works; the tracer
+/// needs sixty-odd bindings across two sets, including an acceleration
+/// structure, an unbounded texture array and two samplers, and the D3D12 side
+/// gets that agreement from `create_root_signature` — 150 hand-written lines
+/// kept in step with `src/shaders/` by care. Writing that twice would be
+/// writing the same liability twice, in the API where it fails quietly, so the
+/// layout here is read back out of the compiled modules (`vk::reflect`) and
+/// this stage is the proof that the reading is USABLE: every kernel creates a
+/// compute pipeline against it, which is exactly where a module meets a layout.
+///
+/// THE FAMILY IS THE UNIT, and that is a finding rather than a filing choice.
+/// D3D12 has several root signatures — the tracer's, FRD's, bloom's, quin's —
+/// and their register maps genuinely CONTRADICT: `t0` is `bvh_nodes`, a
+/// structured buffer, in the tracer and `b_src_diff`, a `Texture2D`, in FRD.
+/// One map over the whole corpus would report that as a conflict and be right
+/// to. So this builds the TRACER family's map; each further family is its own
+/// layout, and the conflict detector is what will say so if one is mixed in.
+#[cfg(unix)]
+fn run_check_vk_layout(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+) -> bool {
+    use gfx::shaders as sh;
+    use gfx::vocab::Vendor;
+    use vk::reflect::{DescKind, Map};
+
+    let mut ok = true;
+
+    // Say it before it becomes 25 validation errors about `RayQueryKHR`. The
+    // shipping assembly uses `rt.hlsli`, so every leaf/hemi/reference/feed
+    // kernel declares ray query; a device without it can still run the tracer
+    // — `--sw-rays` assembles `rt_sw.hlsli` and traverses our own BVH in the
+    // shader — but not THESE modules, and a gate that reported that as a pile
+    // of capability errors would be blaming the corpus for the device.
+    if !hg.vk.info.ray_query || !hg.vk.info.accel_struct {
+        eprintln!(
+            "check-vk: FAIL V5 this device has no ray query, so the shipping (hardware-ray) \
+             assembly cannot be bound here — the --sw-rays arm is what such a device runs"
+        );
+        return false;
+    }
+
+    // Every arm of the tracer family. Both vendors (`cand_defs`) and both sway
+    // arms, deduped by source, because a define that changes the register map
+    // in one arm and not another is exactly what a union is for.
+    let mut units: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut push = |name: String, src: String, units: &mut Vec<(String, String)>| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        if seen.insert(h.finish()) {
+            units.push((name, src));
+        }
+    };
+    for vendor in [Vendor::Nvidia, Vendor::Amd] {
+        for sway in [false, true] {
+            let t = sh::trace_sources(&sh::TraceKeys { scene, vendor, sway_armed: sway });
+            let tag = format!("{vendor:?}{}", if sway { "+sway" } else { "" });
+            for (n, s) in [
+                ("reference", t.reference.clone()),
+                ("resolve", t.resolve.clone()),
+                ("wavefront", t.wavefront.clone()),
+                ("sky", t.sky.clone()),
+                ("leaf", t.leaf.clone()),
+                ("leaf_fb", t.leaf_fb.clone()),
+                ("hemi_wave", t.hemi_wave.clone()),
+                ("hemi_leaf", t.hemi_leaf.clone()),
+                ("compose", t.compose.clone()),
+                ("feed", t.feed.clone()),
+                // Same root signature on D3D12 (NRD_FEED_SET is a heap slice,
+                // not a register space), so it is the same family here.
+                ("nrd_bridge", t.nrd_bridge()),
+            ] {
+                push(format!("{n}[{tag}]"), s, &mut units);
+            }
+        }
+    }
+
+    // ---- reflect every entry point, union the results ----
+    let mut map = Map::default();
+    let mut modules: Vec<(String, String, Vec<u32>)> = Vec::new(); // (unit, entry, words)
+    let mut conflicts: Vec<String> = Vec::new();
+    for (name, src) in &units {
+        let entries = compute_entries(src);
+        if entries.is_empty() {
+            eprintln!("check-vk: FAIL V5 {name}: no [numthreads] entry point found");
+            ok = false;
+            continue;
+        }
+        for e in entries {
+            let what = format!("{name}:{e}");
+            let words = match sp.compile(src, &e, "cs_6_5", &what, false) {
+                Ok(w) => w,
+                Err(err) => {
+                    eprintln!("check-vk: FAIL V5 {err}");
+                    ok = false;
+                    continue;
+                }
+            };
+            match vk::reflect::reflect(&words) {
+                Ok(d) => conflicts.extend(map.add(&what, &d)),
+                Err(err) => {
+                    eprintln!("check-vk: FAIL V5 reflect {what}: {err}");
+                    ok = false;
+                    continue;
+                }
+            }
+            modules.push((name.clone(), e, words));
+        }
+    }
+    for c in &conflicts {
+        eprintln!("check-vk: FAIL V5 register-map conflict: {c}");
+        ok = false;
+    }
+    for c in map.class_violations() {
+        eprintln!("check-vk: FAIL V5 {c}");
+        ok = false;
+    }
+
+    // `FR_VK_MAP=1` — the derived register map itself. The read-only-probe
+    // idiom: this is the D3D12 root signature's Vulkan twin, and "what does
+    // the tracer actually bind" is the first question a green sweep should be
+    // able to answer without reading the shaders.
+    if std::env::var_os("FR_VK_MAP").is_some() {
+        for l in map.lines() {
+            println!("check-vk:   {l}");
+        }
+    }
+
+    // ---- anti-vacuity ----
+    //
+    // A map that reflected nothing would build an empty layout, create every
+    // pipeline against it, and report a clean sweep. So demand the SHAPES that
+    // make this family what it is: the acceleration structure the RayQuery
+    // primitives bind, the unbounded texture table, its samplers, the frame
+    // constant buffer, and both flavours of writable resource. Each is a
+    // different code path through the reflector, so this is coverage as well
+    // as a floor.
+    let kinds: std::collections::HashSet<&'static str> =
+        map.entries.values().map(|e| e.kind.name()).collect();
+    // ...except the acceleration structure under `--sw-rays`, where the corpus
+    // genuinely declares none: that lever swaps every RayQuery body for
+    // `rt_sw.hlsli`'s software traversal of our own BVH, so demanding a TLAS
+    // would be asserting against a different configuration than the one being
+    // reflected. This is the shape of every scene-keyed must-fire here — the
+    // expectation follows what the units were compiled from.
+    let want_as = !gfx::shaders::sw_rays();
+    for want in [
+        DescKind::AccelStruct,
+        DescKind::SampledImage,
+        DescKind::Sampler,
+        DescKind::UniformBuffer,
+        DescKind::StorageBuffer,
+        DescKind::StorageImage,
+    ] {
+        if matches!(want, DescKind::AccelStruct) && !want_as {
+            continue;
+        }
+        if !kinds.contains(want.name()) {
+            eprintln!(
+                "check-vk: FAIL V5 the derived map has no {} — the corpus declares one, so \
+                 this run reflected less than it thinks",
+                want.name()
+            );
+            ok = false;
+        }
+    }
+    let unbounded = map.entries.values().filter(|e| e.count == 0).count();
+    if unbounded == 0 {
+        eprintln!(
+            "check-vk: FAIL V5 no unbounded array in the derived map — texs[] is one, and a \
+             layout that sized it to 1 would truncate every scene's texture table"
+        );
+        ok = false;
+    }
+    if map.entries.len() < 30 {
+        eprintln!(
+            "check-vk: FAIL V5 the derived map has only {} slots — the tracer binds far more",
+            map.entries.len()
+        );
+        ok = false;
+    }
+
+    // ---- build the layouts ----
+    //
+    // The texture table's ceiling comes from the DEVICE, not from a constant:
+    // it is the number that says whether a real scene's table fits, and a
+    // hardcoded one would either waste a limit this device has or exceed one
+    // it does not.
+    let cap = vk::layout::DEFAULT_TEX_CAP.min(hg.vk.info.max_sampled_images);
+    // `FR_VK_DROP_BINDING=set:binding` — the teeth, and the only way to test a
+    // layout that is DERIVED from the shaders: nothing else can make one
+    // wrong. With it set the run MUST fail, which is what proves the pipeline
+    // creations below are checking the layout rather than ignoring it.
+    let drop = std::env::var("FR_VK_DROP_BINDING").ok().and_then(|v| {
+        let (a, b) = v.split_once(':')?;
+        let d = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+        eprintln!("check-vk: FR_VK_DROP_BINDING={v} — set {} binding {} OMITTED from the \
+                   layout; this run MUST fail", d.0, d.1);
+        Some(d)
+    });
+    let layouts = match vk::layout::Layouts::build(&hg.vk, &map, cap, drop) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V5 {e}");
+            return false;
+        }
+    };
+
+    // ---- bind every kernel ----
+    //
+    // `vkCreateComputePipelines` is where a module meets a layout: a binding
+    // the module uses and the layout omits, a descriptor type that disagrees,
+    // or a SPIR-V capability the device lacks all surface here. Nothing is
+    // dispatched — that is M3b, which needs a scene on the GPU — so the
+    // pipelines are created and destroyed, and the CREATION is the assertion.
+    let mut built = 0usize;
+    for (name, entry, words) in &modules {
+        match vk::layout::compute_pipeline(&hg.vk, &layouts, words, entry) {
+            Ok(p) => {
+                built += 1;
+                unsafe { hg.vk.device.destroy_pipeline(p, None) };
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V5 {name}:{entry}: {e}");
+                ok = false;
+            }
+        }
+    }
+    layouts.destroy(&hg.vk);
+
+    if built == 0 {
+        eprintln!("check-vk: FAIL V5 no pipeline was created — this stage proved nothing");
+        ok = false;
+    }
+    let sets = map.entries.keys().map(|&(s, _)| s).collect::<std::collections::HashSet<_>>().len();
+    println!(
+        "check-vk: V5 {} units -> {} slots in {sets} set{} (texs[] capped at {cap}) -> \
+         {built} compute pipelines bound",
+        units.len(),
+        map.entries.len(),
+        if sets == 1 { "" } else { "s" },
+    );
+    ok
+}
+
+/// V6 — the reference kernel actually RENDERING, scored against the CPU.
+///
+/// V5 proved every tracer kernel BINDS. This is the first stage that proves
+/// one of them is right, and it is where the port stops being about Vulkan and
+/// starts being about the renderer: a stream at the wrong slot, a `GpuMat`
+/// stride skewed by `-fvk-use-dx-layout`, a BLAS built from the wrong device
+/// address, a cbuffer field landing one dword over — none of those fail a
+/// pipeline creation, and all of them make a picture that disagrees.
+///
+/// The comparison is `--check-gpu`'s own M2, transplanted: one unjittered
+/// frame each for primary VISIBILITY (`t` and hit/sky class, which is what
+/// scores the acceleration structure), then an accumulated pair for RADIANCE
+/// (which is what scores the shading, the materials, the sky and the cloud
+/// caches). It is STATISTICAL for the reason recorded there — hardware
+/// watertight intersection is not `moller_trumbore`, and the two disagree at
+/// grazing shared edges — so the bars are a bounded mismatch COUNT and a mean
+/// relative error, never exact zero. Exact-zero belongs to GPU-vs-GPU gates,
+/// which arrive with the wavefront.
+///
+/// Small on purpose (`VK_RENDER_W` x `VK_RENDER_H`): the cost here is the CPU
+/// reference, not the GPU, and this stage exists to be run on every commit.
+#[cfg(unix)]
+fn run_check_vk_render(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    structural: bool,
+) -> bool {
+    // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
+    // frame its D3D12 twin does, so the two suites' quadtree structures are
+    // directly comparable rather than merely similar (both read
+    // `leaves 768 | sky-tiles 4 | splits 257 | blocked 256 | cuts 65`, which
+    // is a cross-backend agreement no summary statistic could give). It also
+    // costs nothing — the wall clock here is DXC compiling the corpus, not the
+    // CPU reference: san-miguel-low-poly measured 22.1 s at 400x300 and 21.7 s
+    // here, i.e. inside the noise. And it fires the transmissive must-fire,
+    // which at 400x300 sees ZERO shadow rays crossing San Miguel's glass.
+    const VK_RENDER_W: usize = 800;
+    const VK_RENDER_H: usize = 600;
+    // Accumulated frames on each side of the radiance A/B. The RNG streams
+    // differ by design, so this is variance reduction, not agreement: too few
+    // and the bar measures noise. `FR_VK_AB_FRAMES` overrides it, which is the
+    // instrument that tells a BIAS from a slowly-converging one — a
+    // disagreement that halves as the count doubles was never a defect. (It
+    // is how the blas_tri bug was proven to be one: 16/64/256 frames all read
+    // +3.4%, flat.)
+    let frames: u32 = std::env::var("FR_VK_AB_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(16);
+
+    if !hg.vk.info.ray_query || !hg.vk.info.accel_struct {
+        println!("check-vk: SKIP V6 (no ray query on this device — the shipping tracer needs it)");
+        return true;
+    }
+    // `--sw-rays` swaps every RayQuery body for `rt_sw.hlsli`'s traversal of
+    // OUR BVH, which reads the binary tree at t0 and `tri_idx` at t1. This
+    // backend uploads the binary tree only for the hemi passes and `tri_idx`
+    // not at all, so a render here would bind dummies and produce a confident
+    // wrong picture. V5 above still covers that corpus — it is the LAYOUT that
+    // the lever changes, and the layout is what V5 derives.
+    if gfx::shaders::sw_rays() {
+        println!(
+            "check-vk: SKIP V6/V7/V8/V9 (--sw-rays is armed — its intersector reads the binary \
+             tree at t0 and tri_idx at t1, streams this backend does not bind yet; V5 covers \
+             that corpus's layout)"
+        );
+        return true;
+    }
+    // `FR_VK_RES=WxH`. Two uses, both real: a perf probe wants a shipping
+    // resolution, and V7's drained-queue check is PARITY-SELECTED — `cs_prep`
+    // zeroes only the OUT counter, so which tile queue must be empty at the
+    // end depends on `depth_full % 2`, and the depth follows
+    // `max(rw, rh) / LEAF_TILE`. The default 800x600 gives depth 5 (odd);
+    // **`FR_VK_RES=400x300` gives 4 and is what covers the other arm.** The
+    // D3D12 twin has the identical expression and its own note about a bug an
+    // odd depth hid at exactly this resolution — a parity-selected gate is
+    // half a gate until both parities have run.
+    let (gw, gh) = match std::env::var("FR_VK_RES").ok().and_then(|v| {
+        let (a, b) = v.split_once(['x', 'X'])?;
+        Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+    }) {
+        Some((w, h)) if w > 0 && h > 0 => {
+            println!("check-vk: FR_VK_RES={w}x{h} (default {VK_RENDER_W}x{VK_RENDER_H})");
+            (w, h)
+        }
+        _ => (VK_RENDER_W, VK_RENDER_H),
+    };
+    let vs = match vk::scene::VkScene::new(hg, scene) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 scene upload: {e}");
+            return false;
+        }
+    };
+    let vt = match vk::textures::VkTextures::new(hg, scene) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 texture upload: {e}");
+            vs.destroy(hg);
+            return false;
+        }
+    };
+    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 tracer init: {e}");
+            vt.destroy(hg);
+            vs.destroy(hg);
+            return false;
+        }
+    };
+    // The texture line reports BYTES and SUBRESOURCES, not just a count: a run
+    // that uploaded the table and one that uploaded a table of stubs have the
+    // same count, and a chain that silently lost its mips has the same
+    // subresource count only if it had none to lose.
+    println!(
+        "check-vk: V6 scene uploaded, BLAS/TLAS built ({} tris), {} texture(s) \
+         [{} subresource(s), {:.1} MB, RGBA8 — the --no-bc7 arm] — reference tracer at {gw}x{gh}",
+        scene.tri_count(),
+        scene.textures.len(),
+        vt.levels,
+        vt.bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    let q = Quality::preset(2);
+    let basis = cam0.basis(gw, gh);
+    let params = |frame: u32| gfx::frame::FrameParams {
+        cam: basis,
+        frame,
+        accumulate: true,
+        jitter: frame > 0,
+        frame_jitter: None,
+        prev_cam: None,
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+
+    // The CPU counterpart: the plain per-pixel reference (hybrid = false), the
+    // same contract `--check-gpu` scores against.
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..gw * gh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let cpu_frame = |frame: u32| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: frame > 0,
+            rw: gw,
+            rh: gh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, false);
+    };
+
+    let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+
+    let mut ok = true;
+    let px = gw * gh;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V6 {msg}");
+        *ok = false;
+    };
+
+    // ---- visibility: one unjittered frame each ----
+    if let Err(e) = tg.render(hg, &params(0), 1) {
+        fail(&mut ok, format!("reference dispatch: {e}"));
+    }
+    let gpu_t = match read_f32(&tg.tbuf, px) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, format!("tbuf readback: {e}"));
+            vec![f32::NAN; px]
+        }
+    };
+    cpu_frame(0);
+    let cpu_t: Vec<f32> = tbuf.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
+    let (mut n_hit, mut n_sky, mut class_mismatch, mut t_viol) = (0usize, 0usize, 0usize, 0usize);
+    let mut max_rel = 0.0f32;
+    // Pixels where the CPU and the hardware already disagree — the
+    // two-intersector grazing-edge set. V7 excludes them from its own
+    // wavefront-vs-reference MAX for the reason `--check-gpu` does: the
+    // reference's `t` is not ground truth there, so a difference at one of
+    // them measures two surfaces rather than the quadtree.
+    let mut edge_mask = vec![false; px];
+    for i in 0..px {
+        let (ct, gt) = (cpu_t[i], gpu_t[i]);
+        match (ct.is_finite(), gt.is_finite()) {
+            (true, true) => {
+                n_hit += 1;
+                let rel = (ct - gt).abs() / ct.abs().max(1e-6);
+                max_rel = max_rel.max(rel);
+                if rel > 1e-3 {
+                    t_viol += 1;
+                    edge_mask[i] = true;
+                }
+            }
+            (false, false) => n_sky += 1,
+            _ => {
+                class_mismatch += 1;
+                edge_mask[i] = true;
+            }
+        }
+    }
+    println!(
+        "check-vk: V6 primary visibility ({px} px): hit {n_hit} | sky {n_sky} | \
+         class-mismatch {class_mismatch} | rel-t > 1e-3: {t_viol} | max rel t err {max_rel:.2e}"
+    );
+    // Anti-vacuity, both ways: a frame that is all sky scores the AS not at
+    // all, and a frame with no sky never runs the miss path (the sky dome, the
+    // cloud caches, the whole `sky_radiance_lod` arm this stage dispatches two
+    // extra kernels to fill).
+    if n_hit == 0 || n_sky == 0 {
+        fail(
+            &mut ok,
+            format!("the frame is {} — nothing is being scored",
+                if n_hit == 0 { "all sky" } else { "all geometry" }),
+        );
+    }
+    if class_mismatch as f64 > px as f64 * 5e-4 {
+        fail(&mut ok, format!("hit/sky classification mismatch {class_mismatch} above 0.05%"));
+    }
+    if t_viol as f64 > px as f64 * 1e-4 {
+        fail(&mut ok, format!("rel-t violations {t_viol} above 0.01%"));
+    }
+
+    // ---- radiance: FRAMES accumulated each ----
+    for f in 1..frames {
+        if let Err(e) = tg.render(hg, &params(f), f + 1) {
+            fail(&mut ok, format!("frame {f}: {e}"));
+            break;
+        }
+        cpu_frame(f);
+    }
+    let gpu_a = read_f32(&tg.accum, px * 3).unwrap_or_default();
+    let inv = 1.0 / frames as f32;
+    // THE METRIC IS `--check-gpu`'s, TO THE LINE, and picking a different one
+    // was this stage's first bug. A mean of PER-PIXEL relative errors reads
+    // 16% on a correct image here, because it is dominated by dark pixels
+    // where a 1-spp path tracer's own noise dwarfs the value and the two sides
+    // draw independent samples BY DESIGN. The ratio of channel SUMS asks the
+    // question that actually distinguishes a wired-wrong renderer from a noisy
+    // one — do the two converge to the same picture — and its 2% bar is
+    // calibrated against exactly this kind of disagreement on the D3D12 side.
+    let mut sum_c = [0.0f64; 3];
+    let mut sum_g = [0.0f64; 3];
+    let mut sum_abs = 0.0f64;
+    let mut nonfinite = 0usize;
+    // SPLIT BY WHAT THE PRIMARY RAY HIT, because the two populations fail for
+    // different reasons and a single number cannot tell them apart: sky is the
+    // dome + disc + the cloud caches with no material in sight, geometry is
+    // everything else. An attribution that costs two counters is worth more
+    // than the dump it saves writing.
+    let mut sky_c = 0.0f64;
+    let mut sky_g = 0.0f64;
+    let mut hit_c = 0.0f64;
+    let mut hit_g = 0.0f64;
+    for i in 0..px * 3 {
+        let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
+        let g = gpu_a.get(i).copied().unwrap_or(f32::NAN) * inv;
+        if !g.is_finite() || g < 0.0 {
+            nonfinite += 1;
+            continue;
+        }
+        sum_c[i % 3] += f64::from(c);
+        sum_g[i % 3] += f64::from(g);
+        sum_abs += f64::from((c - g).abs());
+        if cpu_t[i / 3].is_finite() {
+            hit_c += f64::from(c);
+            hit_g += f64::from(g);
+        } else {
+            sky_c += f64::from(c);
+            sky_g += f64::from(g);
+        }
+    }
+    // FR_VK_AB_DUMP=1 — read-only diagnostic (the FR_CHECK_AB_DUMP idiom): the
+    // two converged images as raw f32 RGB, so a failing mean can be attributed
+    // spatially instead of guessed at. No gate reads these files.
+    if std::env::var_os("FR_VK_AB_DUMP").is_some() {
+        let raw = |name: &str, v: &[f32]| {
+            let mut b = Vec::with_capacity(v.len() * 4);
+            for x in v {
+                b.extend_from_slice(&(x * inv).to_le_bytes());
+            }
+            let _ = std::fs::write(name, &b);
+        };
+        let cpu_v: Vec<f32> = accum.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
+        raw("vk-ab-cpu.f32", &cpu_v);
+        raw("vk-ab-gpu.f32", &gpu_a);
+        let tb: Vec<u8> = cpu_t.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let _ = std::fs::write("vk-ab-t.f32", &tb);
+        eprintln!("check-vk: V6 FR_VK_AB_DUMP wrote vk-ab-{{cpu,gpu,t}}.f32 ({gw}x{gh})");
+    }
+
+    let mut mean_rel = 0.0f64;
+    for ch in 0..3 {
+        mean_rel = mean_rel.max((sum_c[ch] - sum_g[ch]).abs() / sum_c[ch].max(1e-9));
+    }
+    println!(
+        "check-vk: V6 radiance A/B over {frames} frames: per-channel mean rel diff {:.3}% | \
+         mean abs px diff {:.4} | non-finite {nonfinite}",
+        mean_rel * 100.0,
+        sum_abs / (px * 3) as f64
+    );
+    println!(
+        "check-vk: V6   by primary hit: sky cpu {:.4} gpu {:.4} ({:+.2}%) | \
+         geometry cpu {:.4} gpu {:.4} ({:+.2}%)",
+        sky_c / (px * 3) as f64,
+        sky_g / (px * 3) as f64,
+        (sky_g - sky_c) / sky_c.max(1e-9) * 100.0,
+        hit_c / (px * 3) as f64,
+        hit_g / (px * 3) as f64,
+        (hit_g - hit_c) / hit_c.max(1e-9) * 100.0
+    );
+    if nonfinite > 0 {
+        fail(&mut ok, format!("{nonfinite} non-finite/negative GPU channels"));
+    }
+    // Anti-vacuity: a pair of all-black images agrees perfectly.
+    if sum_c.iter().sum::<f64>() <= 0.0 || sum_g.iter().sum::<f64>() <= 0.0 {
+        fail(&mut ok, "one of the accumulated images is entirely black".into());
+    }
+    if mean_rel > 0.02 {
+        fail(&mut ok, format!("converged radiance means differ by {:.3}%, above 2%", mean_rel * 100.0));
+    }
+
+    // ---- the resolve link: hdr == accum / samples ----
+    //
+    // The one thing in this stage that touches an IMAGE rather than a buffer,
+    // so it is also the proof that storage-image creation, the GENERAL layout
+    // transition and the image descriptor are all wired. Compared against the
+    // GPU's own accum, not the CPU's: this scores the kernel and the wire, and
+    // folding a CPU disagreement in would make a resolve bug indistinguishable
+    // from a shading one.
+    match tg.read_hdr(hg) {
+        Ok(hdr) => {
+            let mut bad = 0usize;
+            let mut wmax = 0.0f32;
+            let mut nz = 0usize;
+            for i in 0..px {
+                for c in 0..3 {
+                    let want = gpu_a.get(i * 3 + c).copied().unwrap_or(0.0) * inv;
+                    let got = hdr[i * 4 + c];
+                    if want.abs() > 1e-4 {
+                        nz += 1;
+                    }
+                    // One f16 step at this magnitude, plus a floor for the
+                    // denormal end: the wire is RGBA16F, so agreement can only
+                    // ever be to the format's own resolution.
+                    let tol = (want.abs() * (1.0 / 1024.0)).max(1e-4);
+                    let d = (want - got).abs();
+                    wmax = wmax.max(d);
+                    if d > tol {
+                        bad += 1;
+                    }
+                }
+            }
+            println!(
+                "check-vk: V6 resolve link: {bad} channel(s) past one f16 step \
+                 (max |d| {wmax:.3e}, {nz} non-zero)"
+            );
+            if nz == 0 {
+                fail(&mut ok, "the resolved image is entirely zero — the resolve pass proved nothing".into());
+            }
+            if bad > 0 {
+                fail(&mut ok, format!("{bad} resolved channels disagree with accum/samples"));
+            }
+        }
+        Err(e) => fail(&mut ok, format!("hdr readback: {e}")),
+    }
+
+    // ---- the per-scene shading arms: REPORTED, and why they read zero ----
+    //
+    // `ALPHA_CUTOUT` and `TRANS_SHADOW` compile in per scene — that is why V5's
+    // slot count moves with the scene — and a class-mismatch of 0 on a masked
+    // scene only means something if the cutout actually rejects. THE REFERENCE
+    // KERNEL CANNOT SAY: `rt.hlsli`'s `count_alpha_rej`/`count_height_rej` and
+    // the tinted-shadow tally are all `#ifdef HAVE_COUNTERS`, which
+    // `ctr.hlsli` defines for the WAVEFRONT kernels and deliberately not for
+    // the reference kernel or the DXR library. So this is a REPORT, not a
+    // must-fire: asserting `> 0` here would be asserting against an instrument
+    // that structurally cannot reach its target, which is the confidently-wrong
+    // failure mode this tree keeps re-learning. It becomes a real must-fire in
+    // M3c, where `cs_leaf` binds the slot; the readback and the per-frame zero
+    // fill exist now so that gate inherits a working instrument rather than an
+    // untested one.
+    match tg.read_counters(hg) {
+        Ok(c) => {
+            let g = |i: u32| c.get(i as usize).copied().unwrap_or(0);
+            let nz: u32 = c.iter().copied().sum();
+            println!(
+                "check-vk: V6 counters (last frame, sum {nz}): alpha-cutout rejections {} | \
+                 relief rejections {} | tinted-shadow crossings {} \
+                 — the reference kernel binds no counters (HAVE_COUNTERS is wavefront-only), \
+                 so zeros here are structural",
+                g(gfx::shaders::CTR_ALPHA_REJ),
+                g(gfx::shaders::CTR_HEIGHT_REJ),
+                g(gfx::shaders::CTR_TRANS_PASS),
+            );
+        }
+        Err(e) => fail(&mut ok, format!("counter readback: {e}")),
+    }
+
+    // ---- anti-vacuity: the texture table must MATTER ----
+    //
+    // Everything above passes identically whether the 313 images reached the
+    // shader or were uploaded and never read: a scene's albedo textures move
+    // its converged mean, but so does any other correct-looking shading, and
+    // the CPU side has no say in whether the GPU's `texs[]` was bound. So the
+    // gate re-renders the SAME pose with every entry pointed at the 1x1 white
+    // fallback and requires the two GPU images to DIFFER. GPU-vs-GPU, one
+    // descriptor write apart, so the verdict is attributable — the shape
+    // `--check-gpu`'s N8 uses for the same reason.
+    //
+    // Skipped under `FR_VK_DROP_STREAM=texs` (the arms would be identical
+    // BECAUSE the lever already dropped them, and that run is required to fail
+    // on the radiance bar above) and on a textureless scene, where the fallback
+    // IS what a correct run binds.
+    let tex_lever = std::env::var("FR_VK_DROP_STREAM").ok().as_deref() == Some("texs");
+    if scene.textures.is_empty() {
+        println!(
+            "check-vk: V6 texture anti-vacuity SKIPPED (untextured scene — \
+             the fallback is what a correct run binds)"
+        );
+    } else if tex_lever {
+        println!("check-vk: V6 texture anti-vacuity SKIPPED (FR_VK_DROP_STREAM=texs is armed)");
+    } else {
+        tg.bind_textures(hg, &vt, true);
+        let mut probe_ok = true;
+        for f in 0..frames {
+            if let Err(e) = tg.render(hg, &params(f), f + 1) {
+                fail(&mut ok, format!("texture anti-vacuity frame {f}: {e}"));
+                probe_ok = false;
+                break;
+            }
+        }
+        if probe_ok {
+            let flat = read_f32(&tg.accum, px * 3).unwrap_or_default();
+            let mut s_real = 0.0f64;
+            let mut s_flat = 0.0f64;
+            let mut moved = 0usize;
+            for i in 0..px * 3 {
+                let a = gpu_a.get(i).copied().unwrap_or(0.0);
+                let b = flat.get(i).copied().unwrap_or(0.0);
+                s_real += f64::from(a);
+                s_flat += f64::from(b);
+                if (a - b).abs() > f32::max(a.abs(), b.abs()) * 1e-3 {
+                    moved += 1;
+                }
+            }
+            println!(
+                "check-vk: V6 texture anti-vacuity: {} of {} channel(s) move when \
+                 texs[] is flattened to 1x1 white (mean {:+.2}%)",
+                moved,
+                px * 3,
+                (s_flat - s_real) / s_real.max(1e-9) * 100.0
+            );
+            // THE COUNT IS THE TEST AND THE MEAN IS ONLY REPORTED, because a
+            // SIGNED mean cancels: Sponza moves 29.6% of its channels for a
+            // 0.26% mean, which a mean-based bar would have read as "textures
+            // barely matter" and very nearly failed. Counting channels that
+            // moved answers the question actually being asked — is binding the
+            // table a no-op — and cannot cancel. 0.2% of channels is a tenth of
+            // the loosest real reading here and still catches the failure that
+            // found this: dropping `tri_mat` collapses every triangle onto
+            // material 0, textures stop mattering, and the count falls to 653.
+            if moved * 500 < px * 3 {
+                fail(
+                    &mut ok,
+                    format!(
+                        "flattening texs[] moves only {moved} channel(s) — the table may not be \
+                         reaching the shader (or this pose sees no textured surface)"
+                    ),
+                );
+            }
+        }
+        tg.bind_textures(hg, &vt, false);
+    }
+
+    // WHAT THE TEETH REACH, measured rather than claimed, and the two scenes
+    // do not agree — which is the point of running both. `FR_VK_DROP_STREAM`
+    // binds one named stream to the zero dummy (or, for `texs`, the 1x1 white
+    // fallback); on san-miguel-low-poly:
+    //
+    //   materials  FAIL  84.749%   blas_tri  FAIL  1.080% + 0 moved
+    //   texs       FAIL   6.014%   indices   pass  0.485%
+    //   tri_mat    FAIL   1.614% + 653 moved   positions pass 0.129%
+    //                                          normals   pass 0.022%
+    //
+    // THE ROW THAT JUSTIFIES THE ANTI-VACUITY PROBE IS `blas_tri`, because that
+    // is M3b's own bug: with the remap on the dummy every hit resolves to
+    // triangle 0. On the procedural scene it blows the radiance bar; HERE it
+    // reads 1.080%, i.e. it PASSES the bar the stage was shipped with, and only
+    // the probe (0 channels move when the table is flattened, because one
+    // material means textures cannot matter) catches it. `tri_mat` is the same
+    // shape one step further out. So the probe is not decoration: on a textured
+    // scene it is the strictly stronger of the two.
+    //
+    // `positions` and `normals` still pass, and that remains a fact about the
+    // shading path rather than a weak gate: `surface_point` takes the hit point
+    // from `ro + rd*t`, reads `positions` only for a degenerate-normal fallback
+    // and the texture-LOD term, and falls back to the face normal when the
+    // interpolated one is zero. Textures did narrow it — `positions` moved from
+    // ~0 to 0.129% once the LOD term stopped being dead — just not past the
+    // bar. Do not "fix" that by tightening one; fix it, if it matters, with a
+    // pose that makes those streams determine the answer.
+
+    // ---- V7: the wavefront quadtree, scored against the kernel above ----
+    if !run_check_vk_wavefront(hg, &tg, scene, &params(0), &cpu_t, &edge_mask, gw, gh) {
+        ok = false;
+    }
+
+    // ---- V8: the hemisphere bounce tiers ----
+    if !run_check_vk_hemi(hg, &tg, scene, bvh, basis, q, gw, gh, structural) {
+        ok = false;
+    }
+
+    // ---- V9: structure replay ----
+    if !run_check_vk_replay(hg, &tg, scene, basis, q, gw, gh, structural) {
+        ok = false;
+    }
+
+    tg.destroy(hg);
+    vt.destroy(hg);
+    vs.destroy(hg);
+    ok
+}
+
+/// V7 — the WAVEFRONT QUADTREE, and the first EXACT-ZERO gates on Vulkan.
+///
+/// Everything before this is scored against the CPU, so every bar is
+/// statistical: hardware watertight intersection is not `moller_trumbore` and
+/// the RNG streams differ by design. This stage is scored against the VULKAN
+/// REFERENCE KERNEL, which V6 just proved renders the same picture the CPU
+/// does — and two kernels on one device running the same rays through the same
+/// `shade.hlsli` have no such excuse. So the gates here are the transplanted
+/// `--check-gpu` family, at its own strength:
+///
+/// - **claim-violation** — THE soundness contract, asserted directly. A tile's
+///   inherited `t_start` claims that frustum ∩ ball(origin, t_start) is empty;
+///   this reads the claim out of the leaf queue and checks it against the
+///   EARLIEST `t` either intersector reports, which is the most pessimistic
+///   ground truth available. Exact zero.
+/// - **exactly-once coverage + queue accounting** — the leaf and sky rects
+///   must PARTITION the screen (areas sum to `rw*rh`), no pixel may be left
+///   holding the sentinel, both tile queues must have drained, and
+///   `CTR_OVERFLOW` must be 0 (the queues are sized to the structural worst
+///   case, so an overflow is a sizing bug, never a scene). Exact zero.
+/// - **false-sky / tmin-overshoot / hybrid-extra** — the bug class the whole
+///   quadtree exists inside: a tile that proves empty space it does not own
+///   shows up as a pixel the ladder calls sky and the reference does not.
+/// - **the same-seed image A/B**, and **the counter must-fires M3d could not
+///   make**: `cs_leaf` binds `counters`, so `HAVE_COUNTERS` is finally defined
+///   in a kernel that runs here and `CTR_ALPHA_REJ`/`CTR_TRANS_PASS` become
+///   real assertions on the scenes that arm them.
+///
+/// NOT EXACT ON THIS HARDWARE, and it is worth knowing which way: AMD's RT
+/// hardware RE-ORIGINS the ray at TMin, so one ray at TMin=0 (the reference)
+/// and at TMin=t_start (a leaf primary) can return `t` 1-2 ulp apart and, at a
+/// grazing shared edge, accept different geometry outright. NVIDIA does not,
+/// and reads bit-identical on D3D12. So the image A/B is a bounded HOT COUNT
+/// rather than an absolute limit, and the edge pixels are excluded from the
+/// max — exactly as `--check-gpu` handles the same phenomenon from the other
+/// side. `claim_viol` is what guards the contract at them.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_wavefront(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    p: &gfx::frame::FrameParams,
+    cpu_t: &[f32],
+    edge_mask: &[bool],
+    gw: usize,
+    gh: usize,
+) -> bool {
+    use gfx::shaders as gs;
+
+    let Some((depth_full, cap_leaf, cap_sky)) = tg.wave_shape() else {
+        println!(
+            "check-vk: SKIP V7 (--sw-rays is armed — its leaf kernel wants the BINARY tree at \
+             t0 while the ladder holds the WIDE one there, which is a fourth descriptor-set \
+             variant, not a flag)"
+        );
+        return true;
+    };
+    let px = gw * gh;
+    let mut ok = true;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V7 {msg}");
+        *ok = false;
+    };
+    let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    let read_u32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<u32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+
+    // The REFERENCE arm first, at the same pose and frame index, so `accum`
+    // and `tbuf` hold a clean oracle. (They currently hold the texture
+    // anti-vacuity probe's flat-texture frames, which is why this re-renders
+    // rather than reusing V6's readback.)
+    if let Err(e) = tg.render(hg, p, 1) {
+        fail(&mut ok, format!("reference re-run: {e}"));
+        return false;
+    }
+    let (ref_t, ref_acc) = match (read_f32(&tg.tbuf, px), read_f32(&tg.accum, px * 3)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            fail(&mut ok, "reference readback".into());
+            return false;
+        }
+    };
+
+    if let Err(e) = tg.render_wavefront(hg, p, true) {
+        fail(&mut ok, format!("wavefront dispatch: {e}"));
+        return false;
+    }
+    let (wave_t, wave_info, wave_acc, ctrs) = match (
+        read_f32(&tg.tbuf, px),
+        read_u32(&tg.info, px),
+        read_f32(&tg.accum, px * 3),
+        tg.read_counters(hg),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            fail(&mut ok, "wavefront readback".into());
+            return false;
+        }
+    };
+    let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+    // The RAW counter block. Kept because it is how the b1 write-after-read
+    // hazard was found: the frame line reports the handful of counters the
+    // gates read, and what said "level 0 ran and nothing after it" was seeing
+    // BOTH tile counters sitting at 0 beside a split count of 1.
+    if std::env::var_os("FR_VK_CTRS").is_some() {
+        eprintln!("check-vk: V7 counters (index = CTR_*) {ctrs:?}");
+    }
+    let (n_leaf, n_sky) = (ctr(gs::CTR_LEAF) as usize, ctr(gs::CTR_SKY) as usize);
+    println!(
+        "check-vk: V7 wavefront frame (depth {depth_full}, caps leaf {cap_leaf} sky {cap_sky}): \
+         leaves {n_leaf} | sky-tiles {n_sky} | splits {} | blocked {} | cuts {} (fallback {}) | \
+         overflow {}",
+        ctr(gs::CTR_SPLIT),
+        ctr(gs::CTR_BLOCKED),
+        ctr(gs::CTR_CUT),
+        ctr(gs::CTR_CUT_FALLBACK),
+        ctr(gs::CTR_OVERFLOW),
+    );
+
+    // ---- queue accounting + exactly-once coverage ----
+    let (leaf_recs, sky_recs) = match tg.read_queues(hg, n_leaf, n_sky) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, format!("queue readback: {e}"));
+            return false;
+        }
+    };
+    const LEAF_REC_U32S: usize = (gs::LEAF_REC_BYTES / 4) as usize;
+    let rect_px = |xy0: u32, xy1: u32| -> u64 {
+        let (x0, y0) = (xy0 & 0xffff, xy0 >> 16);
+        let (x1, y1) = (xy1 & 0xffff, xy1 >> 16);
+        u64::from(x1 - x0) * u64::from(y1 - y0)
+    };
+    let mut covered: u64 = 0;
+    let mut malformed = 0usize;
+    // The inherited t_start per pixel, scattered from the leaf queue once (a
+    // per-pixel scan of the rects would be O(px * n_leaf)). NaN = not a leaf
+    // pixel — sky rects carry no claim.
+    let mut t_start_of = vec![f32::NAN; px];
+    for r in 0..n_leaf.min(leaf_recs.len() / LEAF_REC_U32S) {
+        let base = r * LEAF_REC_U32S;
+        let (xy0, xy1) = (leaf_recs[base], leaf_recs[base + 1]);
+        covered += rect_px(xy0, xy1);
+        let ts = f32::from_bits(leaf_recs[base + 2]);
+        let (x0, y0) = ((xy0 & 0xffff) as usize, (xy0 >> 16) as usize);
+        let (x1, y1) = ((xy1 & 0xffff) as usize, (xy1 >> 16) as usize);
+        for y in y0..y1.min(gh) {
+            for x in x0..x1.min(gw) {
+                t_start_of[y * gw + x] = ts;
+            }
+        }
+        // The opaque traversal-frontier handle, audited CPU-side only: the
+        // shader call site never interprets either word, it hands them to the
+        // provider unchanged.
+        let (token, cookie) = (leaf_recs[base + 4], leaf_recs[base + 5]);
+        if cookie != gs::FRONTIER_COOKIE_V1
+            || (token != gs::FRONTIER_ROOT_TOKEN && (token >> 6) >= ctr(gs::CTR_CUT))
+        {
+            malformed += 1;
+        }
+    }
+    for r in 0..n_sky.min(sky_recs.len() / 4) {
+        covered += rect_px(sky_recs[r * 4], sky_recs[r * 4 + 1]);
+    }
+    let sentinels = wave_info.iter().filter(|&&i| i == 0xffff_ffff).count();
+    // The last level consumed one tile queue and must have appended nothing
+    // into the other. WHICH one is a parity question — `cs_prep` zeroes only
+    // the OUT counter, so the last level's IN counter legitimately still holds
+    // the tiles it consumed. `FR_VK_RES=800x600` runs the other parity.
+    let dangling =
+        if depth_full % 2 == 0 { ctr(gs::CTR_TILE_A) } else { ctr(gs::CTR_TILE_B) };
+    if ctr(gs::CTR_OVERFLOW) != 0 {
+        fail(&mut ok, "queue overflow (the queues are sized to the structural worst case)".into());
+    }
+    if dangling != 0 {
+        fail(&mut ok, format!("{dangling} tile records left after the last level"));
+    }
+    if covered != px as u64 {
+        fail(&mut ok, format!("leaf+sky rects cover {covered} px, the screen has {px}"));
+    }
+    if sentinels != 0 {
+        fail(&mut ok, format!("{sentinels} px never written (exactly-once coverage)"));
+    }
+    if malformed != 0 {
+        fail(&mut ok, format!("{malformed} LeafRec frontier handles have an invalid cookie/token"));
+    }
+    // Anti-vacuity: a ladder that emitted no sky tile proved no empty space,
+    // which is the quadtree's entire product.
+    if n_leaf == 0 || n_sky == 0 {
+        fail(
+            &mut ok,
+            format!("the ladder produced {n_leaf} leaf and {n_sky} sky records — nothing is scored"),
+        );
+    }
+
+    // ---- the exact-zero pixel gates ----
+    let mut claim_viol = 0usize;
+    let mut culprits: Vec<String> = Vec::new();
+    for i in 0..px {
+        let ts = t_start_of[i];
+        if !ts.is_finite() {
+            continue;
+        }
+        let truth = match (cpu_t[i].is_finite(), ref_t[i].is_finite()) {
+            (true, true) => cpu_t[i].min(ref_t[i]),
+            (true, false) => cpu_t[i],
+            (false, true) => ref_t[i],
+            (false, false) => continue, // both say sky: no geometry to overshoot
+        };
+        if ts > truth * (1.0 + 1e-4) {
+            claim_viol += 1;
+            if culprits.len() < 8 {
+                culprits.push(format!(
+                    "CLAIM VIOLATION px ({},{}): t_start {ts:.6} > nearest hit {truth:.6} \
+                     (cpu {:.6} | gpu-ref {:.6})",
+                    i % gw,
+                    i / gw,
+                    cpu_t[i],
+                    ref_t[i]
+                ));
+            }
+        }
+    }
+    let (mut false_sky, mut overshoot, mut extra, mut edge_skipped) = (0usize, 0usize, 0usize, 0usize);
+    let mut max_rel_t = 0.0f32;
+    for i in 0..px {
+        let (rt, wt) = (ref_t[i], wave_t[i]);
+        let disagree = match (rt.is_finite(), wt.is_finite()) {
+            (true, true) => rt != wt,
+            (false, false) => false,
+            _ => true,
+        };
+        if edge_mask[i] && disagree {
+            edge_skipped += 1;
+            continue;
+        }
+        match (rt.is_finite(), wt.is_finite()) {
+            (true, true) => {
+                let rel = (wt - rt) / rt.max(1e-6);
+                max_rel_t = max_rel_t.max(rel.abs());
+                if rel > 1e-4 {
+                    overshoot += 1;
+                    if culprits.len() < 8 {
+                        culprits.push(format!(
+                            "overshoot px ({},{}): ref t {rt:.6} -> wave t {wt:.6} \
+                             (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            i % gw,
+                            i / gw,
+                            t_start_of[i]
+                        ));
+                    }
+                }
+            }
+            (true, false) => {
+                false_sky += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!(
+                        "false-sky px ({},{}): ref t {rt:.6}, wave = sky",
+                        i % gw,
+                        i / gw
+                    ));
+                }
+            }
+            (false, true) => {
+                extra += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!(
+                        "hybrid-extra px ({},{}): ref = sky, wave t {wt:.6}",
+                        i % gw,
+                        i / gw
+                    ));
+                }
+            }
+            (false, false) => {}
+        }
+    }
+    // Same-seed same-shading image A/B: identical hits => identical RNG
+    // streams => near-identical color, cross-kernel fp aside.
+    let (mut img_sum, mut img_max, mut img_hot, mut nonfinite) = (0.0f64, 0.0f32, 0usize, 0usize);
+    for i in 0..px * 3 {
+        if !wave_acc[i].is_finite() {
+            nonfinite += 1;
+            continue;
+        }
+        let d = (wave_acc[i] - ref_acc[i]).abs();
+        img_sum += f64::from(d);
+        if !edge_mask[i / 3] {
+            img_max = img_max.max(d);
+            if d > 1e-2 {
+                img_hot += 1;
+            }
+        }
+    }
+    let img_mean = img_sum / (px * 3) as f64;
+    println!(
+        "check-vk: V7 wavefront vs reference ({px} px): claim-violation {claim_viol} | \
+         false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | \
+         hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | \
+         same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
+    );
+    for c in &culprits {
+        eprintln!("check-vk:   {c}");
+    }
+    if claim_viol != 0 {
+        fail(&mut ok, "inherited-tmin claim violated (t_start past real geometry — THE bug class)".into());
+    }
+    if false_sky != 0 || overshoot != 0 || extra != 0 {
+        fail(&mut ok, "wavefront visibility gates (the inherited-tmin bug class)".into());
+    }
+    if nonfinite != 0 {
+        fail(&mut ok, format!("{nonfinite} non-finite channel(s) in the wavefront image"));
+    }
+    // The hardware-edge pixels ride the SAME 0.05% allowance the CPU-vs-GPU
+    // comparison uses — they are one phenomenon seen from two sides. A flood
+    // is a real signal (a broken cut surfaces as mass disagreement); one or
+    // two is grazing-edge fp.
+    if edge_skipped as f64 > px as f64 * 5e-4 {
+        fail(
+            &mut ok,
+            format!("{edge_skipped} wavefront/reference disagreements above the 0.05% edge allowance"),
+        );
+    }
+    if img_mean > 1e-5 {
+        fail(&mut ok, format!("same-seed image mean |d| {img_mean:.2e} > 1e-5"));
+    }
+    if img_hot as f64 > px as f64 * 3.0 * 5e-4 {
+        fail(&mut ok, format!("{img_hot} channels past 1e-2 — above the two-intersector allowance"));
+    }
+
+    // ---- the per-scene must-fires M3d could only report ----
+    //
+    // `cs_leaf` pastes `ctr.hlsli`, so `HAVE_COUNTERS` is defined and
+    // `rt.hlsli`'s cutout/relief/tint tallies finally have somewhere to land.
+    // Both directions matter: a masked scene that rejects nothing has dead
+    // cutout code, and an opaque scene that rejects anything means
+    // `ALPHA_CUTOUT` did not compile out. Same `--cam` caveat as `--check-gpu`:
+    // a pose containing no masked geometry would trip the must-fire.
+    let arm = |ok: &mut bool, name: &str, armed: bool, n: u32| {
+        if armed {
+            println!("check-vk: V7 {name}: {n}");
+            if n == 0 {
+                eprintln!("check-vk: FAIL V7 {name} is 0 on a scene that arms it (the path must fire)");
+                *ok = false;
+            }
+        } else if n != 0 {
+            eprintln!("check-vk: FAIL V7 {n} {name} on a scene that does not arm it (it must compile out)");
+            *ok = false;
+        }
+    };
+    arm(&mut ok, "alpha-cutout rejections", scene.any_alpha, ctr(gs::CTR_ALPHA_REJ));
+    arm(&mut ok, "tinted-shadow crossings", scene.any_transmissive, ctr(gs::CTR_TRANS_PASS));
+    arm(
+        &mut ok,
+        "relief-march rejections",
+        scene.any_height && bvh::height_on(),
+        ctr(gs::CTR_HEIGHT_REJ),
+    );
+    arm(&mut ok, "rtgi bounce rays", shade::rtgi_enabled(), ctr(gs::CTR_RTGI_RAYS));
+    ok
+}
+
+/// V8 — the HEMISPHERE BOUNCE TIERS (the H key's AO and GI), the last
+/// render-path arm the Vulkan tracer did not have.
+///
+/// Two halves, and they answer different questions. The PROBE half runs only
+/// the hemisphere passes over a CPU-generated point set, so both sides
+/// integrate at the exact same `(o, n)`:
+///
+/// - **psa-viol** — every point's projected solid angle must account to
+///   exactly pi. That is the integrator's own partition-of-unity: empty cells
+///   contribute analytically and leaf cells by sampling, and if the two
+///   together do not tile the hemisphere the estimate is wrong by whatever is
+///   missing, silently and in a way no image comparison localizes. Exact zero
+///   against a 1e-3 bound, and it rides `FLAG_VERIFY` in `H.w`.
+/// - **false-empty** — an empty-cell claim re-validated with six real
+///   RayQuery rays through the claimed-empty region. This is the hemisphere's
+///   spelling of the false-sky bug: a cell that proves emptiness it does not
+///   own drops occlusion on the floor. Exact zero.
+/// - **tmin-overshoot** — a leaf ray inherits `tc` from its own apex's tmin
+///   chain (NEVER the primary tile's), and a tmin=0 reference ray must not hit
+///   strictly inside the claimed ball. Exact zero.
+/// - the A/Bs, which are statistical BY CONSTRUCTION and stay at the CPU
+///   suite's own tolerances: AO against a 4096-sample cosine reference gates
+///   the SIGNED mean too, because that estimator is unbiased and a bias is the
+///   failure a mean-absolute bar cannot see; GI runs the same depth-1
+///   `BOUNCE_Q` policy on both sides so the comparison isolates integrator
+///   error from policy.
+///
+/// The FRAME half then runs one real wavefront frame with GI on, which is the
+/// only thing that exercises the pieces the probe path bypasses: `cs_leaf`'s fb
+/// arm appending one shading point per hit pixel (gated exactly, `pts == hits`
+/// — an accounting identity, not a tolerance), the batch loop draining them,
+/// and `cs_compose` turning `partial + ambw * ambient(H)` into finite radiance.
+///
+/// NOT covered here, and it is a real gap rather than an oversight: the CPU
+/// suite's `cut-miss` counter, which re-traverses from the root to prove a
+/// cut-seeded query saw everything the full tree would. That instrument lives
+/// in `hemi::VerifyCounters` and has no GPU counterpart on either backend.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_hemi(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    basis: camera::CamBasis,
+    q: Quality,
+    gw: usize,
+    gh: usize,
+    structural: bool,
+) -> bool {
+    use gfx::shaders as gs;
+
+    if !tg.has_hemi() {
+        println!(
+            "check-vk: SKIP V8 (the hemisphere tiers ride the ladder, which --sw-rays takes \
+             with it)"
+        );
+        return true;
+    }
+    let mut ok = true;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V8 {msg}");
+        *ok = false;
+    };
+
+    // The probe set: center rays through a coprime stride, `surface_point`ed
+    // so the apex and normal are EXACTLY what the CPU reference will use.
+    // Same construction as `--check-gpu`'s, which is what makes the two
+    // suites' numbers comparable rather than merely similar.
+    let mut probes: Vec<Vec3A> = Vec::new();
+    let mut normals: Vec<Vec3A> = Vec::new();
+    {
+        let mut vls = stats::LocalStats::default();
+        let mut y = 7usize;
+        while y < gh && probes.len() < 512 {
+            let mut x = 11usize;
+            while x < gw && probes.len() < 512 {
+                let ray = bvh::Ray::new(basis.origin, basis.ray_dir(x as f32 + 0.5, y as f32 + 0.5));
+                if let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
+                    let (o, n) = shade::surface_point(scene, &ray, &h);
+                    probes.push(o);
+                    normals.push(n);
+                }
+                x += 53;
+            }
+            y += 41;
+        }
+    }
+    let pts: Vec<(Vec3A, Vec3A)> =
+        probes.iter().copied().zip(normals.iter().copied()).collect();
+    if pts.is_empty() {
+        println!("check-vk: SKIP V8 (this pose has no geometry to place probes on)");
+        return true;
+    }
+    println!("check-vk: V8 hemi probe set: {} points", pts.len());
+
+    for (mode_name, fb) in [
+        ("AO", shade::FrustumBounce { ao: true, gi: false, depth: 3 }),
+        ("GI", shade::FrustumBounce { ao: false, gi: true, depth: 3 }),
+    ] {
+        // Multi-seed: the CB `frame` seeds the Arvo draws, so each pass is an
+        // independent estimate accumulating into the SAME H. The verify
+        // counters are kept across them (see `cs_seed_probes`), so the
+        // exact-zero gates below observe every seed's rays; PSA therefore
+        // totals SEEDS * pi rather than pi.
+        const SEEDS: u32 = 8;
+        let hq = Quality { fb, ..q };
+        let mut dispatch_ok = true;
+        for s in 0..SEEDS {
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: s,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q: hq,
+                verify: true,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            if let Err(e) = tg.run_hemi_probes(hg, &p, &pts, s == 0) {
+                fail(&mut ok, format!("hemi {mode_name} probes: {e}"));
+                dispatch_ok = false;
+                break;
+            }
+        }
+        if !dispatch_ok {
+            continue;
+        }
+        let (h, ctrs) = match (tg.read_hbuf(hg, pts.len()), tg.read_counters(hg)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                fail(&mut ok, format!("hemi {mode_name} readback"));
+                continue;
+            }
+        };
+        let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+
+        const FIXED: f64 = 262144.0;
+        let seeds_f = f64::from(SEEDS);
+        let mut psa_viol = 0usize;
+        let mut max_psa_err = 0.0f64;
+        for i in 0..pts.len() {
+            let acc = f64::from(h[i * 4 + 3]) / FIXED / seeds_f;
+            let err = (acc - std::f64::consts::PI).abs();
+            max_psa_err = max_psa_err.max(err);
+            if err > 1e-3 {
+                psa_viol += 1;
+            }
+        }
+        let (fe, tm) = (ctr(gs::CTR_V_FALSE_EMPTY), ctr(gs::CTR_V_TMIN));
+        println!(
+            "check-vk: V8 hemi {mode_name} gates ({} probes x {SEEDS} seeds): psa-viol \
+             {psa_viol} (max err {max_psa_err:.2e}) | false-empty {fe} | tmin-overshoot {tm} | \
+             empty-cells {} | leaf-rays {} | overflow {}",
+            pts.len(),
+            ctr(gs::CTR_HEMI_EMPTY),
+            ctr(gs::CTR_HEMI_RAYS),
+            ctr(gs::CTR_OVERFLOW),
+        );
+        if psa_viol != 0 || fe != 0 || tm != 0 {
+            fail(&mut ok, format!("hemi {mode_name} exact-zero gates"));
+        }
+        if ctr(gs::CTR_OVERFLOW) != 0 {
+            fail(&mut ok, format!("hemi {mode_name} queue overflow (a sizing bug, never a scene)"));
+        }
+        // ANTI-VACUITY, and it is doing real work: every gate above is
+        // satisfied by a run that integrated NOTHING. Leaf rays are the
+        // universal half — the sampled tier fires on any scene, and it is what
+        // a mis-parity'd batch loses (the root writing a queue nothing reads
+        // reads exactly as `leaf-rays 0`).
+        if ctr(gs::CTR_HEMI_RAYS) == 0 {
+            fail(&mut ok, format!("hemi {mode_name} leaf rays 0 — the sampled tier never fired"));
+        }
+        // The ANALYTIC half is scene-dependent and follows the suite's own
+        // structural convention, because a real scene can legitimately have no
+        // cell it can prove empty. MEASURED, and it is not hypothetical:
+        // DamagedHelmet at its default pose reads `empty-cells 0` here, and
+        // `--check`'s CPU estimator reads `0.0 cells empty, 64.0 rays` per
+        // point at the same pose — while this run's 80384 rays over 8 seeds
+        // and 157 probes is 64.0 per probe EXACTLY. That per-point agreement
+        // with the CPU is a stronger statement than the must-fire would have
+        // been, and it is why the gate is skipped rather than relaxed.
+        if structural && ctr(gs::CTR_HEMI_EMPTY) == 0 {
+            fail(
+                &mut ok,
+                format!("hemi {mode_name} empty cells 0 — the analytic tier never fired"),
+            );
+        }
+
+        // ---- the A/B against a CPU reference at the same points ----
+        const REF_N: u32 = 4096;
+        let mut rng = fastrand::Rng::with_seed(0x1234_5678);
+        let mut vls = stats::LocalStats::default();
+        let sun = render::sun_dir(scene);
+        if mode_name == "AO" {
+            let (mut sum_abs, mut sum_signed) = (0.0f64, 0.0f64);
+            for (i, &(o, n)) in pts.iter().enumerate() {
+                let gpu_ao = f64::from(h[i * 4]) / FIXED / seeds_f / std::f64::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut open = 0.0f64;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    // `transmittance`, in lockstep with the estimator: tinted
+                    // shadows fold glass to its gray tint, and an opaque scene
+                    // keeps the old 0/1 counts exactly.
+                    let tp = bvh.transmittance(
+                        scene,
+                        &bvh::Ray::new(o, d),
+                        0.0,
+                        scene.ao_radius,
+                        &mut vls.ray_nodes,
+                    );
+                    open += f64::from((tp.x + tp.y + tp.z) / 3.0);
+                }
+                let cpu_ao = open / f64::from(REF_N);
+                sum_abs += (gpu_ao - cpu_ao).abs();
+                sum_signed += gpu_ao - cpu_ao;
+            }
+            let mean_abs = sum_abs / pts.len() as f64;
+            let mean_signed = sum_signed / pts.len() as f64;
+            println!(
+                "check-vk: V8 hemi AO A/B vs {REF_N}-sample cosine reference: mean |d| \
+                 {mean_abs:.4} (limit 0.02) | signed mean {mean_signed:+.4} (limit +/-0.005)"
+            );
+            if mean_abs >= 0.02 || mean_signed.abs() >= 0.005 {
+                fail(&mut ok, "hemi AO A/B (bias or error above the CPU-suite tolerances)".into());
+            }
+        } else {
+            let mut sum_rel = 0.0f64;
+            for (i, &(o, n)) in pts.iter().enumerate() {
+                let gpu_gi = Vec3A::new(
+                    h[i * 4] as f32 / FIXED as f32,
+                    h[i * 4 + 1] as f32 / FIXED as f32,
+                    h[i * 4 + 2] as f32 / FIXED as f32,
+                ) / SEEDS as f32
+                    / std::f32::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut sum = Vec3A::ZERO;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    let ray = bvh::Ray::new(o, d);
+                    sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes)
+                    {
+                        // GATHER, not radiance: this reference must integrate
+                        // the same sky `hemi.rs` does, or the A/B is comparing
+                        // two different functions. Same sky_scale and night
+                        // sources as the hemi leaf miss (night carries the star
+                        // field's smooth mean).
+                        None => sky::gather(d, sun, scene.sky_scale, scene.night),
+                        Some(hh) => shade::shade(
+                            scene,
+                            bvh,
+                            &ray,
+                            &hh,
+                            None,
+                            &hemi::BOUNCE_Q,
+                            &mut rng,
+                            sun,
+                            &clouds::Clouds::check(scene.diag),
+                            // The same bounce cone `hemi.rs`'s leaf shades use —
+                            // both arms have to sample textures alike.
+                            shade::Cone::bounce(),
+                            1,
+                            &mut vls,
+                            None,
+                            shade::VisCtl::Off,
+                            None,
+                            // Fireflies and emissive NEE both excluded, like the
+                            // hemi leaf shades this gates: the gather IS the
+                            // emissive transport.
+                            None,
+                            None,
+                        ),
+                    };
+                }
+                let cpu_gi = sum / REF_N as f32;
+                sum_rel += f64::from((gpu_gi - cpu_gi).length()) / f64::from(cpu_gi.length().max(1e-6));
+            }
+            let mean_rel = sum_rel / pts.len() as f64;
+            println!(
+                "check-vk: V8 hemi GI A/B vs {REF_N}-sample BOUNCE_Q reference: mean rel {:.2}% \
+                 (limit 5%)",
+                mean_rel * 100.0
+            );
+            if mean_rel >= 0.05 {
+                fail(&mut ok, "hemi GI A/B (above the CPU-suite 5% tolerance)".into());
+            }
+        }
+    }
+
+    // ---- the frame half: one real GI frame through the whole pipeline ----
+    //
+    // This is what the probe path cannot reach. `cs_leaf`'s fb arm appends the
+    // shading points, the batch loop drains them, and compose folds H into
+    // accum — and the point count against the hit count is an exact ACCOUNTING
+    // identity, so it catches an append that silently drops or doubles.
+    {
+        let p = gfx::frame::FrameParams {
+            cam: basis,
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            prev_cam: None,
+            q: Quality { fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 }, ..q },
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        let px = gw * gh;
+        if let Err(e) = tg.render_wavefront(hg, &p, false) {
+            fail(&mut ok, format!("hemi frame dispatch: {e}"));
+            return ok;
+        }
+        let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+            let v = hg.read_buffer(b, n * 4)?;
+            Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        };
+        let (acc, t_w, ctrs) =
+            match (read_f32(&tg.accum, px * 3), read_f32(&tg.tbuf, px), tg.read_counters(hg)) {
+                (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                _ => {
+                    fail(&mut ok, "hemi frame readback".into());
+                    return ok;
+                }
+            };
+        let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+        let hits = t_w.iter().filter(|t| t.is_finite()).count();
+        let n_pts = ctr(gs::CTR_HEMI_PT) as usize;
+        let nonfinite = acc.iter().filter(|v| !v.is_finite()).count();
+        println!(
+            "check-vk: V8 hemi GI frame: hit-px {hits} | hemi-points {n_pts} | hemi-rays {} | \
+             empty-cells {} | overflow {} | non-finite {nonfinite}",
+            ctr(gs::CTR_HEMI_RAYS),
+            ctr(gs::CTR_HEMI_EMPTY),
+            ctr(gs::CTR_OVERFLOW),
+        );
+        if n_pts != hits {
+            fail(
+                &mut ok,
+                format!("hemi point count {n_pts} != hit pixels {hits} (the leaf-pass append)"),
+            );
+        }
+        if ctr(gs::CTR_OVERFLOW) != 0 || nonfinite != 0 {
+            fail(&mut ok, "hemi frame overflow / non-finite radiance".into());
+        }
+        if hits == 0 || ctr(gs::CTR_HEMI_RAYS) == 0 {
+            fail(&mut ok, "hemi frame must-fires (hit pixels and leaf rays both expected > 0)".into());
+        }
+    }
+    ok
+}
+
+/// V9 — STRUCTURE REPLAY: a bit-equal-basis frame skips the seed and the whole
+/// level ladder and re-dispatches the persisted terminal queues.
+///
+/// The claim is unusually strong for a performance feature, and that is what
+/// makes it gateable at all: the terminal structure is a pure function of
+/// (scene, BVH, basis, rw, rh), while spp/jitter/frame/fb/quality/clouds ride
+/// the cbuffer — so a replay is not an approximation of a fresh trace, it is
+/// BIT-IDENTICAL to one. Every other Vulkan stage is scored against something
+/// (the CPU, the reference kernel, a cosine reference); this one is scored
+/// against itself, exactly.
+///
+/// Four gates, and the last two are what stop the first two passing vacuously:
+///
+/// - **bit-identity** — tbuf, info and accum, byte for byte, against the frame
+///   that produced the structure.
+/// - **exactly-once coverage** — with the sentinel re-flooded, so a replay that
+///   silently covered fewer pixels cannot hide behind the previous frame's
+///   identical `info`. That flood is the reason the sentinel is re-armed here
+///   rather than reusing V7's.
+/// - **the ladder provably did not run** — `CTR_SPLIT`/`CTR_TILE_A`/
+///   `CTR_TILE_B` all 0. Without this, "replay" that quietly re-traced the
+///   whole quadtree would pass bit-identity PERFECTLY, which is the exact
+///   shape of a feature that is wired up and doing nothing.
+/// - **the terminal counts survived** — `CTR_LEAF`/`CTR_SKY`/`CTR_CUT` equal
+///   across the pair, which is the keep-set `cs_seed_replay` exists to
+///   preserve, and the producing frame must have SPLIT at all.
+///
+/// BOTH TEETH ARE EXERCISED, and each catches what the others cannot. A full
+/// trace in the replay slot passes bit-identity, coverage AND the counts —
+/// only the ladder check fires (measured `split 257 tiles 192/0`). Dropping
+/// the keep-set fails four gates, and the interesting half is which two it
+/// does NOT: `tbuf-diff` and `accum-diff` stay 0, because a replay that
+/// dispatched no terminal work leaves those buffers STALE-CORRECT from the
+/// producing frame. That is the M3d lesson in another currency — an operation
+/// that never happened compares clean — and it is the whole reason the
+/// sentinel is re-flooded here (`replay sentinels 480000` is what caught it).
+///
+/// Then the WARM arm, because frame 0 is the easy case: a replay at a jittered
+/// frame 1 must equal a fresh trace at that frame, via the re-produce sequence
+/// (trace f0, trace f1) vs (trace f0, replay f1). That is what proves the
+/// structure is independent of the SHADING state and not merely stable across
+/// two identical frames.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_replay(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: camera::CamBasis,
+    q: Quality,
+    gw: usize,
+    gh: usize,
+    structural: bool,
+) -> bool {
+    use gfx::shaders as gs;
+
+    if tg.wave_shape().is_none() {
+        println!("check-vk: SKIP V9 (structure replay is the ladder's, and --sw-rays takes it)");
+        return true;
+    }
+    let mut ok = true;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-vk: FAIL V9 {msg}");
+        *ok = false;
+    };
+    let px = gw * gh;
+    let mk = |frame: u32| gfx::frame::FrameParams {
+        cam: basis,
+        frame,
+        accumulate: true,
+        jitter: frame > 0,
+        frame_jitter: None,
+        prev_cam: None,
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+    let read_f32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<f32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    let read_u32 = |b: &vk::device::Buffer, n: usize| -> Result<Vec<u32>, String> {
+        let v = hg.read_buffer(b, n * 4)?;
+        Ok(v.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    // BIT compare, not approximate: `==` on f32 would call two NaNs unequal and
+    // +0.0 equal to -0.0, and this gate means neither.
+    let bits = |a: &[f32], b: &[f32]| {
+        a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    };
+
+    // The producing frame. Sentinel on, so `info` is a clean coverage record.
+    let p0 = mk(0);
+    if let Err(e) = tg.render_wavefront(hg, &p0, true) {
+        fail(&mut ok, format!("produce dispatch: {e}"));
+        return false;
+    }
+    let (prod_t, prod_info, prod_acc, prod_ctr) = match (
+        read_f32(&tg.tbuf, px),
+        read_u32(&tg.info, px),
+        read_f32(&tg.accum, px * 3),
+        tg.read_counters(hg),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            fail(&mut ok, "produce readback".into());
+            return false;
+        }
+    };
+    // Replay the SAME basis, sentinel on again.
+    if let Err(e) = tg.render_wavefront_replay(hg, &p0, true) {
+        fail(&mut ok, format!("replay dispatch: {e}"));
+        return false;
+    }
+    let (rep_t, rep_info, rep_acc, rep_ctr) = match (
+        read_f32(&tg.tbuf, px),
+        read_u32(&tg.info, px),
+        read_f32(&tg.accum, px * 3),
+        tg.read_counters(hg),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            fail(&mut ok, "replay readback".into());
+            return false;
+        }
+    };
+
+    let td = bits(&prod_t, &rep_t);
+    let idiff = prod_info.iter().zip(&rep_info).filter(|(a, b)| a != b).count();
+    let ad = bits(&prod_acc, &rep_acc);
+    let sentinels = rep_info.iter().filter(|&&i| i == 0xffff_ffff).count();
+    let c = |v: &[u32], i: u32| v.get(i as usize).copied().unwrap_or(0);
+    let (leaf_p, leaf_r) = (c(&prod_ctr, gs::CTR_LEAF), c(&rep_ctr, gs::CTR_LEAF));
+    let (sky_p, sky_r) = (c(&prod_ctr, gs::CTR_SKY), c(&rep_ctr, gs::CTR_SKY));
+    let (cut_p, cut_r) = (c(&prod_ctr, gs::CTR_CUT), c(&rep_ctr, gs::CTR_CUT));
+    let split_p = c(&prod_ctr, gs::CTR_SPLIT);
+    let (split_r, ta_r, tb_r) = (
+        c(&rep_ctr, gs::CTR_SPLIT),
+        c(&rep_ctr, gs::CTR_TILE_A),
+        c(&rep_ctr, gs::CTR_TILE_B),
+    );
+    println!(
+        "check-vk: V9 structure replay (frame 0): tbuf-diff {td} | info-diff {idiff} | \
+         accum-diff {ad} | replay sentinels {sentinels} | leaf {leaf_p}/{leaf_r} \
+         sky {sky_p}/{sky_r} cut {cut_p}/{cut_r} | split produce {split_p} replay {split_r} \
+         tiles {ta_r}/{tb_r}"
+    );
+    if td != 0 || idiff != 0 || ad != 0 {
+        fail(
+            &mut ok,
+            format!("replay not bit-identical to the fresh trace (tbuf {td} info {idiff} accum {ad})"),
+        );
+    }
+    if sentinels != 0 {
+        fail(&mut ok, format!("replay left {sentinels} px unwritten (exactly-once coverage)"));
+    }
+    if leaf_p != leaf_r || sky_p != sky_r || cut_p != cut_r {
+        fail(&mut ok, "replay did not preserve the terminal counts (the keep-set)".into());
+    }
+    if split_r != 0 || ta_r != 0 || tb_r != 0 {
+        fail(
+            &mut ok,
+            format!("replay RAN the ladder (split {split_r} tiles {ta_r}/{tb_r} — expected 0)"),
+        );
+    }
+    if structural && split_p == 0 {
+        fail(&mut ok, "the producing frame never split — the replay proof is vacuous".into());
+    }
+
+    // ---- the warm arm: a jittered frame 1 ----
+    //
+    // (trace f0, trace f1) vs (trace f0, replay f1). Per-pixel results are
+    // queue-order-independent, so the two accumulations must agree BITWISE
+    // even though frame 1 shades at a different jitter than frame 0.
+    let p1 = mk(1);
+    let warm = (|| -> Result<(Vec<f32>, Vec<f32>), String> {
+        tg.render_wavefront(hg, &p0, false)?;
+        tg.render_wavefront(hg, &p1, false)?;
+        let traced = read_f32(&tg.accum, px * 3)?;
+        tg.render_wavefront(hg, &p0, false)?; // re-produce the same structure
+        tg.render_wavefront_replay(hg, &p1, false)?;
+        let replayed = read_f32(&tg.accum, px * 3)?;
+        Ok((traced, replayed))
+    })();
+    match warm {
+        Ok((a, b)) => {
+            let wd = bits(&a, &b);
+            println!("check-vk: V9 structure replay (warm frame 1): accum-diff {wd}");
+            if wd != 0 {
+                fail(&mut ok, format!("warm replay diverged from the fresh trace ({wd} channels)"));
+            }
+        }
+        Err(e) => fail(&mut ok, format!("warm arm: {e}")),
+    }
+
+    // ---- the fb arm: a GI frame replays too ----
+    //
+    // The replay path has its own fb branch (zero the H accumulator, then the
+    // hemisphere wavefront and its compose splat), and without this arm nothing
+    // would run it. It is also the gate that WOULD have caught the missing
+    // per-frame `clear_h` this stage fixed: `hbuf` is written by atomic ADD, so
+    // an unzeroed pair integrates the produce frame's answer twice and the
+    // second accum cannot match the first.
+    if tg.has_hemi() {
+        let pf = gfx::frame::FrameParams {
+            q: Quality { fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 }, ..q },
+            ..mk(0)
+        };
+        let fbarm = (|| -> Result<(Vec<f32>, Vec<f32>, usize, [u32; 4], [u32; 4]), String> {
+            let work = |c: &[u32]| {
+                let g = |i: u32| c.get(i as usize).copied().unwrap_or(0);
+                [g(gs::CTR_HEMI_PT), g(gs::CTR_HEMI_RAYS), g(gs::CTR_HEMI_EMPTY), g(gs::CTR_OVERFLOW)]
+            };
+            tg.render_wavefront(hg, &pf, false)?;
+            let traced = read_f32(&tg.accum, px * 3)?;
+            let w1 = work(&tg.read_counters(hg)?);
+            // THE CONTROL, and it has to come first: two FRESH fb traces at the
+            // same pose. The hemisphere integrator's reproducibility claim
+            // rests on integer atomics in `hbuf`, and if it does not hold
+            // trace-to-trace then a trace-vs-replay difference says nothing
+            // about replay.
+            tg.render_wavefront(hg, &pf, false)?;
+            let control = bits(&traced, &read_f32(&tg.accum, px * 3)?);
+            let w2 = work(&tg.read_counters(hg)?);
+            tg.render_wavefront_replay(hg, &pf, false)?;
+            let replayed = read_f32(&tg.accum, px * 3)?;
+            Ok((traced, replayed, control, w1, w2))
+        })();
+        match fbarm {
+            Ok((a, b, control, w1, w2)) => {
+                let fd = bits(&a, &b);
+                let live = a.iter().filter(|v| **v != 0.0).count();
+                println!(
+                    "check-vk: V9 structure replay (fb GI frame): accum-diff {fd} | \
+                     trace-vs-trace control {control} | lit ch {live}"
+                );
+                // THE CONTROL CHOOSES THE TIER; IT MUST NOT SET THE BAR. That
+                // distinction is the whole design here, and it is measured
+                // rather than reasoned: a scene whose two fresh traces agree
+                // bitwise has a reproducible integrator, so the replay must
+                // agree bitwise too — no tolerance at all — while a scene whose
+                // own frames disagree cannot demand better of the replay. On
+                // this hardware an ALPHA-CUTOUT candidate loop enumerates
+                // candidates in an implementation-defined order that varies
+                // between two IDENTICAL dispatches (san-miguel-low-poly:
+                // control ~190 channels of 1.44M, and `FR_ABL=noalpha` returns
+                // BOTH numbers to exactly 0, which is what attributes it;
+                // rungholt has cutout too and still reads 0, so it is that
+                // scene's foliage inside the GI hemisphere, not cutout as such).
+                //
+                // The relaxed tier's bar is an ABSOLUTE fraction of channels,
+                // NOT "no worse than the control" — because a real defect
+                // inflates both. Measured with the per-frame H clear removed:
+                // fd 1014795 against a control of 1014789, i.e. a
+                // relative-to-control bar would have passed the exact bug this
+                // arm exists to catch, while the absolute bar fails it 705x
+                // over.
+                if control == 0 {
+                    if fd != 0 {
+                        fail(
+                            &mut ok,
+                            format!("fb replay diverged from a REPRODUCIBLE fresh trace ({fd} channels)"),
+                        );
+                    }
+                } else {
+                    let bar = ((px * 3) as f64 * 1e-3) as usize;
+                    if fd > bar {
+                        fail(
+                            &mut ok,
+                            format!(
+                                "fb replay diverged by {fd} channels — past the {bar} bar, and \
+                                 far past this frame's own {control}-channel nondeterminism"
+                            ),
+                        );
+                    }
+                }
+                // What LICENSES that relaxation: the two fresh traces must have
+                // done the same WORK. Identical point/ray/empty-cell counts say
+                // the difference is fp ordering inside the same traversal, not
+                // a different traversal — and a structural divergence here
+                // would be a defect in its own right, whatever the pixels say.
+                if w1 != w2 {
+                    fail(
+                        &mut ok,
+                        format!("two fresh fb traces did different WORK: {w1:?} vs {w2:?}"),
+                    );
+                }
+                if live == 0 {
+                    fail(&mut ok, "fb replay arm rendered nothing (the comparison is vacuous)".into());
+                }
+            }
+            Err(e) => fail(&mut ok, format!("fb arm: {e}")),
+        }
+    }
+    ok
 }
 
 fn run_check_nrd(opts: &Opts) -> i32 {

@@ -45,5 +45,6 @@
 
 pub mod frame;
 pub mod guides;
+pub mod scene;
 pub mod shaders;
 pub mod vocab;

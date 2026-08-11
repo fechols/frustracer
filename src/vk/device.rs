@@ -197,13 +197,50 @@ pub struct DeviceInfo {
     /// picks inside per shader and the caps never predict; Vulkan can PIN it
     /// (`VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`), which is the
     /// M2c decision.
+    ///
+    /// `subgroup_size` is `VkPhysicalDeviceSubgroupProperties::subgroupSize` —
+    /// the width an UNPINNED pipeline gets — and is deliberately a separate
+    /// query from the control range, because the two answer different
+    /// questions and coincide only by accident (they do on RADV, which is
+    /// exactly why filling this from `max_subgroup_size` printed a plausible
+    /// number here for a while).
     pub subgroup_size: u32,
     pub subgroup_min: u32,
     pub subgroup_max: u32,
     pub subgroup_size_control: bool,
+    /// `requiredSubgroupSizeStages` includes COMPUTE — i.e. a compute pipeline
+    /// on this device may pin its width. Probed rather than inferred from the
+    /// feature bit: that bit says the device implements size control, this
+    /// says it implements it for the one stage this renderer has.
+    pub subgroup_pin_compute: bool,
+    /// `maxComputeWorkgroupSubgroups` — the pin's own ceiling, since a group of
+    /// `g` threads pinned to width `w` needs `ceil(g / w)` subgroups.
+    pub max_workgroup_subgroups: u32,
     pub ray_query: bool,
     pub accel_struct: bool,
     pub rt_pipeline: bool,
+    /// The descriptor-indexing half the corpus needs, and needs UNCONDITIONALLY
+    /// — these are not features a session opts into. `texs[]` (`t10, space1`)
+    /// is an unbounded `Texture2D` array, which is `OpTypeRuntimeArray` on a
+    /// descriptor; every sample through it goes through
+    /// `NonUniformResourceIndex`, which becomes a `NonUniform` decoration; and
+    /// one pipeline layout serving every kernel means most sets are bound with
+    /// slots the dispatched kernel never touches. Probed as three separate
+    /// bits rather than one because a device missing one of them should say
+    /// which.
+    pub runtime_descriptor_array: bool,
+    pub nonuniform_sampled_image: bool,
+    pub partially_bound: bool,
+    /// `maxPerStageDescriptorSampledImages` — the ceiling on the texture
+    /// table's layout entry, since SPIR-V gives an unbounded array no length
+    /// and Vulkan demands one.
+    pub max_sampled_images: u32,
+    /// `samplerAnisotropy` and `maxSamplerAnisotropy`. ENABLED WHEN PRESENT,
+    /// never required: a device without it renders the `--aniso 1` arm, which
+    /// is the isotropic ray-cone lod path VERBATIM and therefore a supported
+    /// shipping configuration rather than a degradation invented here.
+    pub sampler_anisotropy: bool,
+    pub max_anisotropy: f32,
 }
 
 impl DeviceInfo {
@@ -221,6 +258,21 @@ impl DeviceInfo {
             0x5143 => "Qualcomm",
             0x10005 => "Mesa",
             _ => "unknown vendor",
+        }
+    }
+
+    /// The same fact in the vocabulary the shader assembly speaks. It is a
+    /// PARAMETER of `TraceKeys` rather than a process global for the reason
+    /// `--dual-gpu` records on the D3D12 side: two devices can be live, and
+    /// `cand_defs` arming on the wrong one restores a real defect on the
+    /// device that does not need it.
+    pub fn vendor(&self) -> crate::gfx::vocab::Vendor {
+        use crate::gfx::vocab::Vendor;
+        match self.vendor_id {
+            0x1002 | 0x1022 => Vendor::Amd,
+            0x10DE => Vendor::Nvidia,
+            0x8086 => Vendor::Intel,
+            _ => Vendor::Other,
         }
     }
 
@@ -242,6 +294,13 @@ pub struct Vk {
     #[allow(dead_code)]
     pub entry: ash::Entry,
     pub instance: ash::Instance,
+    /// The physical device we opened. Held because it is IRRECOVERABLE, not
+    /// because something reads it today: Vulkan has no device -> physical-device
+    /// query, so dropping this would make every later capability read
+    /// (acceleration-structure properties, format support, heap budgets)
+    /// require re-enumerating and re-running the pick — i.e. it could pick a
+    /// different device than the one these handles belong to.
+    #[allow(dead_code)]
     pub phys: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: vk::Queue,
@@ -442,15 +501,70 @@ impl Vk {
 
         // Enable only what is required plus what is free and already probed.
         // scalarBlockLayout is the load-bearing one (module header).
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default().scalar_block_layout(true);
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+            .scalar_block_layout(true)
+            // The three the corpus cannot run without; `probe` has already
+            // rejected a device missing any of them, so enabling them here
+            // cannot fail — but they must be enabled EXPLICITLY, because an
+            // available-and-unenabled feature is a validation error at
+            // pipeline creation, not a silent default.
+            .runtime_descriptor_array(true)
+            .shader_sampled_image_array_non_uniform_indexing(true)
+            .descriptor_binding_partially_bound(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
         if info.subgroup_size_control {
             f13 = f13.subgroup_size_control(true).compute_full_subgroups(true);
         }
-        let dci = vk::DeviceCreateInfo::default()
+
+        // RAY QUERY, and the chain it drags in. `rt.hlsli` is the tracer's
+        // default intersector, so every leaf, hemi, reference and feed kernel
+        // declares `RayQueryKHR` and `SPV_KHR_ray_query`; a device created
+        // without them accepts those modules on RADV and reports a validation
+        // ERROR, which is how this list was found rather than guessed.
+        //
+        // The dependency chain is not optional and each link earns its place:
+        // ray query needs acceleration structures, acceleration structures
+        // need `bufferDeviceAddress` (their geometry is addressed by device
+        // address, not by descriptor) and `VK_KHR_deferred_host_operations`
+        // (declared even though nothing here defers a build — it is a hard
+        // dependency of the extension, not of the feature).
+        //
+        // ENABLED WHEN PRESENT rather than required, deliberately: `--sw-rays`
+        // assembles `rt_sw.hlsli` instead and traverses our own BVH in the
+        // shader, so a device without ray tracing can still run the tracer.
+        // What must not happen is a session that silently runs the hardware
+        // arm with the feature off — hence the flag on `DeviceInfo`, which the
+        // gates key their own expectations off.
+        let mut exts: Vec<*const std::ffi::c_char> = Vec::new();
+        let mut fas = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut frq = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+        let rt = info.ray_query && info.accel_struct;
+        if rt {
+            exts.push(ash::khr::deferred_host_operations::NAME.as_ptr());
+            exts.push(ash::khr::acceleration_structure::NAME.as_ptr());
+            exts.push(ash::khr::ray_query::NAME.as_ptr());
+            fas = fas.acceleration_structure(true);
+            frq = frq.ray_query(true);
+            f12 = f12.buffer_device_address(true);
+        }
+
+        // Anisotropic filtering, the one CORE feature this backend enables.
+        // `--aniso 16` is the default, and on D3D12 the anisotropic arm is a
+        // static sampler fed the elliptical footprint through `SampleGrad`;
+        // the same sampler here needs the feature turned on explicitly, and a
+        // device without it simply runs the isotropic arm.
+        let core = vk::PhysicalDeviceFeatures::default()
+            .sampler_anisotropy(info.sampler_anisotropy);
+
+        let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
+            .enabled_extension_names(&exts)
+            .enabled_features(&core)
             .push_next(&mut f12)
             .push_next(&mut f13);
+        if rt {
+            dci = dci.push_next(&mut fas).push_next(&mut frq);
+        }
         let device = unsafe { instance.create_device(phys, &dci, None) }
             .map_err(|e| format!("vkCreateDevice on {}: {e}", info.name))?;
         let queue = unsafe { device.get_device_queue(qfam, 0) };
@@ -467,8 +581,11 @@ impl Vk {
     ) -> (DeviceInfo, Option<String>) {
         let mut driver = vk::PhysicalDeviceDriverProperties::default();
         let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-        let mut props2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut driver).push_next(&mut sg);
+        let mut sgp = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut driver)
+            .push_next(&mut sg)
+            .push_next(&mut sgp);
         unsafe { instance.get_physical_device_properties2(p, &mut props2) };
         let props = props2.properties;
 
@@ -477,6 +594,10 @@ impl Vk {
         let mut feats2 =
             vk::PhysicalDeviceFeatures2::default().push_next(&mut f12).push_next(&mut f13);
         unsafe { instance.get_physical_device_features2(p, &mut feats2) };
+        // Copied out because `feats2` holds `&mut f12`/`&mut f13`: reading it
+        // inside the initializer below would keep that borrow alive across the
+        // f12/f13 field reads in the same expression.
+        let core_feats = feats2.features;
 
         let exts = unsafe { instance.enumerate_device_extension_properties(p) }.unwrap_or_default();
         let has_ext = |n: &CStr| exts.iter().any(|e| cstr(&e.extension_name) == n.to_string_lossy());
@@ -492,13 +613,36 @@ impl Vk {
             api: (vk::api_version_major(api), vk::api_version_minor(api), vk::api_version_patch(api)),
             kind: props.device_type,
             vendor_id: props.vendor_id,
-            subgroup_size: sg.max_subgroup_size,
-            subgroup_min: sg.min_subgroup_size,
-            subgroup_max: sg.max_subgroup_size,
+            subgroup_size: sgp.subgroup_size,
+            // A device that reports no control range still HAS a width, so
+            // degrade the range onto it rather than printing [0..0] — a probe
+            // that says "range zero" reads as broken hardware when what it
+            // means is "no size control here".
+            subgroup_min: if sg.min_subgroup_size == 0 {
+                sgp.subgroup_size
+            } else {
+                sg.min_subgroup_size
+            },
+            subgroup_max: if sg.max_subgroup_size == 0 {
+                sgp.subgroup_size
+            } else {
+                sg.max_subgroup_size
+            },
             subgroup_size_control: f13.subgroup_size_control == vk::TRUE,
+            subgroup_pin_compute: sg
+                .required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE),
+            max_workgroup_subgroups: sg.max_compute_workgroup_subgroups,
             ray_query: has_ext(ash::khr::ray_query::NAME),
             accel_struct: has_ext(ash::khr::acceleration_structure::NAME),
             rt_pipeline: has_ext(ash::khr::ray_tracing_pipeline::NAME),
+            runtime_descriptor_array: f12.runtime_descriptor_array == vk::TRUE,
+            nonuniform_sampled_image: f12.shader_sampled_image_array_non_uniform_indexing
+                == vk::TRUE,
+            partially_bound: f12.descriptor_binding_partially_bound == vk::TRUE,
+            max_sampled_images: props.limits.max_per_stage_descriptor_sampled_images,
+            sampler_anisotropy: core_feats.sampler_anisotropy != 0,
+            max_anisotropy: props.limits.max_sampler_anisotropy,
         };
 
         // Hard requirements, each traceable to a decision already made.
@@ -509,21 +653,33 @@ impl Vk {
             ))
         } else if f12.scalar_block_layout != vk::TRUE {
             Some("lacks scalarBlockLayout, which -fvk-use-dx-layout requires".to_string())
+        } else if !info.runtime_descriptor_array {
+            Some("lacks runtimeDescriptorArray, which the texs[] table requires".to_string())
+        } else if !info.nonuniform_sampled_image {
+            Some(
+                "lacks shaderSampledImageArrayNonUniformIndexing, which every \
+                 NonUniformResourceIndex texture fetch requires"
+                    .to_string(),
+            )
+        } else if !info.partially_bound {
+            Some(
+                "lacks descriptorBindingPartiallyBound, which one-layout-for-every-kernel \
+                 requires"
+                    .to_string(),
+            )
         } else {
             None
         };
         (info, reject)
     }
 
-    /// The `subgroupSize` the driver reports as its natural width. Kept
-    /// separate from the control range because they answer different
-    /// questions: this is what an unpinned pipeline will get, the range is
-    /// what a pinned one may ask for.
+    /// The `subgroupSize` the driver reports as its natural width — what an
+    /// UNPINNED pipeline gets. Kept as a named accessor rather than a bare
+    /// field read because the distinction from the control range is the whole
+    /// M2c question, and a call site that says `natural_subgroup_size()` cannot
+    /// be misread as "the width my kernel got" (which only a probe can answer).
     pub fn natural_subgroup_size(&self) -> u32 {
-        let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
-        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
-        unsafe { self.instance.get_physical_device_properties2(self.phys, &mut p2) };
-        sg.subgroup_size
+        self.info.subgroup_size
     }
 
     pub fn buffer(
@@ -548,7 +704,20 @@ impl Vk {
         let idx = mem_type_index(&self.mem, req.memory_type_bits, want).ok_or_else(|| {
             format!("no memory type for {size} B with {want:?} (mask {:#x})", req.memory_type_bits)
         })?;
-        let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(idx);
+        // A buffer that asks for a device address needs its ALLOCATION flagged
+        // for one too, and the flag is derived from the usage rather than
+        // passed in for the same reason `binding_of` is computed: a caller who
+        // remembers the usage bit and forgets the allocate flag gets a clean
+        // `vkCreateBuffer` and a failure at `vkGetBufferDeviceAddress`, which
+        // is the acceleration-structure path's most confusing possible error.
+        let mut flags = vk::MemoryAllocateFlagsInfo::default()
+            .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut ai = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(idx);
+        if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+            ai = ai.push_next(&mut flags);
+        }
         let mem = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| {
             unsafe { self.device.destroy_buffer(buf, None) };
             format!("vkAllocateMemory({} B): {e}", req.size)
@@ -556,6 +725,17 @@ impl Vk {
         unsafe { self.device.bind_buffer_memory(buf, mem, 0) }
             .map_err(|e| format!("vkBindBufferMemory: {e}"))?;
         Ok(Buffer { buf, mem, size, host })
+    }
+
+    /// The buffer's GPU virtual address — D3D12's `GetGPUVirtualAddress`.
+    /// Valid only for a buffer created with `SHADER_DEVICE_ADDRESS` usage (see
+    /// `buffer`, which flags the allocation from exactly that bit).
+    pub fn buffer_device_address(&self, b: &Buffer) -> vk::DeviceAddress {
+        unsafe {
+            self.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(b.buf),
+            )
+        }
     }
 
     pub fn free_buffer(&self, b: &Buffer) {
@@ -599,6 +779,14 @@ impl Vk {
             self.device.unmap_memory(b.mem);
         }
         Ok(out)
+    }
+
+    /// Validation is ACTUALLY armed — not merely requested. The two differ
+    /// whenever the layer is not installed (`Vk::new` says so and continues),
+    /// and a gate that reports the request instead of the fact would log a
+    /// validated run and an unvalidated one identically.
+    pub fn validated(&self) -> bool {
+        self.debug.is_some()
     }
 
     pub fn line(&self) -> String {

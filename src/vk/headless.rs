@@ -419,3 +419,341 @@ fn smoke_run(hg: &VkHeadless, pipes: &SmokePipes) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The wave-width probe.
+//
+// `waveprobe.hlsl` is the D3D12 suite's own kernel, unmodified: one trivial
+// group, reports `WaveGetLaneCount()` and independently COUNTS its waves, so a
+// driver whose reported width disagreed with how it actually partitioned the
+// group shows up as an inconsistent pair rather than a plausible lie.
+//
+// What is new here is that Vulkan can ask. On D3D12 the width is whatever the
+// driver picked from register pressure and the caps only bound it — the FR_WIDTH
+// campaign exists because that is unobservable from the API. Vulkan exposes
+// three distinct pipeline behaviours, and this runs all three, because the
+// difference between them IS the M2c decision:
+//
+//   default  — no flags. What a naive port gets.
+//   varying  — ALLOW_VARYING_SUBGROUP_SIZE. The driver picks per shader; this
+//              is the ONLY behaviour D3D12 offers, so it is the arm that says
+//              what the D3D12 numbers would look like here.
+//   pinned   — VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. The thing
+//              D3D12 cannot do at all, and the reason this milestone is a
+//              decision rather than a measurement.
+
+/// The width every `LEAF_GROUP` / `SKY_SPLIT` / `WIDE_LEVELS` constant in this
+/// tree was tuned against on D3D12, and therefore the width a pinned pipeline
+/// asks for. A compatibility target, not a preference.
+pub const PIN_TARGET: u32 = 32;
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Arm {
+    Default,
+    Varying,
+    Pinned(u32),
+}
+
+impl Arm {
+    pub fn label(self) -> String {
+        match self {
+            Arm::Default => "default".to_string(),
+            Arm::Varying => "varying".to_string(),
+            Arm::Pinned(w) => format!("pinned {w}"),
+        }
+    }
+}
+
+pub struct WaveRow {
+    pub group: u32,
+    pub arm: Arm,
+    /// `WaveGetLaneCount()` as the compiled kernel reports it.
+    pub lanes: u32,
+    /// Waves counted independently, by `WaveIsFirstLane()` + an atomic.
+    pub waves: u32,
+}
+
+impl WaveRow {
+    /// Fraction of the dispatched lanes that carry a thread. A 32-thread group
+    /// on wave64 hardware is ONE HALF-EMPTY subgroup — which is exactly the
+    /// D3D12 bug that cost -38% in `cs_leaf` before `LEAF_GROUP` moved, and the
+    /// class a pin removes outright.
+    pub fn utilization(&self) -> f32 {
+        if self.waves == 0 || self.lanes == 0 {
+            return 0.0;
+        }
+        self.group as f32 / (self.waves * self.lanes) as f32
+    }
+}
+
+pub struct WaveTable {
+    pub rows: Vec<WaveRow>,
+    /// Rows that could not be trusted. Collected rather than returned as an
+    /// error so the caller prints the WHOLE table before failing: a
+    /// measurement gate that hides its numbers when one cell is wrong is the
+    /// least useful thing it could do.
+    pub problems: Vec<String>,
+    /// Arms and cells this device could not run, said out loud. An arm that
+    /// quietly did not run reads, in the table, exactly like an arm whose
+    /// answer happened to match the default.
+    pub notes: Vec<String>,
+    /// The pinned arm was ELIGIBLE and therefore attempted. Published rather
+    /// than re-derived by the caller, because the eligibility predicate is
+    /// subtle (llvmpipe advertises size control for compute and has range
+    /// [8..8], so pinning 32 there is legal to ask about and impossible to do)
+    /// and two copies of it drift: the caller's anti-vacuity check must be
+    /// keyed off what this function ACTUALLY did.
+    pub pin_attempted: bool,
+}
+
+fn probe_binding() -> u32 {
+    spirv::binding_of(Reg::U, 0)
+}
+
+/// Run the probe at every group width the tracer dispatches, in every arm this
+/// device supports.
+pub fn wave_probe(hg: &VkHeadless, sp: &Spirv) -> Result<WaveTable, String> {
+    use crate::gfx::shaders as gs;
+    let d = &hg.vk.device;
+    let info = &hg.vk.info;
+
+    // The widths that actually SHIP — `cs_level*`/`cs_hemi_*` at 32, `cs_sky`
+    // at SKY_GROUP, `cs_leaf` at LEAF_GROUP — so the table lines up with real
+    // kernels instead of describing hypothetical ones. Same list as
+    // `gpu::trace::wave_probe`, from the same shared constants.
+    let mut widths = vec![32u32, gs::SKY_GROUP, gs::leaf_group()];
+    widths.sort_unstable();
+    widths.dedup();
+
+    let mut notes = Vec::new();
+    let mut arms = vec![Arm::Default];
+    if info.subgroup_size_control {
+        arms.push(Arm::Varying);
+    } else {
+        notes.push(
+            "ALLOW_VARYING_SUBGROUP_SIZE needs the subgroupSizeControl feature — arm skipped"
+                .to_string(),
+        );
+    }
+    let pin_ok = info.subgroup_size_control
+        && info.subgroup_pin_compute
+        && PIN_TARGET >= info.subgroup_min
+        && PIN_TARGET <= info.subgroup_max;
+    if pin_ok {
+        arms.push(Arm::Pinned(PIN_TARGET));
+    } else {
+        notes.push(format!(
+            "cannot pin {PIN_TARGET} here (size control {}, compute stage {}, range [{}..{}]) \
+             — arm skipped",
+            info.subgroup_size_control,
+            info.subgroup_pin_compute,
+            info.subgroup_min,
+            info.subgroup_max
+        ));
+    }
+
+    let binds = [vk::DescriptorSetLayoutBinding::default()
+        .binding(probe_binding())
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+    let set_layout = unsafe {
+        d.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binds),
+            None,
+        )
+    }
+    .map_err(|e| format!("wave probe: vkCreateDescriptorSetLayout: {e}"))?;
+    let sls = [set_layout];
+    let layout = unsafe {
+        d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sls), None)
+    }
+    .map_err(|e| format!("wave probe: vkCreatePipelineLayout: {e}"))?;
+
+    let mut table =
+        WaveTable { rows: Vec::new(), problems: Vec::new(), notes, pin_attempted: pin_ok };
+    let body = (|| -> Result<(), String> {
+        for &w in &widths {
+            // The define is what makes this a probe of THIS width; the kernel
+            // body is deliberately identical across widths, because the lane
+            // count is a property of the compiled group width and a probe that
+            // mimicked a real kernel's register pressure would measure the
+            // probe (waveprobe.hlsl's own header).
+            let src = format!("#define PROBE_GROUP {w}\n{}", gs::WAVEPROBE_HLSL);
+            let words = sp.compile(&src, "cs_wave_probe", "cs_6_5", &format!("wave probe g{w}"), false)?;
+            let module = unsafe {
+                d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            }
+            .map_err(|e| format!("wave probe g{w}: vkCreateShaderModule: {e}"))?;
+
+            for &arm in &arms {
+                if let Arm::Pinned(p) = arm {
+                    let need = w.div_ceil(p);
+                    if need > info.max_workgroup_subgroups {
+                        table.notes.push(format!(
+                            "g{w} pinned {p} needs {need} subgroups, device allows {} — cell skipped",
+                            info.max_workgroup_subgroups
+                        ));
+                        continue;
+                    }
+                }
+                match probe_one(hg, layout, set_layout, module, arm, w) {
+                    Ok(row) => {
+                        // The instrument's own lie detector, kept WITH the
+                        // instrument: these say whether a row is a measurement
+                        // at all. Whether the measurement is ACCEPTABLE is the
+                        // gate's business, not the probe's.
+                        if row.lanes == 0 {
+                            table.problems.push(format!(
+                                "g{w} {}: reported lane count 0 — the kernel did not run",
+                                arm.label()
+                            ));
+                        } else {
+                            // A CEILING, never exact division: a group NARROWER
+                            // than the wave is one PARTIAL wave, which is
+                            // precisely the case this probe exists to find.
+                            let want = w.div_ceil(row.lanes);
+                            if row.waves != want {
+                                table.problems.push(format!(
+                                    "g{w} {}: reports {} lanes but counted {} waves, not {want} \
+                                     — the driver partitioned the group differently than it says",
+                                    arm.label(),
+                                    row.lanes,
+                                    row.waves
+                                ));
+                            }
+                        }
+                        table.rows.push(row);
+                    }
+                    Err(e) => table.problems.push(format!("g{w} {}: {e}", arm.label())),
+                }
+            }
+            unsafe { d.destroy_shader_module(module, None) };
+        }
+        Ok(())
+    })();
+
+    unsafe {
+        d.destroy_pipeline_layout(layout, None);
+        d.destroy_descriptor_set_layout(set_layout, None);
+    }
+    body.map(|()| table)
+}
+
+/// One (width, arm) cell: build the pipeline, dispatch one group, read back.
+fn probe_one(
+    hg: &VkHeadless,
+    layout: vk::PipelineLayout,
+    set_layout: vk::DescriptorSetLayout,
+    module: vk::ShaderModule,
+    arm: Arm,
+    group: u32,
+) -> Result<WaveRow, String> {
+    let d = &hg.vk.device;
+    let name = CString::new("cs_wave_probe").unwrap();
+
+    let mut req = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default();
+    let mut stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module)
+        .name(&name);
+    match arm {
+        Arm::Default => {}
+        Arm::Varying => {
+            stage = stage.flags(vk::PipelineShaderStageCreateFlags::ALLOW_VARYING_SUBGROUP_SIZE)
+        }
+        Arm::Pinned(w) => {
+            req = req.required_subgroup_size(w);
+            stage = stage.push_next(&mut req);
+        }
+    }
+    let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+    let pipe = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None) }
+        .map_err(|(_, e)| format!("vkCreateComputePipelines: {e}"))?[0];
+
+    let vkd = &hg.vk;
+    let sb = vk::BufferUsageFlags::STORAGE_BUFFER
+        | vk::BufferUsageFlags::TRANSFER_SRC
+        | vk::BufferUsageFlags::TRANSFER_DST;
+    let out = vkd.buffer(12, sb, false)?;
+
+    let run = (|| -> Result<WaveRow, String> {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)];
+        let pool = unsafe {
+            d.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(|e| format!("vkCreateDescriptorPool: {e}"))?;
+        let sls = [set_layout];
+        let set = unsafe {
+            d.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&sls),
+            )
+        }
+        .map_err(|e| format!("vkAllocateDescriptorSets: {e}"))?[0];
+        let bi = [vk::DescriptorBufferInfo::default().buffer(out.buf).range(vk::WHOLE_SIZE)];
+        let wr = [vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(probe_binding())
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&bi)];
+        unsafe { d.update_descriptor_sets(&wr, &[]) };
+
+        hg.run(|d, cmd| unsafe {
+            // Two fills, and the split is load-bearing. Slots 0-1 are STORES,
+            // so a sentinel there means "nothing ran" instead of reading back
+            // as a plausible zero; slot 2 is an ACCUMULATOR, so it must start
+            // at a known 0. (The D3D12 twin gets the zero for free from
+            // committed-resource zero-init and has no sentinel at all.)
+            d.cmd_fill_buffer(cmd, out.buf, 0, 8, SENTINEL);
+            d.cmd_fill_buffer(cmd, out.buf, 8, 4, 0);
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            d.cmd_dispatch(cmd, 1, 1, 1);
+            compute_barrier(d, cmd);
+        })?;
+        unsafe { d.destroy_descriptor_pool(pool, None) };
+
+        let b = hg.read_buffer(&out, 12)?;
+        let v: Vec<u32> =
+            b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        if v[1] == SENTINEL {
+            return Err("the group width slot is still the sentinel — the kernel never ran".into());
+        }
+        if v[1] != group {
+            return Err(format!(
+                "kernel echoed group width {} but was compiled for {group} \
+                 — the PROBE_GROUP define did not reach it",
+                v[1]
+            ));
+        }
+        Ok(WaveRow { group, arm, lanes: v[0], waves: v[2] })
+    })();
+
+    vkd.free_buffer(&out);
+    unsafe { d.destroy_pipeline(pipe, None) };
+    run
+}

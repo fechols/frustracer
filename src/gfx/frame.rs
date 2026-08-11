@@ -1301,14 +1301,22 @@ impl FrameCb {
     }
 
     /// Copy into a persistently-mapped CB ring slot.
-    pub(crate) fn store(&self, ptr: *mut u8) {
+    /// The packed cbuffer as bytes — the same image `store` writes, for a
+    /// backend whose upload takes a slice instead of a mapped pointer. ONE
+    /// packing serves both, which is the whole point of `-fvk-use-dx-layout`.
+    pub fn bytes(&self) -> &[u8] {
         unsafe {
-            std::ptr::copy_nonoverlapping(
+            std::slice::from_raw_parts(
                 self as *const FrameCb as *const u8,
-                ptr,
                 std::mem::size_of::<FrameCb>(),
             )
-        };
+        }
+    }
+
+    /// The same image, into a mapped CB ring slot.
+    pub(crate) fn store(&self, ptr: *mut u8) {
+        let b = self.bytes();
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), ptr, b.len()) };
     }
 }
 
