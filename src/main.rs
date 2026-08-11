@@ -61,6 +61,13 @@ mod fireflies;
 mod foliage;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod fsr;
+// The OTHER FidelityFX: SDK 1.1.4, compiled from source, for the Vulkan and
+// Metal backends. `fsr` above is ffx-api v2.3.0 and stays the Windows path —
+// see this module's header for why two generations coexist rather than one
+// replacing the other. Not `cfg(unix)`: its version arithmetic is a fact about
+// the SDK, not the host, and `--check-fsr` gates it on every platform.
+#[cfg_attr(windows, allow(dead_code))]
+mod ffx_fsr3;
 mod frustum;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ftree;
@@ -16610,6 +16617,100 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
     // also exercise the quadtree's odd splits with the capture on).
     for (rw, rh) in [(800usize, 600usize), (531, 399)] {
         all_ok &= fsr_frame_check(scene, bvh, cam0, rw, rh, far, structural);
+    }
+
+    // 8. FidelityFX SDK 1.1.x — the SECOND FSR generation, the one the Vulkan
+    // and Metal backends compile from source (see src/ffx_fsr3.rs's header for
+    // why two coexist). Everything above this point is ffx-api v2.3.0 and is
+    // untouched by it.
+    //
+    // The version arithmetic is pure and gates on EVERY platform including
+    // Windows, which never builds the SDK: the packing is a fact about
+    // ffx_interface.h, not about the host, and a gate that only ran where the
+    // feature is built would stop covering the transcription the moment
+    // someone develops on the other OS.
+    {
+        let mut pass = true;
+        if let Err(e) = ffx_fsr3::self_test() {
+            eprintln!("{e}");
+            pass = false;
+        }
+
+        // The linked half, when it is linked. THE POINT IS THE PIN PAIR: this
+        // reads the version out of the headers the objects were COMPILED
+        // against, so fetching a different FFX_SRC_TAG without moving
+        // ffx_fsr3::PIN fails here instead of surfacing as behaviour nobody
+        // attributes to an SDK bump. Mirrors nrd.rs's GetLibraryDesc gate.
+        if ffx_fsr3::built() {
+            match ffx_fsr3::sdk_version() {
+                Some(v) if v == ffx_fsr3::PIN => {
+                    eprintln!(
+                        "ffx-1.1.x: linked SDK v{}.{}.{} matches the pin",
+                        v.0, v.1, v.2
+                    );
+                }
+                Some(v) => {
+                    eprintln!(
+                        "ffx-1.1.x: linked SDK is v{}.{}.{} but ffx_fsr3::PIN says v{}.{}.{} \
+                         — move install-prerequisites.sh's FFX_SRC_TAG and the PIN together",
+                        v.0, v.1, v.2, ffx_fsr3::PIN.0, ffx_fsr3::PIN.1, ffx_fsr3::PIN.2
+                    );
+                    pass = false;
+                }
+                None => {
+                    eprintln!("ffx-1.1.x: built() is true but sdk_version() returned None");
+                    pass = false;
+                }
+            }
+            // The compat header's context-size override, read back THROUGH the
+            // SDK's own headers. Upstream hard-codes 128 KB against a 2-byte
+            // wchar_t; a 4-byte one bloats the private FSR3 context past it, so
+            // this is a correctness requirement rather than headroom — and it
+            // is applied by a build.rs `-include` flag, which is exactly the
+            // kind of wiring that can stop being passed without anything else
+            // noticing. Asserting we are ABOVE the upstream value (not equal to
+            // some number restated here) keeps the gate about the hazard.
+            match ffx_fsr3::context_size() {
+                Some(sz) if sz > ffx_fsr3::MIN_CONTEXT_SIZE => {
+                    eprintln!(
+                        "ffx-1.1.x: context size {} KiB (> the {} KiB upstream default — \
+                         the wchar_t override reached the SDK headers)",
+                        sz / 1024,
+                        ffx_fsr3::MIN_CONTEXT_SIZE / 1024
+                    );
+                }
+                Some(sz) => {
+                    eprintln!(
+                        "ffx-1.1.x: context size is {sz} B, not above the {} B upstream \
+                         default — shim/ffx_msvc_compat.h did not reach the SDK headers \
+                         (is build.rs still passing -include?)",
+                        ffx_fsr3::MIN_CONTEXT_SIZE
+                    );
+                    pass = false;
+                }
+                None => {
+                    eprintln!("ffx-1.1.x: built() is true but context_size() returned None");
+                    pass = false;
+                }
+            }
+        } else {
+            // Not a failure: the SDK is opt-in and fetched. Say which command
+            // brings it, and say it on Windows too — where it is not merely
+            // absent but deliberately never built.
+            if cfg!(windows) {
+                eprintln!(
+                    "ffx-1.1.x: not built (Windows upscales through ffx-api v2.3.0; \
+                     the 1.1.x arm is for the Vulkan/Metal backends) — math gates only"
+                );
+            } else {
+                eprintln!(
+                    "ffx-1.1.x: SDK not compiled in — math gates only \
+                     (./install-prerequisites.sh fsr3src)"
+                );
+            }
+        }
+        eprintln!("ffx-1.1.x version/pin: {}", if pass { "OK" } else { "FAIL" });
+        all_ok &= pass;
     }
 
     if all_ok {

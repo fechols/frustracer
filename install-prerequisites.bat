@@ -55,6 +55,14 @@ set "FFX_VER=2.3.0"
 set "ORT_VER=1.24.4"
 set "DML_VER=1.15.4"
 set "PIX_VER=1.0.240308001"
+rem  DELIBERATELY NOT MIRRORED HERE: the .sh's FFX_SRC_TAG (FidelityFX SDK
+rem  1.1.4 source). That is a SECOND, older FidelityFX generation that only the
+rem  Vulkan and Metal backends compile — Windows upscales through ffx-api
+rem  FFX_VER above — so fetching its 189 MB tarball on Windows would stage
+rem  source nothing here builds. It is host-native in exactly the sense `spirv`
+rem  and the Linux DXC drop are, and those are .sh-only for the same reason.
+rem  The lockstep rule the header states applies to pins BOTH scripts consume;
+rem  this note exists so the absence reads as a decision rather than as drift.
 rem  NRD is pinned BOTH here and in src/nrd.rs (the transcribed structs +
 rem  runtime GetLibraryDesc gate) — move the two together or --nrd sheds loudly.
 set "NRD_TAG=v4.17.3"

@@ -72,7 +72,15 @@
 #    ./install-prerequisites.sh all --force     re-download and re-extract
 #    ./install-prerequisites.sh --clean         delete the download cache
 #
-#  Components: dxc fsr xess nppd oidn pix nrd spirv
+#  THREE COMPONENTS ARE HOST-NATIVE, not Windows payload: `dxc`'s Linux half and
+#  `spirv` (above), and `fsr3src` — the FidelityFX SDK 1.1.4 SOURCE, which is
+#  what the Vulkan and Metal backends upscale with. It is the only component
+#  here that is COMPILED rather than staged: there is no runtime DLL, build.rs
+#  puts 8 SDK translation units through `cc` and links them statically. Its
+#  other half — the SPIR-V shader permutations — is COMMITTED to this
+#  repository, because the SDK builds those with a Windows-only tool.
+#
+#  Components: dxc fsr xess nppd oidn pix nrd spirv fsr3src
 #  Needs: bash 3.2+, curl (or wget), unzip (or bsdtar). THE BASH FLOOR IS 3.2
 #  BECAUSE macOS SHIPS 3.2 (GPL3) and `#!/usr/bin/env bash` finds it, so the
 #  bash-4 conveniences are out on purpose: no ${x,,}, no mapfile/readarray, and
@@ -162,6 +170,20 @@ FFX_VER=2.3.0
 ORT_VER=1.24.4
 DML_VER=1.15.4
 PIX_VER=1.0.240308001
+#  FidelityFX SDK 1.1.x SOURCE — a SECOND, OLDER FidelityFX generation, and the
+#  two do not compete: FFX_VER above is ffx-api v2.3.0, which ships as signed
+#  prebuilt DX12 provider DLLs and has no Vulkan backend at all (its own readme
+#  lists "Vulkan is currently not supported in SDK" under known issues) and no
+#  custom-backend seam since v2 removed FfxInterface. v1.1.4 is the last
+#  generation that is MIT SOURCE with a stock first-party ffx_vk backend and a
+#  backend seam a Metal implementation can be written against, so it is what the
+#  Vulkan and Metal backends upscale with while Windows keeps 2.3.0.
+#  Pinned here and in build.rs's version probe — move them together.
+FFX_SRC_TAG=v1.1.4
+#  The tarball is the whole repository (189 MB: samples, framework, docs, and a
+#  32 MB Windows-only shader-compiler binary store). We extract FOUR paths from
+#  it — the 8 translation units we compile plus their headers — which is ~19 MB.
+FFX_SRC_SUBSET=(sdk/include sdk/src sdk/libs sdk/CMakeLists.txt)
 #  NRD is pinned BOTH here and in src/nrd.rs (the transcribed structs + runtime
 #  GetLibraryDesc gate) — move them together or --nrd sheds loudly. Unused on
 #  this platform (see the header), kept so the two installers stay comparable.
@@ -193,7 +215,7 @@ fi
 FORCE=
 NRD_EXPLICIT=
 SEL=()
-ALL=(dxc fsr xess nppd oidn pix nrd spirv)
+ALL=(dxc fsr xess nppd oidn pix nrd spirv fsr3src)
 for a in "$@"; do
     case "$(lower "$a")" in
         --force | /force | -f) FORCE=1 ;;
@@ -216,7 +238,7 @@ for a in "$@"; do
             echo "    SDK at BUILD time (set FRUSTRACER_DLSS_SDK; see the header)."
             exit 2
             ;;
-        dxc | fsr | xess | nppd | oidn | pix | spirv)
+        dxc | fsr | xess | nppd | oidn | pix | spirv | fsr3src)
             SEL+=("$(lower "$a")")
             ;;
         nrd)
@@ -444,6 +466,52 @@ do_dxc() {
     fi
 }
 
+do_fsr3src() {
+    # FSR3 for the Vulkan and Metal backends, COMPILED FROM SOURCE — there is no
+    # runtime DLL to stage here and nothing to LoadLibrary, unlike every other
+    # component in this file. build.rs compiles 8 SDK translation units plus our
+    # shim straight through the `cc` crate (no CMake), so what this fetches is
+    # ordinary C++ that ends up statically linked.
+    #
+    # SENTINEL is sdk/CMakeLists.txt: we do not USE CMake, but it is the file
+    # whose presence proves the subset landed rather than a half-extracted tree,
+    # and build.rs keys `cfg(ffx_fsr3_src)` on the same path — one fact, one
+    # place, so a partial install cannot read as a complete one on either side.
+    skip "$SDKS/FidelityFX-SDK/sdk/CMakeLists.txt" "fsr3src (FidelityFX SDK $FFX_SRC_TAG source)" && return 0
+    fetch ffx-src.tar.gz \
+        "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tar.gz/refs/tags/$FFX_SRC_TAG" || return 0
+
+    # NOT `extract`: that helper takes whole archives, and taking this one whole
+    # would land 189 MB (samples, framework, docs, and a 32 MB Windows-only
+    # shader-compiler binary store) to use ~19 MB of it. Naming the four member
+    # paths explicitly also avoids `--wildcards`, which is GNU tar only — BSD
+    # tar on macOS treats bare patterns as literal prefixes and GNU tar accepts
+    # exact paths unchanged, so the same command works on both.
+    local dest="$SDKS/FidelityFX-SDK"
+    local root="FidelityFX-SDK-${FFX_SRC_TAG#v}"
+    local members=()
+    local m
+    for m in "${FFX_SRC_SUBSET[@]}"; do members+=("$root/$m"); done
+    echo "    [+] extracting ffx-src.tar.gz -> ${dest#"$ROOT"/} (${#members[@]} paths of the tree)"
+    mkdir -p "$dest"
+    if ! tar -xzf "$CACHE/ffx-src.tar.gz" -C "$dest" --strip-components=1 "${members[@]}"; then
+        echo "    [x] extract FAILED (corrupt download? rerun with --force)"
+        fail
+        return 0
+    fi
+    # The shader permutations are NOT here and cannot be: the SDK builds them
+    # with FidelityFX_SC.exe, a Windows-only tool, so they are COMMITTED under
+    # SDKs/FidelityFX-SDK-prebuilt/ instead. Say so if they are somehow absent,
+    # because the build needs both halves and only this one is fetchable.
+    local perms="$SDKS/FidelityFX-SDK-prebuilt/shaders/vk/ffx_fsr3upscaler_accumulate_pass_permutations.h"
+    if [[ ! -e $perms ]]; then
+        echo "    [!] the committed SPIR-V permutation headers are missing from"
+        echo "        SDKs/FidelityFX-SDK-prebuilt/shaders/vk/ — they ship in this"
+        echo "        repository (their compiler is Windows-only). Re-check out that"
+        echo "        directory; FSR3 cannot build without it."
+    fi
+}
+
 do_spirv() {
     # spirv-val is the gate on everything DXC emits: DXC will happily produce a
     # module that no driver accepts, and "it compiled" is not the claim the port
@@ -598,6 +666,7 @@ run oidn
 run pix
 run nrd
 run spirv
+run fsr3src
 
 # =========================== verification =================================
 echo
@@ -627,6 +696,12 @@ else
 fi
 check "SPIR-V validation" "$SDKS/spirv-tools/bin/spirv-val"
 check "  (disassembler)" "$SDKS/spirv-tools/bin/spirv-dis"
+# FSR3 needs BOTH halves and only one of them is fetchable, so report them as
+# two rows: a green source row beside a missing shader row is a re-checkout,
+# not a re-download, and one combined row could not say which.
+check "FSR3 upscaler source ($FFX_SRC_TAG)" "$SDKS/FidelityFX-SDK/sdk/CMakeLists.txt"
+check "  (SPIR-V permutations, committed)" \
+    "$SDKS/FidelityFX-SDK-prebuilt/shaders/vk/ffx_fsr3upscaler_accumulate_pass_permutations.h"
 
 # DLSS is decided at BUILD time, not here (see the header) — but say so in the
 # summary, where someone looking for the missing DLSS-RR row will look. The

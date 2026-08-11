@@ -111,6 +111,20 @@ __pycache__/
 # The BUILT artifacts stay ignored: they land in SDKs/NRD/bin (outside this
 # negation), and the submodule's own _Bin/_Build are covered by its .gitignore.
 !/SDKs/NRD-src
+
+# FidelityFX SDK 1.1.4 (the OLDER generation the Vulkan/Metal backends upscale
+# with — see install-prerequisites.sh's FFX_SRC_TAG for why two generations
+# coexist). The SOURCE stays ignored and is fetched by `install-prerequisites.sh
+# fsr3src`; what IS committed is the pre-built SPIR-V shader permutations, and
+# they are committed for one reason: the SDK compiles its shaders with
+# FidelityFX_SC.exe, a WINDOWS-ONLY tool, and upstream ships no pre-compiled
+# SPIR-V. Vendoring the output is what lets a Linux or macOS checkout build FSR3
+# at all. MIT and redistributable (unlike every other SDK here), 200 files /
+# ~17 MiB of generated C arrays, plain git — and they serve BOTH backends: Metal
+# transpiles the same SPIR-V to .metallib at build time. The .h.d depfiles the
+# generator drops beside them are build litter and stay out.
+!/SDKs/FidelityFX-SDK-prebuilt/
+/SDKs/FidelityFX-SDK-prebuilt/shaders/vk/*.h.d
 waveviz-*.png
 
 # Crash handler artifacts (src/crash.rs) — the symbolized report and the
