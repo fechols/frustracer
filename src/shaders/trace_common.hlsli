@@ -137,6 +137,37 @@
                                // other kernel ignores it. Runtime, so the N8
                                // gate can A/B both arms on one PSO. Lockstep
                                // with trace.rs::FLAG_NRD_REJITTER.
+#define FLAG_REMOD_EXACT 16777216u // EXACT REMODULATION: the lap-0 sig
+                               // captures are PRE-SCALED by the post-capture
+                               // factors shade applies to those same lobes
+                               // (sk = 1-0.157*sheen, the translucency split,
+                               // detail_sun_shadow, detail_cavity), so the
+                               // bridge's kd/f0 are the EXACT divisors and the
+                               // denoiser's delta lands at its true physical
+                               // weight. Without it the correction rides at
+                               // 1/m weight and the leftover fraction of every
+                               // bright 1-spp bounce spike stays in `base` RAW
+                               // and un-denoised — a firefly source. Requires
+                               // FLAG_FSR_SIG + NRD wiring by construction
+                               // (the FLAG_NRD_GI shape), so an FSR-RR session
+                               // never sets it. Unlike FLAG_NRD_REJITTER it is
+                               // NOT engine-gated — the mismatch is ours, not
+                               // NVIDIA's, so FRD gets it too. Lockstep with
+                               // trace.rs::FLAG_REMOD_EXACT.
+#define FLAG_NRD_RCLAMP 33554432u // cs_nrd_out soft-caps the RESIDUAL's luma
+                               // against its 8-neighbour ring — the part of
+                               // the frame the denoiser never sees (with the
+                               // GI fold live, dominantly the root glass /
+                               // transmission chain, which is stochastic and
+                               // reaches the screen raw). Read by the bridge
+                               // unit ONLY. Engine-BLIND (no nrd_engine term:
+                               // the residual is the same for FRD and NRD).
+                               // Lockstep with trace.rs::FLAG_NRD_RCLAMP.
+#define FLAG_NRD_RCLAMP_HARD 67108864u // ...at K=1, the DIAGNOSTIC arm: it
+                               // paints everything the cap could touch. Also
+                               // N10's scene-independent teeth. Requires
+                               // FLAG_NRD_RCLAMP. Lockstep with
+                               // trace.rs::FLAG_NRD_RCLAMP_HARD.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -1404,6 +1435,41 @@ struct PrimSurf {
     float shadow_t;  // sun shadow sample 0's occluder t (miss = INF -> CAM_FAR
                      // at the pack; 0 = no front ray, SIGMA's NoL<=0 rule) —
                      // the NRD hit-distance capture, sig.w under FLAG_FSR_SIG
+    // FLAG_REMOD_EXACT's two diffuse sub-term factors, relative to the wire kd.
+    // The diffuse CHANNEL carries two things shade weighted DIFFERENTLY —
+    // `diffuse_d` by sk (no cavity; its own detail_sun_shadow is already inside
+    // it) and the ambient/RTGI bounce by sk*dcav — so no single captured signal
+    // can be remodulated exactly by one divisor. They are carried separately
+    // and blended by ENERGY at the one site where both are known (shade_full's
+    // GI fold under RTGI, the sampled-ambient block otherwise), which is what
+    // makes the delta multiplier exact without touching the captured signal.
+    //
+    // AND THE BLEND IS EXACT, not a compromise, for the correction the
+    // denoiser can actually deliver. Write the diffuse channel as A + B with
+    // factors k_a, k_b; accum holds kd*(k_a*A + k_b*B). If the denoiser returns
+    // D_out = L*D_in — any uniform scaling of the channel — the delta form
+    // gives base + (L-1)*(A+B)*kd*m, and at m = (k_a*A + k_b*B)/(A+B) that
+    // collapses ALGEBRAICALLY to L*kd*(k_a*A + k_b*B), the correct answer. It
+    // is approximate only where the denoiser REDISTRIBUTES between the two
+    // sub-terms, which it cannot do: they were summed before it saw them. One
+    // lane is not a thrifty approximation of two, it is the whole information
+    // the wire format admits.
+    //
+    // WHY NOT `m_d = dcav` WITH THE SIGNAL DIVIDED BY IT (the obvious form):
+    // that injects texel-frequency 1/dcav INTO the denoiser input, which the
+    // spatial filter then averages — blur(S/dcav)*dcav is not S, so the direct
+    // diffuse, which carries no cavity in shade at all, comes back with a
+    // spurious cavity ripple. The energy blend keeps the input clean and puts
+    // every crisp factor on the delta, where `base` already holds the exact
+    // per-pixel value and only the CORRECTION needs weighting.
+    float amb_k;     // the ambient/bounce sub-term's exact factor (sk*dcav)
+    float m_d;       // IN: the direct-diffuse sub-term's factor (sk).
+                     // OUT, after the energy blend: the wire delta multiplier,
+                     // packed into sig.w's high half. Bounded by [sk*dcav, sk]
+                     // BY CONSTRUCTION (a convex combination of the two), so
+                     // it can never amplify — and it is exactly `sk` wherever
+                     // dcav == 1, i.e. on every non-pit pixel and under
+                     // --no-detail-ao. Both are 1.0 with the flag clear.
 };
 
 // dlss::GBufs re-hosted as one interleaved plane; the feed kernels fan it out
@@ -1623,8 +1689,24 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
         float3 is = ps.ind_s / f0_floor;
         // .w — the hit-distance guide lanes (NRD): f16x2(ao_t, shadow_t),
         // the INF-miss clamped to CAM_FAR like spec.w above.
+        //
+        // ...EXCEPT that the HIGH half is on loan to FLAG_REMOD_EXACT, which
+        // carries the diffuse delta multiplier there instead. The loan is safe
+        // and explicit: `shadow_t` is written today and decoded by NOBODY
+        // (nrd_bridge.hlsl masks `sig.w & 0xffff` for ao_t, and FSR-RR never
+        // reads sig.w at all) — it was captured ahead of a SIGMA shadow
+        // denoiser that does not exist yet. Gated, so the flag-clear arm still
+        // packs shadow_t verbatim and N5's sh_fired must-fire runs there.
+        // WHEN SIGMA LANDS both need a home at once, and the exit is the
+        // stride: 72 -> 80 is 16-ALIGNED (72 is not), at ~+11% on a 0.34 ms
+        // store — plus frame.rs's GBUF_EXT_STRIDE, dual.rs's fed_strides /
+        // MAX_FED_STRIDES, and the hardcoded `72` literals in the N5/N6/N7
+        // gates. Append, never insert: every gate decodes lanes by index.
+        float sig_w_hi = (flags & FLAG_REMOD_EXACT)
+            ? ps.m_d
+            : (isinf(ps.shadow_t) ? CAM_FAR : ps.shadow_t);
         g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z),
-                      pack_h2(ps.ao_t, isinf(ps.shadow_t) ? CAM_FAR : ps.shadow_t));
+                      pack_h2(ps.ao_t, sig_w_hi));
         g.sig2 = uint2(pack_h2(ps.ao, is.x), pack_h2(is.y, is.z));
     }
     gbuf_ext[pi] = g;

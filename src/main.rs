@@ -2778,6 +2778,19 @@ fn run_check_dxr(
                 // are rt.hlsli's bodies, so the capture is LIVE here; under
                 // --dxr-inline 0 the rt_dxr twin reports tmax and the
                 // must-fires would go vacuous (run this suite at the default).
+                //
+                // Same FLAG_REMOD_EXACT precondition as the check-gpu twin, and
+                // the same silent-vacuous failure if it lapses (m_d > 0 on
+                // every hit pixel would satisfy the shadow must-fire while
+                // scoring the wrong half of the lane) — see that comment.
+                if dg2.remod_exact() {
+                    eprintln!(
+                        "check-dxr: FAIL N5 precondition — the sig.w oracle was captured with \
+                         FLAG_REMOD_EXACT armed, so its high half is m_d, not shadow_t (the \
+                         shadow must-fire would pass vacuously)"
+                    );
+                    ok = false;
+                }
                 {
                     let (_, far) = dlss::near_far(scene.diag);
                     let h16 = |bits: u16| half::f16::from_bits(bits).to_f32();
@@ -2892,10 +2905,17 @@ fn run_check_dxr(
                         return 1;
                     }
                     dg2.force_sky_ext_skip(Some(true));
+                    // See the check-gpu twin: `pack2_ext` is the FSR4-RR
+                    // capture, taken with FLAG_REMOD_EXACT clear, so the skip
+                    // frame must be pinned to the same arm or every hit pixel
+                    // differs on the sig lanes alone — noise about a gate that
+                    // only claims store elision.
+                    dg2.force_remod_exact(Some(false));
                     dg2.write_cb(0, &p);
                     let mut rec7 = Ok(());
                     let traced = hg.run(|l| rec7 = dg2.record_frame(l, 0));
                     dg2.force_sky_ext_skip(None);
+                    dg2.force_remod_exact(None);
                     if traced.is_err() || rec7.is_err() {
                         eprintln!("check-dxr: FAIL N7 skip trace");
                         return 1;
@@ -7652,6 +7672,26 @@ fn run_check_gpu(
                 // [0, CAM_FAR] (f16 slack); must-fires prove the capture ran
                 // (an AO occluder inside the radius, a fired shadow ray) —
                 // without them a dead `0u` lane passes every bound.
+                //
+                // ITS PRECONDITION IS FLAG_REMOD_EXACT CLEAR, and the failure
+                // if that ever stops holding is SILENT-VACUOUS rather than
+                // loud: the armed pack lends sig.w's HIGH half to `m_d`, which
+                // is strictly positive on every hit pixel, so `sh_fired` would
+                // count all of them and the must-fire would PASS while scoring
+                // the wrong lane. It holds today because `pack2_ext` is the
+                // FSR4-RR capture taken above, where nrd_wired is empty and the
+                // flag cannot arm — a data dependency, not merely an ordering
+                // one, but re-capturing the oracle after the bridge wiring
+                // would break it. Assert the precondition rather than trusting
+                // a comment.
+                if ptg.remod_exact() {
+                    eprintln!(
+                        "check-gpu: FAIL N5 precondition — the sig.w oracle was captured with \
+                         FLAG_REMOD_EXACT armed, so its high half is m_d, not shadow_t (the \
+                         shadow must-fire would pass vacuously)"
+                    );
+                    ok = false;
+                }
                 {
                     let (_, far) = dlss::near_far(scene.diag);
                     let h16 = |bits: u16| half::f16::from_bits(bits).to_f32();
@@ -7850,6 +7890,23 @@ fn run_check_gpu(
                     // byte-diff-0 exercise the re-jitter path a shipping NRD
                     // session takes, which is the only place the delta form's
                     // `0.0 * j == 0.0` claim is checked against real bytes.
+                    //
+                    // PIN THE RESIDUAL CAP OFF FOR EVERY BRIDGE GATE FROM HERE
+                    // DOWN, and pin it EXPLICITLY rather than relying on the
+                    // lever's default. Two reasons, either sufficient. (1) N3
+                    // and F3 assert a BYTE-IDENTICAL passthrough recompose: the
+                    // cap is a real filter on a real noisy residual, so an
+                    // armed run fires and breaks that compare — correctly, but
+                    // the gate's subject is the recompose, not the cap. (2) N4,
+                    // F4 and N8 score the DENOISER and the Jacobian; a gate
+                    // whose subject shares a post-process with the thing under
+                    // test is not scoring the thing under test (the same
+                    // argument already recorded for nrd_rejitter's engine
+                    // term). Without the pin all five silently change meaning
+                    // the moment someone runs the suite under FR_NRD_RCLAMP=on.
+                    // N10 is the cap's OWN gate and opts back in explicitly,
+                    // restoring this pin rather than the derived value.
+                    ptg.force_nrd_rclamp(Some((false, false)));
                     if let Err(e) = ptg.wire_nrd_feed(
                         &hg.device,
                         true,
@@ -8565,6 +8622,1165 @@ fn run_check_gpu(
                                     }
                                 }
                             }
+                            // --- N10: the RESIDUAL SPIKE CAP (FLAG_NRD_RCLAMP).
+                            // N8's shape, and for N8's reason: re-run ONLY
+                            // cs_nrd_out over the converged planes, three arms,
+                            // no re-trace and no second denoise pass, so the
+                            // arms differ in exactly one CB bit and the verdict
+                            // is attributable.
+                            {
+                                let p10 = gpu::trace::FrameParams {
+                                    sway_prev_time: None,
+                                    cam: basis_b,
+                                    frame: 108,
+                                    accumulate: false,
+                                    jitter: false,
+                                    frame_jitter: Some((0.0, 0.0)),
+                                    prev_cam: Some(basis_b),
+                                    q: uq,
+                                    verify: false,
+                                    spp: 1,
+                                    probe_sample: 0,
+                                    clouds: crate::clouds::Clouds::check(scene.diag),
+                                    fireflies: crate::fireflies::Fireflies::check(scene),
+                                    sway_time: check_sway,
+                                    replay: false,
+                                };
+                                let mut arms: Vec<Vec<u8>> = Vec::new();
+                                let mut fail = false;
+                                // RE-JITTER IS LEFT AT ITS DERIVED VALUE, and
+                                // the first draft pinning it off was wrong on
+                                // both counts. It cannot confound this gate:
+                                // `r` is defined j-FREE (the Jacobian is a
+                                // correction to the DELTA, not to the residual)
+                                // and the j-scaled deltas are byte-identical
+                                // across the three arms, so they cancel in
+                                // every comparison below. And pinning it made
+                                // the off arm differ from N4's own frame 8 in
+                                // the ReJitter bit rather than the clamp bit,
+                                // which is exactly the byte-identity this gate
+                                // then failed on. Derived also means the cap is
+                                // scored in the configuration a shipping
+                                // session runs.
+                                for arm in [(false, false), (true, false), (true, true)] {
+                                    ptg.force_nrd_rclamp(Some(arm));
+                                    ptg.write_cb(0, &p10);
+                                    let mut r = Ok(());
+                                    let sub = hg.run(|l| r = ptg.record_nrd_out(l, 0));
+                                    if sub.is_err() || r.is_err() {
+                                        eprintln!("check-gpu: FAIL N10 nrd-out record");
+                                        fail = true;
+                                        break;
+                                    }
+                                    match rb!(0, 8) {
+                                        Ok(v) => arms.push(v),
+                                        Err(e) => {
+                                            eprintln!("check-gpu: FAIL N10 readback: {e}");
+                                            fail = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Restore the BLOCK'S PIN, not None: the gates
+                                // downstream (N6, N7) are pinned off by the
+                                // same argument, and handing them back the
+                                // lever-derived value would re-arm the cap
+                                // under FR_NRD_RCLAMP=on.
+                                ptg.force_nrd_rclamp(Some((false, false)));
+                                // The kernel's OWN inputs, read back so the
+                                // oracle below scores the shader against an
+                                // independent implementation rather than
+                                // against itself: `accum` IS `base` (cs_nrd_out
+                                // reads it as such) and gbuf's core.z is the
+                                // out-of-range predicate's source. Cheap — 28
+                                // B/px — and deliberately NOT gbuf_ext: the
+                                // oracle needs no neighbour residuals, which is
+                                // the same property that keeps the shader's halo
+                                // clear of N7's unwritten sky ext.
+                                let n10_in = if fail {
+                                    None
+                                } else {
+                                    match (
+                                        hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
+                                        hg.read_buffer(
+                                            &ptg.gbuf,
+                                            ua,
+                                            pw * ph * gpu::trace::GBUF_STRIDE as usize,
+                                        ),
+                                    ) {
+                                        (Ok(a), Ok(c)) => Some((a, c)),
+                                        _ => {
+                                            eprintln!("check-gpu: FAIL N10 base/core readback");
+                                            fail = true;
+                                            None
+                                        }
+                                    }
+                                };
+                                if !fail {
+                                    let h = |b: &[u8], i: usize, l: usize| {
+                                        half::f16::from_bits(u16::from_le_bytes(
+                                            b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                                        ))
+                                        .to_f32()
+                                    };
+                                    // The bridge's own luma (nrd_ycocg(c).x),
+                                    // mirrored so the gate scores the shader in
+                                    // the units the shader decides in.
+                                    let lum = |b: &[u8], i: usize| {
+                                        0.25 * h(b, i, 0) + 0.5 * h(b, i, 1) + 0.25 * h(b, i, 2)
+                                    };
+                                    let npx = pw * ph;
+                                    let (n10_acc, n10_core) = n10_in.as_ref().unwrap();
+                                    let clanes = gpu::trace::GBUF_STRIDE as usize / 4;
+                                    let (_, n10_far) = dlss::near_far(scene.diag);
+                                    // `base` and the out-of-range predicate,
+                                    // read exactly as cs_nrd_out reads them.
+                                    let base_l = |i: usize| {
+                                        let f = |l: usize| {
+                                            f32::from_le_bytes(
+                                                n10_acc[(i * 3 + l) * 4..][..4].try_into().unwrap(),
+                                            )
+                                        };
+                                        crate::nrd::oracle::rclamp_luma([f(0), f(1), f(2)])
+                                    };
+                                    let in_range = |i: usize| {
+                                        f32::from_le_bytes(
+                                            n10_core[(i * clanes + 2) * 4..][..4].try_into().unwrap(),
+                                        ) < 0.999 * n10_far
+                                    };
+                                    // The 8-neighbour ring, edge-CLAMPED like
+                                    // the shader's halo fill, out-of-range
+                                    // EXCLUDED (None) like its -1.0 sentinel.
+                                    let ring = |i: usize| {
+                                        let (x, y) = ((i % pw) as isize, (i / pw) as isize);
+                                        let mut r = [None; 8];
+                                        let mut k = 0;
+                                        for dy in -1isize..=1 {
+                                            for dx in -1isize..=1 {
+                                                if dx == 0 && dy == 0 {
+                                                    continue;
+                                                }
+                                                let qx = (x + dx).clamp(0, pw as isize - 1) as usize;
+                                                let qy = (y + dy).clamp(0, ph as isize - 1) as usize;
+                                                let qi = qy * pw + qx;
+                                                r[k] = if in_range(qi) {
+                                                    Some(base_l(qi).max(0.0))
+                                                } else {
+                                                    None
+                                                };
+                                                k += 1;
+                                            }
+                                        }
+                                        r
+                                    };
+                                    let (mut fired_on, mut fired_hard) = (0usize, 0usize);
+                                    let (mut sum_off, mut sum_on, mut sum_hard) = (0f64, 0f64, 0f64);
+                                    let (mut rose, mut nonfinite) = (0usize, false);
+                                    let (mut oob_moved, mut unsound) = (0usize, 0usize);
+                                    let (mut orc_on, mut orc_hard) = (0usize, 0usize);
+                                    for i in 0..npx {
+                                        let (lo, ln, lh) =
+                                            (lum(&arms[0], i), lum(&arms[1], i), lum(&arms[2], i));
+                                        if !ln.is_finite() || !lh.is_finite() {
+                                            nonfinite = true;
+                                        }
+                                        let f_on =
+                                            arms[1][i * 8..i * 8 + 6] != arms[0][i * 8..i * 8 + 6];
+                                        let f_hard =
+                                            arms[2][i * 8..i * 8 + 6] != arms[0][i * 8..i * 8 + 6];
+                                        if f_on {
+                                            fired_on += 1;
+                                        }
+                                        if f_hard {
+                                            fired_hard += 1;
+                                        }
+                                        // OUT-OF-RANGE UNTOUCHED. The early
+                                        // return puts sky and the
+                                        // [0.999*far, far) band ahead of the
+                                        // clamp, so both armed arms must be
+                                        // byte-equal to the off arm there.
+                                        // Structural today — which is exactly
+                                        // why it is worth pinning: a future
+                                        // hoist of the clamp above that return
+                                        // (the halo fill has already been
+                                        // hoisted once) would be silent.
+                                        let live = in_range(i);
+                                        if !live && (f_on || f_hard) {
+                                            oob_moved += 1;
+                                        }
+                                        // ORACLE AGREEMENT vs nrd::oracle::
+                                        // rclamp_scale — an INDEPENDENT
+                                        // implementation, which is what pins
+                                        // the halo geometry, the centre
+                                        // exclusion, the out-of-range exclusion,
+                                        // the min-ring floor and all three K
+                                        // constants across shader and CPU at
+                                        // once. ONE-DIRECTIONAL by design: the
+                                        // shader additionally requires rl > 0,
+                                        // and rl needs the IN planes and
+                                        // gbuf_ext to reconstruct, so the gate
+                                        // asserts SOUNDNESS ("never clamps a
+                                        // pixel the oracle would not") and
+                                        // reports the converse as a count. A
+                                        // wrong K, a mis-strided halo or a
+                                        // centre-inclusive ring all break the
+                                        // sound direction, because every one of
+                                        // them makes the shader fire somewhere
+                                        // the oracle says it must not.
+                                        if live {
+                                            let r8 = ring(i);
+                                            let bl = base_l(i);
+                                            let o_on =
+                                                crate::nrd::oracle::rclamp_scale(bl, &r8, false)
+                                                    < 1.0;
+                                            let o_hard =
+                                                crate::nrd::oracle::rclamp_scale(bl, &r8, true)
+                                                    < 1.0;
+                                            if o_on {
+                                                orc_on += 1;
+                                            }
+                                            if o_hard {
+                                                orc_hard += 1;
+                                            }
+                                            // Each arm against ITS OWN oracle.
+                                            // (cap_hard <= cap_on always, so
+                                            // o_on implies o_hard — but scoring
+                                            // the default arm against the hard
+                                            // oracle would be the loose test,
+                                            // and the loose test is the one that
+                                            // misses a wrong K_MEAN.)
+                                            if (f_on && !o_on) || (f_hard && !o_hard) {
+                                                unsound += 1;
+                                            }
+                                        }
+                                        // LUMA-only monotonicity. Per-CHANNEL is
+                                        // NOT implied and must not be asserted:
+                                        // the residual can be negative in a
+                                        // channel (the deterministic-factor
+                                        // remainders leave base carrying less
+                                        // diffuse than D_in*kd at some pixels),
+                                        // so scaling r down can legitimately
+                                        // RAISE one channel. N8's own recorded
+                                        // first-draft failure is the same trap.
+                                        if ln > lo + 1e-4 {
+                                            rose += 1;
+                                        }
+                                        sum_off += lo as f64;
+                                        sum_on += ln as f64;
+                                        sum_hard += lh as f64;
+                                    }
+                                    let n = npx as f64;
+                                    let (m_off, m_on, m_hard) =
+                                        (sum_off / n, sum_on / n, sum_hard / n);
+                                    let drop_on = (m_off - m_on) / m_off.max(1e-9);
+                                    let drop_hard = (m_off - m_hard) / m_off.max(1e-9);
+                                    println!(
+                                        "check-gpu: nrd N10 residual-clamp — fired on \
+                                         {fired_on}/{npx} hard {fired_hard} (oracle-eligible \
+                                         {orc_on}/{orc_hard}) | mean {m_off:.4} -> {m_on:.4} \
+                                         (drop {:.2}%) | hard drop {:.2}% | luma-rose {rose} \
+                                         unsound {unsound} oob-moved {oob_moved}",
+                                        drop_on * 100.0,
+                                        drop_hard * 100.0
+                                    );
+                                    // SAY WHAT A GREEN N10 PROVES, because the
+                                    // numbers above invite the wrong reading.
+                                    // Both arms routinely report a 0.00% drop
+                                    // and that is CORRECT, not a dead gate: the
+                                    // trim is `1 - cap/bl`, so a pixel that only
+                                    // just clears its cap loses only just more
+                                    // than nothing, and on N4's CONVERGED,
+                                    // DENOISED planes almost every firing pixel
+                                    // is exactly that (the hard arm's cap is
+                                    // `ring_max`, so it fires on strict local
+                                    // maxima — of which a smooth image has few
+                                    // and marginal ones). What this gate holds
+                                    // is the WIRING and the SOUNDNESS: the halo
+                                    // is alive (the dead-ring bound), the
+                                    // barrier sits above both returns, the arms
+                                    // nest, the off arm is byte-exact, luma
+                                    // never rises, out-of-range never moves, and
+                                    // the shader agrees with the CPU oracle
+                                    // pixel for pixel. It does NOT measure
+                                    // whether the cap removes fireflies — that
+                                    // needs a noisy 1-spp frame with real glass,
+                                    // which is the --frd-lab / --qa campaign the
+                                    // lever stays default-OFF pending.
+                                    if drop_on < 1e-4 && drop_hard < 1e-4 {
+                                        println!(
+                                            "check-gpu: NOTE N10 — both arms removed ~0% of mean \
+                                             luma: on converged planes the firing pixels only just \
+                                             clear their cap, so this run proves the cap SOUND and \
+                                             WIRED, not that it catches fireflies"
+                                        );
+                                    }
+                                    let mut bad = Vec::new();
+                                    if nonfinite {
+                                        bad.push("non-finite");
+                                    }
+                                    if unsound > 0 {
+                                        bad.push(
+                                            "clamped a pixel nrd::oracle::rclamp_scale says it \
+                                             must not (halo geometry / K constants / centre \
+                                             exclusion disagree)",
+                                        );
+                                    }
+                                    if oob_moved > 0 {
+                                        bad.push(
+                                            "an out-of-range pixel moved (the clamp ran ahead of \
+                                             the passthrough return)",
+                                        );
+                                    }
+                                    // The off arm must reproduce N4's own LAST
+                                    // frame byte for byte. Frame 8 and not 7:
+                                    // the planes cs_nrd_out reads are whatever
+                                    // N4's loop left in them, and its last
+                                    // iteration is k = 8 at `frame: 108`, which
+                                    // p10 reproduces. This is re-recorded
+                                    // rather than reused, so it pins two things
+                                    // nothing else does — record_nrd_out is
+                                    // deterministic over unchanged planes, and
+                                    // the block-level clamp pin really did
+                                    // leave the CB in the state N4 scored (a
+                                    // stray armed bit shows up here as a diff
+                                    // against the frame N4 measured).
+                                    if arms[0] != frames[8] {
+                                        bad.push(
+                                            "the off arm is not byte-identical to N4's frame 8 \
+                                             (the disarmed recompose moved)",
+                                        );
+                                    }
+                                    // The hard arm is the strictly weaker cap
+                                    // (cap_hard <= cap_on pixelwise), so it can
+                                    // only ever clamp a SUPERSET. Equality here
+                                    // would mean the two arms share a
+                                    // multiplier — the exact defect the K_MAX
+                                    // relaxation was written to fix, which had
+                                    // shipped once.
+                                    if fired_hard < fired_on {
+                                        bad.push("the hard arm clamped fewer pixels than the default");
+                                    }
+                                    if rose > 0 {
+                                        bad.push("luma rose (the cap must only attenuate)");
+                                    }
+                                    // The 90%-of-the-pool lesson as a number:
+                                    // a spike cap that eats 5% of the frame's
+                                    // mean is eating signal, not spikes.
+                                    if drop_on > 0.05 {
+                                        bad.push("armed arm removed > 5% of mean luma");
+                                    }
+                                    // THE DEAD-HALO BOUND. If the groupshared
+                                    // fill never ran or the barrier sits below
+                                    // an early return, ring_mean reads 0, the
+                                    // cap collapses to ~0 and EVERYTHING clamps
+                                    // to nothing. A silent zero-ring is the most
+                                    // likely implementation bug in this pass and
+                                    // this is what names it.
+                                    if drop_hard >= 0.99 {
+                                        bad.push("hard arm removed ~everything (dead halo?)");
+                                    }
+                                    // ANTI-VACUITY. The hard arm is `cap ==
+                                    // ring_max`, i.e. "is this pixel a strict
+                                    // local maximum" — scene-independent, so it
+                                    // must fire SOMEWHERE on any real frame. If
+                                    // it does not, the gate is measuring a block
+                                    // that never executed and the default arm's
+                                    // quiet 0 means nothing.
+                                    if must_fire && fired_hard == 0 {
+                                        bad.push("hard arm never fired (the block never ran)");
+                                    }
+                                    if !bad.is_empty() {
+                                        eprintln!(
+                                            "check-gpu: FAIL N10 nrd residual-clamp: {}",
+                                            bad.join(", ")
+                                        );
+                                        ok = false;
+                                    }
+                                }
+                            }
+                            // --- N11: THE m_d MULTIPLY. N9-GPU gates the
+                            // CAPTURE (shade packs the right signal and the
+                            // right multiplier); this gates the bridge's USE of
+                            // it, which nothing else does and which N9 provably
+                            // cannot — see its comment: at that site OUT equals
+                            // IN byte-for-byte, so the delta is zero and `m_d`
+                            // multiplies nothing.
+                            //
+                            // TWO CHOICES MAKE IT WORK. It runs on N4's
+                            // CONVERGED planes, where ReBLUR really ran and
+                            // `d_out - d_in` is genuinely non-zero — the only
+                            // state in this suite where the multiply has
+                            // anything to multiply. And it FORCES the lane
+                            // rather than hoping the scene supplies one: the
+                            // ext record is rewritten with a known m_d on every
+                            // pixel (the N7 sentinel-fill idiom), so the gate
+                            // is SCENE-INDEPENDENT — the procedural check scene
+                            // derives m_d == 1.0 everywhere, which would make a
+                            // scene-supplied version vacuous exactly where the
+                            // suite always runs.
+                            //
+                            // Only sig.w's HIGH half is rewritten. cs_nrd_out
+                            // reads alb, spec, that half, and (under ReJitter,
+                            // pinned off here) nr — never the low half, which
+                            // is cs_nrd_pack's ao_t. So the two arms differ in
+                            // exactly one decoded scalar.
+                            {
+                                let ext_size = pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize;
+                                let el11 = gpu::trace::GBUF_EXT_STRIDE as usize;
+                                let clanes11 = gpu::trace::GBUF_STRIDE as usize / 4;
+                                let (_, far11) = dlss::near_far(scene.diag);
+                                let orig_ext = match hg.read_buffer(&ptg.gbuf_ext, ua, ext_size) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!("check-gpu: FAIL N11 ext readback: {e}");
+                                        return 1;
+                                    }
+                                };
+                                // The scratch every arm rewrites in place: a copy
+                                // of the real record with only bytes 62..64
+                                // replaced per arm, so nothing else about the
+                                // frame moves between them. The per-arm fill
+                                // lives in the loop below — do NOT pre-fill it
+                                // here, the first iteration would only overwrite
+                                // it and a reader would take that value for the
+                                // one under test.
+                                let mut forced = orig_ext.clone();
+                                // Upload it (the N7 fill, with our bytes).
+                                let up = {
+                                    let mut res: Option<ID3D12Resource> = None;
+                                    let hr = unsafe {
+                                        hg.device.CreateCommittedResource(
+                                            &gpu::d3d12::upload_heap(),
+                                            D3D12_HEAP_FLAG_NONE,
+                                            &gpu::d3d12::buffer_desc(ext_size as u64),
+                                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                                            None,
+                                            &mut res,
+                                        )
+                                    };
+                                    match (hr, res) {
+                                        (Ok(()), Some(r)) => r,
+                                        _ => {
+                                            eprintln!("check-gpu: FAIL N11 upload alloc");
+                                            return 1;
+                                        }
+                                    }
+                                };
+                                // A MACRO, not a closure — the rb! comment's
+                                // own lesson, and it bites here for the same
+                                // reason: a closure over `hg` pins &mut for the
+                                // whole block and rb! then cannot borrow it.
+                                macro_rules! fill {
+                                    ($src:expr) => {{
+                                        let mut ptr = std::ptr::null_mut();
+                                        if unsafe { up.Map(0, None, Some(&mut ptr)) }.is_err() {
+                                            false
+                                        } else {
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    $src.as_ptr(),
+                                                    ptr as *mut u8,
+                                                    ext_size,
+                                                );
+                                                up.Unmap(0, None);
+                                            }
+                                            hg.run(|l| unsafe {
+                                                l.ResourceBarrier(&[gpu::d3d12::transition(
+                                                    &ptg.gbuf_ext,
+                                                    ua,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                                )]);
+                                                l.CopyBufferRegion(
+                                                    &ptg.gbuf_ext,
+                                                    0,
+                                                    &up,
+                                                    0,
+                                                    ext_size as u64,
+                                                );
+                                                l.ResourceBarrier(&[gpu::d3d12::transition(
+                                                    &ptg.gbuf_ext,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                                    ua,
+                                                )]);
+                                            })
+                                            .is_ok()
+                                        }
+                                    }};
+                                }
+                                let p11 = gpu::trace::FrameParams {
+                                    sway_prev_time: None,
+                                    cam: basis_b,
+                                    frame: 108,
+                                    accumulate: false,
+                                    jitter: false,
+                                    frame_jitter: Some((0.0, 0.0)),
+                                    prev_cam: Some(basis_b),
+                                    q: uq,
+                                    verify: false,
+                                    spp: 1,
+                                    probe_sample: 0,
+                                    clouds: crate::clouds::Clouds::check(scene.diag),
+                                    fireflies: crate::fireflies::Fireflies::check(scene),
+                                    sway_time: check_sway,
+                                    replay: false,
+                                };
+                                // j == (1,1): the Jacobian scales the SAME
+                                // delta in every arm, so it cancels out of the
+                                // differences below - but pin it anyway, so a
+                                // failure is attributable to one scalar.
+                                ptg.force_nrd_rejitter(Some(false));
+                                // THREE FORCED VALUES, and the flag stays ARMED
+                                // throughout. That is the trick: the arms
+                                // differ only in the BYTES OF THE LANE, so what
+                                // is under test is the path from the lane to
+                                // the multiply with no flag semantics mixed in
+                                // - and the test becomes pure LINEARITY:
+                                //
+                                //   col(m) = base + D*kd*m + S*f0   (j == 1)
+                                //   col(0.50) - col(1.0) = -0.50 * D*kd
+                                //   col(0.25) - col(1.0) = -0.75 * D*kd
+                                //   => the second difference is EXACTLY 1.5x
+                                //      the first, per channel.
+                                //
+                                // It needs neither `D` nor `kd`, which is what
+                                // makes it robust. An earlier draft rebuilt the
+                                // expected difference from the IN/OUT plane
+                                // readbacks and could NOT be trusted: those two
+                                // planes read back BYTE-EQUAL here while the
+                                // shader demonstrably saw them differ (the arms
+                                // moved 145703 px on a supposedly zero delta,
+                                // and a probe pixel read di == od == 0.92676
+                                // with the two colors 0.40039 vs 0.39575).
+                                // Whatever that readback anomaly is - it is
+                                // NOT understood and is worth a look if the
+                                // OUT planes are ever needed by a gate - this
+                                // formulation is immune to it, because every
+                                // unknown cancels in the ratio.
+                                let ms = [1.0f32, 0.5, 0.25];
+                                let mut cols: Vec<Vec<u8>> = Vec::new();
+                                let mut f11 = false;
+                                ptg.force_remod_exact(Some(true));
+                                for &m in &ms {
+                                    let bits = half::f16::from_f32(m).to_bits().to_le_bytes();
+                                    for i in 0..pw * ph {
+                                        forced[i * el11 + 62..i * el11 + 64]
+                                            .copy_from_slice(&bits);
+                                    }
+                                    if !fill!(&forced) {
+                                        eprintln!("check-gpu: FAIL N11 forced-ext fill");
+                                        return 1;
+                                    }
+                                    ptg.write_cb(0, &p11);
+                                    let mut r = Ok(());
+                                    let sub = hg.run(|l| r = ptg.record_nrd_out(l, 0));
+                                    if sub.is_err() || r.is_err() {
+                                        eprintln!("check-gpu: FAIL N11 nrd-out (m {m})");
+                                        f11 = true;
+                                        break;
+                                    }
+                                    match rb!(0, 8) {
+                                        Ok(v) => cols.push(v),
+                                        Err(e) => {
+                                            eprintln!("check-gpu: FAIL N11 readback: {e}");
+                                            f11 = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                ptg.force_remod_exact(None);
+                                ptg.force_nrd_rejitter(None);
+                                // RESTORE the real ext before anything else
+                                // reads it (the N7 discipline), and before the
+                                // verdict below, so a failing gate cannot leave
+                                // forged bytes behind for N9/N6/N7.
+                                if !fill!(&orig_ext) {
+                                    eprintln!("check-gpu: FAIL N11 ext restore");
+                                    return 1;
+                                }
+                                let cor11 =
+                                    match hg.read_buffer(&ptg.gbuf, ua, pw * ph * clanes11 * 4) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            eprintln!("check-gpu: FAIL N11 core readback: {e}");
+                                            return 1;
+                                        }
+                                    };
+                                if !f11 {
+                                    let texh = |b: &[u8], i: usize, l: usize| {
+                                        half::f16::from_bits(u16::from_le_bytes(
+                                            b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                                        ))
+                                        .to_f32()
+                                    };
+                                    // (0.25 - 1) / (0.5 - 1) = 1.5
+                                    let ratio = (ms[2] - ms[0]) / (ms[1] - ms[0]);
+                                    let (mut live_ch, mut bad_ch, mut worst) =
+                                        (0usize, 0usize, 0.0f32);
+                                    let mut moved = 0usize;
+                                    for i in 0..pw * ph {
+                                        let vz = f32::from_le_bytes(
+                                            cor11[(i * clanes11 + 2) * 4..][..4].try_into().unwrap(),
+                                        );
+                                        if vz >= 0.999 * far11 {
+                                            continue;
+                                        }
+                                        if cols[1][i * 8..i * 8 + 6] != cols[0][i * 8..i * 8 + 6] {
+                                            moved += 1;
+                                        }
+                                        for c in 0..3 {
+                                            let (c0, c1, c2) = (
+                                                texh(&cols[0], i, c),
+                                                texh(&cols[1], i, c),
+                                                texh(&cols[2], i, c),
+                                            );
+                                            // The store clamps to
+                                            // [0, NRD_FP16_MAX_B]; a channel on
+                                            // either rail carries no delta.
+                                            let rail = |v: f32| v <= 0.0 || v >= 65000.0;
+                                            if rail(c0) || rail(c1) || rail(c2) {
+                                                continue;
+                                            }
+                                            let (d1, d2) = (c1 - c0, c2 - c0);
+                                            // 3 f16 quanta at the operands' own
+                                            // magnitude: three stored values
+                                            // enter the two differences.
+                                            let mag = c0.abs().max(c1.abs()).max(c2.abs());
+                                            let tol = (mag / 512.0 * 3.0).max(2e-5);
+                                            if d1.abs() > 4.0 * tol {
+                                                live_ch += 1;
+                                                let e = (d2 - ratio * d1).abs();
+                                                if e > tol {
+                                                    bad_ch += 1;
+                                                    worst =
+                                                        worst.max(e / (ratio * d1).abs().max(1e-6));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    println!(
+                                        "check-gpu: nrd N11 m_d-multiply - moved {moved} px | \
+                                         live {live_ch} ch | non-linear {bad_ch} worst-rel \
+                                         {worst:.2e}"
+                                    );
+                                    let mut b11 = Vec::new();
+                                    if bad_ch > 0 {
+                                        b11.push(
+                                            "the delta does not scale LINEARLY with the m_d lane \
+                                             (the bridge mis-applies it)",
+                                        );
+                                    }
+                                    // ANTI-VACUITY, and exactly what a planted
+                                    // `m_d = 1.0` in cs_nrd_out trips: with the
+                                    // lane ignored all three arms are
+                                    // IDENTICAL, so nothing moves and no
+                                    // channel is live. SCENE-INDEPENDENT by
+                                    // construction, because the lane is FORCED
+                                    // rather than hoped for - it fires on the
+                                    // procedural scene, whose scene-derived
+                                    // m_d is 1.0 on every pixel.
+                                    if moved == 0 {
+                                        b11.push(
+                                            "the arms produced IDENTICAL output - the bridge \
+                                             never read the m_d lane",
+                                        );
+                                    }
+                                    if live_ch == 0 {
+                                        b11.push(
+                                            "no channel had a materially non-zero delta (this \
+                                             site needs a live denoise - OUT == IN?)",
+                                        );
+                                    }
+                                    if !b11.is_empty() {
+                                        eprintln!(
+                                            "check-gpu: FAIL N11 m_d multiply: {}",
+                                            b11.join(", ")
+                                        );
+                                        ok = false;
+                                    }
+                                } else {
+                                    ok = false;
+                                }
+                            }
+                            // --- N9-GPU: the RESIDUAL SIGN gate — the one
+                            // that scores the REAL shader's remodulation
+                            // rather than a model of it.
+                            //
+                            // ALGEBRAICALLY `col = R + D_out·kd·m_d +
+                            // S_out·f0` with `R = base − D_in·kd·m_d −
+                            // S_in·f0` the part no denoiser ever touched. R is
+                            // what shade composed MINUS what the bridge
+                            // believes it composed, so if the remodulation is
+                            // exact R is a sum of the terms that were never
+                            // folded — emissive, the glass chain — every one
+                            // of which is NON-NEGATIVE. If the remodulation
+                            // over-states the folds, R goes NEGATIVE, and that
+                            // sign is checkable without any ground truth for
+                            // "what shade composed" other than shade's own
+                            // non-negativity, which IS ground truth.
+                            //
+                            // THE PLAN'S ERASE ARM DOES NOT WORK and this
+                            // replaces it: zeroing the OUT planes to read
+                            // `col0 = base − (folds)` off the output plane
+                            // fails because cs_nrd_out ends with
+                            // `clamp(col, 0, NRD_FP16_MAX_B)` — a negative
+                            // residual is clipped at the store and is exactly
+                            // as invisible as a correct one. R is
+                            // reconstructed on the CPU from the kernel's own
+                            // inputs instead.
+                            //
+                            // IT MUST RUN UNDER RTGI, and that is a fact about
+                            // the wire rather than a convenience. Off the RTGI
+                            // path the bridge rebuilds the ambient sub-term as
+                            // `ao * sh_irradiance(wire n_s)` while shade used
+                            // `amb_irradiance(n, n_s)` — the AMB_BUMP-amplified
+                            // response, whose deviation term is SIGNED and
+                            // whose ratio is per-channel RGB, needing the
+                            // geometric normal that is not on the wire. So the
+                            // bridge legitimately over-subtracts wherever the
+                            // amplified response dips below the plain one, R is
+                            // legitimately negative, and a sign gate there
+                            // measures a documented known-approximate instead
+                            // of the remodulation (MEASURED: 2.95e3 of negative
+                            // energy over 53603 px, IDENTICAL in both remod
+                            // arms — the tell that it is not this feature's).
+                            // Under RTGI the split arm leaves `prim.ao` at 0,
+                            // the whole `ao * amb` term drops out of D_in, and
+                            // what remains is exactly what shade captured.
+                            if crate::shade::rtgi_enabled() {
+                                let q9 = Quality { rtgi: true, ..Quality::upscaler_1spp() };
+                                let p9 = gpu::trace::FrameParams {
+                                    sway_prev_time: None,
+                                    cam: basis_b,
+                                    frame: 109,
+                                    accumulate: false,
+                                    jitter: false,
+                                    frame_jitter: Some((0.0, 0.0)),
+                                    prev_cam: Some(basis_b),
+                                    q: q9,
+                                    verify: false,
+                                    spp: 1,
+                                    probe_sample: 0,
+                                    clouds: crate::clouds::Clouds::check(scene.diag),
+                                    fireflies: crate::fireflies::Fireflies::check(scene),
+                                    sway_time: check_sway,
+                                    replay: false,
+                                };
+                                // Per arm: accum, gbuf, gbuf_ext, in_diff,
+                                // in_spec, out_diff, out_spec, color — every
+                                // input cs_nrd_out reads plus what it wrote, so
+                                // the recompose can be scored against a CPU
+                                // ORACLE rather than merely reconstructed.
+                                //
+                                // RECONSTRUCTION ALONE IS NOT ENOUGH, and this
+                                // gate's first draft proved it: it rebuilt
+                                // `R = base − D_in·kd·m_d − S_in·f0` on the
+                                // CPU, which applies m_d ITSELF, so a bridge
+                                // that IGNORES the m_d lane is invisible to it
+                                // — planted (`m_d = 1.0` in cs_nrd_out) and the
+                                // numbers came back bit-identical. The output
+                                // plane is the only place the bridge's own use
+                                // of the lane is observable.
+                                let mut a9: Vec<Vec<Vec<u8>>> = Vec::new();
+                                let mut f9 = false;
+                                // j == 1, so the oracle needs no Jacobian: the
+                                // subject here is the remodulation, and N8 owns
+                                // the re-jitter.
+                                ptg.force_nrd_rejitter(Some(false));
+                                for exact in [true, false] {
+                                    ptg.force_remod_exact(Some(exact));
+                                    ptg.write_cb(0, &p9);
+                                    let (mut rp, mut ro) = (Ok(()), Ok(()));
+                                    let sub = hg.run(|l| {
+                                        ptg.record_wavefront(l, 0, &p9, false);
+                                        rp = ptg.record_nrd_pack(l, 0);
+                                        ro = ptg.record_nrd_out(l, 0);
+                                    });
+                                    if sub.is_err() || rp.is_err() || ro.is_err() {
+                                        eprintln!("check-gpu: FAIL N9 trace/pack/out ({exact})");
+                                        f9 = true;
+                                        break;
+                                    }
+                                    let acc = hg.read_buffer(&ptg.accum, ua, pw * ph * 12);
+                                    let cor = hg.read_buffer(
+                                        &ptg.gbuf,
+                                        ua,
+                                        pw * ph * gpu::trace::GBUF_STRIDE as usize,
+                                    );
+                                    let ext = hg.read_buffer(
+                                        &ptg.gbuf_ext,
+                                        ua,
+                                        pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize,
+                                    );
+                                    match (
+                                        acc,
+                                        cor,
+                                        ext,
+                                        rb!(5, 8),
+                                        rb!(6, 8),
+                                        rb!(7, 8),
+                                        rb!(3, 8),
+                                        rb!(0, 8),
+                                    ) {
+                                        (
+                                            Ok(a),
+                                            Ok(c),
+                                            Ok(e),
+                                            Ok(d),
+                                            Ok(s),
+                                            Ok(od),
+                                            Ok(os),
+                                            Ok(col),
+                                        ) => a9.push(vec![a, c, e, d, s, od, os, col]),
+                                        _ => {
+                                            eprintln!(
+                                                "check-gpu: FAIL N9 readback (exact {exact})"
+                                            );
+                                            f9 = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                ptg.force_remod_exact(None);
+                                ptg.force_nrd_rejitter(None);
+                                if !f9 {
+                                    let clanes = gpu::trace::GBUF_STRIDE as usize / 4;
+                                    let el = gpu::trace::GBUF_EXT_STRIDE as usize;
+                                    let elanes = el / 4;
+                                    let (_, n9far) = dlss::near_far(scene.diag);
+                                    let texh = |b: &[u8], i: usize, l: usize| {
+                                        half::f16::from_bits(u16::from_le_bytes(
+                                            b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                                        ))
+                                        .to_f32()
+                                    };
+                                    // Per arm: the negative-residual ENERGY and
+                                    // its pixel count. Energy rather than a
+                                    // bare count because a count is dominated
+                                    // by ulp-scale noise at dim pixels, while
+                                    // the defect this looks for is systematic
+                                    // and proportional.
+                                    // WHERE THE TWO ARMS' CAPTURES ACTUALLY
+                                    // DIFFER (the sig.xyz lobe lanes). Scoring
+                                    // the whole frame BURIES the effect: on
+                                    // san-miguel-lp only 1514 of 153974 hit
+                                    // pixels carry a non-unity factor, so a
+                                    // frame-wide energy compare read 2.4614e3
+                                    // vs 2.4616e3 — a 4-pixel margin, teeth in
+                                    // name only. The subset is where the claim
+                                    // lives and where it can be measured.
+                                    let live_px_mask: Vec<bool> = (0..pw * ph)
+                                        .map(|i| {
+                                            a9[0][2][i * el + 48..i * el + 60]
+                                                != a9[1][2][i * el + 48..i * el + 60]
+                                        })
+                                        .collect();
+                                    // (neg energy, defect-scale px, folded
+                                    // energy, SIGNED residual sum, px with
+                                    // ao != 0). The signed sum is what the
+                                    // teeth read: negative-energy alone is
+                                    // insensitive here, because a correction
+                                    // that shifts R by a few percent at pixels
+                                    // where R is already positive moves the
+                                    // negative tail almost not at all
+                                    // (measured: a 9% m_d correction produced
+                                    // a 0.056%-of-folded change in the negative
+                                    // energy). The SIGNED difference between
+                                    // arms is the correction itself, and every
+                                    // unmodelled term in `base` cancels out of
+                                    // it exactly, since the two arms differ
+                                    // ONLY in the capture.
+                                    let score = |k: usize,
+                                                 exact: bool,
+                                                 subset: bool|
+                                     -> (f64, usize, f64, f64, usize) {
+                                        let (acc, cor, ext, di, sp) = (
+                                            &a9[k][0],
+                                            &a9[k][1],
+                                            &a9[k][2],
+                                            &a9[k][3],
+                                            &a9[k][4],
+                                        );
+                                        let (mut neg, mut cnt, mut tot) = (0.0f64, 0usize, 0.0f64);
+                                        let (mut ao_sum, mut ao_nz) = (0.0f64, 0usize);
+                                        for i in 0..pw * ph {
+                                            let vz = f32::from_le_bytes(
+                                                cor[(i * clanes + 2) * 4..][..4].try_into().unwrap(),
+                                            );
+                                            if vz >= 0.999 * n9far || (subset && !live_px_mask[i]) {
+                                                continue;
+                                            }
+                                            let ef = |l: usize| {
+                                                f32::from_le_bytes(
+                                                    ext[(i * elanes + l) * 4..][..4]
+                                                        .try_into()
+                                                        .unwrap(),
+                                                )
+                                            };
+                                            let base = Vec3A::new(
+                                                f32::from_le_bytes(
+                                                    acc[i * 12..i * 12 + 4].try_into().unwrap(),
+                                                ),
+                                                f32::from_le_bytes(
+                                                    acc[i * 12 + 4..i * 12 + 8].try_into().unwrap(),
+                                                ),
+                                                f32::from_le_bytes(
+                                                    acc[i * 12 + 8..i * 12 + 12].try_into().unwrap(),
+                                                ),
+                                            );
+                                            let kd = Vec3A::new(ef(4), ef(5), ef(6));
+                                            let f0 = fsr::sqrt_wire3(Vec3A::new(
+                                                ef(8),
+                                                ef(9),
+                                                ef(10),
+                                            ))
+                                            .max(Vec3A::splat(1e-4));
+                                            let m_d = if exact {
+                                                let w = u32::from_le_bytes(
+                                                    ext[i * el + 60..i * el + 64]
+                                                        .try_into()
+                                                        .unwrap(),
+                                                );
+                                                half::f16::from_bits((w >> 16) as u16).to_f32()
+                                            } else {
+                                                1.0
+                                            };
+                                            let inv = |b: &[u8]| {
+                                                let c = crate::nrd::oracle::ycocg_to_linear([
+                                                    texh(b, i, 0),
+                                                    texh(b, i, 1),
+                                                    texh(b, i, 2),
+                                                ]);
+                                                Vec3A::new(c[0], c[1], c[2])
+                                            };
+                                            // The AO lane the bridge multiplies
+                                            // sh_irradiance by. Under RTGI the
+                                            // split arm leaves it at 0, which
+                                            // is the precondition this whole
+                                            // gate rests on — so REPORT it
+                                            // rather than assume it.
+                                            let aow = u32::from_le_bytes(
+                                                ext[i * el + 64..i * el + 68].try_into().unwrap(),
+                                            );
+                                            let ao = half::f16::from_bits(aow as u16).to_f32();
+                                            if ao != 0.0 {
+                                                ao_nz += 1;
+                                            }
+                                            let d_fold = inv(di) * kd * m_d;
+                                            let s_fold = inv(sp) * f0;
+                                            let r = base - d_fold - s_fold;
+                                            let lum = |v: Vec3A| 0.25 * v.x + 0.5 * v.y + 0.25 * v.z;
+                                            let (rl, sub) =
+                                                (lum(r) as f64, (lum(d_fold) + lum(s_fold)) as f64);
+                                            ao_sum += rl;
+                                            tot += sub;
+                                            if rl < 0.0 {
+                                                neg -= rl;
+                                                // Count only DEFECT-scale
+                                                // over-subtraction: 1% of what
+                                                // was subtracted at that pixel,
+                                                // which is far above f16 wire
+                                                // quantization and far below
+                                                // the ~4-450% the pre-fix
+                                                // arithmetic produces.
+                                                if rl < -1e-2 * sub {
+                                                    cnt += 1;
+                                                }
+                                            }
+                                        }
+                                        (neg, cnt, tot, ao_sum, ao_nz)
+                                    };
+                                    let (ne_x, nc_x, tot_x, _, ao_nz) = score(0, true, false);
+                                    let (ne_p, nc_p, _, _, _) = score(1, false, false);
+                                    // ...and again over the differing pixels
+                                    // ONLY, which is where the teeth go.
+                                    let (le_x, lc_x, ltot, rs_x, _) = score(0, true, true);
+                                    let (le_p, lc_p, _, rs_p, _) = score(1, false, true);
+                                    let n_live = live_px_mask.iter().filter(|b| **b).count();
+                                    // AN OUTPUT ORACLE CANNOT LIVE HERE, and
+                                    // the reason is worth recording because it
+                                    // is not obvious and cost a full
+                                    // investigation to find. This block traces,
+                                    // packs and recomposes, but it NEVER RUNS
+                                    // NRD — so the OUT planes come back
+                                    // BYTE-EQUAL to the IN planes (the `plane
+                                    // means` line below prints both; measured
+                                    // identical to five figures), the delta
+                                    // `d_out - d_in` is IDENTICALLY ZERO, and
+                                    // `m_d` multiplies zero. The bridge's USE
+                                    // of the lane is therefore unobservable at
+                                    // this site BY CONSTRUCTION: planting
+                                    // `m_d = 1.0` inside cs_nrd_out changed not
+                                    // one byte of the output here, which is how
+                                    // the attempt was caught.
+                                    //
+                                    // So this gate's subject is the CAPTURE —
+                                    // does shade pack the right signal and the
+                                    // right multiplier — which the correction
+                                    // below does measure, from the packed
+                                    // planes. The MULTIPLY's own home is a site
+                                    // with a LIVE denoise, i.e. N4's converged
+                                    // planes where OUT genuinely differs from
+                                    // IN; that is N11, immediately above, which
+                                    // forces the lane to three known values and
+                                    // asserts the output moves LINEARLY in it.
+                                    // The two gates are the halves of one claim
+                                    // and neither substitutes for the other.
+                                    // Plane-liveness probe: an OUT plane that
+                                    // reads back as zeros (a wrong rest state,
+                                    // a plane NRD never wrote) makes the oracle
+                                    // compare `col` against the RESIDUAL and
+                                    // report a meaningless 1e5-scale error.
+                                    let pmean = |b: &[u8]| {
+                                        let mut s = 0.0f64;
+                                        for i in 0..pw * ph {
+                                            s += texh(b, i, 0).abs() as f64;
+                                        }
+                                        s / (pw * ph) as f64
+                                    };
+                                    println!(
+                                        "check-gpu: N9 plane means — in_diff {:.4e} out_diff \
+                                         {:.4e} in_spec {:.4e} out_spec {:.4e} color {:.4e}",
+                                        pmean(&a9[0][3]),
+                                        pmean(&a9[0][5]),
+                                        pmean(&a9[0][4]),
+                                        pmean(&a9[0][6]),
+                                        pmean(&a9[0][7])
+                                    );
+                                    // The correction the fix applied, in the
+                                    // frame's own radiance units.
+                                    let dsum = rs_x - rs_p;
+                                    // Does this scene exercise the fix at all?
+                                    // The LOBE lanes only (sig.xyz, bytes
+                                    // 48..60) — sig.w's high half swaps
+                                    // shadow_t for m_d on every hit pixel by
+                                    // construction, so a whole-record compare
+                                    // reports "live" on a scene where nothing
+                                    // was re-captured at all (it did, in this
+                                    // gate's first draft).
+                                    let live = n_live > 0;
+                                    println!(
+                                        "check-gpu: nrd N9 residual-sign — frame: armed neg \
+                                         {ne_x:.4e} ({nc_x} px) vs pre-fix {ne_p:.4e} ({nc_p} \
+                                         px), folded {tot_x:.4e} | live {n_live} px: neg \
+                                         {le_x:.4e} ({lc_x}) vs {le_p:.4e} ({lc_p}), correction \
+                                         {dsum:.4e} of folded {ltot:.4e} | ao-nz {ao_nz}"
+                                    );
+                                    let mut bad = Vec::new();
+                                    // THE CLAIM IS RELATIVE, AND DELIBERATELY
+                                    // NOT ABSOLUTE. An absolute "R >= 0" tooth
+                                    // was written first and does NOT hold, for
+                                    // a reason worth recording rather than
+                                    // re-discovering: `base` carries terms this
+                                    // reconstruction does not model, so R comes
+                                    // out positive on average and negative on a
+                                    // large minority of pixels EVEN WITH THE
+                                    // FIX ARMED — MEASURED on the procedural
+                                    // scene under RTGI at mean base 0.413 vs
+                                    // mean folded 0.376, with 3.07e3 of
+                                    // negative energy over 63755 px, and
+                                    // IDENTICAL in both remod arms. Two
+                                    // candidates were eliminated by
+                                    // measurement, not argument: the sampled
+                                    // ambient's AMB_BUMP mismatch (this gate
+                                    // runs under RTGI precisely to remove it —
+                                    // `ao-nz` in the report is 0, so the term
+                                    // is provably gone) and the remodulation
+                                    // itself (the two arms agree to five
+                                    // figures). Accounting for every term in
+                                    // `base` is the FSR composite identity
+                                    // gate's job; this one's subject is the
+                                    // DIFFERENCE between two arms, where
+                                    // everything unmodelled cancels exactly.
+                                    //
+                                    // SOUNDNESS: the fix may only ever REDUCE
+                                    // over-subtraction. Holds on every scene,
+                                    // live or not, and is what an inverted
+                                    // remodulation would break.
+                                    if ne_x > ne_p * 1.001 + 1e-6 {
+                                        bad.push(
+                                            "the exact arm over-subtracts MORE than pre-fix (the \
+                                             remodulation is inverted)",
+                                        );
+                                    }
+                                    // (No oracle assertion — see the comment at
+                                    // its definition: with OUT == IN the delta
+                                    // is zero, so the number it produces is a
+                                    // statement about `base` vs the recompose's
+                                    // own passthrough, which N3 already owns.)
+                                    // TEETH, gated on `live` and DELIBERATELY
+                                    // NOT on `must_fire`. That distinction is
+                                    // the whole reason this gate works at all:
+                                    // `must_fire` is FALSE on loaded OBJ scenes
+                                    // and TRUE on the procedural one — i.e.
+                                    // exactly inverted from where this feature
+                                    // is exercised — so teeth behind it could
+                                    // never fire anywhere (they didn't; the
+                                    // gate "passed" san-miguel on a 4-pixel
+                                    // margin without ever evaluating them).
+                                    // `must_fire` guards assumptions about the
+                                    // DEFAULT scene's topology; `live` is a
+                                    // MEASURED precondition, which is the
+                                    // stronger thing to gate on.
+                                    if live && dsum <= 0.0 {
+                                        bad.push(
+                                            "the fix did not reduce the subtraction on the \
+                                             differing pixels (its sign is wrong)",
+                                        );
+                                    }
+                                    // ...and by a real share of what was folded
+                                    // there, never a handful of ulps.
+                                    if live && dsum < 1e-3 * ltot.max(1e-9) {
+                                        bad.push(
+                                            "the correction on the differing pixels is below \
+                                             0.1% of their folded energy (ulp-scale — the flag \
+                                             reached the pack but changed nothing)",
+                                        );
+                                    }
+                                    if !live {
+                                        println!(
+                                            "check-gpu: NOTE N9 — the two remod arms packed \
+                                             IDENTICAL bytes on this scene, so the teeth stood \
+                                             down: nothing here has sheen, translucency, a cavity \
+                                             pit or a detail sun-shadow. The scene-independent \
+                                             proof is --check's `remod` sweep."
+                                        );
+                                    }
+                                    if !bad.is_empty() {
+                                        eprintln!(
+                                            "check-gpu: FAIL N9 nrd residual-sign: {}",
+                                            bad.join(", ")
+                                        );
+                                        ok = false;
+                                    }
+                                }
+                                // Restore frame B and its pack (the N4/N6/N7
+                                // discipline — the gates below read frame-B
+                                // state off these buffers and the IN planes).
+                                ptg.write_cb(0, &p);
+                                let mut rr = Ok(());
+                                if hg
+                                    .run(|l| {
+                                        ptg.record_wavefront(l, 0, &p, false);
+                                        rr = ptg.record_nrd_pack(l, 0);
+                                    })
+                                    .is_err()
+                                    || rr.is_err()
+                                {
+                                    eprintln!("check-gpu: FAIL N9 frame-B restore");
+                                    return 1;
+                                }
+                            } else {
+                                // --no-rtgi: the shade block whose `prim.ao = 0`
+                                // makes the residual's sign meaningful never
+                                // compiled, so the gate stands down rather than
+                                // measure the AMB_BUMP mismatch (the N6 stand-
+                                // down shape).
+                                println!(
+                                    "check-gpu: NOTE N9 skipped — --no-rtgi leaves the sampled \
+                                     ambient in the fold, where the bridge's sh_irr(n_s) and \
+                                     shade's amb_irradiance(n, n_s) legitimately disagree"
+                                );
+                            }
                             if !n4_fail {
                                 let lum = |b: &[u8], i: usize| -> f32 {
                                     let h = |l: usize| {
@@ -8897,6 +10113,212 @@ fn run_check_gpu(
                             }
                         } else {
                             ok = false;
+                        }
+                        // --- F10: N10's FRD twin, and the ONLY thing that
+                        // makes "the residual cap is engine-blind" a checked
+                        // claim rather than a comment on the flag const. The
+                        // bridge is one TEXT compiled against two engines'
+                        // wiring, so this is not re-measuring identical math
+                        // the way a DXR arm of N8 would be: the OUT planes here
+                        // are FRD's, produced by a different denoiser, and the
+                        // cap must behave the same over them. Reuses F4's
+                        // converged planes and re-runs ONLY cs_nrd_out, three
+                        // arms, one CB bit apart.
+                        if !f4_fail && !frames.is_empty() {
+                            let base_arm = frames.len() - 1;
+                            // The LAST loop iteration's params, rebuilt: the
+                            // planes cs_nrd_out reads are that frame's, so the
+                            // off arm must reproduce `frames[base_arm]` byte
+                            // for byte and any mismatch means the CB moved.
+                            let fp_last = gpu::trace::FrameParams {
+                                sway_prev_time: None,
+                                cam: basis_b,
+                                frame: 208,
+                                accumulate: false,
+                                jitter: false,
+                                frame_jitter: Some((0.0, 0.0)),
+                                prev_cam: Some(basis_b),
+                                q: uq,
+                                verify: false,
+                                spp: 1,
+                                probe_sample: 0,
+                                clouds: crate::clouds::Clouds::check(scene.diag),
+                                fireflies: crate::fireflies::Fireflies::check(scene),
+                                sway_time: check_sway,
+                                replay: false,
+                            };
+                            let mut arms10: Vec<Vec<u8>> = Vec::new();
+                            let mut f10_fail = false;
+                            for arm in [(false, false), (true, false), (true, true)] {
+                                ptg.force_nrd_rclamp(Some(arm));
+                                ptg.write_cb(0, &fp_last);
+                                let mut r = Ok(());
+                                let sub = hg.run(|l| r = ptg.record_nrd_out(l, 0));
+                                if sub.is_err() || r.is_err() {
+                                    eprintln!("check-gpu: FAIL F10 nrd-out record");
+                                    f10_fail = true;
+                                    break;
+                                }
+                                match rb!(0, 8) {
+                                    Ok(v) => arms10.push(v),
+                                    Err(e) => {
+                                        eprintln!("check-gpu: FAIL F10 readback: {e}");
+                                        f10_fail = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Back to the block pin, never None (the F5/F6/F7
+                            // probes below score FRD, not the cap).
+                            ptg.force_nrd_rclamp(Some((false, false)));
+                            let f10_in = if f10_fail {
+                                None
+                            } else {
+                                match (
+                                    hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
+                                    hg.read_buffer(
+                                        &ptg.gbuf,
+                                        ua,
+                                        pw * ph * gpu::trace::GBUF_STRIDE as usize,
+                                    ),
+                                ) {
+                                    (Ok(a), Ok(c)) => Some((a, c)),
+                                    _ => {
+                                        eprintln!("check-gpu: FAIL F10 base/core readback");
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some((f10_acc, f10_core)) = f10_in {
+                                let clanes = gpu::trace::GBUF_STRIDE as usize / 4;
+                                let (_, f10_far) = dlss::near_far(scene.diag);
+                                let h = |b: &[u8], i: usize, l: usize| {
+                                    half::f16::from_bits(u16::from_le_bytes(
+                                        b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                                    ))
+                                    .to_f32()
+                                };
+                                let lum = |b: &[u8], i: usize| {
+                                    0.25 * h(b, i, 0) + 0.5 * h(b, i, 1) + 0.25 * h(b, i, 2)
+                                };
+                                let base_l = |i: usize| {
+                                    let f = |l: usize| {
+                                        f32::from_le_bytes(
+                                            f10_acc[(i * 3 + l) * 4..][..4].try_into().unwrap(),
+                                        )
+                                    };
+                                    crate::nrd::oracle::rclamp_luma([f(0), f(1), f(2)])
+                                };
+                                let in_range = |i: usize| {
+                                    f32::from_le_bytes(
+                                        f10_core[(i * clanes + 2) * 4..][..4].try_into().unwrap(),
+                                    ) < 0.999 * f10_far
+                                };
+                                let ring = |i: usize| {
+                                    let (x, y) = ((i % pw) as isize, (i / pw) as isize);
+                                    let mut r = [None; 8];
+                                    let mut k = 0;
+                                    for dy in -1isize..=1 {
+                                        for dx in -1isize..=1 {
+                                            if dx == 0 && dy == 0 {
+                                                continue;
+                                            }
+                                            let qx = (x + dx).clamp(0, pw as isize - 1) as usize;
+                                            let qy = (y + dy).clamp(0, ph as isize - 1) as usize;
+                                            let qi = qy * pw + qx;
+                                            r[k] = if in_range(qi) {
+                                                Some(base_l(qi).max(0.0))
+                                            } else {
+                                                None
+                                            };
+                                            k += 1;
+                                        }
+                                    }
+                                    r
+                                };
+                                let npx = pw * ph;
+                                let (mut f_on_n, mut f_hard_n) = (0usize, 0usize);
+                                let (mut rose, mut unsound, mut oob_moved) = (0usize, 0usize, 0usize);
+                                let (mut s_off, mut s_on, mut s_hard) = (0f64, 0f64, 0f64);
+                                for i in 0..npx {
+                                    let (lo, ln, lh) =
+                                        (lum(&arms10[0], i), lum(&arms10[1], i), lum(&arms10[2], i));
+                                    let f_on =
+                                        arms10[1][i * 8..i * 8 + 6] != arms10[0][i * 8..i * 8 + 6];
+                                    let f_hard =
+                                        arms10[2][i * 8..i * 8 + 6] != arms10[0][i * 8..i * 8 + 6];
+                                    f_on_n += f_on as usize;
+                                    f_hard_n += f_hard as usize;
+                                    if ln > lo + 1e-4 {
+                                        rose += 1;
+                                    }
+                                    let live = in_range(i);
+                                    if !live {
+                                        if f_on || f_hard {
+                                            oob_moved += 1;
+                                        }
+                                    } else {
+                                        let r8 = ring(i);
+                                        let bl = base_l(i);
+                                        let o_on =
+                                            crate::nrd::oracle::rclamp_scale(bl, &r8, false) < 1.0;
+                                        let o_hard =
+                                            crate::nrd::oracle::rclamp_scale(bl, &r8, true) < 1.0;
+                                        if (f_on && !o_on) || (f_hard && !o_hard) {
+                                            unsound += 1;
+                                        }
+                                    }
+                                    s_off += lo as f64;
+                                    s_on += ln as f64;
+                                    s_hard += lh as f64;
+                                }
+                                let n = npx as f64;
+                                let (m_off, m_on, m_hard) = (s_off / n, s_on / n, s_hard / n);
+                                let drop_on = (m_off - m_on) / m_off.max(1e-9);
+                                let drop_hard = (m_off - m_hard) / m_off.max(1e-9);
+                                println!(
+                                    "check-gpu: frd F10 residual-clamp — fired on {f_on_n}/{npx} \
+                                     hard {f_hard_n} | mean {m_off:.4} -> {m_on:.4} (drop \
+                                     {:.2}%) | hard drop {:.2}% | luma-rose {rose} unsound \
+                                     {unsound} oob-moved {oob_moved}",
+                                    drop_on * 100.0,
+                                    drop_hard * 100.0
+                                );
+                                let mut bad = Vec::new();
+                                if rose > 0 {
+                                    bad.push("luma rose (the cap must only attenuate)");
+                                }
+                                if unsound > 0 {
+                                    bad.push("clamped a pixel the oracle says it must not");
+                                }
+                                if oob_moved > 0 {
+                                    bad.push("an out-of-range pixel moved");
+                                }
+                                if arms10[0] != frames[base_arm] {
+                                    bad.push("the off arm is not byte-identical to F4's last frame");
+                                }
+                                if f_hard_n < f_on_n {
+                                    bad.push("the hard arm clamped fewer pixels than the default");
+                                }
+                                if drop_on > 0.05 {
+                                    bad.push("armed arm removed > 5% of mean luma");
+                                }
+                                if drop_hard >= 0.99 {
+                                    bad.push("hard arm removed ~everything (dead halo?)");
+                                }
+                                if must_fire && f_hard_n == 0 {
+                                    bad.push("hard arm never fired (engine-blindness unproven)");
+                                }
+                                if !bad.is_empty() {
+                                    eprintln!(
+                                        "check-gpu: FAIL F10 frd residual-clamp: {}",
+                                        bad.join(", ")
+                                    );
+                                    ok = false;
+                                }
+                            } else {
+                                ok = false;
+                            }
                         }
                         // Restore frame B's buffers (the N4/M10 gate-
                         // independence rule): the probe traces left
@@ -10047,9 +11469,22 @@ fn run_check_gpu(
                             return 1;
                         }
                         ptg.force_sky_ext_skip(Some(true));
+                        // PIN THE REMODULATION ARM, and this is a correctness
+                        // requirement of the comparison rather than tidiness:
+                        // the hit-record oracle below is `pack2_ext`, captured
+                        // under the FSR4-RR wiring above where nrd_wired is
+                        // empty and FLAG_REMOD_EXACT is therefore CLEAR. This
+                        // frame runs after the NRD bridge is wired, so without
+                        // the pin it packs pre-scaled sig lanes (and m_d in
+                        // sig.w's high half) against an un-scaled oracle and
+                        // every hit pixel "differs" — a diff that says nothing
+                        // about store elision, which is all N7 claims. The
+                        // armed pack is N2's and N9's subject, not this gate's.
+                        ptg.force_remod_exact(Some(false));
                         ptg.write_cb(0, &p);
                         let traced = hg.run(|l| ptg.record_wavefront(l, 0, &p, false));
                         ptg.force_sky_ext_skip(None);
+                        ptg.force_remod_exact(None);
                         if traced.is_err() {
                             eprintln!("check-gpu: FAIL N7 skip trace");
                             return 1;
@@ -10298,6 +11733,152 @@ fn run_check_gpu(
                              dd-differs {dd_differs})"
                         );
                         ok = false;
+                    }
+                    // --- N6b: EXACT REMODULATION's capture-invariance arm —
+                    // the M9b claim ("the sig capture is assignment-only, so
+                    // accum is bit-identical") extended to FLAG_REMOD_EXACT,
+                    // which M9b itself cannot make: M9b runs under the FSR4-RR
+                    // wiring, where nrd_sig is false and the flag is
+                    // structurally unarmable. This is the first place both are
+                    // true at once, and it borrows N6's RTGI-live params so the
+                    // shade_full blend site is exercised rather than only the
+                    // sampled-ambient one.
+                    //
+                    // TWO ASSERTIONS, and the second is the load-bearing one.
+                    // Accum bit-identical says the re-capture stayed out of
+                    // shading. The sig lanes MUST DIFFER says the flag actually
+                    // reached the pack — without it a flag that never armed
+                    // passes the first assertion perfectly, which is the exact
+                    // shape of every vacuity failure recorded in this file.
+                    {
+                        let mut arms: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                        ptg.force_fsr_sig(true);
+                        ptg.force_nrd_sig(Some(true));
+                        // PIN THE SKY-EXT SKIP OFF, because this gate's sky
+                        // predicate is "the whole sig lane pair is 0" — which
+                        // gbuf_write_sky guarantees only when it actually RUNS.
+                        // Under FLAG_SKY_EXT_SKIP a sky texel's ext record is
+                        // deliberately left UNWRITTEN, so those 72 bytes are
+                        // whatever the previous trace left and the m_d bound
+                        // below would be scoring stale garbage. It passes today
+                        // because both arms inherit the same stale bytes, which
+                        // is luck, not a contract (N7 is the gate that owns the
+                        // skip; this one owns the capture).
+                        ptg.force_sky_ext_skip(Some(false));
+                        for on in [false, true] {
+                            ptg.force_remod_exact(Some(on));
+                            ptg.write_cb(0, &pg);
+                            if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &pg, false)) {
+                                eprintln!("check-gpu: FAIL N6b remod trace (on {on}): {e}");
+                                return 1;
+                            }
+                            match (
+                                hg.read_buffer(
+                                    &ptg.gbuf_ext,
+                                    ua,
+                                    pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize,
+                                ),
+                                hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
+                            ) {
+                                (Ok(e), Ok(a)) => arms.push((e, a)),
+                                _ => {
+                                    eprintln!("check-gpu: FAIL N6b remod readback (on {on})");
+                                    return 1;
+                                }
+                            }
+                        }
+                        ptg.force_fsr_sig(false);
+                        ptg.force_nrd_sig(None);
+                        ptg.force_remod_exact(None);
+                        ptg.force_sky_ext_skip(None);
+                        let ((oe, oa), (ne, na)) = (&arms[0], &arms[1]);
+                        let (mut hit_px, mut sig_differs, mut md_bad, mut md_min, mut md_max) =
+                            (0usize, 0usize, 0usize, f32::INFINITY, 0f32);
+                        let mut lobe_differs = 0usize;
+                        let el = gpu::trace::GBUF_EXT_STRIDE as usize;
+                        for i in 0..pw * ph {
+                            let w = u32::from_le_bytes(
+                                ne[i * el + 60..i * el + 64].try_into().unwrap(),
+                            );
+                            let ow = u32::from_le_bytes(
+                                oe[i * el + 60..i * el + 64].try_into().unwrap(),
+                            );
+                            // Sky zeroes the whole sig, so a zero lane pair is
+                            // the sky marker and carries no m_d to score.
+                            if w == 0 && ow == 0 {
+                                continue;
+                            }
+                            hit_px += 1;
+                            if ne[i * el + 48..i * el + 64] != oe[i * el + 48..i * el + 64] {
+                                sig_differs += 1;
+                            }
+                            // BROKEN OUT because the two halves prove different
+                            // things and one of them is nearly free. sig.w's
+                            // high half differs on EVERY hit pixel by
+                            // construction (the lane swaps shadow_t for m_d),
+                            // so the whole-sig count above can be satisfied
+                            // without the dd/ds RE-CAPTURE having moved
+                            // anything at all. This count is the re-capture's
+                            // own liveness, and it is SCENE-DEPENDENT: it needs
+                            // sheen, translucency, a detail-cavity pit or a
+                            // detail sun-shadow to be non-zero.
+                            if ne[i * el + 48..i * el + 60] != oe[i * el + 48..i * el + 60] {
+                                lobe_differs += 1;
+                            }
+                            // m_d is a convex combination of sk and sk*dcav,
+                            // both in (0, 1] — so the wire lane is bounded BY
+                            // CONSTRUCTION and a value outside it means the
+                            // blend, the pack, or the f16 loan is wrong.
+                            let md = half::f16::from_bits((w >> 16) as u16).to_f32();
+                            if !(md > 0.0 && md <= 1.0 + 1e-3) {
+                                md_bad += 1;
+                            }
+                            md_min = md_min.min(md);
+                            md_max = md_max.max(md);
+                        }
+                        println!(
+                            "check-gpu: nrd N6b remod — hit {hit_px} sig-differs {sig_differs} \
+                             (lobes {lobe_differs}) m_d [{md_min:.4}, {md_max:.4}] bad {md_bad}"
+                        );
+                        // SAY THE COVERAGE OUT LOUD RATHER THAN LET A GREEN RUN
+                        // IMPLY IT. On a scene with no sheen, no translucency
+                        // and no detail-cavity pits every factor this feature
+                        // corrects is exactly 1.0, so `m_d` pins at 1 and the
+                        // re-capture moves nothing — the fix is INERT here and
+                        // this gate can only prove it is harmless. That is a
+                        // real property worth having (it is the off-arm
+                        // contract), but it is not evidence the remodulation is
+                        // right, and a reader seeing a green N6b beside a
+                        // [1.0000, 1.0000] range should not conclude otherwise.
+                        // The gate that does not depend on scene content is
+                        // N9-CPU's synthetic sheen x tl x dcav x dsun sweep.
+                        if md_max <= 1.0 + 1e-6 && md_min >= 1.0 - 1e-6 {
+                            println!(
+                                "check-gpu: NOTE N6b — every factor is 1.0 on this scene (no \
+                                 sheen / translucency / cavity), so the remodulation fix is \
+                                 INERT here: this run proves it harmless, not correct"
+                            );
+                        }
+                        if oa != na {
+                            eprintln!(
+                                "check-gpu: FAIL N6b remod accum not bit-identical (the \
+                                 re-capture changed shading — it must be assignment-only)"
+                            );
+                            ok = false;
+                        }
+                        if md_bad > 0 {
+                            eprintln!(
+                                "check-gpu: FAIL N6b remod m_d outside (0, 1] on {md_bad} px"
+                            );
+                            ok = false;
+                        }
+                        if must_fire && hit_px > 0 && sig_differs == 0 {
+                            eprintln!(
+                                "check-gpu: FAIL N6b remod must-fire (the sig lanes are \
+                                 identical across the toggle — the flag never reached the pack)"
+                            );
+                            ok = false;
+                        }
                     }
                     // Restore frame B (the N4 discipline — the gates below
                     // read frame-B state off these buffers).
@@ -11884,6 +13465,15 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         ok = false;
     } else {
         println!("check-nrd: N0 oracle math OK");
+    }
+    // N9-CPU rides along here too (its home is --check, which is where it runs
+    // DLL-free on every platform) — a caller reaching for the NRD suite should
+    // not have to know the remodulation identity lives elsewhere.
+    if let Err(e) = nrd::remod::self_test() {
+        eprintln!("check-nrd: FAIL N9-CPU {e}");
+        ok = false;
+    } else {
+        println!("check-nrd: N9-CPU remodulation identity OK");
     }
 
     // N1 — the DLL contract. Windows-only for now, and SAID rather than
@@ -18645,6 +20235,23 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // N9-CPU: EXACT REMODULATION's identity, swept over the factors directly
+    // rather than over a scene. It runs HERE, in --check, and not only in
+    // --check-nrd, for two reasons: it needs no DLL and no adapter, so it is
+    // the only remodulation gate that runs on Linux at all; and the GPU gates
+    // that DO score the real shader are scene-dependent — N6b measures every
+    // factor at exactly 1.0 on the procedural check scene, i.e. the feature is
+    // structurally inert there and a green --check-gpu proves it harmless
+    // rather than correct. This is the half that carries the anti-vacuity
+    // teeth: the pre-fix arithmetic must PROVABLY FAIL the same sweep.
+    let remod_ok = match nrd::remod::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("remod self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
     // slip), cone sampling inside-and-covering the disc, the disc test agreeing
     // with the cone the sampler draws from, the DOME carrying no disc (the
@@ -21585,6 +23192,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("tod", tod_ok),
         ("bloom", bloom_ok),
         ("frd", frd_ok),
+        ("remod", remod_ok),
         ("autoexp", autoexp_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),

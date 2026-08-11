@@ -500,6 +500,13 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    pub fn remod_exact(&self) -> bool {
+        match self {
+            Tracer::Wave(t) => t.remod_exact(),
+            Tracer::Dxr(d) => d.remod_exact(),
+        }
+    }
+
     pub fn force_gbuf_ext(&self, on: bool) {
         match self {
             Tracer::Wave(t) => t.force_gbuf_ext(on),
@@ -518,6 +525,13 @@ impl<'a> Tracer<'a> {
         match self {
             Tracer::Wave(t) => t.force_nrd_sig(v),
             Tracer::Dxr(d) => d.force_nrd_sig(v),
+        }
+    }
+
+    pub fn force_remod_exact(&self, v: Option<bool>) {
+        match self {
+            Tracer::Wave(t) => t.force_remod_exact(v),
+            Tracer::Dxr(d) => d.force_remod_exact(v),
         }
     }
 

@@ -3059,6 +3059,55 @@ mod nrd_clean_room_tests {
         assert!(pasted.contains("NRD_FrontEnd_PackNormalAndRoughness"));
     }
 
+    /// `cs_nrd_out`'s residual-clamp halo is indexed from `NRD_OUT_G`, not from
+    /// the `[numthreads]` attribute the hardware actually launches — HLSL gives
+    /// no way to read that attribute back, so the two are coupled by
+    /// convention and nothing else. They must agree: a group shape changed at
+    /// the attribute alone leaves the fill striding the wrong tile and the ring
+    /// reduction reading a neighbourhood that is not this pixel's, which is
+    /// WRONG QUIETLY (a plausible cap built from the wrong neighbours) rather
+    /// than a compile error or an out-of-bounds read — the halo's own bounds
+    /// stay valid because they are derived from the same wrong constant.
+    #[test]
+    fn nrd_out_group_shape_is_derived() {
+        let src = code_only(super::NRD_BRIDGE_HLSL);
+        let g = src
+            .find("#define NRD_OUT_G")
+            .map(|i| src[i + "#define NRD_OUT_G".len()..].trim_start())
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse::<u32>().ok())
+            .expect("NRD_OUT_G is gone — the halo lost its named group shape");
+        // The attribute on cs_nrd_out itself, read back out of the source.
+        let at = src
+            .find("void cs_nrd_out")
+            .expect("cs_nrd_out is gone");
+        let decl = src[..at]
+            .rfind("[numthreads(")
+            .map(|i| &src[i..at])
+            .expect("cs_nrd_out lost its numthreads attribute");
+        let dims: Vec<u32> = decl
+            .trim_start_matches("[numthreads(")
+            .split(')')
+            .next()
+            .unwrap()
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect();
+        assert_eq!(
+            dims,
+            vec![g, g, 1],
+            "cs_nrd_out's [numthreads] and NRD_OUT_G ({g}) disagree — the clamp halo would \
+             silently read the wrong neighbourhood"
+        );
+        // Anti-vacuity: the parse really found a shape, and the halo really
+        // uses the name rather than a literal that happens to match it.
+        assert!(g >= 2, "a degenerate group shape parsed as {g}");
+        assert!(
+            src.contains("sh_bl[NRD_OUT_HN]") && src.contains("k % NRD_OUT_H"),
+            "the halo went back to literals — the pin no longer constrains it"
+        );
+    }
+
     /// THE COMPANION PIN: we INCLUDE NVIDIA's header, we do not TRANSCRIBE it.
     /// The test above proves no NRD source is in our files; this one proves the
     /// string we hand the compiler is the submodule's own file, byte for byte,

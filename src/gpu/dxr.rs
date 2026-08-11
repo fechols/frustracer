@@ -509,6 +509,8 @@ pub struct DxrGpu {
     /// See `sky_ext_skip` — the armed-skip gate's hook (the force_nrd_sig
     /// Option-override shape).
     force_sky_ext_skip: std::cell::Cell<Option<bool>>,
+    /// See `remod_exact` — the dual-GPU secondary's mirror, same shape.
+    force_remod_exact: std::cell::Cell<Option<bool>>,
     /// The wired denoiser is NRD, not FRD (`wire_nrd_feed`'s `dn_is_nrd` —
     /// the TraceGpu twin's field, same reason).
     nrd_engine: bool,
@@ -1509,6 +1511,7 @@ impl DxrGpu {
             force_fsr_sig: std::cell::Cell::new(false),
             force_nrd_sig: std::cell::Cell::new(None),
             force_sky_ext_skip: std::cell::Cell::new(None),
+            force_remod_exact: std::cell::Cell::new(None),
             nrd_engine: false,
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: srcs.sway_mv_on,
@@ -1633,6 +1636,42 @@ impl DxrGpu {
         self.nrd_engine && !self.nrd_wired.is_empty() && trace::nrd_rejitter_lever()
     }
 
+    /// The `TraceGpu::remod_exact` twin (FLAG_REMOD_EXACT) — one bridge, two
+    /// pipelines, so a DXR-fed NRD session must pre-scale its sig captures
+    /// identically or the two would recompose differently from the same planes.
+    ///
+    /// THIS ONE DOES CARRY A `force_*` OVERRIDE, unlike `nrd_rejitter` above,
+    /// and the reason is the dual-GPU mirror rather than a gate: `dual::arm_for`
+    /// picks DXR for an NVIDIA/AMD secondary, and a band packed with the flag
+    /// clear beside one packed with it set is a per-band denoise-semantics seam
+    /// — exactly what `force_nrd_sig` exists for.
+    pub fn remod_exact(&self) -> bool {
+        self.force_remod_exact
+            .get()
+            .unwrap_or(!self.nrd_wired.is_empty() && trace::nrd_remod_lever())
+    }
+
+    pub fn force_remod_exact(&self, v: Option<bool>) {
+        self.force_remod_exact.set(v);
+    }
+
+    /// The `TraceGpu::nrd_rclamp` twin — one bridge, two pipelines, so a
+    /// DXR-fed NRD session must cap identically. No `force_*` here, the
+    /// `nrd_rejitter` reason: the math is the same TEXT either way, so a hook
+    /// with nothing to drive it would be dead code claiming to be one.
+    ///
+    /// SAY THE COVERAGE PLAINLY: `--check-dxr` never dispatches `cs_nrd_out`
+    /// AT ALL — every bridge-out gate (N3, N4, N8, N10, F3, F4, F10) lives in
+    /// check-gpu — so an armed cap on this pipeline is exercised by no gate in
+    /// the tree. That is the accepted "one text, two root-signature objects"
+    /// argument and not an oversight, but it also means this accessor's only
+    /// gated property is that it EXISTS and feeds `with_frame`; if the clamp
+    /// ever grows engine- or pipeline-dependent behaviour, check-dxr needs a
+    /// bridge-out arm before that lands.
+    pub fn nrd_rclamp(&self) -> (bool, bool) {
+        if self.nrd_wired.is_empty() { (false, false) } else { trace::nrd_rclamp_lever() }
+    }
+
     /// The band `record_frame` will dispatch — gates only, and deliberately
     /// not the same claim as `set_band` returning true: this is the value the
     /// DISPATCH_RAYS_DESC height is actually derived from.
@@ -1732,6 +1771,8 @@ impl DxrGpu {
             self.nrd_sig(),
             self.sky_ext_skip(),
             self.nrd_rejitter(),
+            self.remod_exact(),
+            self.nrd_rclamp(),
         );
         // Sway MVs: arm the flag + the ring-slot base, and stash the clock
         // pair for record_frame's dmv fill — one predicate (sway_mv_pair +

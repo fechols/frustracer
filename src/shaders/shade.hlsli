@@ -313,6 +313,29 @@ float detail_aniso_base(float2 gu, float2 gv) {
 float detail_cavity(float h) {
     return exp(DETAIL_AO_K * min(h, 0.0));
 }
+// FLAG_REMOD_EXACT's energy blend — the ONE site the wire delta multiplier's
+// formula lives (nrd::remod::blend is the CPU twin the N9 gate scores against;
+// keep the two in lockstep). The diffuse channel carries two sub-terms with
+// different exact factors (see PrimSurf), so the multiplier that makes the
+// DELTA exact is their energy-weighted mean:
+//
+//     m = (E_a*k_a + E_b*k_b) / (E_a + E_b)
+//
+// A convex combination, so m is bounded by [min(k_a,k_b), max(k_a,k_b)] BY
+// CONSTRUCTION — it can never amplify, and it is exactly k_a == k_b whenever
+// the two factors agree (every non-pit pixel, and every pixel under
+// --no-detail-ao), which is what keeps the common path free of any weighting
+// at all. A zero-energy pixel contributes nothing to the recompose either way,
+// so the degenerate denominator returns k_a rather than dividing.
+//
+// Energy is the channel MEAN, not a perceptual luma: this weights how much of
+// the delta each sub-term owns, which is a radiometric question.
+float remod_blend(float3 e_a, float k_a, float3 e_b, float k_b) {
+    float a = dot(max(e_a, 0.0), float3(1.0, 1.0, 1.0) / 3.0);
+    float b = dot(max(e_b, 0.0), float3(1.0, 1.0, 1.0) / 3.0);
+    float s = a + b;
+    return s > 0.0 ? (a * k_a + b * k_b) / s : k_a;
+}
 // shade.rs::DETAIL_AO_RANGE / detail_ao_field — coarse height octaves
 // (8/4-texel-equivalent cells, salts 43/44, windows log2(cell) − dlod): the
 // lower-frequency pools that make the cavity read as AO and reach
@@ -1116,6 +1139,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             prim.metallic = metal_eff;
             prim.trans = SHADE_MAT_TRANSMISSION(mat);
             prim.ripple_amp = SHADE_MAT_RIPPLE(mat);
+            // FLAG_REMOD_EXACT's two sub-term factors — the multiplicative
+            // identity until the post-capture block below knows sk/dcav. The
+            // blend sites read them whether or not that block ran, so they
+            // must be set on EVERY lap-0 path (an unset factor would scale the
+            // fold by garbage).
+            prim.amb_k = 1.0;
+            prim.m_d = 1.0;
         }
 
         float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal_eff);
@@ -1397,6 +1427,44 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                          + direct_t * SHADE_MAT_TRANSLUCENCY(mat);
         float kt = 1.0 - SHADE_MAT_TRANSMISSION(mat);
 
+        // EXACT REMODULATION (FLAG_REMOD_EXACT) — RE-capture the two lobes now
+        // that every post-capture factor has been applied, so the bridge's
+        // kd/f0 become the EXACT divisors and the denoiser's delta lands at its
+        // true physical weight. See trace.rs::FLAG_REMOD_EXACT for what the
+        // 1/m-weighted correction was costing (a raw fraction of every bright
+        // 1-spp bounce spike, un-denoised).
+        //
+        // A REASSIGNMENT, not a relocation: the originals at the `lap == 0u`
+        // block above stay put, so the flag-clear arm is textually and
+        // numerically today's code — the guarded-never-`* 1.0` discipline this
+        // file already states for dcav, and what keeps the off arm's expression
+        // DAG bit-identical for the M9b/N6 accum gates.
+        //
+        // WHY `diffuse_d` AND NOT `direct_d * (1 - tl)`: diffuse_d already
+        // carries the translucency BACK-RAY term (direct_t * tl), which has no
+        // wire lane of its own and is therefore 100% un-denoised stochastic
+        // residual today. Capturing the sum pulls it into the denoised channel
+        // for free — the one place this fix also removes noise rather than
+        // merely reweighting it.
+        //
+        // The specular lane needs no factor of its own: `ds`'s exact factor is
+        // dcav (applied at the cavity block) and `is`'s is exactly 1, so
+        // folding dcav into ds leaves BOTH sub-terms remodulating at f0. That
+        // lands the free side of the split on `is`, the reflection bounce —
+        // the noisy one — which is why m_s stays 1.
+        //
+        // The DIFFUSE lane cannot do the same, because its two sub-terms
+        // disagree (diffuse_d by sk, the ambient/bounce by sk*dcav), so both
+        // factors are carried and blended by energy downstream — see PrimSurf.
+        // The captured SIGNAL stays the clean demodulated radiance either way.
+        if (lap == 0u && (flags & FLAG_REMOD_EXACT)) {
+            float sk = 1.0 - 0.157 * SHADE_MAT_SHEEN(mat);
+            prim.direct_d = diffuse_d;  // dsun + the tl split; sk rides m_d
+            prim.direct_s = direct_s;   // carries dcav (m_s == 1)
+            prim.m_d = sk;              // the direct-diffuse sub-term's factor
+            prim.amb_k = sk * dcav;     // the ambient/bounce sub-term's factor
+        }
+
         if (split_ambient && lap == 0u) {
             // Hemi mode: the primary ambient is integrated by the hemisphere
             // wavefront (compose applies amb_w * ambient later). No AO draws
@@ -1463,6 +1531,23 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // subexpression, same tree; the off arm's DAG identity is what
             // the same-seed byte gates verify.
             float3 amb_t = amb_irradiance(n, n_s) * ao;
+            // FLAG_REMOD_EXACT, the SAMPLED-ambient arm's blend site: the two
+            // diffuse sub-terms are known here, so weight their factors before
+            // the cavity is applied below (the weight asks "how much of the
+            // delta does each own", which is a pre-cavity question — the cavity
+            // is what the factor CARRIES, not part of the share).
+            //
+            // KNOWN-APPROXIMATE, and stated where it bites: shade's ambient is
+            // amb_irradiance(n, n_s) — the AMB_BUMP-amplified response — while
+            // the bridge rebuilds sh_irradiance(n_s). That ratio is per-channel
+            // RGB and needs the GEOMETRIC normal, which is not on the wire, so
+            // no scalar lane can carry it. It is structurally ZERO on the live
+            // NRD path (the split-ambient arm leaves prim.ao at 0 under RTGI,
+            // so the bridge's ao*amb term vanishes); this arm only runs in a
+            // non-RTGI NRD session.
+            if (lap == 0u && (flags & FLAG_REMOD_EXACT)) {
+                prim.m_d = remod_blend(diffuse_d, prim.m_d, amb_t, prim.amb_k);
+            }
             if (dh < 0.0 && (flags & FLAG_DETAIL_AO)) amb_t *= dcav;
             float3 c = tput * (kd * kt * (diffuse_d + amb_t) + direct_s);
             total += c;
@@ -1837,6 +1922,22 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
             // zero rng — accum and the same-seed A/Bs are untouched, and
             // FSR-RR sessions (FLAG_FSR_SIG without this bit) keep dd = pure
             // direct diffuse for AMD's own denoiser.
+            // FLAG_REMOD_EXACT, the RTGI arm's blend site — the one place the
+            // bounce's own factor (prim.amb_k = sk*dcav) meets the direct
+            // diffuse's (prim.m_d = sk), so the delta multiplier is weighted
+            // here, BEFORE the add, while prim.direct_d still holds only the
+            // direct term. WITHOUT this the bounce enters accum at kd*sk*dcav
+            // while the bridge remodulates its correction at kd — on a cavity
+            // pit that is up to 3.3x, and the leftover raw fraction of every
+            // 1-spp spike never reaches the denoiser at all.
+            //
+            // The captured signal stays RAW `li` in both arms, so the fold
+            // line below is textually and numerically today's code: every
+            // correction rides the multiplier, and the denoiser input is the
+            // clean demodulated radiance it was before.
+            if (flags & FLAG_REMOD_EXACT) {
+                prim.m_d = remod_blend(prim.direct_d, prim.m_d, li, prim.amb_k);
+            }
             prim.direct_d += li;
             prim.ao_t = bhit ? bh.t : CAM_FAR;
         }

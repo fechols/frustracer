@@ -894,6 +894,327 @@ impl Drop for Nrd {
 // file itself is never committed or pasted.
 // ---------------------------------------------------------------------------
 
+/// N9-CPU: EXACT REMODULATION's identity, as closed-form math (DLL-free, so it
+/// runs in `--check` on every platform).
+///
+/// IT EXISTS BECAUSE THE GPU GATES ARE SCENE-DEPENDENT AND THE CHECK SCENE HAS
+/// NONE OF THE MATERIALS INVOLVED. N6b measures the procedural scene's every
+/// factor at exactly 1.0 (no sheen, no translucency, no cavity pits, no detail
+/// sun-shadow), so the whole feature is INERT there and a green suite proves
+/// only that it is harmless. San Miguel exercises it (m_d down to 0.9087 over
+/// 1514 pixels) but that is a downloaded scene, not a gate the tree can rely
+/// on. This module owes nothing to scene content: it sweeps the factors
+/// directly.
+///
+/// THE MODEL, and it is deliberately a model rather than a re-derivation of the
+/// shader. The denoiser is taken to scale the diffuse channel by `l` — the one
+/// assumption that makes "the correct answer" well defined at all, since the
+/// wire hands the denoiser `A + B` and there is no decomposition to recover.
+/// Under it the truth is simply `l * base`, and the question the gate asks is
+/// how close each remodulation lands to that.
+pub mod remod {
+    /// `shade.hlsli::remod_blend` — the ONE formula, mirrored. The energy is
+    /// the channel MEAN (a radiometric share, not a perceptual luma) and the
+    /// degenerate denominator returns `k_a` rather than dividing.
+    pub fn blend(e_a: [f32; 3], k_a: f32, e_b: [f32; 3], k_b: f32) -> f32 {
+        let m = |e: [f32; 3]| (e[0].max(0.0) + e[1].max(0.0) + e[2].max(0.0)) / 3.0;
+        let (a, b) = (m(e_a), m(e_b));
+        let s = a + b;
+        if s > 0.0 { (a * k_a + b * k_b) / s } else { k_a }
+    }
+
+    /// A primary hit's material, in shade's own vocabulary.
+    #[derive(Clone, Copy)]
+    pub struct Hit {
+        pub albedo: [f32; 3],
+        pub metallic: f32,
+        pub trans: f32,
+        pub sheen: f32,
+        /// Translucency: splits the direct diffuse front/back.
+        pub tl: f32,
+        /// `detail_cavity(dh)` — applied to the ambient/bounce sub-term.
+        pub dcav: f32,
+        /// `detail_sun_shadow(..)` — applied to the direct diffuse, INSIDE the
+        /// captured signal (it is not a delta multiplier).
+        pub dsun: f32,
+    }
+
+    impl Hit {
+        /// The wire diffuse albedo the bridge remodulates at.
+        pub fn wire_kd(&self) -> [f32; 3] {
+            let k = (1.0 - self.metallic) * (1.0 - self.trans);
+            [self.albedo[0] * k, self.albedo[1] * k, self.albedo[2] * k]
+        }
+        /// The Charlie energy term shade folds into its own `kd`.
+        pub fn sk(&self) -> f32 {
+            1.0 - 0.157 * self.sheen
+        }
+    }
+
+    fn v_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+    }
+    fn v_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+    fn v_mul(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] * b[0], a[1] * b[1], a[2] * b[2]]
+    }
+    fn v_scale(a: [f32; 3], s: f32) -> [f32; 3] {
+        [a[0] * s, a[1] * s, a[2] * s]
+    }
+    /// The f16 the sig lanes really are — so "exact" below means exact to the
+    /// wire's own quantum and the tolerances are that quantum, not a fudge.
+    fn q16(a: [f32; 3]) -> [f32; 3] {
+        [
+            half::f16::from_f32(a[0]).to_f32(),
+            half::f16::from_f32(a[1]).to_f32(),
+            half::f16::from_f32(a[2]).to_f32(),
+        ]
+    }
+
+    /// What the pack captures and what shade's accum actually received.
+    /// `dd_pre` is `direct_d` BEFORE `detail_sun_shadow`, `dt` the
+    /// translucency back-ray term, `amb` the ambient (or RTGI bounce)
+    /// sub-term BEFORE the cavity.
+    pub struct Split {
+        /// shade's own diffuse contribution to accum.
+        pub base: [f32; 3],
+        /// The bridge's `D_in` = the wire dd lane + the reconstructed ambient.
+        pub d_in: [f32; 3],
+        /// The delta multiplier riding sig.w's high half (1.0 pre-fix).
+        pub m_d: f32,
+    }
+
+    /// `exact` selects the arm: true = FLAG_REMOD_EXACT's re-capture, false =
+    /// the pre-2026-08-10 capture (dd taken before dsun and before the
+    /// translucency split, remodulated at a bare kd).
+    pub fn split(h: &Hit, dd_pre: [f32; 3], dt: [f32; 3], amb: [f32; 3], exact: bool) -> Split {
+        let (sk, kd) = (h.sk(), h.wire_kd());
+        let dd_post = v_scale(dd_pre, h.dsun);
+        let diffuse_d = v_add(v_scale(dd_post, 1.0 - h.tl), v_scale(dt, h.tl));
+        // shade: kd_local * kt * (diffuse_d + amb*dcav), and kd_local*kt is
+        // exactly wire_kd*sk.
+        let base = v_mul(v_scale(kd, sk), v_add(diffuse_d, v_scale(amb, h.dcav)));
+        if exact {
+            let m_d = blend(diffuse_d, sk, amb, sk * h.dcav);
+            Split { base, d_in: v_add(q16(diffuse_d), amb), m_d }
+        } else {
+            Split { base, d_in: v_add(q16(dd_pre), amb), m_d: 1.0 }
+        }
+    }
+
+    /// The bridge's delta-form recompose (`nrd_bridge.hlsl`).
+    pub fn compose(base: [f32; 3], kd: [f32; 3], d_in: [f32; 3], d_out: [f32; 3], m_d: f32) -> [f32; 3] {
+        v_add(base, v_scale(v_mul(v_sub(d_out, d_in), kd), m_d))
+    }
+
+    /// The model truth: the denoiser scaled the diffuse channel by `l`, so
+    /// both sub-terms scale and shade's own composition scales with them.
+    pub fn truth(base: [f32; 3], l: f32) -> [f32; 3] {
+        v_scale(base, l)
+    }
+
+    /// One row of the sweep: the relative error each arm lands at.
+    pub fn score(h: &Hit, dd_pre: [f32; 3], dt: [f32; 3], amb: [f32; 3], l: f32) -> (f32, f32) {
+        let kd = h.wire_kd();
+        let err = |exact: bool| {
+            let s = split(h, dd_pre, dt, amb, exact);
+            let out = v_scale(s.d_in, l);
+            let got = compose(s.base, kd, s.d_in, out, s.m_d);
+            let want = truth(s.base, l);
+            let (mut e, mut mag) = (0.0f32, 0.0f32);
+            for c in 0..3 {
+                e = e.max((got[c] - want[c]).abs());
+                mag = mag.max(want[c].abs());
+            }
+            e / mag.max(1e-6)
+        };
+        (err(true), err(false))
+    }
+
+    /// N9-CPU. Sweeps sheen x tl x dcav x dsun x trans, achromatic and
+    /// chromatic, and asserts BOTH directions: the exact arm holds the
+    /// identity, and the pre-fix arm PROVABLY FAILS it wherever any factor
+    /// departs from 1 — the anti-vacuity half, without which the gate passes
+    /// on a feature that never ran.
+    pub fn self_test() -> Result<(), String> {
+        // The blend's own contracts first (it is the piece with no GPU twin
+        // the gates can reach).
+        let one = [1.0f32; 3];
+        if blend(one, 0.5, [0.0; 3], 0.1) != 0.5 {
+            return Err("remod: blend with zero b-energy != k_a".into());
+        }
+        if blend([0.0; 3], 0.5, [0.0; 3], 0.1) != 0.5 {
+            return Err("remod: degenerate blend != k_a".into());
+        }
+        if blend(one, 0.5, one, 0.5) != 0.5 {
+            return Err("remod: blend of equal factors is not that factor".into());
+        }
+        let mid = blend(one, 1.0, one, 0.4);
+        if (mid - 0.7).abs() > 1e-6 {
+            return Err(format!("remod: equal-energy blend 0.7 != {mid}"));
+        }
+        // CONVEXITY — the property that makes m_d an attenuation and never an
+        // amplifier, swept rather than argued.
+        for i in 0..17 {
+            let e = [i as f32 * 0.25; 3];
+            let m = blend(one, 0.9, e, 0.3);
+            if !(0.3 - 1e-6..=0.9 + 1e-6).contains(&m) {
+                return Err(format!("remod: blend {m} escaped [0.3, 0.9]"));
+            }
+        }
+
+        let (mut worst_exact, mut worst_pre, mut rows, mut teeth) = (0.0f32, 0.0f32, 0, 0);
+        let mut min_pre_on_live = f32::INFINITY;
+        for &sheen in &[0.0f32, 0.5, 1.0] {
+            for &tl in &[0.0f32, 0.5, 1.0] {
+                for &dcav in &[1.0f32, 0.5, 0.1] {
+                    for &dsun in &[1.0f32, 0.3] {
+                        for &trans in &[0.0f32, 0.97] {
+                            for &l in &[0.5f32, 1.0, 2.0, 8.0] {
+                                let h = Hit {
+                                    albedo: [0.8, 0.6, 0.4],
+                                    metallic: 0.0,
+                                    trans,
+                                    sheen,
+                                    tl,
+                                    dcav,
+                                    dsun,
+                                };
+                                // ACHROMATIC sub-terms: the scalar blend is
+                                // exact only when the two sub-terms share a
+                                // hue (otherwise the per-channel factor is
+                                // channel-dependent and one lane cannot carry
+                                // it). This row is the exactness claim.
+                                let (e_ex, e_pre) =
+                                    score(&h, [0.4; 3], [0.25; 3], [0.3; 3], l);
+                                rows += 1;
+                                worst_exact = worst_exact.max(e_ex);
+                                worst_pre = worst_pre.max(e_pre);
+                                // A row is "live" when some factor departs
+                                // from 1 AND the denoiser actually moved
+                                // (l == 1 leaves every arm exact by the delta
+                                // form's own construction — the pre-fix bug is
+                                // a bug in the CORRECTION, not in `base`).
+                                let live = (sheen > 0.0 || tl > 0.0 || dcav < 1.0 || dsun < 1.0)
+                                    && (l - 1.0).abs() > 1e-6;
+                                if live {
+                                    teeth += 1;
+                                    min_pre_on_live = min_pre_on_live.min(e_pre);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if worst_exact > 1.0 / 2048.0 {
+            return Err(format!(
+                "remod: the exact arm missed the identity by {worst_exact:.2e} (> one f16 \
+                 capture quantum) over {rows} rows"
+            ));
+        }
+        // THE TEETH. Without this the whole sweep passes on a build where
+        // FLAG_REMOD_EXACT does nothing at all.
+        if teeth == 0 {
+            return Err("remod: the sweep produced no live rows (vacuous)".into());
+        }
+        // THE ANCHOR, not a threshold. The sweep's MILDEST live row is
+        // sheen-only (tl = dcav = dsun = 1) at the smallest departure of `l`,
+        // and its pre-fix error has a closed form: the correction enters at
+        // kd instead of kd*sk, so
+        //     err = (l-1)*(1-sk) / (l*sk)
+        // which at sheen 0.5 (sk = 0.9215) and l = 2 is 4.26e-2. Asserting
+        // that identity is worth more than asserting "> 5%": it pins WHY the
+        // pre-fix arm is wrong and by exactly how much, and it cannot be
+        // satisfied by a sweep that merely produces large numbers.
+        let sk_a = 1.0 - 0.157 * 0.5f32;
+        let l_a = 2.0f32;
+        let want_a = (l_a - 1.0) * (1.0 - sk_a) / (l_a * sk_a);
+        let anchor = Hit {
+            albedo: [0.8, 0.6, 0.4],
+            metallic: 0.0,
+            trans: 0.0,
+            sheen: 0.5,
+            tl: 0.0,
+            dcav: 1.0,
+            dsun: 1.0,
+        };
+        let (a_ex, a_pre) = score(&anchor, [0.4; 3], [0.25; 3], [0.3; 3], l_a);
+        if (a_pre - want_a).abs() > 1e-3 {
+            return Err(format!(
+                "remod: the sheen-only pre-fix anchor {a_pre:.4e} != the closed form \
+                 {want_a:.4e} — the model and the arithmetic disagree"
+            ));
+        }
+        if a_ex > 1.0 / 2048.0 {
+            return Err(format!("remod: the exact arm missed the anchor by {a_ex:.2e}"));
+        }
+        // ...and no live row may be MILDER than that anchor, which is what
+        // stops the sweep from silently losing its hardest cases (a factor
+        // list edited down to only near-unity values would pass every other
+        // assertion here).
+        if min_pre_on_live < want_a * 0.99 {
+            return Err(format!(
+                "remod: a live row's PRE-FIX error {min_pre_on_live:.2e} fell below the \
+                 sheen-only anchor {want_a:.2e} — the sweep stopped exercising the defect"
+            ));
+        }
+
+        // CHROMATIC sub-terms: the scalar lane cannot be exact, so the claim
+        // is the BOUND (m_d stays inside the two factors) plus a strict
+        // aggregate improvement over the pre-fix arm.
+        let (mut sum_ex, mut sum_pre, mut n) = (0.0f64, 0.0f64, 0usize);
+        for &sheen in &[0.0f32, 0.6] {
+            for &dcav in &[1.0f32, 0.2] {
+                for &l in &[0.5f32, 4.0] {
+                    let h = Hit {
+                        albedo: [0.7, 0.7, 0.7],
+                        metallic: 0.0,
+                        trans: 0.0,
+                        sheen,
+                        tl: 0.0,
+                        dcav,
+                        dsun: 1.0,
+                    };
+                    // Deliberately opposite hues, the worst case for a scalar.
+                    let (dd, amb) = ([0.9, 0.05, 0.0], [0.0, 0.05, 0.9]);
+                    let s = split(&h, dd, [0.0; 3], amb, true);
+                    let (lo, hi) = (h.sk() * h.dcav, h.sk());
+                    if !(lo - 1e-6..=hi + 1e-6).contains(&s.m_d) {
+                        return Err(format!(
+                            "remod: chromatic m_d {} escaped [{lo}, {hi}]",
+                            s.m_d
+                        ));
+                    }
+                    let (e_ex, e_pre) = score(&h, dd, [0.0; 3], amb, l);
+                    sum_ex += e_ex as f64;
+                    sum_pre += e_pre as f64;
+                    n += 1;
+                }
+            }
+        }
+        if sum_ex >= sum_pre {
+            return Err(format!(
+                "remod: on chromatic rows the exact arm is no better than pre-fix \
+                 ({:.3e} vs {:.3e})",
+                sum_ex / n as f64,
+                sum_pre / n as f64
+            ));
+        }
+
+        eprintln!(
+            "remod self-test: {rows} rows, exact worst {worst_exact:.2e}, pre-fix worst \
+             {worst_pre:.2e} (teeth {teeth} live rows, min pre-fix err \
+             {min_pre_on_live:.2e}), chromatic mean {:.2e} vs {:.2e} OK",
+            sum_ex / n as f64,
+            sum_pre / n as f64
+        );
+        Ok(())
+    }
+}
+
 pub mod oracle {
     use super::{NRD_EPS, NRD_FP16_MAX};
 
@@ -971,6 +1292,70 @@ pub mod oracle {
     pub fn norm_hit_dist(hit_dist: f32, view_z: f32, params: [f32; 3], roughness: f32) -> f32 {
         let f = hit_dist_normalization(view_z, params, roughness);
         (hit_dist / f).clamp(0.0, 1.0).max(NRD_EPS)
+    }
+
+    // ---- THE RESIDUAL SPIKE CAP (FLAG_NRD_RCLAMP) -------------------------
+    //
+    // CPU twins of `nrd_bridge.hlsl`'s clamp — the NRD_HITDIST_PARAMS
+    // precedent, and here they carry a second job: N10 scores the real shader
+    // against `rclamp_scale`, so the K values, the centre exclusion, the
+    // out-of-range exclusion and the min-ring floor are pinned across shader
+    // and CPU AT ONCE rather than by the shader agreeing with itself.
+
+    /// Ring-mean multiplier — FRD's `FIREFLY_K`, deliberately the same number
+    /// so the two clamps in this tree speak one value. Decoupling them means
+    /// two named constants with two doc comments, never one with a caveat.
+    pub const RCLAMP_K_MEAN: f32 = 8.0;
+    /// Ring-MAX multiplier, and the term that makes the cap safe: a lone
+    /// one-sample spike has mean ~ max so the mean term binds, while a
+    /// RESOLVED feature (a bright emissive texel, a caustic edge) has at least
+    /// one bright neighbour, so max >> mean and this term protects it.
+    pub const RCLAMP_K_MAX: f32 = 3.0;
+    /// The `hard` diagnostic arm's multiplier, applied to BOTH terms: `cap` is
+    /// a max and `max >= mean` always, so relaxing only the mean one leaves
+    /// `K_MAX * ring_max` binding and the "hard" arm is barely harder than the
+    /// default (measured: it gated nothing). At 1.0 on both, `cap == ring_max`
+    /// and the test becomes "is this pixel a strict local maximum".
+    pub const RCLAMP_K_HARD: f32 = 1.0;
+    /// A 3-neighbour estimate is not a neighbourhood.
+    pub const RCLAMP_MIN_RING: usize = 4;
+
+    /// The bridge's own luma — `nrd_ycocg(c).x`, the luma the DENOISER reasons
+    /// in, deliberately not a Rec.709 perceptual weight.
+    pub fn rclamp_luma(c: [f32; 3]) -> f32 {
+        0.25 * c[0] + 0.5 * c[1] + 0.25 * c[2]
+    }
+
+    /// The scale applied to the RESIDUAL, given this pixel's BASE luma and its
+    /// 8-neighbour ring of base lumas (`None` = out of range / excluded).
+    /// Returns 1.0 when the cap does not fire.
+    ///
+    /// THE TEST IS ON BASE AND THE CORRECTION LANDS ON THE RESIDUAL, which
+    /// reads like a units error and is not. Model a neighbour's residual as its
+    /// base times this pixel's residual FRACTION `f = rl/bl`; then
+    /// `rl > K*mean(ring_R)` reduces exactly to `bl > K*mean(ring_base)` — the
+    /// `f` cancels — so the outlier test is a statement about base, which we
+    /// have a ring for, while the scale applies to the residual, the only part
+    /// the denoiser did not clean. Everything stays in one unit, and no
+    /// neighbour residuals (hence no neighbour `gbuf_ext` reads, hence N7's
+    /// unwritten-sky-ext contract) are needed.
+    pub fn rclamp_scale(base_luma: f32, ring: &[Option<f32>], hard: bool) -> f32 {
+        let (mut sum, mut mx, mut n) = (0.0f32, 0.0f32, 0usize);
+        for v in ring.iter().flatten() {
+            sum += *v;
+            mx = mx.max(*v);
+            n += 1;
+        }
+        if n < RCLAMP_MIN_RING || !(base_luma > 0.0) {
+            return 1.0;
+        }
+        let (km, kx) = if hard {
+            (RCLAMP_K_HARD, RCLAMP_K_HARD)
+        } else {
+            (RCLAMP_K_MEAN, RCLAMP_K_MAX)
+        };
+        let cap = (km * (sum / n as f32)).max(kx * mx);
+        if base_luma > cap { cap / base_luma } else { 1.0 }
     }
 
     /// N0: the DLL-free math gates. Pins round-trips and closed-form anchors
@@ -1071,8 +1456,66 @@ pub mod oracle {
             return Err(format!("nrd: normHitDist roughness adaptivity ({sm} vs {rg})"));
         }
 
+        // ---- the residual spike cap's closed forms (the N10 twin) ---------
+        let flat = [Some(1.0f32); 8];
+        // A pixel level with its ring never fires: cap = max(8, 3) * 1 = 8.
+        if rclamp_scale(1.0, &flat, false) != 1.0 {
+            return Err("nrd: rclamp fired on a flat neighbourhood".into());
+        }
+        // A lone 100x spike does: ring mean = max = 1, cap = 8, scale = 0.08.
+        let s = rclamp_scale(100.0, &flat, false);
+        if (s - 0.08).abs() > 1e-6 {
+            return Err(format!("nrd: rclamp lone-spike scale 0.08 != {s}"));
+        }
+        // THE K_MAX TEETH — a RESOLVED feature must survive. One bright
+        // neighbour at 40 puts ring mean at ~5.9 (cap 47.1 via K_MEAN) but
+        // K_MAX*max = 120, so the max term binds and a 100 centre passes.
+        let mut resolved = [Some(1.0f32); 8];
+        resolved[0] = Some(40.0);
+        if rclamp_scale(100.0, &resolved, false) != 1.0 {
+            return Err("nrd: rclamp clamped a resolved feature (K_MAX inert?)".into());
+        }
+        // ...and the same centre against the same ring DOES clamp under the
+        // hard arm, where cap == ring_max. Without this the two arms could
+        // share a multiplier and nothing would notice.
+        let sh = rclamp_scale(100.0, &resolved, true);
+        if (sh - 0.4).abs() > 1e-6 {
+            return Err(format!("nrd: rclamp hard scale 0.4 != {sh}"));
+        }
+        // The hard arm is exactly "strict local maximum": a centre at the
+        // ring's own max must NOT fire (cap == max == bl).
+        if rclamp_scale(40.0, &resolved, true) != 1.0 {
+            return Err("nrd: rclamp hard fired on a non-maximum".into());
+        }
+        // Out-of-range neighbours are EXCLUDED, not zeroed — zeroing would
+        // drag the mean down and clamp along every horizon. With 5 of 8
+        // excluded the surviving 3 still set the cap, unchanged.
+        let mut sparse = [None; 8];
+        for e in sparse.iter_mut().take(4) {
+            *e = Some(1.0);
+        }
+        if rclamp_scale(100.0, &sparse, false) != 0.08 {
+            return Err("nrd: rclamp excluded neighbours changed the mean".into());
+        }
+        // ...and below the min-ring floor it stands down entirely.
+        let mut thin = [None; 8];
+        for e in thin.iter_mut().take(RCLAMP_MIN_RING - 1) {
+            *e = Some(1.0);
+        }
+        if rclamp_scale(100.0, &thin, false) != 1.0 {
+            return Err("nrd: rclamp fired below the min-ring floor".into());
+        }
+        // Only ever an attenuation, at every input.
+        for bl in [0.0f32, 1e-6, 0.5, 7.9, 8.1, 1e6] {
+            let sc = rclamp_scale(bl, &flat, false);
+            if !(0.0..=1.0).contains(&sc) {
+                return Err(format!("nrd: rclamp scale {sc} out of (0,1] at bl {bl}"));
+            }
+        }
+
         eprintln!(
-            "nrd self-test: ycocg + normal-enc2 (worst dot {worst_dot:.6}) + norm-hit-dist OK"
+            "nrd self-test: ycocg + normal-enc2 (worst dot {worst_dot:.6}) + norm-hit-dist \
+             + rclamp OK"
         );
         Ok(())
     }
