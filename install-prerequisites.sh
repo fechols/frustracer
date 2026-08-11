@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # ===========================================================================
-#  frustracer — runtime SDK installer (the Linux twin of
-#  install-prerequisites.bat: same pins, same destinations, same markers)
+#  frustracer — runtime SDK installer (the UNIX twin of
+#  install-prerequisites.bat: same pins, same destinations, same markers).
+#  Runs on Linux and macOS; the split from the .bat is the SHELL LANGUAGE, not
+#  the platform, which is why there is no third script — the per-platform
+#  surface is three constants and one component arm, and a third copy of the
+#  fetch/extract/report machinery would drift exactly as the header below warns
+#  the .bat and this one can.
 #
 #  MOST OF WHAT IT FETCHES IS WINDOWS BINARIES, ON PURPOSE. frustracer is a
 #  D3D12 renderer, so those components do not run on Linux. The point is that a
@@ -11,14 +16,24 @@
 #  exactly the directory the matching default in src/cli.rs points at, so the
 #  Windows session that consumes them needs no flags.
 #
-#  TWO COMPONENTS ARE LINUX-NATIVE and exist for the Vulkan backend port:
+#  TWO COMPONENTS ARE HOST-NATIVE and exist for the Vulkan backend port:
 #  `dxc` additionally fetches the Linux DXC (SPIR-V codegen — verified present
 #  in the official build, which is the port's whole toolchain premise) beside
 #  the Windows one at the SAME pin, and `spirv` fetches SPIRV-Tools for
 #  validating what DXC emits. Both are no-ops for a Windows session. They are
-#  in `all` because a Linux checkout that cannot compile a shader cannot make
+#  in `all` because a checkout that cannot compile a shader cannot make
 #  progress on the port, and finding that out at the first kernel is worse than
 #  paying the download here.
+#
+#  ON macOS THE HOST-NATIVE DXC HALF IS NOT AVAILABLE, and the reason is the
+#  pin rather than effort: Microsoft publishes exactly three assets at DXC_TAG
+#  (the Windows zip, a linux x86_64 tarball, and a PDB zip) — no macOS build and
+#  no arm64 build of any kind. A community binary would be, by construction, not
+#  from that tag, which breaks the invariant DXC_LINUX_TGZ's own comment calls
+#  out as one no gate could see. So the half skips with a loud line naming the
+#  route that preserves the pin (a source build at DXC_TAG, the shape `nrd`
+#  already uses on the other side), and `spirv` — which DOES publish a macOS
+#  prebuilt — installs normally.
 #
 #  Building NEVER needs any of this: the MIT headers the shims compile against
 #  (FidelityFX) are committed, and every SDK below is LoadLibrary'd at runtime,
@@ -57,18 +72,65 @@
 #    ./install-prerequisites.sh all --force     re-download and re-extract
 #    ./install-prerequisites.sh --clean         delete the download cache
 #
-#  Components: dxc fsr xess nppd oidn pix nrd
-#  Needs: bash 4+, curl (or wget), unzip (or bsdtar). Measured on a full run:
+#  Components: dxc fsr xess nppd oidn pix nrd spirv
+#  Needs: bash 3.2+, curl (or wget), unzip (or bsdtar). THE BASH FLOOR IS 3.2
+#  BECAUSE macOS SHIPS 3.2 (GPL3) and `#!/usr/bin/env bash` finds it, so the
+#  bash-4 conveniences are out on purpose: no ${x,,}, no mapfile/readarray, and
+#  no GNU-only utility flags (`grep -P`, `readlink -f`) — BSD userland has to
+#  run this too. That is not a style preference; ${x,,} under 3.2 aborts the
+#  enclosing `case` without matching any branch, and with no `set -e` the arg
+#  parser then fell THROUGH to an empty SEL, i.e. "install everything" in answer
+#  to `--help`. An arg parser that fails open is worse than one that exits.
+#  Measured on a full run:
 #  ~510 MB of downloads, 549 MB in SDKs/ after extraction. (The .bat quotes
 #  ~2 GB because its nrd component also unpacks and builds an NRD source tree,
 #  which this one does not.)
 # ===========================================================================
 set -uo pipefail
 
-cd "$(dirname "$(readlink -f "$0")")" || exit 2
-ROOT="$PWD"
+# `readlink -f` is GNU; BSD readlink only grew it in recent macOS, so resolving
+# the directory by cd'ing there is the portable spelling and drops a macOS
+# version floor the rest of the script does not have. `pwd -P` does the symlink
+# resolution the -f was wanted for.
+cd "$(dirname "$0")" || exit 2
+ROOT="$(pwd -P)"
+cd "$ROOT" || exit 2
 SDKS="$ROOT/SDKs"
 CACHE="${TMPDIR:-/tmp}/frustracer-prereqs"
+
+# --- host ----------------------------------------------------------------
+#  The host decides exactly two things: which SPIRV-Tools prebuilt to fetch and
+#  whether the host-native DXC half exists at all. Everything else is Windows
+#  payload that lands identically either way — which IS the point of the script
+#  (see the header): populating SDKs/ from the machine the checkout lives on.
+case "$(uname -s)" in
+    Darwin) OS=macos ;;
+    Linux) OS=linux ;;
+    *)
+        # Name it and continue rather than exiting: the Windows components are
+        # host-agnostic downloads, so a BSD or Solaris checkout still gets a
+        # complete SDKs/ tree. Only the two host-native rows stand down.
+        OS=other
+        echo "[i] unrecognized host \"$(uname -s)\" — fetching the Windows"
+        echo "    components only; the host-native dxc/spirv halves stand down."
+        ;;
+esac
+
+# lower <str> — ${x,,} is bash 4 and macOS ships 3.2. tr is everywhere.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# read_lines <var> — mapfile/readarray are bash 4 too. Reads stdin into the
+# named array. The trailing element guard matters: a `find` that matches
+# nothing yields one EMPTY line under a plain read loop, which would then look
+# like one result to the callers below, both of which count matches.
+read_lines() {
+    local __n="$1" __line
+    eval "$__n=()"
+    while IFS= read -r __line; do
+        [[ -n $__line ]] || continue
+        eval "$__n+=(\"\$__line\")"
+    done
+}
 
 # --- pinned versions ------------------------------------------------------
 #  Keep these in lockstep with install-prerequisites.bat — the two scripts
@@ -91,7 +153,11 @@ DXC_LINUX_TGZ=linux_dxc_2026_05_26.x86_64.tar.gz
 #  SPIRV-Tools: the prebuilt install.tgz from the SPIRV-Tools CI bucket, whose
 #  latest link is a redirect stub we resolve at run time rather than pinning a
 #  build number that expires. `spirv-val` is the gate on everything DXC emits.
-SPIRV_BADGE=https://storage.googleapis.com/spirv-tools/badges/build_link_linux_clang_release.html
+#  The bucket publishes a macOS clang build beside the Linux one, so this is the
+#  one host-native component that needs nothing but the right URL — with the
+#  caveat that the macOS build is x86_64 only (Rosetta on Apple silicon; see
+#  do_spirv, which checks rather than assumes).
+SPIRV_BADGE_BASE=https://storage.googleapis.com/spirv-tools/badges/build_link
 FFX_VER=2.3.0
 ORT_VER=1.24.4
 DML_VER=1.15.4
@@ -117,7 +183,9 @@ command -v unzip >/dev/null 2>&1 && UNZIP=unzip
 [[ -z $UNZIP ]] && command -v bsdtar >/dev/null 2>&1 && UNZIP=bsdtar
 if [[ -z $UNZIP ]]; then
     echo "[x] need unzip or bsdtar on PATH (GNU tar cannot read a zip)"
-    echo "    apt install unzip   |   dnf install unzip   |   pacman -S unzip"
+    echo "    apt install unzip | dnf install unzip | pacman -S unzip"
+    echo "    (macOS ships bsdtar as /usr/bin/tar's sibling — if this fires there,"
+    echo "     PATH is unusual)"
     exit 2
 fi
 
@@ -127,7 +195,7 @@ NRD_EXPLICIT=
 SEL=()
 ALL=(dxc fsr xess nppd oidn pix nrd spirv)
 for a in "$@"; do
-    case "${a,,}" in
+    case "$(lower "$a")" in
         --force | /force | -f) FORCE=1 ;;
         --clean | /clean)
             echo "removing $CACHE"
@@ -149,7 +217,7 @@ for a in "$@"; do
             exit 2
             ;;
         dxc | fsr | xess | nppd | oidn | pix | spirv)
-            SEL+=("${a,,}")
+            SEL+=("$(lower "$a")")
             ;;
         nrd)
             SEL+=(nrd)
@@ -274,7 +342,7 @@ extract() {
             return 1
         fi
         local inner=()
-        mapfile -t inner < <(find "$stage" -mindepth 1 -maxdepth 1)
+        read_lines inner < <(find "$stage" -mindepth 1 -maxdepth 1)
         if ((${#inner[@]} != 1)) || [[ ! -d ${inner[0]} ]]; then
             echo "    [x] $1: expected ONE top-level directory to strip, found ${#inner[@]}"
             fail
@@ -305,7 +373,7 @@ grab() {
         cp -f "$src/$rel" "$dst/" && return 0
         return 1
     fi
-    mapfile -t hit < <(find "$src" -ipath "*/${rel}" -type f)
+    read_lines hit < <(find "$src" -ipath "*/${rel}" -type f)
     if ((${#hit[@]} == 1)); then
         cp -f "${hit[0]}" "$dst/" && return 0
         return 1
@@ -349,6 +417,25 @@ do_dxc() {
     # NOTE the runtime needs its own lib/ on the loader path:
     #     LD_LIBRARY_PATH=SDKs/dxc-linux/lib SDKs/dxc-linux/bin/dxc ...
     # since bin/dxc resolves libdxcompiler.so by soname, not by sibling.
+    #
+    # ONLY LINUX HAS AN UPSTREAM DROP, and that is a fact about the release
+    # rather than about this script: DXC_TAG publishes the Windows zip, this
+    # tarball, and a PDB zip — nothing for macOS, nothing for arm64. The pin is
+    # what makes a substitute unacceptable rather than merely unofficial (see
+    # DXC_LINUX_TGZ above: the two backends compile the identical concatenated
+    # source, so a front-end difference is invisible to every gate), so the
+    # macOS answer is a source build at the SAME tag, not a community binary.
+    if [[ $OS != linux ]]; then
+        if [[ ! -e $SDKS/dxc-$OS/bin/dxc ]]; then
+            echo "[i] dxc (host-native, SPIR-V) skipped — upstream publishes no"
+            echo "    $OS build at $DXC_TAG (windows zip + linux x86_64 tarball only)."
+            echo "    A community binary would not be from this pin, and the pin is"
+            echo "    what keeps the DXIL and SPIR-V front ends from drifting."
+            echo "    Build it from source at the tag, then point"
+            echo "    FRUSTRACER_DXC_SPIRV_PATH at the result."
+        fi
+        return 0
+    fi
     if ! skip "$SDKS/dxc-linux/bin/dxc" "dxc (linux, SPIR-V)"; then
         if fetch dxc-linux.tar.gz "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_TAG/$DXC_LINUX_TGZ"; then
             extract dxc-linux.tar.gz "$SDKS/dxc-linux" || return 0
@@ -368,14 +455,24 @@ do_spirv() {
     # pin (upstream ships SPIRV-Tools through the Vulkan SDK), so we resolve the
     # CI bucket's "latest" redirect stub at run time rather than pin a build
     # number that will 404 within weeks.
+    if [[ $OS == other ]]; then
+        echo "    [i] spirv skipped — the CI bucket publishes linux and macos"
+        echo "        builds only. apt install spirv-tools, or the LunarG Vulkan"
+        echo "        SDK, which carries spirv-val and a DXC too."
+        return 0
+    fi
     skip "$SDKS/spirv-tools/bin/spirv-val" spirv && return 0
     local url
-    url=$(curl -sS --max-time 60 "$SPIRV_BADGE" 2>/dev/null |
-        grep -oP 'url=\K[^"]+' | head -1)
+    # `grep -oP` is GNU-only — BSD grep rejects -P outright ("invalid option"),
+    # which on macOS made this resolve to empty and report the bucket as
+    # unreachable. sed's BRE does the same job everywhere.
+    url=$(curl -sS --max-time 60 "${SPIRV_BADGE_BASE}_${OS}_clang_release.html" 2>/dev/null |
+        sed -n 's/.*url=\([^"]*\)".*/\1/p' | head -1)
     if [[ -z $url ]]; then
         echo "    [x] could not resolve the SPIRV-Tools latest-build link"
-        echo "        alternative: apt install spirv-tools (needs root), or the"
-        echo "        LunarG Vulkan SDK, which carries spirv-val and a DXC too"
+        echo "        alternative: apt install spirv-tools / brew install"
+        echo "        spirv-tools, or the LunarG Vulkan SDK, which carries"
+        echo "        spirv-val and a DXC too"
         fail
         return 0
     fi
@@ -383,6 +480,24 @@ do_spirv() {
     # archive root is a single install/ dir holding bin/ include/ lib/
     extract spirv-tools.tgz "$SDKS/spirv-tools" strip1 || return 0
     chmod +x "$SDKS/spirv-tools/bin/"* 2>/dev/null
+    # THE macOS PREBUILT IS x86_64 — the bucket publishes no arm64 build — so on
+    # Apple silicon it runs under Rosetta, and on a machine without Rosetta it
+    # fails as "Bad CPU type in executable" rather than as anything mentioning
+    # architecture. Say so at install time: a gate that cannot start its
+    # validator is otherwise indistinguishable from one whose modules are bad.
+    if [[ $OS == macos && $(uname -m) == arm64 ]] &&
+        file "$SDKS/spirv-tools/bin/spirv-val" 2>/dev/null | grep -q x86_64; then
+        if ! "$SDKS/spirv-tools/bin/spirv-val" --version >/dev/null 2>&1; then
+            echo "    [x] spirv-val will not execute: the prebuilt is x86_64 and this"
+            echo "        is arm64. Install Rosetta (softwareupdate --install-rosetta)"
+            echo "        or: brew install spirv-tools"
+            fail
+            return 0
+        fi
+        echo "    [i] note: the macOS prebuilt is x86_64 (no arm64 build upstream),"
+        echo "        so it runs under Rosetta here. brew install spirv-tools for"
+        echo "        a native one."
+    fi
 }
 
 do_fsr() {
@@ -499,9 +614,17 @@ check "OIDN (--oidn / N)" "$SDKS/oidn.x64.windows/bin/OpenImageDenoise.dll"
 check "PIX markers (--pix-markers)" "$SDKS/pix/bin/x64/WinPixEventRuntime.dll"
 check "NRD denoiser (--nrd)" "$SDKS/NRD/bin/NRD.dll"
 check "  (perf variant, --nrd-perf)" "$SDKS/NRD/bin/perf/NRD.dll"
-echo "---- linux-native (vulkan backend port) ----"
-check "DXC -> SPIR-V" "$SDKS/dxc-linux/bin/dxc"
-check "  (runtime; needs LD_LIBRARY_PATH)" "$SDKS/dxc-linux/lib/libdxcompiler.so"
+echo "---- host-native ($OS; vulkan backend port) ----"
+if [[ $OS == linux ]]; then
+    check "DXC -> SPIR-V" "$SDKS/dxc-linux/bin/dxc"
+    check "  (runtime; needs LD_LIBRARY_PATH)" "$SDKS/dxc-linux/lib/libdxcompiler.so"
+else
+    # Report the ABSENCE with its reason rather than a bare MISSING row: this
+    # one is not retryable, so a row that looks like a failed download would
+    # send someone rerunning the script forever.
+    echo " [--] DXC -> SPIR-V  no upstream $OS build at $DXC_TAG — source build"
+    echo "                     at the tag (--check-spirv/--check-vk need it)"
+fi
 check "SPIR-V validation" "$SDKS/spirv-tools/bin/spirv-val"
 check "  (disassembler)" "$SDKS/spirv-tools/bin/spirv-dis"
 
