@@ -40,6 +40,20 @@ dlss_gbuf_*.png
 oidn_*.png
 nppd_*.png
 xess_gbuf_*.png
+# --check's rendered frame for any NON-default scene (`san-miguel.obj --check`,
+# `--check --stress 5000`, the opt-in world). check.png / check_gi.png are the
+# TRACKED goldens — the default scene's frame, byte-compared by hand — and a
+# scene-keyed run writes here instead so it cannot dirty them. The hyphen is
+# what separates the two: the goldens use `_`, these use `-`.
+/check-*.png
+# The opt-in diagnostic dumps that also land in CWD, for the same reason: a
+# `git status` that is only ever dirty when YOU dirtied it is the instrument
+# several bit-identity claims in this tree rest on, so nothing a dev lever
+# writes belongs in it. FR_CHECK_AB_DUMP's CPU/GPU/diff/water dumps,
+# FR_NRD_DEBUG's OUT_VALIDATION frame, FRUSTRACER_HUD_STATS' buffer dump.
+/check_ab_*.png
+/nrd-validation.png
+/hud-buffer-dump.png
 # --cinematic output: PNG/PNG16 sequences, EXR masters and encoded video. These
 # are working files — often tens of GB for one 4K60 sequence. Only the curated,
 # downscaled results under docs/media/ are committed.

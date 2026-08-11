@@ -2427,6 +2427,8 @@ pub fn usage() {
                 eprintln!("    --cinematic-encode         run ffmpeg (default: just print the commands)");
                 eprintln!("    --cinematic-dry-run        resolve + print the plan, render nothing");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
+                eprintln!("                (the DEFAULT scene's frame; a scene-keyed run writes check-<tag>.png");
+                eprintln!("                 instead, so it cannot dirty the tracked goldens)");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
                 eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/spec_albedo/normal/misc/mv)");
                 eprintln!("  --no-dlss     skip the DLSS-RR level of the upscaler chain (falls to FSR4/XeSS/FSR3);");
