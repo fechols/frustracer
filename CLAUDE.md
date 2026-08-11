@@ -4658,6 +4658,110 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # argument array is UTF-32. Vulkan-on-Windows needs that cfg, the
                                       # library name, and the module/dep cfg lifted — nothing else; the
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
+cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
+                                      # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b).
+                                      # --check-spirv proves the corpus COMPILES; this proves a DEVICE
+                                      # CONSUMES it, and those are different claims: spirv-val validates a
+                                      # MODULE and knows nothing about the pipeline layout we bind it
+                                      # against, so a module can be perfectly valid and read the wrong
+                                      # resource. Four stages: V0 the pure pick/memory logic (runs with no
+                                      # Vulkan on the box at all) | V1 loader + instance + device | V2
+                                      # compile smoke.hlsl to SPIR-V and build the pipelines | V3 run the
+                                      # seed -> prep -> indirect-fill chain and read the results back.
+                                      # V3 IS THE POINT: constants reaching a kernel, storage buffers
+                                      # bound and written, a GPU-WRITTEN counter turned into dispatch
+                                      # arguments by a second kernel, and a third kernel launched from
+                                      # those arguments with the CPU never seeing the count. That is the
+                                      # whole wavefront design, and it is the SAME smoke.hlsl the D3D12
+                                      # suite runs, unmodified — the shader is shared, only the recording
+                                      # differs. MEASURED (Radeon 8060S / RADV STRIX_HALO, Mesa 26.0.3,
+                                      # Vulkan 1.4): PASSED, and PASSED again forced onto llvmpipe, so
+                                      # the chain is proven on two independent ICDs.
+                                      # V0 EXISTS BECAUSE OF THE TWO-ICD HAZARD, and it is the most
+                                      # transferable part: this box exposes a real RDNA3.5 iGPU AND
+                                      # llvmpipe, and a ranking bug that prefers the software device does
+                                      # not fail — it renders, correctly, a hundred times slower, and
+                                      # every measurement taken afterwards describes llvmpipe. So `pick`
+                                      # and `mem_type_index` are ordinary functions over plain data with
+                                      # teeth both ways: iGPU must beat CPU-class AND must still beat it
+                                      # with the list REVERSED (else the answer is a property of
+                                      # enumeration order, not of the ranking); a REJECTED device is never
+                                      # chosen however high it ranks; ties break by enumeration index; and
+                                      # the requirement mask in mem_type_index is a hardware constraint,
+                                      # so a type carrying every wanted flag but masked out must NOT be
+                                      # picked.
+                                      # THE absent/told SPLIT, found by exercising the lever rather than
+                                      # by reading the code: `device::VkError` carries `absent`, and the
+                                      # gate SKIPs (exit 0) only on it. A box with no loader, no device,
+                                      # or no device meeting the floor is an environment fact — the
+                                      # bare-checkout degrade every SDK gate here follows. A mistyped
+                                      # FR_VK_DEVICE is NOT: the box may be full of working GPUs and the
+                                      # lever named none of them, so that exits 2 (the --check-gpu
+                                      # convention: 2 = environment, 1 = a gate failed). The first draft
+                                      # skipped-and-exited-0 on both, which turns being-told into
+                                      # passing — the --fsr4 doctrine violated in the one place nothing
+                                      # would have noticed.
+                                      # TWO HARD DEVICE REQUIREMENTS, both inherited from --check-spirv's
+                                      # flag set rather than chosen here: Vulkan 1.3 (the SPIR-V target
+                                      # env; a 1.2 device could not consume the modules) and
+                                      # scalarBlockLayout (what -fvk-use-dx-layout costs, and therefore
+                                      # what ONE Rust CB packer costs). The second is not theoretical
+                                      # here — smoke.hlsl's `RWStructuredBuffer<uint3> args` is a 12-byte
+                                      # stride under DX rules against std430's 16, so the smoke test
+                                      # exercises the relaxation it requires. REQUIRED, never preferred:
+                                      # a device without it would validate every module and then read the
+                                      # wrong bytes.
+                                      # BINDINGS ARE COMPUTED, NEVER WRITTEN DOWN: the descriptor-set
+                                      # layout reads vk::spirv::binding_of, the same rule the -fvk-*-shift
+                                      # flags are generated from, because a literal is exactly how a
+                                      # layout drifts away from the flags its modules were compiled with.
+                                      # TEETH, all three exercised rather than asserted: a binding
+                                      # shifted by ONE fails V3 with `outbuf[0] = 0xeeeeeeee ... (never
+                                      # written)` — the buffer is pre-poisoned with a sentinel so a
+                                      # never-dispatched fill cannot read back as zeros and look like a
+                                      # shader that ran; under FR_VK_VALIDATION the same bug is named
+                                      # exactly ("uses descriptor [Set 0, Binding 2002, variable
+                                      # \"outbuf\"] but the binding was not declared"). Losing the
+                                      # roundup in prep ((n+63)/64 -> n/64) fails on the args themselves
+                                      # ([8,1,1] vs [9,1,1]). Removing the shader's own bounds guard
+                                      # fails on the TAIL check — 64 sentinel words past the fill count
+                                      # that the last group provably dispatched over and must not have
+                                      # written (a tooth the D3D12 twin does not have). A second pass at
+                                      # count 0 pins the empty-queue case every ladder level hits: args
+                                      # [0,0,1] and not one word written.
+                                      # LEVERS: FR_VK_DEVICE=<index|name-substring> forces the adapter
+                                      # (loud; an ambiguous substring is an ERROR rather than first-match,
+                                      # since "amd" matching two adapters and quietly taking one is how a
+                                      # measurement ends up describing the other device);
+                                      # FR_VK_VALIDATION=1 arms VK_LAYER_KHRONOS_validation +
+                                      # VK_EXT_debug_utils, and the gate FAILS on any ERROR-severity
+                                      # message — validation armed and unread is the same as unarmed, the
+                                      # --gpu-debug lesson spelled for Vulkan. A validation layer that is
+                                      # requested but not installed is LOUD and continues unvalidated.
+                                      # THE SUBGROUP FINDING, printed every run because M2c decides from
+                                      # it: this device's natural subgroupSize is 64, min 32 / max 64,
+                                      # with subgroupSizeControl — so Vulkan can PIN the width via
+                                      # VkPipelineShaderStageRequiredSubgroupSizeCreateInfo, which D3D12
+                                      # cannot (there the driver picks per shader and the caps never
+                                      # predict it — see the FR_WIDTH campaign). Every LEAF_GROUP /
+                                      # SKY_SPLIT constant in this tree was tuned against 32, and the
+                                      # wave64 lane-waste bug that cost -38% is exactly the hazard a pin
+                                      # would remove. llvmpipe reports 8.
+                                      # VK_EXT_headless_surface is NOT used and the plan that named it was
+                                      # wrong: that extension runs the PRESENTATION path without a window,
+                                      # and compute needs no surface at all — the harness has one less
+                                      # moving part than expected. It becomes relevant when the display
+                                      # stage wants gating, not before.
+                                      # NOT scene-keyed (unlike --check-spirv): smoke.hlsl carries no
+                                      # scene-derived defines, so this gate is a pure function of the
+                                      # device. `ash` is the one new dependency — a generated binding, not
+                                      # a framework (no allocator, no render graph, no policy), and its
+                                      # default `loaded` feature dlopens libvulkan.so.1 and resolves every
+                                      # entry point by symbol: the same footprint policy as dxc/oidn/xess/
+                                      # nrd, so nothing links Vulkan and every other --check* stays
+                                      # unaffected. unix-only today for the same reason vk/spirv.rs is —
+                                      # nothing here forbids Vulkan on Windows, the Windows build simply
+                                      # must not gain a dependency it does not yet use
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)
 cargo run --release -- --prefer-intel # pick that vendor's adapter for the D3D12 device (also
                                       # --prefer-nvidia / --prefer-amd; default NVIDIA, or AMD under
