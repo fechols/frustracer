@@ -15,4 +15,6 @@
 //! the flag set, the register-space -> descriptor-set mapping it implies, and
 //! the measurement.
 
+pub mod device;
+pub mod headless;
 pub mod spirv;

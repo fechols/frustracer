@@ -343,6 +343,7 @@ fn main() {
         nppd_dump,
         check_nrd,
         check_spirv,
+        check_vk,
         check_gpu,
         check_dxr,
         no_xess_explicit,
@@ -926,6 +927,9 @@ fn main() {
         // carries it, so `--check-spirv san-miguel.obj` gates arms the
         // procedural scene cannot reach.
         || check_spirv
+        // NOT scene-keyed: the smoke kernel is one file with no scene-derived
+        // defines, so this gate is a pure function of the device.
+        || check_vk
         || check_gpu
         || check_dxr;
     // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites run
@@ -1132,6 +1136,21 @@ fn main() {
             eprintln!(
                 "--check-spirv is unix-only today (the Vulkan backend's SPIR-V \
                  compiler); see src/vk/spirv.rs for what the Windows arm needs"
+            );
+            std::process::exit(2);
+        }
+    }
+    if check_vk {
+        #[cfg(unix)]
+        {
+            let code = run_check_vk();
+            std::process::exit(code);
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!(
+                "--check-vk is unix-only today (the Vulkan backend); nothing here forbids \
+                 Vulkan on Windows, the dependency is simply not built there yet"
             );
             std::process::exit(2);
         }
@@ -11577,6 +11596,119 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         }
     }
     println!("CHECK-SPIRV {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
+}
+
+/// `--check-vk`: the Vulkan backend actually running something.
+///
+/// `--check-spirv` proves the corpus COMPILES; this proves a device CONSUMES
+/// it, and those are different claims — a module can validate perfectly and
+/// still read the wrong resource, because `spirv-val` checks a module and
+/// knows nothing about the pipeline layout we bind it against. So the four
+/// stages are: the pure pick/memory logic (V0), a real device (V1), pipelines
+/// built from freshly compiled SPIR-V (V2), and the indirect-dispatch chain
+/// executed with its results read back (V3).
+///
+/// V3 is the one that matters. The whole wavefront design rests on a kernel
+/// writing a count that the command processor turns into a launch grid with
+/// the CPU never seeing it; if `vkCmdDispatchIndirect` does not work, nothing
+/// above it can. It is the same `smoke.hlsl` the D3D12 suite runs, unmodified.
+///
+/// Degrades loudly and exits 0 when there is no loader or no usable device —
+/// the bare-checkout rule every SDK-dependent gate here follows. It does NOT
+/// degrade on a device that is present and wrong.
+#[cfg(unix)]
+fn run_check_vk() -> i32 {
+    let mut ok = true;
+
+    // ---- V0: the pure half. Meaningful on a box with no Vulkan at all. ----
+    match vk::device::self_test() {
+        Ok(()) => println!("check-vk: V0 device pick + memory-type selection OK"),
+        Err(e) => {
+            eprintln!("check-vk: FAIL V0 {e}");
+            ok = false;
+        }
+    }
+
+    // ---- V1: a real device. Absence is a normal condition. ----
+    let validate = std::env::var("FR_VK_VALIDATION").is_ok_and(|v| v != "0");
+    if validate {
+        println!("check-vk: FR_VK_VALIDATION set — arming VK_LAYER_KHRONOS_validation");
+    }
+    let hg = match vk::headless::VkHeadless::new(validate) {
+        Ok(h) => h,
+        // Absent Vulkan is a normal condition and skips. Anything else — a
+        // lever that named no device, a driver refusing a device we chose — is
+        // NOT: reporting "you typoed FR_VK_DEVICE" as "this box has no GPU"
+        // exits 0 on a run that gated nothing, which is how a broken lever
+        // reads as a passing suite.
+        Err(e) if e.absent => {
+            println!("check-vk: SKIP V1 ({e})");
+            return i32::from(!ok);
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V1 {e}");
+            println!("CHECK-VK FAILED");
+            return 2;
+        }
+    };
+    println!("check-vk: V1 {}", hg.vk.line());
+
+    // The natural width is a FACT worth printing every run, not a footnote:
+    // it is what an unpinned pipeline gets, and every LEAF_GROUP / SKY_SPLIT
+    // constant in this tree was tuned against 32. M2c decides what to do with
+    // that; this line is the measurement it will decide from.
+    let natural = hg.vk.natural_subgroup_size();
+    println!(
+        "check-vk: V1 natural subgroupSize {natural}{}",
+        if hg.vk.info.subgroup_size_control {
+            format!(
+                " (pinnable to [{}..{}] — D3D12 cannot)",
+                hg.vk.info.subgroup_min, hg.vk.info.subgroup_max
+            )
+        } else {
+            " (not pinnable on this device)".to_string()
+        }
+    );
+    if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+        println!(
+            "check-vk: NOTE this is a SOFTWARE device — correct, and useless for any timing"
+        );
+    }
+
+    // ---- V2 + V3: compile, build pipelines, run the chain. ----
+    let dir = vk::spirv::default_dir();
+    let sp = match vk::spirv::Spirv::load(&dir) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("check-vk: SKIP V2 ({e})");
+            return i32::from(!ok);
+        }
+    };
+    println!("check-vk: V2 libdxcompiler.so loaded from {dir}");
+
+    match vk::headless::smoke_test(&hg, &sp) {
+        Ok(()) => println!(
+            "check-vk: V3 push constants + storage buffers + GPU-written indirect args + \
+             vkCmdDispatchIndirect OK"
+        ),
+        Err(e) => {
+            eprintln!("check-vk: FAIL V3 {e}");
+            ok = false;
+        }
+    }
+
+    // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
+    // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
+    let ve = vk::device::validation_errors();
+    if ve > 0 {
+        eprintln!("check-vk: FAIL {ve} validation error(s) — see the vk validation lines above");
+        ok = false;
+    } else if validate {
+        println!("check-vk: validation clean");
+    }
+
+    println!("CHECK-VK {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
 }
 

@@ -713,6 +713,9 @@ pub struct Cli {
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
+    /// `--check-vk`: bring up a real Vulkan device and run the indirect-dispatch
+    /// smoke chain on it. unix-only today, like the backend it gates.
+    pub check_vk: bool,
     pub check_gpu: bool,
     pub check_dxr: bool,
     /// `--no-xess` was passed (distinct from the chain simply never reaching
@@ -990,6 +993,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut nppd_dump = false;
     let mut check_nrd = false;
     let mut check_spirv = false;
+    let mut check_vk = false;
     let mut no_xess_explicit = false;
     let mut fsr_forced = false;
     let mut dxr_explicit = false;
@@ -1048,6 +1052,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--check-nrd" => check_nrd = true,
             "--check-spirv" => check_spirv = true,
+            "--check-vk" => check_vk = true,
             "--nrd" => {
                 opts.nrd = true;
                 opts.nrd_explicit = true;
@@ -2307,6 +2312,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         nppd_dump,
         check_nrd,
         check_spirv,
+        check_vk,
         check_gpu,
         check_dxr,
         no_xess_explicit,
@@ -2480,6 +2486,11 @@ pub fn usage() {
                 eprintln!("  --check-spirv headless (unix): assemble the shipping kernel corpus and compile every");
                 eprintln!("                unit to SPIR-V for the Vulkan backend, then spirv-val each module —");
                 eprintln!("                needs SDKs/dxc-linux (install-prerequisites.sh dxc); no GPU");
+                eprintln!("  --check-vk    headless (unix): bring up a real Vulkan device and run the indirect-");
+                eprintln!("                dispatch smoke chain on it (constants, storage buffers, a GPU-written");
+                eprintln!("                counter turned into dispatch args, vkCmdDispatchIndirect consuming");
+                eprintln!("                them). FR_VK_DEVICE=<index|name> forces the adapter,");
+                eprintln!("                FR_VK_VALIDATION=1 arms the Khronos validation layer");
                 eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser, OPT-IN since");
                 eprintln!("                2026-08-10 (NRD is the default). THE FAST ARM: 2.5x NRD's speed in the");
                 eprintln!("                denoiser region, no DLL and no install step — the kernels compile like");

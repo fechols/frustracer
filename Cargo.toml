@@ -158,8 +158,19 @@ windows = { version = "0.62", features = [
 # platform fact: DXC's WinAdapter typedefs LPCWSTR as `const wchar_t*`, which
 # is 4 bytes here and 2 on Windows. Vulkan-on-Windows needs that cfg and the
 # library name flipped, nothing else — see the header in vk/spirv.rs.
+#
+# `ash` is the raw Vulkan API — a generated binding, not a framework: no
+# allocator, no render graph, no policy of its own, which is what makes it the
+# peer of `windows`'s D3D12 module rather than a second engine. Its DEFAULT
+# `loaded` feature is the same footprint policy again (it dlopens
+# libvulkan.so.1 through `libloading` and resolves every entry point by
+# symbol), so a box with no Vulkan loader gets a clean error instead of a
+# failed exec. unix-only for now for the same reason the module is: nothing
+# here forbids Vulkan on Windows, but the Windows build must not gain a
+# dependency it does not yet use.
 [target.'cfg(unix)'.dependencies]
 libloading = "0.8"
+ash = "0.38"
 
 [build-dependencies]
 cc = "1"
