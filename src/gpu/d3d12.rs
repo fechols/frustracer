@@ -801,6 +801,19 @@ impl D3d {
 /// executes, and BLOCKS until the GPU finishes, which is what lets one
 /// staging ring be reused across calls instead of committing a full second
 /// copy of the scene in upload heaps.
+///
+/// DELIBERATELY NOT IN `gfx::` (weighed in M1 of the Vulkan port and left
+/// here). What is portable about this is the CONTRACT in the paragraph above,
+/// not the trait: its one method hands back an `ID3D12GraphicsCommandList`, so
+/// hoisting it would mean an associated `type List` — a general RHI trait in
+/// miniature, which the port's architecture explicitly rejected. And it would
+/// buy nothing, because nothing would be generic over it: every consumer
+/// (`stream_buffer`, the BLAS/TLAS builds, `SwTreesGpu::new_uploaded`) is
+/// `&mut dyn Submit` inside a body that is pure D3D12 — `CopyBufferRegion`,
+/// resource states, acceleration-structure descs — which a Vulkan upload does
+/// not share a line of. Two implementations wearing one name is not reuse. A
+/// `VkHeadless` gets the same SHAPE, spelled in its own module, and the doc
+/// above is the specification both follow.
 pub trait Submit {
     fn run_list(
         &mut self,

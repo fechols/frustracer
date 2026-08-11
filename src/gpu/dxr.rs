@@ -23,16 +23,14 @@
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
 use super::trace::{
-    // This pipeline's own three units come from `gfx::shaders` through
-    // `trace`'s re-export, like every other pasted source: the shader-source
-    // gates pin rt.hlsli and rt_dxr.hlsli against EACH OTHER, so both have to
-    // be visible to one module, and that module has to be one `cargo test`
-    // compiles off Windows.
-    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, DXR_HLSL, DXR_SHADE_HLSL, RP_FRAME_CBV,
-    RP_GBUF, RP_GBUF_EXT, RP_PUSH, RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, RT_DXR_HLSLI,
-    SRV_INDICES, SRV_MATERIALS, SRV_NORMALS, SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE,
-    TEX_TABLE_BUFS, UAV_ACCUM, UAV_COUNTERS, UAV_INFO, UAV_QIN, UAV_QLEAF, UAV_QOUT, UAV_QSKY,
-    UAV_TBUF,
+    // No HLSL sources here any more: this pipeline's three units (dxr.hlsl,
+    // dxr_shade.hlsl, rt_dxr.hlsli) live in `gfx::shaders` with the rest of the
+    // corpus, and so does the assembly that pastes them. What is left is the
+    // register/slot vocabulary the RECORDING needs.
+    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_GBUF_EXT, RP_PUSH,
+    RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS, SRV_POSITIONS,
+    SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_COUNTERS, UAV_INFO,
+    UAV_QIN, UAV_QLEAF, UAV_QOUT, UAV_QSKY, UAV_TBUF,
 };
 use crate::scene::Scene;
 use windows::core::{Interface, PCWSTR};
@@ -739,72 +737,10 @@ impl DxrGpu {
         // `scene.any_*`, so this arm's AS flag and its any-hit shaders are one
         // decision — and an FR_ABL neutralization moves both together.
         let non_opaque = trace::non_opaque(scene);
-        // The cbuffer's --spp jitter-table size, injected like alpha_defs.
-        let sd = trace::spp_defs();
-        let sd = sd.as_str();
-        // The detail strength knobs (shade.hlsli's DETAIL_STR seams).
-        let dd = trace::detail_defs();
-        let dd = dd.as_str();
-        // The uploaded ring's existence, read off `SceneGpu` rather than
-        // re-derived — see the wavefront's twin call site. DXR never
-        // software-rays, so it takes the predicate unconditionally.
-        let sway_def = trace::sway_defs(scene_gpu.sway.is_some());
-        let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            // SCENE_EMPTY is INERT in this pipeline and is carried only so the
-            // two arms' define sets stay comparable: the guards it gates live in
-            // frustum.hlsli and rt_sw.hlsli, neither of which this library
-            // pastes, and DXR rays go through the TLAS (an empty TLAS is the
-            // driver's problem, not ours). It becomes load-bearing the moment
-            // this pipeline ever pastes a software-BVH consumer.
-            trace::empty_defs(scene),
-            trace::alpha_defs(scene),
-            trace::height_defs(scene),
-            trace::trans_defs(scene),
-            trace::blas_defs(),
-            // SWAY_MV: the prev-pose MV correction in gbuf_write_hit, off the
-            // uploaded ring's existence (trace::sway_defs — no --sw-rays
-            // carve-out here, DXR never software-rays).
-            sway_def,
-            // FR_ABL, shared with the wavefront — without it every cloud cost
-            // attribution was wavefront-only and silently incomparable here.
-            trace::abl_defs(),
-            // Real-time GI (--no-rtgi omits): shade_full's bounce block —
-            // shared with the wavefront so the two pipelines' shading stays
-            // one source (the probe-reach rule).
-            trace::rtgi_defs()
-        );
-        // The cloud shading caches, snapshotted at construction like TraceGpu:
-        // the library is compiled against these, the buffers sized against them,
-        // and record_frame's fills / write_cb's grid all read the fields, so a
-        // mid-process A/B (the --check-dxr on/off gate flips the static between
-        // two DxrGpu builds) can never desync a shader from its fill dispatch.
-        let sky_lod_k = trace::sky_lod();
-        let cloud_shadow_n = trace::cloud_shadow_n();
-        // The two cache defines arm trace_common's cached cloud_sun_transmittance
-        // (u6) + skylod.hlsli's sky_radiance_lod (u5) for EVERY shade path in the
-        // library — parity inherited, not re-ported. u5/u6 are unbound in the DXR
-        // root signature today (the wavefront's tile queues), so binding dedicated
-        // buffers there needs no root-signature change.
-        let cloud_defs = format!(
-            "#define CLOUD_SHADOW_N {cloud_shadow_n}\n#define SKY_LOD {sky_lod_k}\n#define SKY_LOD_LOG {}",
-            sky_lod_k.trailing_zeros()
-        );
-        // Mode 0 assembles EXACTLY the shipping sequence (the lever's
-        // off-state is byte-identical source, not merely equivalent); armed
-        // modes prepend the define and paste rt.hlsli's RayQuery primitives
-        // ahead of rt_dxr.hlsli, whose TraceRay flavors + tlas/HitInfo
-        // compile out under DXR_INLINE_SEC. The two cache defines ride in every
-        // mode (the shipping sequence now carries them; mode 0 stays
-        // byte-identical ACROSS inline modes, the lever's actual contract).
-        // --dxr-sbt 3 (recurse — arms only at inline 0, the snapshot's
-        // degrade) is the HYBRID paste: rt.hlsli rides along for INLINE
-        // occlusion (shadow/AO rays never re-enter the pipeline, which is
-        // what caps the recursion at 5) while DXR_SBT_RECURSE reshapes
-        // rt_dxr.hlsli (tlas/HitInfo/TraceRay primitives out, trace_shade in)
-        // and shade_split's continuations (recursive TraceRay in place of the
-        // lap loop). An unarmed sbt mode leaves every push identical — the
-        // mode-0 byte-identity contract holds across the WHOLE ladder.
+        // The one sbt mode the SOURCE can see (it pastes rt.hlsli for inline
+        // occlusion and reshapes rt_dxr.hlsli + shade_split's continuations);
+        // 1 and 2 move only the SBT and the export list. Read here because the
+        // lean qualification below needs it as well.
         let recurse = sbt_mode == 3;
         // FR_DXR_LEAN — the dead-exports control (doc at lean_on). Qualifies
         // ONLY at mode 2 with the sbt ladder off: every other config has real
@@ -843,93 +779,34 @@ impl DxrGpu {
         } else {
             false
         };
-        let inline_def = format!("#define DXR_INLINE_SEC {inline_mode}");
-        let mut parts = vec![defs.as_str(), sd, dd, cloud_defs.as_str()];
-        if inline_mode > 0 {
-            parts.push(inline_def.as_str());
-        }
-        if recurse {
-            parts.push("#define DXR_SBT_RECURSE 1");
-        }
-        // FR_WIDTH: the raygen wave-width report (dxr_width[0]) — armed only
-        // where the library compiles at lib_6_5 (the inline modes' floor;
-        // wave ops in a 6_3 library are off the table, and mode 0's raygen
-        // is not the lottery victim anyway). The deferred-shade unit below
-        // carries its own WIDTH_PROBE define.
-        if trace::width_probe_on() && (inline_mode > 0 || recurse) {
-            parts.push("#define WIDTH_PROBE_RAYGEN 1");
-        }
-        // FR_BALLAST=dxr:N — the raygen ballast (the knee-vs-knee host
-        // comparison; reference.hlsl's liveness argument, mirrored in
-        // dxr.hlsl's mode-2 arm). The blocks' compound guard already
-        // confines them to DXR_INLINE_SEC == 2, but pushing the define into
-        // a mode whose arm compiles out would leave the SEED live and the
-        // update dead — a ballast that "measures" a flat curve — so any
-        // other mode refuses loudly instead (the FR_WIDE rule).
-        let bd = trace::ballast_dxr_defs();
-        if !bd.is_empty() {
-            if inline_mode == 2 {
-                parts.push(bd.as_str());
-            } else {
-                eprintln!(
-                    "gpu: FR_BALLAST=dxr:N needs --dxr-inline 2 (this session is \
-                     mode {inline_mode}) — off"
-                );
-            }
-        }
-        // FR_WAVEVIZ — the wave-ticket overlay's DXR half. Modes 1/2 only:
-        // mode 0's raygen is lib_6_3 (no wave ops) and mode 3's thin raygen
-        // is PINNED to write no tbuf (the deferred kernel is plain compute —
-        // its packing is the dispatch grid's, nothing to discover). The
-        // `chs` sub-mode additionally needs mode 1 (the one mode whose
-        // primary runs a closest-hit).
-        let wv = trace::waveviz_defs();
-        // The arming is fully expressed by the parts pushes; the binding is
-        // kept for the branch structure only (underscored at the 2026-08-06
-        // merge — it was an unused-variable warning as pushed).
-        let _wv_armed = if !wv.is_empty() {
-            if inline_mode == 1 || inline_mode == 2 {
-                parts.push(wv.as_str());
-                if trace::waveviz_chs() {
-                    if inline_mode == 1 {
-                        parts.push("#define WAVEVIZ_CHS 1");
-                    } else {
-                        eprintln!(
-                            "gpu: FR_WAVEVIZ=chs needs --dxr-inline 1 (this session \
-                             is mode {inline_mode}) — raygen tickets instead"
-                        );
-                    }
-                }
-                true
-            } else {
-                eprintln!(
-                    "gpu: FR_WAVEVIZ needs --dxr-inline 1|2 (this session is mode \
-                     {inline_mode}) — off on this pipeline"
-                );
-                false
-            }
-        } else {
-            false
-        };
-        parts.push(trace::TRACE_COMMON_HLSLI);
-        // skylod.hlsli after trace_common (needs sky_compose/sky_backdrop/rw); no
-        // SKY_UNIT — this unit pastes no queues.hlsli, so u5 is free anyway.
-        parts.push(trace::SKYLOD_HLSLI);
-        if inline_mode > 0 || recurse {
-            parts.push(trace::RT_HLSLI);
-        }
-        parts.extend([
-            RT_DXR_HLSLI,
-            trace::RIPPLE_HLSLI,
-            trace::SHADE_HLSLI,
-            DXR_HLSL,
-        ]);
-        let lib_src = parts.join("\n");
-        // rt.hlsli's RayQuery in a library target needs SM 6.5 — the inline
-        // modes' floor, and mode 3's (the snapshot degraded to 2 if the
-        // device lacks it).
-        let lib_target = if inline_mode > 0 || recurse { "lib_6_5" } else { "lib_6_3" };
-        let dxil = dxc.compile(&lib_src, "", lib_target, "dxr library", debug)?;
+        // Every compile unit, assembled by the shared layer (gfx::shaders) —
+        // the strings are what BOTH backends hand their compiler, so a Vulkan
+        // pipeline cannot drift into running different programs. The two mode
+        // fields go in POST-DEGRADE: the caps gate, the Intel heightfield
+        // refusal and the sbt ladder's own degrades have all run above, and
+        // handing the assembly a refused mode is how you get a DXC error or a
+        // hung device. `lean` deliberately does not go in at all — it moves
+        // only the export list, never a byte of source.
+        let srcs = crate::gfx::shaders::dxr_sources(&crate::gfx::shaders::DxrKeys {
+            scene,
+            // The uploaded ring's existence, read off `SceneGpu` rather than
+            // re-derived — see the wavefront's twin call site.
+            sway_armed: scene_gpu.sway.is_some(),
+            inline_mode,
+            recurse,
+            gbuf_full,
+            nrd,
+        });
+        // The cloud shading caches, snapshotted at construction like TraceGpu:
+        // the library is compiled against these, the buffers sized against them,
+        // and record_frame's fills / write_cb's grid all read the fields, so a
+        // mid-process A/B (the --check-dxr on/off gate flips the static between
+        // two DxrGpu builds) can never desync a shader from its fill dispatch.
+        // Which is why they are read back off `srcs` rather than from the
+        // statics again.
+        let sky_lod_k = srcs.sky_lod;
+        let cloud_shadow_n = srcs.cloud_shadow_n;
+        let dxil = dxc.compile(&srcs.library, "", srcs.lib_target, "dxr library", debug)?;
         // --dxr-sbt 2: one SPECIALIZED library per PRESENT class (k ≠ uber) —
         // shadeclass::strip_defines(k) prepended to the IDENTICAL source, so
         // that class's chs_shade compiles with its provably-dead arms folded
@@ -951,153 +828,97 @@ impl DxrGpu {
         let class_dxil: Vec<Vec<u8>> = spec_classes
             .iter()
             .map(|&k| {
-                let src_k = format!("{}{}", crate::shadeclass::strip_defines(k as u8), lib_src);
+                let src_k =
+                    format!("{}{}", crate::shadeclass::strip_defines(k as u8), srcs.library);
                 dxc.compile(
                     &src_k,
                     "",
-                    lib_target,
+                    srcs.lib_target,
                     &format!("dxr library c{k} ({})", crate::shadeclass::NAMES[k]),
                     debug,
                 )
             })
             .collect::<Result<_>>()?;
-        // The waveviz overlay composites at the present funnel, not here —
-        // this resolve runs only on the plain arm and stays lever-free.
-        let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
             device,
             &root_sig,
-            &dxc.compile(&resolve_src, "cs_resolve", "cs_6_3", "dxr resolve", debug)?,
+            &dxc.compile(&srcs.resolve, "cs_resolve", "cs_6_3", "dxr resolve", debug)?,
             "dxr resolve",
         )?;
-        // The cloud-cache FILL kernels (cs_sky_lod / cs_cloud_shadow), from the
-        // SHARED sky_unit_src so they cannot drift from the wavefront's — plain
-        // compute (no rays), so cs_6_3 like the resolve/feed kernels. Compiled
-        // only when the respective cache is armed; None otherwise.
-        let (pso_sky_lod, pso_cloud_shadow) = if sky_lod_k > 1 || cloud_shadow_n > 0 {
-            let sky_unit = trace::sky_unit_src(sky_lod_k, cloud_shadow_n);
-            let mk = |entry: &str, name: &str| -> Result<Option<ID3D12PipelineState>> {
-                Ok(Some(trace::compute_pso(
-                    device,
-                    &root_sig,
-                    &dxc.compile(&sky_unit, entry, "cs_6_3", name, debug)?,
-                    name,
-                )?))
-            };
-            (
-                if sky_lod_k > 1 { mk("cs_sky_lod", "dxr sky_lod")? } else { None },
-                if cloud_shadow_n > 0 { mk("cs_cloud_shadow", "dxr cloud_shadow")? } else { None },
-            )
-        } else {
-            (None, None)
+        // The cloud-cache FILL kernels (cs_sky_lod / cs_cloud_shadow) — one
+        // unit, compiled per armed cache; None otherwise.
+        let (pso_sky_lod, pso_cloud_shadow) = match &srcs.sky {
+            Some(sky_unit) => {
+                let mk = |entry: &str, name: &str| -> Result<Option<ID3D12PipelineState>> {
+                    Ok(Some(trace::compute_pso(
+                        device,
+                        &root_sig,
+                        &dxc.compile(sky_unit, entry, "cs_6_3", name, debug)?,
+                        name,
+                    )?))
+                };
+                (
+                    if sky_lod_k > 1 { mk("cs_sky_lod", "dxr sky_lod")? } else { None },
+                    if cloud_shadow_n > 0 {
+                        mk("cs_cloud_shadow", "dxr cloud_shadow")?
+                    } else {
+                        None
+                    },
+                )
+            }
+            None => (None, None),
         };
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
-        let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
-            // abl_defs FIRST so a feed ablation is not silently inert — the
-            // library's `defs` above already carries it, but this unit did
-            // not, so an `FR_ABL=nopack` probe under --dxr compared identical
-            // code against itself (feed.hlsl consumes ABL_NOPACK; trace.rs's
-            // feed_src learned the same lesson — "an ablation that cannot
-            // reach its target answers confidently"). Pushed CONDITIONALLY,
-            // unlike trace.rs's unconditional first element: this unit's
-            // unarmed baseline has no leading blank line, and an empty first
-            // segment + join("\n") would prepend one — the unarmed source
-            // stays byte-identical. Armed, both pipelines' feed units
-            // assemble identical leading text (abl_defs ends in '\n').
-            let feed_abl = trace::abl_defs();
-            let mut feed_parts: Vec<&str> = Vec::new();
-            if !feed_abl.is_empty() {
-                feed_parts.push(feed_abl.as_str());
-            }
-            feed_parts.extend([
-                sd,
-                trace::TRACE_COMMON_HLSLI,
-                trace::FSR_WIRE_HLSLI,
-                trace::FEED_HLSL,
-            ]);
-            let feed_src = feed_parts.join("\n");
-            let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
-                trace::compute_pso(
-                    device,
-                    &root_sig,
-                    &dxc.compile(&feed_src, entry, "cs_6_3", name, debug)?,
-                    name,
+        let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = match &srcs.feed {
+            Some(feed_src) => {
+                let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
+                    trace::compute_pso(
+                        device,
+                        &root_sig,
+                        &dxc.compile(feed_src, entry, "cs_6_3", name, debug)?,
+                        name,
+                    )
+                };
+                (
+                    Some(pso("cs_feed_xess", "dxr feed_xess")?),
+                    Some(pso("cs_feed_rr", "dxr feed_rr")?),
+                    Some(pso("cs_feed_fsr_rr", "dxr feed_fsr_rr")?),
                 )
-            };
-            (
-                Some(pso("cs_feed_xess", "dxr feed_xess")?),
-                Some(pso("cs_feed_rr", "dxr feed_rr")?),
-                Some(pso("cs_feed_fsr_rr", "dxr feed_fsr_rr")?),
-            )
-        } else {
-            (None, None, None)
+            }
+            None => (None, None, None),
         };
         // --nrd bridge kernels: the same nrd_bridge.hlsl unit at this
-        // pipeline's cs_6_3 floor (conditional abl_defs push — the feed
-        // unit's byte-identity rule above).
-        let nrd_res = if gbuf_full && nrd {
-            let abl = trace::abl_defs();
-            let mut parts: Vec<&str> = Vec::new();
-            if !abl.is_empty() {
-                parts.push(abl.as_str());
+        // pipeline's cs_6_3 floor.
+        let nrd_res = match &srcs.nrd_bridge {
+            Some(nrd_src) => {
+                let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
+                    trace::compute_pso(
+                        device,
+                        &root_sig,
+                        &dxc.compile(nrd_src, entry, "cs_6_3", name, debug)?,
+                        name,
+                    )
+                };
+                Some(trace::NrdRes::from_psos(
+                    pso("cs_nrd_pack", "dxr nrd_pack")?,
+                    pso("cs_nrd_out", "dxr nrd_out")?,
+                ))
             }
-            // The tail (NVIDIA's NRD.hlsli + our bridge) comes from the ONE
-            // shared assembler, never re-joined here — see nrd_bridge_tail.
-            let tail = crate::gfx::shaders::nrd_bridge_tail();
-            parts.extend([sd, trace::TRACE_COMMON_HLSLI, trace::FSR_WIRE_HLSLI, tail.as_str()]);
-            let nrd_src = parts.join("\n");
-            let pso = |src: &str, entry: &str, name: &str| -> Result<ID3D12PipelineState> {
-                trace::compute_pso(
-                    device,
-                    &root_sig,
-                    &dxc.compile(src, entry, "cs_6_3", name, debug)?,
-                    name,
-                )
-            };
-            Some(trace::NrdRes::from_psos(
-                pso(&nrd_src, "cs_nrd_pack", "dxr nrd_pack")?,
-                pso(&nrd_src, "cs_nrd_out", "dxr nrd_out")?,
-            ))
-        } else {
-            None
+
+            None => None,
         };
         // --dxr-inline 3: the deferred-shade kernel. cs_6_5 — it fires
         // rt.hlsli's inline RayQuery secondaries, the same SM 6.5 / tier 1.1
-        // floor the armed-mode gate above already enforced. Sources mirror
-        // the library's minus its DispatchRays halves: NO rt_dxr.hlsli and NO
-        // dxr.hlsl — this unit must never contain a TraceRay (cargo test pins
-        // the kernel source for one).
-        let pso_dxr_shade = if inline_mode == 3 {
-            // FR_WIDTH pushed conditionally (the trace.rs unit rule): arms
-            // dxr_shade.hlsl's guarded u3 view + width write (slot 1).
-            let wd = trace::width_defs();
-            let mut shade_parts: Vec<&str> = Vec::new();
-            if !wd.is_empty() {
-                shade_parts.push(wd.as_str());
-            }
-            shade_parts.extend([
-                defs.as_str(),
-                sd,
-                dd,
-                cloud_defs.as_str(),
-                inline_def.as_str(),
-                trace::TRACE_COMMON_HLSLI,
-                trace::SKYLOD_HLSLI,
-                trace::RT_HLSLI,
-                trace::RIPPLE_HLSLI,
-                trace::SHADE_HLSLI,
-                DXR_SHADE_HLSL,
-            ]);
-            let shade_src = shade_parts.join("\n");
-            Some(trace::compute_pso(
+        // floor the armed-mode gate above already enforced.
+        let pso_dxr_shade = match &srcs.dxr_shade {
+            Some(shade_src) => Some(trace::compute_pso(
                 device,
                 &root_sig,
-                &dxc.compile(&shade_src, "cs_dxr_shade", "cs_6_5", "dxr deferred shade", debug)?,
+                &dxc.compile(shade_src, "cs_dxr_shade", "cs_6_5", "dxr deferred shade", debug)?,
                 "dxr deferred shade",
-            )?)
-        } else {
-            None
+            )?),
+            None => None,
         };
 
         // --- RTPSO. Every pDesc payload (and every name string) lives in a
@@ -1690,7 +1511,7 @@ impl DxrGpu {
             force_sky_ext_skip: std::cell::Cell::new(None),
             nrd_engine: false,
             sway_mv_t: std::cell::Cell::new(None),
-            sway_mv_on: !sway_def.is_empty(),
+            sway_mv_on: srcs.sway_mv_on,
             mode3,
             width_buf: if trace::width_probe_on() {
                 Some(committed_buffer(device, 16, uaf, ua)?)

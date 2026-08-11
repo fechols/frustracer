@@ -158,6 +158,10 @@ mod tone;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
+// The Vulkan backend, peer of `gpu/` over the shared `gfx/` core. unix-only
+// for exactly one reason today — DXC's `wchar_t` width — see vk/spirv.rs.
+#[cfg(unix)]
+mod vk;
 mod world;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
@@ -338,6 +342,7 @@ fn main() {
         check_nppd,
         nppd_dump,
         check_nrd,
+        check_spirv,
         check_gpu,
         check_dxr,
         no_xess_explicit,
@@ -915,6 +920,11 @@ fn main() {
         || check_fsr
         || check_nppd
         || check_nrd
+        // Scene-keyed like the rest: the conditional-hit machinery
+        // (alpha cutout, tinted shadows, relief) only COMPILES on a scene that
+        // carries it, so `--check-spirv san-miguel.obj` gates arms the
+        // procedural scene cannot reach.
+        || check_spirv
         || check_gpu
         || check_dxr;
     // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites run
@@ -1106,6 +1116,24 @@ fn main() {
     if check_nrd {
         let code = run_check_nrd(&opts);
         std::process::exit(code);
+    }
+    if check_spirv {
+        #[cfg(unix)]
+        {
+            let code = run_check_spirv(&scene);
+            std::process::exit(code);
+        }
+        #[cfg(not(unix))]
+        {
+            // Said, not silently skipped: the SPIR-V path is one `wchar_t`
+            // width and one library name away from working here — see the
+            // header in src/vk/spirv.rs.
+            eprintln!(
+                "--check-spirv is unix-only today (the Vulkan backend's SPIR-V \
+                 compiler); see src/vk/spirv.rs for what the Windows arm needs"
+            );
+            std::process::exit(2);
+        }
     }
     if check_nppd {
         #[cfg(windows)]
@@ -11377,6 +11405,341 @@ fn run_check_gpu(
 /// blobs, non-empty texture pools, a constant buffer, exactly the 2 static
 /// samplers — then pulls one dispatch list through SetCommonSettings at a
 /// synthetic 320x180 and bounds-checks every DispatchDesc.
+/// `--check-spirv` — the Vulkan backend's shader toolchain, gated.
+///
+/// S0 is pure (the binding scheme, the blob checks). S1 loads the compiler.
+/// S2 assembles the SHIPPING corpus through `gfx::shaders` — the same
+/// functions a session calls, not a transcription of them, which is the whole
+/// point of M1 having moved the assembly into the shared core — and compiles
+/// every unit. S3 hands each module to `spirv-val`.
+///
+/// S2 and S3 answer different questions and neither substitutes for the other:
+/// DXC will happily emit a module no driver accepts, and `spirv-val` validates
+/// a MODULE, so it can say nothing about whether two registers landed on one
+/// binding (S0's injectivity sweep is that guard).
+///
+/// ENTRY POINTS ARE DISCOVERED FROM THE SOURCE, not listed here. A hardcoded
+/// table would go stale the first time a kernel gained an entry, and silently:
+/// the gate would pass having compiled less. Scanning for `[numthreads]`
+/// cannot, and it over-covers rather than under-covers — an entry the D3D12
+/// backend never compiles still has to be valid.
+///
+/// What this run CANNOT vary is the process-global levers (`--sw-rays`,
+/// `--no-ftree`, `--heightfield`, the `FR_*` family): they are read through
+/// `OnceLock`s, so one process is one configuration. Re-run the gate under
+/// them — the same rule `tools/dump-hlsl.ps1` states for the same reason.
+#[cfg(unix)]
+fn run_check_spirv(scene: &scene::Scene) -> i32 {
+    use gfx::shaders as sh;
+    use gfx::vocab::Vendor;
+
+    let mut ok = true;
+
+    // ---- S0: the pure half. Runs with or without a compiler on disk. ----
+    match vk::spirv::self_test() {
+        Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 {e}");
+            ok = false;
+        }
+    }
+
+    // ---- S1: the compiler. A missing drop is a normal condition. ----
+    let dir = vk::spirv::default_dir();
+    let dxc = match vk::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-spirv: SKIP S1 ({e})");
+            return i32::from(!ok);
+        }
+    };
+    println!("check-spirv: S1 libdxcompiler.so loaded from {dir}");
+
+    // ---- S2: assemble the corpus. ----
+    /// A compile unit: how to target it, and how to find its entry points.
+    enum Shape {
+        /// Compute: entries scanned out of the assembled source.
+        Compute(&'static str),
+        /// A DXR library — every `[shader(...)]` export at once, no `-E`.
+        Lib(String),
+        /// The display pair, which every `.hlsl` here spells identically.
+        Gfx,
+    }
+    let mut units: Vec<(String, String, Shape)> = Vec::new();
+    // Dedupe by SOURCE: the vendor and sway arms below usually assemble to
+    // the same bytes, and compiling one unit twice under two names would
+    // inflate the count into a claim of coverage it does not have.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let hash = |s: &str| -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut h);
+        h.finish()
+    };
+    macro_rules! push {
+        ($name:expr, $src:expr, $shape:expr) => {{
+            let src: String = $src;
+            if seen.insert(hash(&src)) {
+                units.push(($name.to_string(), src, $shape));
+            }
+        }};
+    }
+
+    // The wavefront tracer, both vendor arms (`cand_defs`' CAND_TMIN0 is the
+    // AMD-only candidate-loop workaround) and both sway arms.
+    let mut vendor_arms = 0usize;
+    for vendor in [Vendor::Nvidia, Vendor::Amd] {
+        let before = units.len();
+        for sway in [false, true] {
+            let t = sh::trace_sources(&sh::TraceKeys { scene, vendor, sway_armed: sway });
+            let tag = format!("{vendor:?}{}", if sway { "+sway" } else { "" });
+            push!(format!("reference[{tag}]"), t.reference, Shape::Compute("cs_6_5"));
+            push!(format!("resolve[{tag}]"), t.resolve, Shape::Compute("cs_6_5"));
+            push!(format!("wavefront[{tag}]"), t.wavefront, Shape::Compute("cs_6_5"));
+            push!(format!("sky[{tag}]"), t.sky, Shape::Compute("cs_6_5"));
+            push!(format!("leaf[{tag}]"), t.leaf, Shape::Compute("cs_6_5"));
+            push!(format!("leaf_fb[{tag}]"), t.leaf_fb, Shape::Compute("cs_6_5"));
+            push!(format!("hemi_wave[{tag}]"), t.hemi_wave, Shape::Compute("cs_6_5"));
+            push!(format!("hemi_leaf[{tag}]"), t.hemi_leaf, Shape::Compute("cs_6_5"));
+            push!(format!("compose[{tag}]"), t.compose, Shape::Compute("cs_6_5"));
+            push!(format!("feed[{tag}]"), t.feed, Shape::Compute("cs_6_5"));
+        }
+        if units.len() > before {
+            vendor_arms += 1;
+        }
+    }
+    // The dedupe above is what keeps the module count honest, and it is also
+    // the one thing that could silently HALVE this gate's reach: if
+    // `cand_defs` ever stopped distinguishing the vendors, the AMD arm would
+    // collapse into the NVIDIA one and the run would still say PASSED. It has
+    // a real difference to find — CAND_TMIN0, the RDNA4 candidate-loop
+    // workaround whose absence was worth 2x on textured scenes — so demand it.
+    if vendor_arms < 2 {
+        eprintln!(
+            "check-spirv: FAIL S2 the vendor arms assembled identically — \
+             cand_defs no longer distinguishes them, so this run covered one"
+        );
+        ok = false;
+    }
+
+    // The DXR pipeline, every `--dxr-inline` arm. Mode 0 is the lib_6_3
+    // all-TraceRay build; 1..3 are lib_6_5, and 3 alone emits the deferred
+    // compute shader. `recurse` is the `--dxr-sbt 3` arm, legal only at
+    // mode 0.
+    for mode in 0..=3u32 {
+        for recurse in [false, true] {
+            if recurse && mode != 0 {
+                continue;
+            }
+            let d = sh::dxr_sources(&sh::DxrKeys {
+                scene,
+                sway_armed: true,
+                inline_mode: mode,
+                recurse,
+                gbuf_full: true,
+                nrd: true,
+            });
+            let tag = format!("{mode}{}", if recurse { "+sbt3" } else { "" });
+            push!(format!("dxr-lib[{tag}]"), d.library, Shape::Lib(d.lib_target.to_string()));
+            push!(format!("dxr-resolve[{tag}]"), d.resolve, Shape::Compute("cs_6_5"));
+            if let Some(s) = d.sky {
+                push!(format!("dxr-sky[{tag}]"), s, Shape::Compute("cs_6_5"));
+            }
+            if let Some(s) = d.feed {
+                push!(format!("dxr-feed[{tag}]"), s, Shape::Compute("cs_6_5"));
+            }
+            if let Some(s) = d.nrd_bridge {
+                push!(format!("dxr-nrd[{tag}]"), s, Shape::Compute("cs_6_5"));
+            }
+            if let Some(s) = d.dxr_shade {
+                push!(format!("dxr-shade[{tag}]"), s, Shape::Compute("cs_6_5"));
+            }
+        }
+    }
+
+    // The denoiser, the FSR composite, and the two infrastructure probes M2b
+    // brings up.
+    let f = sh::frd_sources();
+    push!("frd-temporal", f.temporal, Shape::Compute("cs_6_5"));
+    push!("frd-blur", f.blur, Shape::Compute("cs_6_5"));
+    push!("fsr-composite", sh::fsr_composite_src(), Shape::Compute("cs_6_5"));
+    push!("smoke", sh::SMOKE_HLSL.to_string(), Shape::Compute("cs_6_5"));
+    push!("waveprobe", sh::WAVEPROBE_HLSL.to_string(), Shape::Compute("cs_6_5"));
+    push!("quin", sh::QUIN_HLSL.to_string(), Shape::Compute("cs_6_5"));
+    // DELIBERATELY ABSENT: nppd.hlsl. Its staging kernels are ordinary
+    // compute and would compile, but the stage they stage for is ONNX Runtime
+    // + the DirectML EP, which has no Vulkan execution provider — NPPD is out
+    // of the port's scope by decision, not oversight. Nothing else in
+    // `src/shaders/` is skipped.
+    // `workgraph.hlsl` is likewise out, and for a stated reason: a
+    // `VK_AMDX_shader_enqueue` translation exists but that extension is a
+    // vendor provisional, and the file is a default-off env lever measured as
+    // a wash. See gfx/mod.rs.
+
+    // The display stage. These are the tree's only fxc units (cs_5_0/ps_5_0 —
+    // see the "bloom no-DXC precedent"), so Vulkan compiles them at the SM 6
+    // floor DXC's SPIR-V backend supports. Nothing about them changes; the
+    // target string is the whole difference.
+    push!("bloom", sh::BLOOM_HLSL.to_string(), Shape::Compute("cs_6_0"));
+    push!("autoexp", sh::AUTOEXP_HLSL.to_string(), Shape::Compute("cs_6_0"));
+    push!("bc7enc", sh::BC7ENC_HLSL.to_string(), Shape::Compute("cs_6_0"));
+    push!("tonemap", sh::TONEMAP_HLSL.to_string(), Shape::Gfx);
+    push!("blit", sh::BLIT_HLSL.to_string(), Shape::Gfx);
+    push!("hud", sh::HUD_HLSL.to_string(), Shape::Gfx);
+    push!("waveviz", sh::WAVEVIZ_HLSL.to_string(), Shape::Gfx);
+
+    // ---- the entry scanner ----
+    // A `[numthreads(...)]` attribute followed by the function it decorates.
+    // Deliberately narrow: it must not match the many ordinary `void foo(`
+    // helpers these units paste in, which are not entry points and fail to
+    // compile as one.
+    fn compute_entries(src: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !l.trim_start().starts_with("[numthreads") {
+                continue;
+            }
+            // The attribute may be followed by more attributes or a blank
+            // line before the signature.
+            for l2 in lines.iter().skip(i + 1).take(3) {
+                let t = l2.trim_start();
+                if let Some(rest) = t.strip_prefix("void ") {
+                    if let Some(name) = rest.split('(').next() {
+                        let name = name.trim();
+                        if !name.is_empty() && !out.contains(&name.to_string()) {
+                            out.push(name.to_string());
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    // ---- S3: spirv-val, if the drop is here. ----
+    let val = {
+        let bundled = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/SDKs/spirv-tools/bin/spirv-val"
+        ));
+        if bundled.is_file() {
+            Some(bundled)
+        } else if std::process::Command::new("spirv-val")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            Some(std::path::PathBuf::from("spirv-val"))
+        } else {
+            None
+        }
+    };
+    if val.is_none() {
+        println!(
+            "check-spirv: SKIP S3 (spirv-val not found; run \
+             ./install-prerequisites.sh spirv) — S2 still compiled every unit"
+        );
+    }
+    let tmp = std::env::temp_dir().join(format!("frustracer-spirv-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // ---- compile + validate ----
+    let (mut compiled, mut validated, mut failed) = (0usize, 0usize, 0usize);
+    for (name, src, shape) in &units {
+        // (entry, target) pairs for this unit.
+        let jobs: Vec<(String, String)> = match shape {
+            Shape::Lib(t) => vec![(String::new(), t.clone())],
+            Shape::Gfx => {
+                vec![("vsmain".into(), "vs_6_0".into()), ("psmain".into(), "ps_6_0".into())]
+            }
+            Shape::Compute(t) => {
+                let e = compute_entries(src);
+                if e.is_empty() {
+                    // Anti-vacuity: a unit that yields no entries compiled
+                    // nothing, and a silent zero reads exactly like a pass.
+                    eprintln!("check-spirv: FAIL S2 {name}: no [numthreads] entry point found");
+                    ok = false;
+                    failed += 1;
+                    continue;
+                }
+                e.into_iter().map(|e| (e, (*t).to_string())).collect()
+            }
+        };
+        for (entry, target) in jobs {
+            let what = if entry.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}:{entry}")
+            };
+            let words = match dxc.compile(src, &entry, &target, &what, false) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("check-spirv: FAIL S2 {e}");
+                    ok = false;
+                    failed += 1;
+                    continue;
+                }
+            };
+            compiled += 1;
+            let Some(val) = val.as_ref() else { continue };
+            let path = tmp.join(format!("{}.spv", what.replace(['[', ']', ':', '+'], "_")));
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            if std::fs::write(&path, &bytes).is_err() {
+                continue;
+            }
+            match std::process::Command::new(val).arg(&path).output() {
+                Ok(o) if o.status.success() => validated += 1,
+                Ok(o) => {
+                    eprintln!(
+                        "check-spirv: FAIL S3 {what}: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                    ok = false;
+                    failed += 1;
+                }
+                Err(e) => {
+                    eprintln!("check-spirv: FAIL S3 {what}: spirv-val: {e}");
+                    ok = false;
+                    failed += 1;
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(&tmp);
+
+    // A corpus that assembled to nothing would report a clean sweep.
+    if compiled == 0 {
+        eprintln!("check-spirv: FAIL S2 the corpus assembled zero units");
+        ok = false;
+    }
+    // The assembled byte count is in the summary because the unit and module
+    // COUNTS cannot distinguish two scenes: san-miguel arms ALPHA_CUTOUT and
+    // TRANS_SHADOW where the procedural scene arms neither, and both produce
+    // the same 46 units. Two identical counts beside two different sizes is a
+    // gate that keyed on the scene; two identical sizes would mean it did
+    // not, and nothing else here would have said so.
+    let bytes: usize = units.iter().map(|(_, s, _)| s.len()).sum();
+    println!(
+        "check-spirv: S2 {} units ({bytes} B assembled) -> {compiled} SPIR-V modules | \
+         S3 {validated} validated | {failed} failed",
+        units.len()
+    );
+    // `FR_SPIRV_LIST=1` — what actually got compiled. The read-only-probe
+    // idiom: a count cannot show that an arm survived the dedupe, and "which
+    // configurations did this run really cover" is the first question a
+    // green sweep should be able to answer.
+    if std::env::var_os("FR_SPIRV_LIST").is_some() {
+        for (name, _, _) in &units {
+            println!("check-spirv:   {name}");
+        }
+    }
+    println!("CHECK-SPIRV {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
+}
+
 fn run_check_nrd(opts: &Opts) -> i32 {
     // Only N1 reads it (the DLL path); N0 below is pure.
     #[cfg(not(windows))]
@@ -18365,19 +18728,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // the renderer's own midpoint-split rect geometry, at a power-of-two and
     // an odd resolution, plus the partition/complement contracts at every
     // split position. Pure and lever-independent — the blas-split rule.
-    // Both dual-GPU gates below are PURE math that happens to be hosted in the
-    // D3D12 backend (tile-split bit arithmetic; transfer byte addressing) —
-    // they move to the shared core with the rest of the layout math, and
-    // rejoin this suite on every platform when they do. Until then they SAY
-    // they were skipped, for the reason the comment below already gives: a
-    // gate that prints nothing reads exactly like a gate that was never wired.
-    #[cfg(not(windows))]
-    let split_ok = {
-        eprintln!("dual-gpu split self-test: SKIP (D3D12-hosted; pending the shared-core move)");
-        true
-    };
-    #[cfg(windows)]
-    let split_ok = match gpu::trace::split_self_test() {
+    // RUNS ON EVERY PLATFORM since `TileSplit` moved to `gfx::frame` with the
+    // cbuffer whose 64 bits it packs (the M1 layout slice); it was skipped off
+    // Windows for as long as it was hosted in the D3D12 backend, which is
+    // exactly how long its `owns_px`-vs-`row_range` agreement sweep was
+    // unreachable from a Linux `--check`.
+    let split_ok = match gfx::frame::split_self_test() {
         Ok(()) => {
             // Announce on success like every neighbouring self-test: a gate
             // that prints only on failure reads exactly like a gate that was
@@ -18397,9 +18753,14 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // Pure and lever-independent (the blas-split rule). This is the level
     // below the split gate — a wrong offset here renders a plausible image
     // with one displaced stripe, which is far harder to attribute than a hole.
+    // Still D3D12-hosted: unlike the split gate above, `dual::self_test` also
+    // exercises the recording halves (`DxrGpu::set_band`, the arm policy's
+    // caps read), so it moves with `dual.rs` rather than with the layout math.
+    // It SAYS it was skipped — a gate that prints nothing reads exactly like a
+    // gate that was never wired.
     #[cfg(not(windows))]
     let dual_ok = {
-        eprintln!("dual-gpu transfer self-test: SKIP (D3D12-hosted; pending the shared-core move)");
+        eprintln!("dual-gpu transfer self-test: SKIP (D3D12-hosted; pending its own move)");
         true
     };
     #[cfg(windows)]

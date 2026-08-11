@@ -33,7 +33,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 
-const HUD_HLSL: &str = include_str!("../shaders/hud.hlsl");
+use crate::gfx::shaders::HUD_HLSL;
 
 /// D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT — a placed footprint's Offset must
 /// be 512-aligned, so the per-frame-in-flight slice is rounded up to it.

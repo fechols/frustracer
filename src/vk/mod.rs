@@ -1,0 +1,18 @@
+//! The Vulkan backend.
+//!
+//! Peer of `src/gpu/` (D3D12), over the shared `src/gfx/` core. The split is
+//! the one the whole tree already runs on — ONE source of truth for the math
+//! and the vocabulary, one implementation of the plumbing per API — so what
+//! lives here is *recording*: devices, queues, memory, descriptor sets,
+//! pipelines, command buffers. Kernel assembly, the constant-buffer layout,
+//! the FLAG_* vocabulary and every tuning knob come from `gfx::` and are
+//! shared byte-for-byte with the D3D12 backend rather than mirrored.
+//!
+//! THE HLSL IS NOT PORTED, AND THAT IS MEASURED, NOT HOPED FOR. `src/shaders/`
+//! is one corpus with two code generators: the same concatenated source that
+//! `gpu/dxc.rs` compiles to DXIL, `vk/spirv.rs` compiles to SPIR-V with a
+//! fixed flag set and zero edits to any `.hlsl`. See that module's header for
+//! the flag set, the register-space -> descriptor-set mapping it implies, and
+//! the measurement.
+
+pub mod spirv;
