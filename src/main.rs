@@ -13019,6 +13019,101 @@ fn run_check_gpu(
         ok = false;
     }
 
+    // --- M13b: the glare COMPOSITE's alignment ---
+    // M13 above stops at the pyramid's OUTPUT. The last step — the tonemap PS
+    // sampling that pyramid and blending it into the frame — was covered by
+    // nothing, and it shipped with an off-by-half-texel: `(pos.xy + 0.5)/dims`,
+    // where SV_Position already carries the .5. That is exactly the class M13's
+    // own header warns about (it PRESENTS, so being slightly wrong just looks
+    // slightly wrong), one step further down the pipe.
+    //
+    // The assertion is SYMMETRY, which needs no CPU tent mirrored here: put a
+    // single bright texel in the glare and the halo it paints must be centred on
+    // it, so the pixels either side must come back equal. A sample point off by
+    // half a texel breaks that immediately — every tap becomes a 50/50 blend of
+    // adjacent texels and the halo leans one way. MEASURED on this fixture, in
+    // presented units: correct reads peak 0.502 with all four sides 0.376,
+    // while the old `(pos.xy + 0.5)` reads peak 0.396 | left 0.396 right 0.247
+    // | up 0.396 down 0.247 — the peak stops being a peak (its energy is split
+    // with the up-left neighbour, which is where a down-right sample shift puts
+    // it) and both symmetry axes break by ~38 LSBs at 8-bit.
+    //
+    // `selftest` binds the glare SRV to the source itself, so the pyramid is
+    // full-res here and a correct sample lands on exact texel centres. That is
+    // the point: it isolates the COMPOSITE's addressing from the pyramid's.
+    {
+        const BW: u32 = 32;
+        const BH: u32 = 32;
+        let n = (BW * BH) as usize;
+        let (cx, cy) = (16usize, 12usize);
+        let px = |x: usize, y: usize| y * BW as usize + x;
+        let mut src = vec![0.0f32; n * 3];
+        for ch in 0..3 {
+            src[px(cx, cy) * 3 + ch] = 1.0;
+        }
+        // strength 1.0 => the colour IS the tent, so nothing of the source
+        // leaks through to mask an asymmetry; taps one full-res texel apart.
+        let bloom = (1.0f32, 1.0 / BW as f32, 1.0 / BH as f32);
+        match gpu::tonemap::selftest(
+            &mut hg,
+            &src,
+            BW,
+            BH,
+            gpu::d3d12::SWAPCHAIN_FORMAT,
+            tone::ToneParams::SDR,
+            bloom,
+        ) {
+            Ok(img) => {
+                let at = |x: usize, y: usize| img[px(x, y)][0];
+                let (l, r) = (at(cx - 1, cy), at(cx + 1, cy));
+                let (u, d) = (at(cx, cy - 1), at(cx, cy + 1));
+                let peak = at(cx, cy);
+                let tol = 2.0 / 255.0; // the 8-bit wire, plus a bilinear ulp
+                let shape = format!(
+                    "peak {peak:.4} | left {l:.4} right {r:.4} | up {u:.4} down {d:.4}"
+                );
+                // THREE separate claims, reported separately, because a
+                // half-texel shift breaks them in a way that is easy to
+                // misdiagnose: it does not erase the halo, it SPLITS it across
+                // two pixels, so the peak stops being a peak while the fixture
+                // is working perfectly well. A single "vacuous" message there
+                // would blame the test for what the shader did (measured: the
+                // old code returns peak == left == 0.3961).
+                let flat = !(img.iter().map(|p| p[0]).fold(0.0f32, f32::max) > tol);
+                if flat {
+                    eprintln!("check-gpu: FAIL M13b vacuous — the frame is blank, no halo at all");
+                    ok = false;
+                } else {
+                    let mut bad = false;
+                    if !(peak > l + tol && peak > r + tol && peak > u + tol && peak > d + tol) {
+                        eprintln!(
+                            "check-gpu: FAIL M13b the halo is not CENTRED on the spike — its \
+                             energy is split across neighbouring pixels, the signature of a \
+                             half-texel error in the tonemap PS's sample position. {shape}"
+                        );
+                        bad = true;
+                    }
+                    if (l - r).abs() > tol || (u - d).abs() > tol {
+                        eprintln!(
+                            "check-gpu: FAIL M13b the halo LEANS — it must be symmetric about a \
+                             symmetric source. {shape}"
+                        );
+                        bad = true;
+                    }
+                    if bad {
+                        ok = false;
+                    } else {
+                        println!("check-gpu: M13b glare composite centred ({shape})");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("check-gpu: FAIL M13b glare composite selftest: {e}");
+                ok = false;
+            }
+        }
+    }
+
     // --- M14: the registered-consensus fuse (--quinlight) ---
     // The REAL kernel, through its REAL root signature and descriptor table,
     // over synthetic engine images. Three gates, each aimed at a different way

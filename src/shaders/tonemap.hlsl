@@ -152,7 +152,15 @@ float4 psmain(float4 pos : SV_Position) : SV_Target {
         // Energy-conserving composite (bloom.rs): glare REDISTRIBUTES light, it
         // never adds any, so a uniformly lit frame comes back unchanged — which
         // is what keeps bloom from being tunable into an exposure change.
-        float2 uv = (pos.xy + 0.5) / dims;
+        // `pos.xy` is SV_Position, which ALREADY points at the pixel CENTRE
+        // (16.5 for pixel 16) — the `src.Load(int3(pos.xy, 0))` above relies on
+        // exactly that, since Load truncates the .5 away. So this must NOT add
+        // another half: `(pos.xy + 0.5)` sampled the glare half a full-res texel
+        // down-right, which on the half-res pyramid is a QUARTER of a glare
+        // texel, and disagreed with the CPU twin (bloom.rs's `u = (x + 0.5) *
+        // gw / w - 0.5`, which lands on 7.75 where this landed on 8.0). Small on
+        // a blur, and gated now by M13b's symmetry arm rather than by argument.
+        float2 uv = pos.xy / dims;
         c = lerp(c, tent(uv), bloom_strength);
     }
     // THE SPIKE GUARD: withhold the aperture's boost from pixels that are

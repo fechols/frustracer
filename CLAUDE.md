@@ -3282,7 +3282,35 @@ cargo run --release -- --no-bloom     # A/B lever: no glare. Bloom (`src/bloom.r
                                       # <= 0.02 / worst <= 0.10, measured 0.0009/0.0024. It is a
                                       # WIRING gate (f16 + hardware bilinear will never match f32
                                       # exactly, but a bad weight/barrier/slot/pitch moves the halo
-                                      # by tens of percent). Never widen those limits to pass a port
+                                      # by tens of percent). Never widen those limits to pass a port.
+                                      # M13 STOPS AT THE PYRAMID'S OUTPUT, and the last step — the
+                                      # tonemap PS sampling that pyramid and blending it into the
+                                      # frame — was covered by NOTHING until M13b (2026-08-11),
+                                      # which is how it carried an off-by-half-texel from the
+                                      # beginning: `uv = (pos.xy + 0.5)/dims` where SV_Position
+                                      # ALREADY points at the pixel centre (the `src.Load(int3(
+                                      # pos.xy, 0))` two lines up relies on exactly that, since Load
+                                      # truncates the .5 away). The glare is half-res, so the error
+                                      # was half a full-res texel = a QUARTER of a glare texel, and
+                                      # it DISAGREED with the CPU twin (bloom.rs's textbook
+                                      # `u = (x + 0.5)*gw/w - 0.5` lands on 7.75 where the shader
+                                      # landed on 8.0). Fixed to `pos.xy / dims`. Visually tiny —
+                                      # it is a quarter texel on a deliberate blur — which is
+                                      # exactly why nothing noticed for so long; it surfaced only
+                                      # because it DEFEATED a test being written for something else
+                                      # (the M12b pre-glare plant relied on that sample landing
+                                      # squarely on a bright texel, and the slip split it across
+                                      # two). M13b's assertion is SYMMETRY and needs no CPU tent
+                                      # mirrored: one bright texel in the glare must paint a halo
+                                      # CENTRED on it, so the pixels either side come back equal.
+                                      # A half-texel slip does not erase the halo, it SPLITS it
+                                      # across two pixels — so the gate asserts the peak is a peak
+                                      # AND both axes are symmetric, and reports all five numbers in
+                                      # either failure (a bare anti-vacuity message there blames the
+                                      # test for what the shader did). Measured: correct reads peak
+                                      # 0.502 / sides 0.376 x4; the old code reads peak 0.396 | left
+                                      # 0.396 right 0.247 | up 0.396 down 0.247 — teeth verified by
+                                      # planting the original expression back (exit 1, both arms)
 cargo run --release -- --no-auto-exposure  # KILL the adaptive aperture (src/autoexp.rs +
                                       # gpu/autoexp.rs + shaders/autoexp.hlsl — DEFAULT ON
                                       # since 2026-08-10, the user's call; THREE MOVES: ON for
