@@ -12343,19 +12343,17 @@ fn run_check_vk_render(
         println!("check-vk: SKIP V6 (no ray query on this device — the shipping tracer needs it)");
         return true;
     }
-    // `--sw-rays` swaps every RayQuery body for `rt_sw.hlsli`'s traversal of
-    // OUR BVH, which reads the binary tree at t0 and `tri_idx` at t1. This
-    // backend uploads the binary tree only for the hemi passes and `tri_idx`
-    // not at all, so a render here would bind dummies and produce a confident
-    // wrong picture. V5 above still covers that corpus — it is the LAYOUT that
-    // the lever changes, and the layout is what V5 derives.
+    // `--sw-rays` renders here now — see the tracer's module header for what it
+    // costs (two descriptor overrides and two more streams, not a new variant).
+    // What it does NOT relax is this device gate: the corpus under the lever
+    // declares no acceleration structure, but `VkScene` still builds a
+    // BLAS/TLAS, so a genuinely RT-less device is still out of reach and that
+    // is said rather than implied.
     if gfx::shaders::sw_rays() {
         println!(
-            "check-vk: SKIP V6/V7/V8/V9 (--sw-rays is armed — its intersector reads the binary \
-             tree at t0 and tri_idx at t1, streams this backend does not bind yet; V5 covers \
-             that corpus's layout)"
+            "check-vk: --sw-rays is armed — every ray below traverses OUR binary BVH \
+             (rt_sw.hlsli) instead of a RayQuery"
         );
-        return true;
     }
     // `FR_VK_RES=WxH`. Two uses, both real: a perf probe wants a shipping
     // resolution, and V7's drained-queue check is PARITY-SELECTED — `cs_prep`
@@ -12903,11 +12901,7 @@ fn run_check_vk_wavefront(
     use gfx::shaders as gs;
 
     let Some((depth_full, cap_leaf, cap_sky)) = tg.wave_shape() else {
-        println!(
-            "check-vk: SKIP V7 (--sw-rays is armed — its leaf kernel wants the BINARY tree at \
-             t0 while the ladder holds the WIDE one there, which is a fourth descriptor-set \
-             variant, not a flag)"
-        );
+        println!("check-vk: SKIP V7 (this tracer has no wavefront ladder)");
         return true;
     };
     let px = gw * gh;
@@ -13031,6 +13025,28 @@ fn run_check_vk_wavefront(
         if depth_full % 2 == 0 { ctr(gs::CTR_TILE_A) } else { ctr(gs::CTR_TILE_B) };
     if ctr(gs::CTR_OVERFLOW) != 0 {
         fail(&mut ok, "queue overflow (the queues are sized to the structural worst case)".into());
+    }
+    // Cut-pool exhaustion, GATED here where `--check-gpu` only counts it — and
+    // the difference is deliberate rather than an oversight in either suite.
+    // A fallback is SOUND (an ancestor's cut is valid for any descendant
+    // frustum, so the tile just refines a coarser one), which is why D3D12
+    // reports it and moves on. But the pool is sized to a STRUCTURAL bound in
+    // both arms — one slot per split, doubled under `--sw-rays` + FTREE for
+    // `level_finish`'s translated copy — so a nonzero count here is a sizing
+    // transcription error and nothing else, which is exactly the class a
+    // second backend introduces. It caught one on its first run: 107 fallbacks
+    // against D3D12's 0 on the identical 800x600 frame, because the doubling
+    // had not been mirrored. The frontier counters below stayed inside their
+    // bounds throughout, so nothing but this notices.
+    if ctr(gs::CTR_CUT_FALLBACK) != 0 {
+        fail(
+            &mut ok,
+            format!(
+                "{} cut-pool fallbacks — the pool is sized to a structural bound, so this is \
+                 a sizing error, not a scene",
+                ctr(gs::CTR_CUT_FALLBACK)
+            ),
+        );
     }
     if dangling != 0 {
         fail(&mut ok, format!("{dangling} tile records left after the last level"));
@@ -13216,6 +13232,38 @@ fn run_check_vk_wavefront(
         ctr(gs::CTR_HEIGHT_REJ),
     );
     arm(&mut ok, "rtgi bounce rays", shade::rtgi_enabled(), ctr(gs::CTR_RTGI_RAYS));
+
+    // ---- the continuation frontier, under `--sw-rays` ----
+    //
+    // The lever's own anti-vacuity, and `--check-gpu`'s verbatim. These fire
+    // once per CONSUMED non-root `LeafRec` (never per ray — a per-ray atomic
+    // would tax the very path the lever exists to measure), so `rays > handles`
+    // is the REUSE claim stated as an inequality: one published frontier serves
+    // every ray and every spp sample in its leaf record.
+    //
+    // The off arm is exact 0 BY CONSTRUCTION rather than by this resolution's
+    // split ladder: `frontier_record_reuse` zeroes its flag on `!SW_RAYS_LEAF`
+    // while still executing all three atomics, so the root control pays
+    // identical telemetry cost and reports nothing. That is what lets the
+    // unlevered branch demand zero instead of a bound.
+    let (fh, fr, fe) = (
+        ctr(gs::CTR_FRONTIER_HANDLES),
+        ctr(gs::CTR_FRONTIER_RAYS),
+        ctr(gs::CTR_FRONTIER_ENTRIES),
+    );
+    if gs::sw_rays_leaf() {
+        println!(
+            "check-vk: V7 opaque frontiers: {fh}/{n_leaf} non-root handles | {fr} rays \
+             ({:.1}/handle) | {fe} entries ({:.1}/handle)",
+            f64::from(fr) / f64::from(fh.max(1)),
+            f64::from(fe) / f64::from(fh.max(1))
+        );
+        if fh == 0 || fr <= fh || fe < fh || fe > fh.saturating_mul(64) {
+            fail(&mut ok, "continuation reuse/shape counters are vacuous or malformed".into());
+        }
+    } else if fh != 0 || fr != 0 || fe != 0 {
+        fail(&mut ok, format!("frontier counters fired ({fh}/{fr}/{fe}) without the lever"));
+    }
     ok
 }
 
@@ -13272,10 +13320,7 @@ fn run_check_vk_hemi(
     use gfx::shaders as gs;
 
     if !tg.has_hemi() {
-        println!(
-            "check-vk: SKIP V8 (the hemisphere tiers ride the ladder, which --sw-rays takes \
-             with it)"
-        );
+        println!("check-vk: SKIP V8 (this tracer has no hemisphere tiers)");
         return true;
     }
     let mut ok = true;
@@ -13641,7 +13686,7 @@ fn run_check_vk_replay(
     use gfx::shaders as gs;
 
     if tg.wave_shape().is_none() {
-        println!("check-vk: SKIP V9 (structure replay is the ladder's, and --sw-rays takes it)");
+        println!("check-vk: SKIP V9 (structure replay is the ladder's, and this tracer has none)");
         return true;
     }
     let mut ok = true;
@@ -13798,10 +13843,21 @@ fn run_check_vk_replay(
             q: Quality { fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 }, ..q },
             ..mk(0)
         };
-        let fbarm = (|| -> Result<(Vec<f32>, Vec<f32>, usize, [u32; 4], [u32; 4]), String> {
+        let fbarm = (|| -> Result<(Vec<f32>, Vec<f32>, usize, [u32; 5], [u32; 5]), String> {
             let work = |c: &[u32]| {
                 let g = |i: u32| c.get(i as usize).copied().unwrap_or(0);
-                [g(gs::CTR_HEMI_PT), g(gs::CTR_HEMI_RAYS), g(gs::CTR_HEMI_EMPTY), g(gs::CTR_OVERFLOW)]
+                [
+                    g(gs::CTR_HEMI_PT),
+                    g(gs::CTR_HEMI_RAYS),
+                    g(gs::CTR_HEMI_EMPTY),
+                    g(gs::CTR_OVERFLOW),
+                    // The hemi cut pool is reset PER BATCH, and which batch a
+                    // point lands in follows the atomic append order — so an
+                    // exhausted pool would be the one way two fresh traces could
+                    // legitimately traverse differently. Measured identical, so
+                    // that is ruled out rather than assumed.
+                    g(gs::CTR_CUT_FALLBACK),
+                ]
             };
             tg.render_wavefront(hg, &pf, false)?;
             let traced = read_f32(&tg.accum, px * 3)?;
@@ -13819,12 +13875,48 @@ fn run_check_vk_replay(
             Ok((traced, replayed, control, w1, w2))
         })();
         match fbarm {
-            Ok((a, b, control, w1, w2)) => {
+            Ok((a, b, control0, w1, w2)) => {
                 let fd = bits(&a, &b);
                 let live = a.iter().filter(|v| **v != 0.0).count();
+                // A CONTROL OF ZERO IS ONE BERNOULLI DRAW, NOT A PROOF — and
+                // that is the defect this arm shipped with, found by a lever
+                // that made the noise SMALLER rather than by one that made it
+                // bigger. On san-miguel-low-poly the two fresh traces disagree
+                // by ~190 channels through the hardware intersector, so the
+                // control never reads 0 and the tier is never in doubt; under
+                // `--sw-rays` the same scene's amplitude falls to 3-9 channels
+                // and the control reads 0 about a quarter of the time — at
+                // which point a single sample declares a NOISY frame
+                // reproducible and holds the replay to an exact bar it cannot
+                // meet. Measured directly: control 0/6/6/3 over four runs, with
+                // the replay's own diff drawn from the same distribution.
+                //
+                // So: spend more traces, but only where the answer matters. A
+                // nonzero control has already decided the tier; an exact match
+                // has already passed. It is the ambiguous corner alone —
+                // control 0 AND a differing replay — that buys extra draws, and
+                // any nonzero one demotes the frame to the relaxed tier. Common
+                // paths cost nothing, and the flake rate falls as p0^k.
+                const V9_CONTROL_DRAWS: usize = 3;
+                let mut control = control0;
+                let mut draws = 1usize;
+                while control == 0 && fd != 0 && draws <= V9_CONTROL_DRAWS {
+                    draws += 1;
+                    match (|| -> Result<usize, String> {
+                        tg.render_wavefront(hg, &pf, false)?;
+                        Ok(bits(&a, &read_f32(&tg.accum, px * 3)?))
+                    })() {
+                        Ok(c) => control = control.max(c),
+                        Err(e) => {
+                            fail(&mut ok, format!("fb control re-draw: {e}"));
+                            break;
+                        }
+                    }
+                }
                 println!(
                     "check-vk: V9 structure replay (fb GI frame): accum-diff {fd} | \
-                     trace-vs-trace control {control} | lit ch {live}"
+                     trace-vs-trace control {control}{} | lit ch {live}",
+                    if draws > 1 { format!(" (max of {draws} draws)") } else { String::new() }
                 );
                 // THE CONTROL CHOOSES THE TIER; IT MUST NOT SET THE BAR. That
                 // distinction is the whole design here, and it is measured
@@ -13832,13 +13924,25 @@ fn run_check_vk_replay(
                 // bitwise has a reproducible integrator, so the replay must
                 // agree bitwise too — no tolerance at all — while a scene whose
                 // own frames disagree cannot demand better of the replay. On
-                // this hardware an ALPHA-CUTOUT candidate loop enumerates
-                // candidates in an implementation-defined order that varies
-                // between two IDENTICAL dispatches (san-miguel-low-poly:
-                // control ~190 channels of 1.44M, and `FR_ABL=noalpha` returns
-                // BOTH numbers to exactly 0, which is what attributes it;
-                // rungholt has cutout too and still reads 0, so it is that
-                // scene's foliage inside the GI hemisphere, not cutout as such).
+                // this hardware san-miguel-low-poly's two fresh traces disagree
+                // by ~190 channels of 1.44M, and `FR_ABL=noalpha` returns BOTH
+                // numbers to exactly 0 while `notrans` does not — so the source
+                // is CUTOUT GEOMETRY INSIDE THE GI HEMISPHERE (rungholt has
+                // cutout too and reads 0; the non-fb arms above read 0 on every
+                // scene and every lever).
+                //
+                // WHAT IT IS NOT, corrected by measurement: the driver's
+                // RayQuery candidate enumeration order, which is what this
+                // comment claimed when the arm shipped. `--sw-rays` replaces
+                // every candidate loop with our own fixed-order walk of our own
+                // BVH and the effect SURVIVES at 3-9 channels, same `noalpha`
+                // attribution. Two fresh traces there are additionally measured
+                // to do identical WORK (points, rays, empty cells, overflow,
+                // cut fallbacks all equal), so it is not a coarser cut or a
+                // different traversal either — the same rays, shaded to
+                // slightly different values. The mechanism is open, it lives in
+                // the shared HLSL rather than in either backend, and naming it
+                // needs an instrument neither suite has.
                 //
                 // The relaxed tier's bar is an ABSOLUTE fraction of channels,
                 // NOT "no worse than the control" — because a real defect

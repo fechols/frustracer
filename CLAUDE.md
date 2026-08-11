@@ -4661,7 +4661,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
-                                      # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9).
+                                      # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9; --sw-rays covered
+                                      # in M3g).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
@@ -5108,12 +5109,51 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # The push helper carries both barriers itself now, which is why it is
                                       # one function rather than three lines at each of its two dozen call
                                       # sites.
-                                      # NOT COVERED, and said loudly rather than silently: structure replay,
-                                      # and --sw-rays, whose LEAF kernel wants the BINARY tree at t0 while the
-                                      # ladder holds the WIDE one there (V8's hemi variants prove that
-                                      # mechanism, but the leaf pass would need its own, and this backend
-                                      # binds no tri_idx at all) — so V6/V7/V8 SKIP with that sentence when
-                                      # the lever is armed, V5 still covering that corpus's layout. COMPOSE is
+                                      # --sw-rays IS COVERED (M3g) and wanted NO new set variant, which is the
+                                      # part worth keeping: the lever swaps every RayQuery body for
+                                      # rt_sw.hlsli's traversal of OUR binary BVH, reading the tree at t0 and
+                                      # tri_idx at t1 — two registers that already MEAN different things per
+                                      # phase here, so it is two more OVERRIDES on variants that exist. The
+                                      # ladder keeps the WIDE tree at t0 (a frustum query cannot descend the
+                                      # binary one) and takes ft_bnode at t1 for level_finish's leaf-cut
+                                      # translation; the TERMINAL variant — bound by the leaf, sky AND
+                                      # reference passes alike — takes the binary tree at t0 and the real
+                                      # tri_idx at t1. That is D3D12's own two rebinds, spelled as the
+                                      # difference between two variants instead of as root-descriptor writes.
+                                      # It found ONE porting defect and the gate did NOT: cap_cut is DOUBLED
+                                      # under sw_rays_leaf + FTREE (level_finish allocates a second slot per
+                                      # split for the translated binary ids) and the doubling had not been
+                                      # mirrored, so the pool exhausted 107 times at 800x600 and those tiles
+                                      # degraded to ROOT seeding — sound, and a different structure, against
+                                      # D3D12's 0 on the identical frame. The frontier counters stayed inside
+                                      # their bounds throughout, so nothing but a side-by-side read noticed;
+                                      # CTR_CUT_FALLBACK is now GATED at 0 here (where --check-gpu only counts
+                                      # it) precisely because the pool is sized to a STRUCTURAL bound in both
+                                      # arms, which makes a nonzero count a sizing transcription error and
+                                      # nothing else — the class a second backend introduces. V7 also gains
+                                      # the lever's OWN anti-vacuity, --check-gpu's verbatim: the three
+                                      # CTR_FRONTIER counters fire once per CONSUMED non-root LeafRec (never
+                                      # per ray — a per-ray atomic would tax the very path the lever exists
+                                      # to measure), so rays > handles IS the reuse claim stated as an
+                                      # inequality, and the OFF arm demands exact 0 because
+                                      # frontier_record_reuse zeroes its flag on !SW_RAYS_LEAF while still
+                                      # executing all three atomics. Fixed, the two backends agree to the
+                                      # digit: 768/768 non-root handles, 468.8 rays/handle, 0 fallbacks,
+                                      # cuts 449 (vs 65 unlevered — the terminal-cut skip that SW_RAYS_LEAF
+                                      # disables), llvmpipe byte-for-byte the same. AND V6 gets STRICTLY
+                                      # BETTER under the lever, which is the tell that the port is right:
+                                      # max rel t err 2.33e-1 with one disagreeing pixel through the
+                                      # hardware intersector, 2.10e-5 with zero through ours — both sides
+                                      # of that comparison now run the SAME traversal as the CPU tracer, so
+                                      # the watertight-vs-moller edge class disappears exactly as the D3D12
+                                      # note predicts for TMin re-origining.
+                                      # ONE THING THE LEVER DOES NOT BUY HERE, said
+                                      # rather than implied: a device with no ray tracing. Its corpus declares
+                                      # no acceleration structure (which is why the TLAS descriptor write is
+                                      # GUARDED on the map — the samplers have carried that guard since M3a,
+                                      # and this one was simply never reachable before), but VkScene still
+                                      # builds a BLAS/TLAS nothing reads, so V6 still requires
+                                      # VK_KHR_ray_query. COMPOSE is
                                       # dispatched under fb ONLY, and that is D3D12's rule verbatim rather
                                       # than an omission: with fb off the leaf and sky passes splat straight
                                       # into accum through accum_splat, so a compose would be a
@@ -5256,12 +5296,36 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # tolerance at all, which is what every scene but one gets. If they do
                                       # not, the replay cannot be held to better. MEASURED:
                                       # san-miguel-low-poly reads a ~190-channel control out of 1.44M, and
-                                      # FR_ABL=noalpha returns BOTH that and the replay diff to EXACTLY 0 —
-                                      # which attributes it to the ALPHA-CUTOUT candidate loop, whose
-                                      # candidate enumeration order is implementation-defined and, on this
-                                      # driver, varies between two IDENTICAL dispatches (rungholt has cutout
-                                      # too and still reads 0, so it is that scene's foliage inside the GI
-                                      # hemisphere, not cutout as such). The relaxed tier's bar is an ABSOLUTE
+                                      # FR_ABL=noalpha returns BOTH that and the replay diff to EXACTLY 0
+                                      # while notrans does not — so the source is CUTOUT GEOMETRY INSIDE THE
+                                      # GI HEMISPHERE (rungholt has cutout too and reads 0; every non-fb arm
+                                      # reads 0 on every scene and every lever).
+                                      # A CONTROL OF ZERO IS ONE BERNOULLI DRAW, NOT A PROOF — the defect
+                                      # this arm SHIPPED with (M3f), found in M3g by a lever that made the
+                                      # noise SMALLER rather than one that made it bigger. Through the
+                                      # hardware intersector smlp's control never reads 0, so the tier is
+                                      # never in doubt; under --sw-rays the same scene falls to 3-9 channels
+                                      # and the control reads 0 about a QUARTER of the time — at which point
+                                      # one sample declares a noisy frame reproducible and holds the replay
+                                      # to an exact bar it cannot meet (measured 0/6/6/3 over four runs, the
+                                      # replay drawn from the same distribution). The fix spends more traces
+                                      # only where the answer matters: a nonzero control has already chosen
+                                      # the tier and an exact match has already passed, so ONLY the ambiguous
+                                      # corner — control 0 AND a differing replay — re-draws (up to 3 more,
+                                      # any nonzero one demoting to the relaxed tier), which costs nothing on
+                                      # the common path and drops the flake rate as p0^k. Observed live: the
+                                      # re-draw fired in 2 of 6 smlp runs and rescued both.
+                                      # AND THE M3f ATTRIBUTION IS CORRECTED BY THAT SAME MEASUREMENT: it is
+                                      # NOT the driver's RayQuery candidate enumeration order. --sw-rays
+                                      # replaces every candidate loop with our own fixed-order walk of our
+                                      # own BVH and the effect SURVIVES, same noalpha attribution; the two
+                                      # fresh traces there additionally do identical WORK (points, rays,
+                                      # empty cells, overflow, AND cut fallbacks all equal — the last added
+                                      # to the tuple to rule out a per-batch hemi cut-pool exhaustion, the
+                                      # one way two traces could legitimately traverse differently), so it is
+                                      # the same rays shaded to slightly different values. Mechanism OPEN, in
+                                      # the shared HLSL rather than either backend, and naming it needs an
+                                      # instrument neither suite has. The relaxed tier's bar is an ABSOLUTE
                                       # fraction of channels and deliberately NOT "no worse than the control",
                                       # because a real defect inflates BOTH: with clear_h removed the smlp
                                       # arm reads fd 1014795 against a control of 1014789, so a

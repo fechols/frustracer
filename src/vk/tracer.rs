@@ -58,10 +58,24 @@
 //! only real work was factoring the terminal fills so both paths run the SAME
 //! code rather than two similar-looking blocks.
 //!
-//! NOT COVERED, and said loudly at the call site rather than silently:
-//! `--sw-rays` (whose LEAF kernel wants the binary tree at t0 while the ladder
-//! holds the wide one — the hemi variants below prove the mechanism, but the
-//! leaf pass would need its own, plus a `tri_idx` stream nothing here uploads).
+//! `--sw-rays` IS COVERED, and it turned out to want no new set variant at all.
+//! That lever swaps every RayQuery body for `rt_sw.hlsli`'s traversal of OUR
+//! binary BVH, which reads the tree at t0 and `tri_idx` at t1 — two registers
+//! that already MEAN different things per phase here, so the arm is two more
+//! OVERRIDES on variants that exist. The ladder keeps the WIDE tree at t0 (a
+//! frustum query cannot descend the binary one) and takes `ft_bnode` at t1 for
+//! `level_finish`'s leaf-cut translation; the TERMINAL variant — which the
+//! leaf, sky AND reference passes all bind — takes the binary tree at t0 and
+//! the real `tri_idx` at t1. That is D3D12's own two rebinds, spelled as the
+//! difference between two variants instead of as root-descriptor writes.
+//!
+//! ONE THING THE LEVER DOES NOT BUY HERE, and it is worth saying rather than
+//! implying: a device with no ray tracing. The corpus under it declares no
+//! acceleration structure — which is exactly why the TLAS write below is
+//! guarded on the MAP rather than issued unconditionally — but `VkScene` still
+//! builds a BLAS/TLAS nothing reads, so the gate still requires
+//! `VK_KHR_ray_query`. Making that conditional is a separate claim, and one
+//! neither ICD on this box can test.
 //!
 //! COMPOSE IS DISPATCHED ONLY UNDER fb, and that is D3D12's rule verbatim
 //! rather than an omission: with fb off the leaf and sky passes splat straight
@@ -128,9 +142,9 @@ struct Image {
 
 /// The wavefront quadtree's own half: the queues, the indirect args, the
 /// frustum structure, the ladder kernels, and the two ping-pong descriptor
-/// sets. Separate from the reference tracer's fields because it is genuinely
-/// optional — `--sw-rays` is not covered (see the module header) and a device
-/// or scene that cannot run it should still get V6.
+/// sets. Kept `Option` so a future device or memory gate is expressible without
+/// threading a flag through every method — nothing turns it off today, the last
+/// thing that did being `--sw-rays`, which now brings its own streams instead.
 struct Wave {
     /// Ping-pong tile queues. Level `d` reads `d % 2 == 0 ? qa : qb`.
     qa: Buffer,
@@ -145,6 +159,15 @@ struct Wave {
     /// (`ftree::QFNode`), or the binary BVH under `--no-ftree`. The tracer's
     /// software half — RT cores cannot answer a frustum query.
     tree: Buffer,
+    /// t1 space0 — `--sw-rays` + cut consumption + FTREE only: the wide tree's
+    /// slot -> binary-node map (the `FNode.bnode` field the quantized wire
+    /// format deliberately drops), which `level_finish` reads to translate a
+    /// slot-ref leaf cut into the binary node ids the software ray traversal
+    /// seeds from. It rides `tri_idx`'s register because that register is DEAD
+    /// in every ladder kernel — the same phase-scoped re-meaning u5/u6 take,
+    /// and the terminal variant binds the real `tri_idx` there before any ray
+    /// fires.
+    ft_bnode: Option<Buffer>,
     pipes: [vk::Pipeline; 9],
     /// Set 0 with u5=qa/u6=qb and the swap; index 1 of each is the SAME set-1
     /// handle the terminal variant holds (the scene/texture set never varies).
@@ -183,9 +206,6 @@ struct Hemi {
     /// u13: the shading points. Host-visible because the probe path writes it
     /// from the CPU; the frame path has `cs_leaf` append into it instead.
     pts: Buffer,
-    /// t0 for these passes only — see the module header on why the hemi
-    /// kernels want the binary tree while the ladder holds the wide one.
-    binary: Buffer,
     pipes: [vk::Pipeline; 8],
     sets_a: Vec<vk::DescriptorSet>,
     sets_b: Vec<vk::DescriptorSet>,
@@ -219,6 +239,19 @@ pub struct VkTracer {
     cloud_shadow: Buffer,
     frame_cb: Buffer,
     push: Buffer,
+    /// The BINARY BVH. TWO consumers, which is why it sits here rather than in
+    /// `Hemi` where it started: the hemi kernels descend it in every session
+    /// (short queries lose on the wide tree — measured +35% there against -54%
+    /// on the tile path), and under `--sw-rays` the software ray loops descend
+    /// it too, in the reference, leaf and hemi-leaf units alike. Under
+    /// `--no-ftree` it is byte-identical to `Wave::tree`; that duplicate is the
+    /// price of `Buffer` being owned rather than shared, and it is a memory
+    /// question only.
+    binary: Buffer,
+    /// `bvh.tri_idx` at t1 space0 — scene triangle ids in leaf slices, the one
+    /// stream `rt_sw.hlsli` needs that nothing else in the corpus declares.
+    /// `None` without `--sw-rays`, where t1 falls through to the dummy.
+    sw_tri: Option<Buffer>,
     hdr: Image,
     samp_lin: vk::Sampler,
     samp_aniso: vk::Sampler,
@@ -295,9 +328,9 @@ impl VkTracer {
             (&srcs.sky, "cs_sky_lod", "sky-lod"),
             (&srcs.sky, "cs_cloud_shadow", "cloud-shadow"),
         ];
-        // The ladder. `--sw-rays` is deliberately not covered (module header):
-        // its leaf kernel wants the BINARY tree at t0 while the ladder holds
-        // the WIDE one there, which is a fourth set variant, not a flag.
+        // The ladder. Under `--sw-rays` these compile against `rt_sw.hlsli`
+        // like everything else and the only difference is which buffer sits
+        // behind t0/t1 per phase (module header).
         let wave_units: [(&str, &str, &str); 9] = [
             (&srcs.wavefront, "cs_seed", "wf-seed"),
             (&srcs.wavefront, "cs_prep", "wf-prep"),
@@ -322,7 +355,11 @@ impl VkTracer {
             (&srcs.wavefront, "cs_clear_h", "wf-clear-h"),
             (&srcs.leaf_fb, "cs_leaf", "wf-leaf-fb"),
         ];
-        let want_wave = !gs::sw_rays();
+        // Nothing turns these off today (see `Wave`'s doc). The flags stay
+        // because the compile/allocate/write sites all key off them, so a
+        // future gate — a device floor, a memory ceiling — is one expression
+        // rather than a rewrite.
+        let want_wave = true;
         // fb rides on the ladder: `cs_leaf` is what appends the shading points,
         // and compose reads the planes the leaf pass filled.
         let want_hemi = want_wave;
@@ -448,6 +485,17 @@ impl VkTracer {
         let cap_hemi_cell = u64::from(HEMI_BATCH) * (1u64 << (2 * (HEMI_MAX_DEPTH - 1)));
         let cap_hemi_cut =
             u64::from(HEMI_BATCH) * (((1u64 << (2 * (HEMI_MAX_DEPTH - 1))) - 1) / 3 + 1);
+        // The software half of the intersector, built ahead of both optional
+        // halves because both want it: the hemi kernels descend the binary tree
+        // in every session, and under `--sw-rays` so do the ray loops in the
+        // reference, leaf and hemi-leaf units — which is also the one arm that
+        // needs `tri_idx`, since a RayQuery gets its triangles from the driver.
+        let binary = host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?;
+        let sw_tri = if gs::sw_rays() {
+            Some(host_buf(vkd, bytes_of(&bvh.tri_idx), sb)?)
+        } else {
+            None
+        };
         let mut wave = if want_wave {
             if dd > 11 {
                 return Err(format!("{rw}x{rh} needs quadtree depth {dd} > 11 indirect-arg slots"));
@@ -455,6 +503,14 @@ impl VkTracer {
             let cap_tile = if dd >= 1 { 1u64 << (2 * (dd - 1)) } else { 1 };
             let cap_leaf = 1u64 << (2 * dd);
             let cap_cut = ((1u64 << (2 * dd)) - 1) / 3 + 1;
+            // `--sw-rays` + FTREE: `level_finish` translates each leaf-emitting
+            // split's slot-ref cut into a SECOND fresh slot of binary node ids,
+            // so doubling keeps the pool structurally overflow-free. Sizing it
+            // is not optional tidiness — the exhaustion arm degrades to ROOT
+            // seeding, which is sound but is a different structure, and this
+            // backend measured 107 such fallbacks at 800x600 before the
+            // doubling landed, against D3D12's 0 on the identical frame.
+            let cap_cut = if gs::sw_rays_leaf() && srcs.ftree_on { cap_cut * 2 } else { cap_cut };
             // The kernels read every one of these off the cbuffer, so a
             // buffer sized here and a cap written there must be the same
             // number — hence one place computing both. The hemi three are the
@@ -475,10 +531,20 @@ impl VkTracer {
             // shortcut: the CPU keeps f32 nodes, the GPU trades decode ALU for
             // -56% tree bandwidth and the decoded boxes still CONTAIN the true
             // ones, so every prune stays conservative.
-            let tree = if srcs.ftree_on {
-                host_buf(vkd, bytes_of(&crate::ftree::FTree::build(bvh).quantized()), sb)?
-            } else {
-                host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?
+            let ft = if srcs.ftree_on { Some(crate::ftree::FTree::build(bvh)) } else { None };
+            let tree = match &ft {
+                Some(f) => host_buf(vkd, bytes_of(&f.quantized()), sb)?,
+                None => host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?,
+            };
+            // The leaf-cut translation map. Gated on `sw_rays_leaf` rather than
+            // `sw_rays` for the reason the HLSL is: under `--no-cut-rays` the
+            // leaf traverses from the root, `level_finish` compiles no
+            // translation, and the wavefront unit declares no t1 at all.
+            let ft_bnode = match &ft {
+                Some(f) if gs::sw_rays_leaf() => {
+                    Some(host_buf(vkd, bytes_of(&f.bnode_flat()), sb)?)
+                }
+                _ => None,
             };
             Some(Wave {
                 qa: vkd.buffer(cap_tile * 24, sb, false)?,
@@ -488,6 +554,7 @@ impl VkTracer {
                 cut_pool: vkd.buffer(cap_cut * 256, sb, false)?,
                 args: vkd.buffer(16 * 12, sb | vk::BufferUsageFlags::INDIRECT_BUFFER, false)?,
                 tree,
+                ft_bnode,
                 pipes: wpipes,
                 sets_a: Vec::new(),
                 sets_b: Vec::new(),
@@ -514,11 +581,6 @@ impl VkTracer {
                 // `cs_leaf` appends into it device-side, which host-visible
                 // memory serves perfectly well.
                 pts: vkd.buffer(px * 32, sb, true)?,
-                // The binary BVH, uploaded IN ADDITION to the wide tree when
-                // FTREE is on. Not a duplicate of the same thing: the ladder
-                // descends the 8-wide structure and the hemi kernels compile
-                // the binary `bound_query`, so both are live in one frame.
-                binary: host_buf(vkd, bytes_of(&nodes_wire(bvh)), sb)?,
                 pipes: hpipes,
                 sets_a: Vec::new(),
                 sets_b: Vec::new(),
@@ -625,6 +687,8 @@ impl VkTracer {
             cloud_shadow,
             frame_cb,
             push,
+            binary,
+            sw_tri,
             hdr,
             samp_lin,
             samp_aniso,
@@ -673,46 +737,49 @@ impl VkTracer {
         // The TERMINAL variant, which is also the only one a reference-kernel
         // frame ever binds: u5/u6 hold the cloud lattice and the slab-space
         // shadow cache, the registers' second meaning.
-        self.write_variant(
-            hg,
-            vs,
-            &self.sets,
-            &[(Reg::U, 5, &self.cloud_lod), (Reg::U, 6, &self.cloud_shadow)],
-            &drop,
-        );
+        //
+        // `--sw-rays` adds two more. The reference, leaf and sky passes all
+        // bind THIS variant and all three run the software intersector, so t0
+        // becomes the BINARY tree (the ladder's wide one is a structure the ray
+        // loops cannot descend) and t1 the real `tri_idx`. That pair is D3D12's
+        // two rebinds between the ladder and the fills, spelled as a variant
+        // difference rather than as root-descriptor writes.
+        let mut term: Vec<(Reg, u32, &Buffer)> =
+            vec![(Reg::U, 5, &self.cloud_lod), (Reg::U, 6, &self.cloud_shadow)];
+        if let Some(t) = &self.sw_tri {
+            term.push((Reg::T, 0, &self.binary));
+            term.push((Reg::T, 1, t));
+        }
+        self.write_variant(hg, vs, &self.sets, &term, &drop);
         if let Some(w) = &self.wave {
-            self.write_variant(hg, vs, &w.sets_a, &[(Reg::U, 5, &w.qa), (Reg::U, 6, &w.qb)], &drop);
-            self.write_variant(hg, vs, &w.sets_b, &[(Reg::U, 5, &w.qb), (Reg::U, 6, &w.qa)], &drop);
+            // The ladder keeps the WIDE tree at t0 (it comes from the base) and
+            // takes the slot -> node map at t1 when the lever arms it.
+            for (sets, q0, q1) in [(&w.sets_a, &w.qa, &w.qb), (&w.sets_b, &w.qb, &w.qa)] {
+                let mut o: Vec<(Reg, u32, &Buffer)> = vec![(Reg::U, 5, q0), (Reg::U, 6, q1)];
+                if let Some(bn) = &w.ft_bnode {
+                    o.push((Reg::T, 1, bn));
+                }
+                self.write_variant(hg, vs, sets, &o, &drop);
+            }
         }
         if let Some(h) = &self.hemi {
             // FIVE moved slots, not two: the cell ping-pong, the hemi leaf
-            // queue and cut pool at u7/u9, and t0 back to the binary tree.
-            self.write_variant(
-                hg,
-                vs,
-                &h.sets_a,
-                &[
-                    (Reg::T, 0, &h.binary),
-                    (Reg::U, 5, &h.hq_a),
-                    (Reg::U, 6, &h.hq_b),
+            // queue and cut pool at u7/u9, and t0 back to the binary tree —
+            // plus `tri_idx` under the lever, since `cs_hemi_leaf` shoots its
+            // rays through the same software loops.
+            for (sets, q0, q1) in [(&h.sets_a, &h.hq_a, &h.hq_b), (&h.sets_b, &h.hq_b, &h.hq_a)] {
+                let mut o: Vec<(Reg, u32, &Buffer)> = vec![
+                    (Reg::T, 0, &self.binary),
+                    (Reg::U, 5, q0),
+                    (Reg::U, 6, q1),
                     (Reg::U, 7, &h.hq_leaf),
                     (Reg::U, 9, &h.cut),
-                ],
-                &drop,
-            );
-            self.write_variant(
-                hg,
-                vs,
-                &h.sets_b,
-                &[
-                    (Reg::T, 0, &h.binary),
-                    (Reg::U, 5, &h.hq_b),
-                    (Reg::U, 6, &h.hq_a),
-                    (Reg::U, 7, &h.hq_leaf),
-                    (Reg::U, 9, &h.cut),
-                ],
-                &drop,
-            );
+                ];
+                if let Some(t) = &self.sw_tri {
+                    o.push((Reg::T, 1, t));
+                }
+                self.write_variant(hg, vs, sets, &o, &drop);
+            }
         }
         // `FR_VK_DROP_STREAM=texs` is the whole-run lever; `bind_textures` is
         // also what V6's own anti-vacuity probe calls, so the two share one
@@ -837,6 +904,13 @@ impl VkTracer {
             .collect();
 
         // The TLAS, and the one storage image the resolve pass writes.
+        //
+        // GUARDED ON THE MAP, unlike the storage image: `--sw-rays`' corpus
+        // declares no acceleration structure at all (`rt_sw.hlsli` traverses
+        // our own BVH), so the derived layout has no such binding — and a write
+        // to a binding the layout does not have is not a harmless no-op. The
+        // sampler writes below have carried this guard since M3a for the same
+        // reason; this one was simply never reachable until now.
         let accels = [vs.tlas];
         let mut asw = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(&accels);
@@ -846,7 +920,9 @@ impl VkTracer {
             .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
             .push_next(&mut asw);
         w_as.descriptor_count = 1;
-        writes.push(w_as);
+        if self.map.entries.contains_key(&(0, binding_of(Reg::T, 7))) {
+            writes.push(w_as);
+        }
 
         let ii = [vk::DescriptorImageInfo::default()
             .image_view(self.hdr.view)
@@ -1486,8 +1562,8 @@ impl VkTracer {
         Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
     }
 
-    /// Are the hemisphere tiers live? (`--sw-rays` takes the ladder, and so
-    /// these, with it.)
+    /// Are the hemisphere tiers live? Always, today — see `Wave`'s doc on why
+    /// the `Option` stays.
     pub fn has_hemi(&self) -> bool {
         self.hemi.is_some()
     }
@@ -1585,26 +1661,23 @@ impl VkTracer {
             &self.cloud_shadow,
             &self.frame_cb,
             &self.push,
+            &self.binary,
         ] {
             vkd.free_buffer(b);
         }
+        for b in self.sw_tri.iter() {
+            vkd.free_buffer(b);
+        }
         if let Some(w) = &self.wave {
-            for b in [&w.qa, &w.qb, &w.qleaf, &w.qsky, &w.cut_pool, &w.args, &w.tree] {
+            for b in [&w.qa, &w.qb, &w.qleaf, &w.qsky, &w.cut_pool, &w.args, &w.tree]
+                .into_iter()
+                .chain(w.ft_bnode.iter())
+            {
                 vkd.free_buffer(b);
             }
         }
         if let Some(h) = &self.hemi {
-            for b in [
-                &h.hq_a,
-                &h.hq_b,
-                &h.hq_leaf,
-                &h.cut,
-                &h.partial,
-                &h.ambw,
-                &h.hbuf,
-                &h.pts,
-                &h.binary,
-            ] {
+            for b in [&h.hq_a, &h.hq_b, &h.hq_leaf, &h.cut, &h.partial, &h.ambw, &h.hbuf, &h.pts] {
                 vkd.free_buffer(b);
             }
         }
