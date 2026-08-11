@@ -29,6 +29,22 @@ pub fn shadow_aabb(scene: &Scene) -> ([f32; 3], [f32; 3]) {
     ([amn.x, amn.y, amn.z], [amx.x, amx.y, amx.z])
 }
 
+/// How many bytes the geometry/material stream set below occupies on the GPU
+/// — what an upload ring is sized against.
+///
+/// Here rather than in either backend because it is a pure function of the
+/// `Scene` and of the wire formats stated in THIS file: `GpuMat`'s size is
+/// part of the answer, so a copy living next to one backend's ring would go
+/// stale the next time the material struct grows. Textures are deliberately
+/// excluded — they are per-image and each backend's own staging shape decides
+/// what indivisible piece it must additionally be able to hold.
+pub fn stream_bytes(scene: &Scene) -> usize {
+    let v = scene.positions.len();
+    let t = scene.indices.len();
+    let m = scene.materials.len();
+    v * (12 + 12 + 8) + t * (12 + 4) + m * (std::mem::size_of::<GpuMat>() + 4)
+}
+
 /// `bvh.rs::Node` packed for `StructuredBuffer<BvhNode>` (frustum.hlsli).
 ///
 /// The frustum ladder's own tree — the software half of the tracer, since RT

@@ -241,6 +241,12 @@ pub struct DeviceInfo {
     /// shipping configuration rather than a degradation invented here.
     pub sampler_anisotropy: bool,
     pub max_anisotropy: f32,
+    /// `textureCompressionBC`. ENABLED WHEN PRESENT and never required, for
+    /// the `sampler_anisotropy` reason: RGBA8 uploads are `--no-bc7`, an arm
+    /// this renderer ships, and one that moves the CPU-vs-GPU comparison in
+    /// the SAFE direction rather than degrading it. A device without it gets
+    /// one loud line and uncompressed textures.
+    pub texture_compression_bc: bool,
 }
 
 impl DeviceInfo {
@@ -548,13 +554,16 @@ impl Vk {
             f12 = f12.buffer_device_address(true);
         }
 
-        // Anisotropic filtering, the one CORE feature this backend enables.
-        // `--aniso 16` is the default, and on D3D12 the anisotropic arm is a
-        // static sampler fed the elliptical footprint through `SampleGrad`;
-        // the same sampler here needs the feature turned on explicitly, and a
-        // device without it simply runs the isotropic arm.
+        // The two CORE features this backend enables, both ENABLED-WHEN-PRESENT
+        // and neither required, because each one's absence lands on a shipping
+        // arm rather than on a degradation invented here: `--aniso 1` is the
+        // isotropic ray-cone lod path VERBATIM, and `--no-bc7` is RGBA8
+        // uploads. On D3D12 neither is a feature bit at all — anisotropy is a
+        // static sampler and BC7 is a format — so this is the one place the
+        // two APIs' shapes genuinely differ rather than merely spell.
         let core = vk::PhysicalDeviceFeatures::default()
-            .sampler_anisotropy(info.sampler_anisotropy);
+            .sampler_anisotropy(info.sampler_anisotropy)
+            .texture_compression_bc(info.texture_compression_bc);
 
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
@@ -643,6 +652,7 @@ impl Vk {
             max_sampled_images: props.limits.max_per_stage_descriptor_sampled_images,
             sampler_anisotropy: core_feats.sampler_anisotropy != 0,
             max_anisotropy: props.limits.max_sampler_anisotropy,
+            texture_compression_bc: core_feats.texture_compression_bc != 0,
         };
 
         // Hard requirements, each traceable to a decision already made.

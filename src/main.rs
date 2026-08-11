@@ -1203,7 +1203,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk(&scene, &bvh, cam0, structural);
+            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -13566,6 +13566,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     push!("fsr-composite", sh::fsr_composite_src(), Shape::Compute("cs_6_5"));
     push!("smoke", sh::SMOKE_HLSL.to_string(), Shape::Compute("cs_6_5"));
     push!("waveprobe", sh::WAVEPROBE_HLSL.to_string(), Shape::Compute("cs_6_5"));
+    push!("bc7read", sh::BC7_READ_HLSL.to_string(), Shape::Compute("cs_6_0"));
     push!("quin", sh::QUIN_HLSL.to_string(), Shape::Compute("cs_6_5"));
     // DELIBERATELY ABSENT: nppd.hlsl. Its staging kernels are ordinary
     // compute and would compile, but the stage they stage for is ONNX Runtime
@@ -13730,12 +13731,29 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 /// the bare-checkout rule every SDK-dependent gate here follows. It does NOT
 /// degrade on a device that is present and wrong.
 #[cfg(unix)]
-fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
+fn run_check_vk(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    structural: bool,
+    bc7_mode: bc7::Bc7Mode,
+) -> i32 {
     let mut ok = true;
 
     // ---- V0: the pure half. Meaningful on a box with no Vulkan at all. ----
     match vk::device::self_test() {
         Ok(()) => println!("check-vk: V0 device pick + memory-type selection OK"),
+        Err(e) => {
+            eprintln!("check-vk: FAIL V0 {e}");
+            ok = false;
+        }
+    }
+    // The staging ring's chunking arithmetic, which no image gate can reach
+    // unless the scene is big enough to chunk at all — and at a 64 MB ring the
+    // procedural scene never is, so a device-side proof would be silently
+    // scene-dependent. Pure, so it runs here beside the pick.
+    match vk::stage::self_test() {
+        Ok(()) => println!("check-vk: V0 staging-ring chunk plan OK"),
         Err(e) => {
             eprintln!("check-vk: FAIL V0 {e}");
             ok = false;
@@ -13832,7 +13850,12 @@ fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: 
     }
 
     // ---- V6: the reference kernel rendering, scored against the CPU. ----
-    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural) {
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode) {
+        ok = false;
+    }
+
+    // ---- V10: the BC7 encoder, scored through the hardware decoder. ----
+    if !run_check_vk_bc7(&hg, &sp, scene, bc7_mode) {
         ok = false;
     }
 
@@ -13855,6 +13878,73 @@ fn run_check_vk(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: 
 
     println!("CHECK-VK {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// V10 — the BC7 encoder, scored through the hardware decoder.
+///
+/// IT EXISTS BECAUSE EVERY OTHER NUMBER IN THIS SUITE IS BLIND TO IT. V6's
+/// radiance A/B is a 2% bar on a frame where textures are one term of the
+/// shading, and its texture anti-vacuity probe asks whether the table reached
+/// the shader at all, not whether its CONTENT survived the encode — so a wrong
+/// row stride, a mis-set window or a broken partition table all read green
+/// there while the picture is visibly wrong. (The D3D12 twin learned this from
+/// the other side: `FR_VK_DROP_STREAM=blas_tri` PASSES san-miguel's radiance
+/// bar at 1.080% and only the probe's zero-channels-moved catches it.)
+///
+/// Two halves, because they answer different questions. The STRUCTURAL half is
+/// synthetic and therefore fires on every scene INCLUDING the untextured
+/// procedural default, where the fidelity half has nothing to score; the
+/// FIDELITY half runs the session's own arm over the scene's own textures and
+/// is the only thing that says the encoder is good rather than merely wired.
+///
+/// The 25 dB bar is `--check-gpu`'s M11: a WIRING gate, not a quality one —
+/// pitch, footprint and format errors land at ~10-20 dB, while the honest
+/// worst measured on D3D12 is 32.0 (GPU) / 33.0 (ispc) at `fast`.
+#[cfg(unix)]
+fn run_check_vk_bc7(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    mode: bc7::Bc7Mode,
+) -> bool {
+    let mut ok = true;
+    match vk::bc7::structural(hg, sp) {
+        Ok(s) => println!("check-vk: V10 bc7 structural: {s}"),
+        Err(e) => {
+            eprintln!("check-vk: FAIL V10 bc7 structural: {e}");
+            ok = false;
+        }
+    }
+    match vk::bc7::fidelity(hg, sp, scene, mode) {
+        Ok(None) => println!(
+            "check-vk: V10 bc7 fidelity SKIPPED (BC7 off, or nothing in this scene is \
+             compressible — the structural half above is what covers the encoder here)"
+        ),
+        Ok(Some(f)) => {
+            println!(
+                "check-vk: V10 bc7 fidelity over {} texture(s): mean |d| {:.3} LSB | max {} | \
+                 worst RGB PSNR {:.1} dB ({})",
+                f.textures,
+                f.mean_abs,
+                f.max_abs,
+                f.worst_psnr,
+                if f.worst_name.is_empty() { "<inline>" } else { &f.worst_name }
+            );
+            if f.worst_psnr < 25.0 {
+                eprintln!(
+                    "check-vk: FAIL V10 worst BC7 PSNR {:.1} dB < 25 — that band is a WIRING \
+                     failure (pitch/footprint/format), not encoder quality",
+                    f.worst_psnr
+                );
+                ok = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V10 bc7 fidelity: {e}");
+            ok = false;
+        }
+    }
+    ok
 }
 
 /// V4 — the wave-width table, printed WHOLE and then judged.
@@ -14248,6 +14338,7 @@ fn run_check_vk_render(
     bvh: &bvh::Bvh,
     cam0: Camera,
     structural: bool,
+    bc7_mode: bc7::Bc7Mode,
 ) -> bool {
     // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
     // frame its D3D12 twin does, so the two suites' quadtree structures are
@@ -14308,14 +14399,14 @@ fn run_check_vk_render(
         }
         _ => (VK_RENDER_W, VK_RENDER_H),
     };
-    let vs = match vk::scene::VkScene::new(hg, scene) {
+    let vs = match vk::scene::VkScene::new(hg, scene, bvh) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("check-vk: FAIL V6 scene upload: {e}");
             return false;
         }
     };
-    let vt = match vk::textures::VkTextures::new(hg, scene) {
+    let vt = match vk::textures::VkTextures::new(hg, sp, scene, bc7_mode) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("check-vk: FAIL V6 texture upload: {e}");
@@ -14338,11 +14429,65 @@ fn run_check_vk_render(
     // subresource count only if it had none to lose.
     println!(
         "check-vk: V6 scene uploaded, BLAS/TLAS built ({} tris), {} texture(s) \
-         [{} subresource(s), {:.1} MB, RGBA8 — the --no-bc7 arm] — reference tracer at {gw}x{gh}",
+         [{} subresource(s), {:.1} MB raw -> {:.1} MB on device, {} of {} BC7: {}] \
+         — reference tracer at {gw}x{gh}",
         scene.tri_count(),
         scene.textures.len(),
         vt.levels,
-        vt.bytes as f64 / (1024.0 * 1024.0)
+        vt.bytes as f64 / (1024.0 * 1024.0),
+        vt.device_bytes as f64 / (1024.0 * 1024.0),
+        vt.n_bc7,
+        scene.textures.len(),
+        vt.bc7_note
+    );
+    println!("check-vk: V6 blas-split: {}", vs.blas_report);
+    // Anti-vacuity, the --check-gpu / --check-dxr twin: an armed lever that
+    // produced ONE chunk has exercised nothing the unarmed run does not —
+    // every hit lands in instance 0 and `chunk_base[0]` is 0, so a wrong
+    // arena offset, a wrong window, or a wrong instance id all still read
+    // right. A scene genuinely under the cap is a note, not a failure, and
+    // `--blas-split N` is how any scene reaches the multi-chunk path.
+    if let Some(cap) = blas_split::max_prims() {
+        if vs.n_chunks < 2 {
+            if scene.tri_count() as u32 > cap {
+                eprintln!(
+                    "check-vk: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
+                     from {} tris — the remap is untested",
+                    vs.n_chunks,
+                    scene.tri_count()
+                );
+                tg.destroy(hg);
+                vt.destroy(hg);
+                vs.destroy(hg);
+                return false;
+            }
+            println!(
+                "check-vk: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                 the remap runs as the identity here (use --blas-split N to split it)",
+                scene.tri_count()
+            );
+        }
+    }
+    // What the staging ring actually carried. Reported for the reason the
+    // texture line reports bytes rather than a count: a mapped upload and a
+    // staged one allocate exactly the same buffers and render exactly the same
+    // frame, so BYTES and SUBMITS are the only things that can tell a run that
+    // streamed from one that did not — and the chunk count is additionally
+    // what says whether the multi-chunk path ran on this scene at all.
+    let (sb, sc) = vs.staged;
+    let (tb, tc) = vt.staged;
+    let (rb, rc) = tg.staged;
+    println!(
+        "check-vk: V6 staged {:.1} MB in {} submit(s) — scene {:.1}/{}, textures {:.1}/{}, \
+         trees {:.1}/{}",
+        (sb + tb + rb) as f64 / (1024.0 * 1024.0),
+        sc + tc + rc,
+        sb as f64 / (1024.0 * 1024.0),
+        sc,
+        tb as f64 / (1024.0 * 1024.0),
+        tc,
+        rb as f64 / (1024.0 * 1024.0),
+        rc,
     );
 
     let q = Quality::preset(2);

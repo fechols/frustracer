@@ -28,19 +28,6 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
 use crate::gfx::shaders::BC7ENC_HLSL;
 
-/// The kernel's effort tier for an ispc `Quality` name: 0 = mode-6 PCA fit,
-/// no refinement; 1 = + 2 least-squares rounds + CONDITIONAL mode-1 (top-4
-/// partitions, only on blocks where mode 6 left visible error); 2/3 =
-/// mode-1 always, top-8/16 partitions.
-pub fn effort(q: bc7::Quality) -> u32 {
-    match q {
-        bc7::Quality::UltraFast => 0,
-        bc7::Quality::Fast => 1,
-        bc7::Quality::Basic => 2,
-        bc7::Quality::Slow => 3,
-    }
-}
-
 pub struct Bc7Enc {
     root_sig: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -76,7 +63,7 @@ impl Bc7Enc {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: 0,
                         RegisterSpace: 0,
-                        Num32BitValues: 8,
+                        Num32BitValues: 9,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -153,13 +140,20 @@ impl Bc7Enc {
             band_rows as usize * d3d12::block_pitch(mw) <= self.block_cap,
             "bc7gpu: band over block_buf capacity"
         );
-        let consts: [u32; 8] = [mw, staged_rows, src_pitch, bw, band_rows, row_blocks, effort, 0];
+        // The two trailing zeros are the kernel's `src_off`/`dst_off` window,
+        // which this backend expresses as the root SRV/UAV virtual addresses
+        // instead (they name a band's ring slice and the whole block buffer);
+        // the Vulkan host binds one descriptor per buffer for a whole batch
+        // and moves the window in the constants. Zero byte offsets are exact
+        // integer identities, so both hosts encode the same blocks.
+        let consts: [u32; 9] =
+            [mw, staged_rows, src_pitch, bw, band_rows, row_blocks, effort, 0, 0];
         unsafe {
             l.SetComputeRootSignature(&self.root_sig);
             l.SetPipelineState(&self.pso);
             l.SetComputeRootShaderResourceView(0, src.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(1, self.block_buf.GetGPUVirtualAddress());
-            l.SetComputeRoot32BitConstants(2, 8, consts.as_ptr() as *const _, 0);
+            l.SetComputeRoot32BitConstants(2, 9, consts.as_ptr() as *const _, 0);
             l.Dispatch(bw.div_ceil(8), band_rows.div_ceil(8), 1);
         }
     }

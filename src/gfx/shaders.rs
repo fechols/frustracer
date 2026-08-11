@@ -826,6 +826,28 @@ pub const AUTOEXP_HLSL: &str = include_str!("../shaders/autoexp.hlsl");
 // fxc tier for the same reason (it must run before the tracer's kernels).
 pub const BC7ENC_HLSL: &str = include_str!("../shaders/bc7enc.hlsl");
 
+/// The BC7 fidelity gates' decode kernel: `.Load` one texel of a BC7 SRV
+/// (legal on a BC format — it returns the hardware-DECODED texel) and store it
+/// back as packed RGBA8. BC7 DECODE is required to be bit-exact, so
+/// `round(load * 255)` recovers the decoder's exact 8-bit values and the diff
+/// against the CPU source measures the ENCODER's loss and nothing else.
+///
+/// Shared rather than per-backend for the reason `BC7ENC_HLSL` is: two gates
+/// scoring one encoder against two hardware decoders have to be reading the
+/// same thing, and a second transcription of four lines is exactly where that
+/// stops being true.
+pub const BC7_READ_HLSL: &str = r#"
+Texture2D<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer C : register(b0) { uint W; uint H; }
+[numthreads(8, 8, 1)]
+void cs_bc7_read(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= W || id.y >= H) return;
+    uint4 q = (uint4)round(saturate(src.Load(int3(int(id.x), int(id.y), 0))) * 255.0);
+    dst.Store((id.y * W + id.x) * 4u, q.x | (q.y << 8u) | (q.z << 16u) | (q.w << 24u));
+}
+"#;
+
 /// Per-scene HLSL prelude: alpha-masked scenes compile the cutout candidate
 /// loops / any-hit shaders in; opaque scenes compile byte-identical sources
 /// to the pre-cutout tracer. Shared with dxr.rs (the DXR library concat).

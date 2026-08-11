@@ -716,7 +716,9 @@ cargo run --release -- model.obj --tile 3       # replicate a loaded OBJ into a 
                                                 # composes with --check* as the loaded-scene gate class)
 cargo run --release -- model.obj --no-bc7  # A/B lever: upload scene textures as raw RGBA8. BC7
                                         # block compression is ON BY DEFAULT (8 bpp vs 32 — GPU
-                                        # upload only; measured live set incl. mips: Intel Sponza
+                                        # upload only; on BOTH backends since 2026-08-11, see
+                                        # src/vk/bc7.rs and the M3j block in --check-vk: one
+                                        # kernel, two hosts, and `should_compress` called verbatim; measured live set incl. mips: Intel Sponza
                                         # 4608 -> 3072 MB, Bistro 2310 -> 1725; the CPU samplers
                                         # keep exact RGBA8 and alpha-masked cutout / height-
                                         # carrying textures NEVER compress — see Real scenes). The
@@ -1478,13 +1480,17 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # (non-neural) temporal ray reconstruction that makes the
                                       # TAA-upscalers peers of the RR engines (the quinlight
                                       # "pre-denoise their SHARED input" follow-on, built).
-                                      # OPT-IN SINCE THE FRD PHASE-E DEFAULT FLIP (2026-08-09 —
-                                      # FRD is the default denoiser now; see the --frd entry):
-                                      # --nrd claims the one denoiser slot from the defaulted
-                                      # frd (silently — opting into the oracle is opting out of
-                                      # the default) and NRD stays as the A/B ORACLE until its
-                                      # planned one-commit deletion; --no-nrd spells the
-                                      # default. Opts::nrd_explicit is the fg_explicit pattern —
+                                      # THE DEFAULT DENOISER (d1b315f — it briefly was not: the
+                                      # 2026-08-09 Phase-E flip handed the slot to FRD and the
+                                      # same week's emissive-integration campaign handed it
+                                      # back, NRD measuring ahead where this content lives; the
+                                      # --frd entry carries the numbers and the full order).
+                                      # So --nrd holds the one denoiser slot, --frd CLAIMS it,
+                                      # and --no-nrd --no-frd is the plain undenoised baseline.
+                                      # This is also why build.rs's require_nrd() hard-FAILS
+                                      # rather than degrading: a tree that cannot produce NRD is
+                                      # a tree whose DEFAULT session silently runs undenoised.
+                                      # Opts::nrd_explicit is the fg_explicit pattern —
                                       # a FILE-defaulted nrd under --nppd disarms with a loud
                                       # line while the EXPLICIT pair exits 2 (a default must
                                       # never make another flag fatal), and the "not armed"
@@ -2618,11 +2624,24 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # the ReBLUR-class recurrent 3-dispatch shape (temporal /
                                       # blur / post+feedback) at fp16, wave-ops, narrow barriers,
                                       # B70-first (XMX ruled out: bilateral weights are not a
-                                      # GEMM). THE DEFAULT SINCE THE PHASE-E FLIP (2026-08-09,
-                                      # same day — the parity bar was met: quality band held on
-                                      # both boxes at 2.5x NRD's speed; the DELETION half of E
-                                      # stays a later one-commit move, NRD serving as the
-                                      # opt-in A/B oracle until then): frd takes the ONE
+                                      # GEMM). NOT THE DEFAULT — NRD IS. This constant moved
+                                      # TWICE and the second move is the one that sticks, so
+                                      # read the order: FRD took the slot at the PHASE-E FLIP
+                                      # (2026-08-09 — the parity bar was met, quality band held
+                                      # on both boxes at 2.5x NRD's speed), and d1b315f
+                                      # REVERSED it, because the emissive-integration campaign
+                                      # measured NRD ahead where this content lives (68% vs 42%
+                                      # of DLSS-RR's pool delivery, still-frame stability 0.29
+                                      # vs 0.47) and the parked-camera darkening report is the
+                                      # visible half of that gap. THE CODE IS THE ARBITER when
+                                      # this entry and the --nrd one disagree: cli.rs's
+                                      # defaults() reads `frd: false`, and the shipping --help
+                                      # says "--no-frd spells the default (NRD holds the slot)".
+                                      # The DELETION half of Phase E is retired with the flip;
+                                      # FRD stays compiled and reachable as --frd on its own
+                                      # merits — 2.5x faster in the denoiser region, and the A/B
+                                      # oracle that isolated every bug in that campaign. It
+                                      # takes the ONE
                                       # denoiser
                                       # slot (enum DnGpu in gpu/mod.rs — arm_denoiser_for /
                                       # nrd_frame_step / the shed machinery are engine-blind, the
@@ -2630,17 +2649,15 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # wiring UNCHANGED: FrdGpu carries NrdGpu's exact plane
                                       # contract); only EXPLICIT pairs are fatal — explicit
                                       # --frd + explicit --nrd exits 2, explicit --frd + --nppd
-                                      # exits 2, an explicit --nrd silently disarms the
-                                      # DEFAULTED frd (opting into the oracle is opting out of
-                                      # the default), the defaulted frd yields LOUDLY to a bare
-                                      # --nppd (a default never makes another flag fatal — the
-                                      # fg_explicit doctrine; both-defaulted = a FILE-saved nrd
-                                      # beats the compiled frd, silently — a saved preference
-                                      # beats a compiled default); the not-armed session notes
+                                      # exits 2, --frd CLAIMS the slot from the nrd default, and
+                                      # a bare --nppd disarms a FILE-SAVED frd loudly (a default
+                                      # never makes another flag fatal — the fg_explicit
+                                      # doctrine); the not-armed session notes
                                       # key on frd_explicit/nrd_explicit, so a default never
-                                      # nags; --no-frd is the kill lever (= the plain undenoised
-                                      # baseline), --frd spells the default; settings rows `frd`
-                                      # (Toggle default ON) + `nrd` (the oracle, default OFF)
+                                      # nags; --no-frd spells the default (NRD holds the slot)
+                                      # and --no-nrd --no-frd is the plain undenoised
+                                      # XeSS/FSR3 baseline; settings rows `frd`
+                                      # (Toggle, default OFF) + `nrd` (default ON)
                                       # drive the default arms only (the fg-row rule).
                                       # --frd-max-accum-frames/-fast-frames/-max-stab-frames/
                                       # -blur-radius/-clamp-sigma/-[no-]anti-firefly/-no-fp16 =
@@ -3065,9 +3082,12 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # relax the translation cap, signed/concave curvature),
                                       # then
                                       # E's
-                                      # remaining half — the NRD deletion (the FLIP half of E
-                                      # SHIPPED 2026-08-09, same day: frd defaults ON, nrd is
-                                      # the opt-in oracle; see the precedence block above).
+                                      # remaining half — the NRD deletion, which is NOT
+                                      # PENDING BUT RETIRED: E's flip half shipped 2026-08-09
+                                      # and was REVERSED by d1b315f the same week, so NRD is
+                                      # the default and deleting it is off the table until FRD
+                                      # wins the quality argument it lost (see the precedence
+                                      # block above for the numbers).
                                       # THE SMEAR-FIX INTERACTIVE PROTOCOL (the feel-test):
                                       # (1) moving sun, parked camera — `--gpu --xess --frd` on
                                       # rungholt water or a bistro glossy floor, park, hold `.`
@@ -5354,7 +5374,7 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # substitutes: DXC will happily emit a module no driver accepts,
                                       # and spirv-val validates a MODULE, so it can say nothing about two
                                       # registers landing on one binding (S0's injectivity sweep is that
-                                      # guard). MEASURED: 46 units -> 77 modules, 77 validated, 0 failed
+                                      # guard). MEASURED: 47 units -> 78 modules, 78 validated, 0 failed
                                       # — all four --dxr-inline libraries (mode 0's lib_6_3 all-TraceRay
                                       # build included) plus --dxr-sbt 3's recursive arm, the wavefront
                                       # ladder, FRD's kernels, the FSR composite, quin, and the display
@@ -5399,8 +5419,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 46/77. Measured 7332616 B procedural
-                                      # vs 7333760 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 47/78. Measured 7679015 B procedural
+                                      # vs 7680159 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
                                       # keying reaches. (A first draft printed 2-decimal MB and read
                                       # identical across all three: an instrument at the wrong
@@ -5423,7 +5443,19 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # fetches the Linux tarball and the Windows zip from the SAME
                                       # release tag, so the compiler emitting DXIL and the one emitting
                                       # SPIR-V cannot drift to different HLSL front ends) + SDKs/
-                                      # spirv-tools (install-prerequisites.sh spirv). Either missing =
+                                      # spirv-tools (install-prerequisites.sh spirv). ON macOS THE DXC
+                                      # HALF DOES NOT EXIST and the pin is why, not effort: DXC_TAG
+                                      # publishes a Windows zip, a linux x86_64 tarball and a PDB zip —
+                                      # no macOS build, no arm64 build of anything — so a community
+                                      # binary would not be from the tag, breaking the same-front-end
+                                      # invariant above, which is exactly the drift no gate can see. The
+                                      # route that keeps it is a source build at DXC_TAG (the shape
+                                      # `nrd` already uses); the installer says so and stands the half
+                                      # down rather than substituting. spirv DOES have a macOS prebuilt,
+                                      # x86_64-only, so it runs under Rosetta on Apple silicon and the
+                                      # installer checks that it EXECUTES rather than assuming. So
+                                      # --check-spirv/--check-vk SKIP on macOS today, which is the
+                                      # bare-checkout degrade and not a failure. Either missing =
                                       # loud SKIP + exit 0, the bare-checkout degrade; the path lever is
                                       # FRUSTRACER_DXC_SPIRV_PATH and NOT FRUSTRACER_DXC_PATH, which
                                       # names the Windows drop (two artifacts, two directories — one
@@ -5439,7 +5471,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
                                       # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9; --sw-rays covered
-                                      # in M3g).
+                                      # in M3g, staging uploads in M3h, the real --blas-split in M3i,
+                                      # BC7 in M3j).
                                       # --check-spirv proves the corpus COMPILES; this proves a DEVICE
                                       # CONSUMES it, and those are different claims: spirv-val validates a
                                       # MODULE and knows nothing about the pipeline layout we bind it
@@ -5648,6 +5681,8 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # actually bind" answerable without reading the shaders);
                                       # FR_VK_DROP_BINDING=<set>:<binding> is V5's teeth above;
                                       # FR_VK_DROP_STREAM=<name> and FR_VK_AB_FRAMES=<n> are V6's (below);
+                                      # FR_SPLIT_AUDIT=1 and FR_SPLIT_NOREBASE=1 are M3i's, and are the D3D12
+                                      # levers of the same names rather than new ones;
                                       # FR_VK_AB_DUMP=1 writes the two converged images + the CPU t buffer
                                       # as raw f32 (vk-ab-{cpu,gpu,t}.f32) for spatial attribution — the
                                       # FR_CHECK_AB_DUMP idiom, and what turned "the shading is 11% dark"
@@ -5656,7 +5691,8 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # V7's drained-queue check is PARITY-SELECTED, so
                                       # **FR_VK_RES=400x300 is what covers its other arm** (see V7);
                                       # FR_VK_CTRS=1 dumps V7's raw counter block, which is how the b1
-                                      # write-after-read hazard below was found.
+                                      # write-after-read hazard below was found; FR_VK_STAGE=<bytes> (a k or m
+                                      # suffix scales) is the staging ring's cap and is M3h's teeth — see below.
                                       # V6 — THE REFERENCE KERNEL RENDERING (M3b, 2026-08-10;
                                       # src/vk/scene.rs + src/vk/tracer.rs). V5 proved every tracer kernel
                                       # BINDS; this is the first stage that proves one of them is RIGHT,
@@ -5744,14 +5780,13 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # avoid. samplerAnisotropy is the one CORE feature the backend
                                       # enables, ENABLED-WHEN-PRESENT: a device without it runs --aniso 1,
                                       # which is the isotropic ray-cone lod path VERBATIM.
-                                      # BC7 IS DEFERRED, NOT DIVERGED: every texture uploads RGBA8 (the
-                                      # --no-bc7 arm), which is a MEMORY question and moves the CPU-vs-GPU
-                                      # comparison in the SAFE direction — the CPU samplers keep exact
-                                      # RGBA8 either way, so an uncompressed upload is strictly closer to
-                                      # the reference than the shipping D3D12 default. It inherits
-                                      # bc7::should_compress verbatim when it lands, including the
-                                      # carve-out that alpha-masked and height-carrying textures never
-                                      # compress (a VISIBILITY contract).
+                                      # BC7 WAS DEFERRED HERE AND LANDED IN M3j (below): M3d uploaded every
+                                      # texture as RGBA8, i.e. the --no-bc7 arm, which is a MEMORY question
+                                      # that moves the CPU-vs-GPU comparison in the SAFE direction — the CPU
+                                      # samplers keep exact RGBA8 either way — and therefore a legitimate
+                                      # place to stop. It inherited bc7::should_compress verbatim when it
+                                      # did land, including the carve-out that alpha-masked and
+                                      # height-carrying textures never compress (a VISIBILITY contract).
                                       # THE ANTI-VACUITY PROBE, and it earns its keep immediately: every
                                       # metric above passes identically whether 313 images reached the
                                       # shader or were uploaded and never read, so V6 re-renders the SAME
@@ -5781,8 +5816,9 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # 0.020%, stress + procedural green. (The M3d readings were taken at the
                                       # then-default 400x300 and are superseded, not contradicted: smlp read
                                       # 0.007% there, the helmet 0.081%.)
-                                      # WHAT V6 STILL SKIPS, LOUDLY: a device with no ray query. The remaining
-                                      # M3b/M3d boundaries are staging uploads, the real --blas-split, and BC7.
+                                      # WHAT V6 STILL SKIPS, LOUDLY: a device with no ray query. M3b/M3d's other
+                                      # declared boundaries — staging uploads, the real --blas-split, BC7 — are
+                                      # M3h, M3i and M3j, all landed.
                                       # V7 — THE WAVEFRONT QUADTREE, and the first EXACT-ZERO gates on
                                       # Vulkan (M3c, 2026-08-11; the ladder half of src/vk/tracer.rs). V6's
                                       # bars are all statistical, and unavoidably so: it is scored against the
@@ -5935,6 +5971,331 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # than an omission: with fb off the leaf and sky passes splat straight
                                       # into accum through accum_splat, so a compose would be a
                                       # buffer-to-buffer copy of a full screen.
+                                      # M3h — STAGING UPLOADS (2026-08-11), the last of vk/scene.rs's three
+                                      # declared M3b boundaries. Every immutable stream — the scene's eleven, the
+                                      # software trees, and the texture chains that already had their own ring —
+                                      # is DEVICE_LOCAL now and written through src/vk/stage.rs's one reusable
+                                      # host-visible chunk (64 MB cap, sized DOWN to what a scene actually
+                                      # carries, freed before each constructor returns, so peak commit is
+                                      # steady-state + one chunk rather than twice steady-state — the
+                                      # SceneGpu::new_uploaded discipline in the other API). Two costs it
+                                      # removes, only one of which is measurable here: PEAK HOST MEMORY (a
+                                      # mapped upload is a second full copy and the repack feeding it was a
+                                      # THIRD — at 34.4M tris the wide tree alone is ~480 MB and the binary tree
+                                      # ~960, so the collect-then-map shape cost ~2.9 GB of RAM to move ~1.4 GB)
+                                      # and READ BANDWIDTH FOREVER (a host-visible buffer a shader reads is host
+                                      # memory a shader reads — invisible on this UMA box and a per-access PCIe
+                                      # round trip on a discrete GPU, i.e. the half that cannot be measured here
+                                      # and so the half worth getting structurally right rather than
+                                      # empirically). The generator form is what deletes the repack outright:
+                                      # stream_gen takes a COUNT and a closure, so positions/normals/uv convert
+                                      # INSIDE the ring and blas_tri's identity remap (138 MB of `i` at 34.4M
+                                      # tris) is never built at all. WHAT STAYS MAPPED, deliberately: frame_cb,
+                                      # push, and the hemi probe points — the dynamic class, where staging would
+                                      # trade a host write for a host write plus a copy plus a barrier.
+                                      # THE BARRIER IS EMITTED ON THE LAST CHUNK ONLY, and that is a property of
+                                      # Vulkan's synchronization scopes rather than an optimization: a pipeline
+                                      # barrier's first scope is "all commands earlier in SUBMISSION ORDER",
+                                      # which spans earlier submits on the same queue, so one barrier after the
+                                      # final write covers every chunk in whatever command buffer it landed. Its
+                                      # dst mask carries ACCELERATION_STRUCTURE_READ as well as SHADER_READ,
+                                      # because positions/indices are read by the BLAS build through a device
+                                      # address and not by a shader — a shader-only mask would be right for nine
+                                      # of the eleven streams and silently wrong for the two whose corruption is
+                                      # hardest to attribute.
+                                      # THE COVERAGE PROBLEM AND ITS LEVER, which is the transferable part: the
+                                      # multi-chunk path is otherwise reachable only on a scene big enough to
+                                      # need it, so the gate's reach would be a property of which scene somebody
+                                      # happened to run — at 64 MB the procedural check scene is one chunk per
+                                      # stream and every off-by-one is invisible, while san-miguel's 67 MB index
+                                      # stream chunks by ACCIDENT. FR_VK_STAGE=<bytes> caps the ring, so
+                                      # FR_VK_STAGE=64k puts every stream on any scene through the chunked path;
+                                      # measured procedural 16 -> 88 submits with every gate's number IDENTICAL
+                                      # (radiance 0.045%, same-seed image 0.00e0, hemi 0.0067/3.02%, replay all
+                                      # zero). BYTES rather than the MiB the first draft took — the procedural
+                                      # scene's largest stream is under 1 MB, so a 1 MiB floor armed the lever
+                                      # and chunked nothing (13 submits before and after): an instrument at the
+                                      # wrong RESOLUTION cannot see what it was built for, the v1.5.3 lab lesson
+                                      # in a third currency.
+                                      # GATED IN TWO PLACES because neither reaches the other's failures.
+                                      # V0 runs vk::stage::self_test (pure, device-free, beside the device pick)
+                                      # over the CHUNK PLAN — coverage, byte-vs-element offsets, the ragged
+                                      # tail, the empty stream, a ring that is not a multiple of the element
+                                      # size (must round DOWN), and the oversized-element case where the loop's
+                                      # own `.max(1)` keeps it terminating and would overrun the mapping, which
+                                      # is why stream_gen refuses that configuration outright rather than
+                                      # trusting the plan. The loop CONSUMES `plan` rather than repeating it, so
+                                      # the gate scores the shipping code and not a parallel description of it.
+                                      # TEETH, both exercised: an offset in elements instead of bytes fails V0
+                                      # on every scene AND loses the device under FR_VK_STAGE=64k (a copy past
+                                      # the destination) while passing every device gate at the default ring —
+                                      # the coverage argument, demonstrated; a dropped tail chunk fails V0 plus
+                                      # four V6/V7 gates (class-mismatch 341393, radiance 85.194%, rtgi rays 0).
+                                      # The V6 line reports staged BYTES and SUBMITS split three ways
+                                      # (scene/textures/trees) for the reason the texture line reports bytes: a
+                                      # mapped upload and a staged one allocate the same buffers and render the
+                                      # same frame, so only the byte total tells them apart — and the chunk
+                                      # count is additionally what says whether the multi-chunk path ran at all.
+                                      # TWO SHARED-CORE MOVES FELL OUT, both the gpu_bvh_node shape: gfx::scene
+                                      # gains stream_bytes (the ring's sizing rule, beside the wire formats it
+                                      # counts — GpuMat's own size is a term, so a copy next to one backend's
+                                      # ring goes stale when the material struct grows; gpu/trace.rs imports it
+                                      # under its old local name) and ftree gains quantize_node/bnode_at, so the
+                                      # wide tree streams a node at a time while D3D12 keeps materializing —
+                                      # one per-node CONVERSION, two iterations. `quantized()` is now that
+                                      # function in a map, so the two cannot diverge.
+                                      # MEASURED (RADV, 800x600): procedural staged 4.7 MB in 16 submits,
+                                      # san-miguel-low-poly 929.6 MB in 29 (scene 327.2/16 — three of those
+                                      # chunked — textures 511.5/10, trees 90.8/3), rungholt 702.6/24,
+                                      # Sponza 507.2/24, vokselia 203.7/17, the helmet 107.7/18. Six scenes,
+                                      # both FR_VK_RES parities, --sw-rays (cuts 449, fallback 0, 768/768
+                                      # frontiers at 468.8 rays/handle — M3g's numbers to the digit),
+                                      # --no-ftree, --no-wide-levels and llvmpipe all unmoved; and the same
+                                      # 929.6 MB through a 64 KB ring is 6735 submits with every number
+                                      # IDENTICAL (radiance 0.006%, image 7.47e-9, hemi 0.97%) — the
+                                      # chunking proof at a scale no default configuration reaches.
+                                      # M3i — THE REAL --blas-split (2026-08-11), the last of vk/scene.rs's M3b
+                                      # boundaries and the one with a known hazard behind it: one BLAS per maximal BVH
+                                      # subtree under the cap, each instanced identity with InstanceID = the chunk
+                                      # index, built worst-case with ALLOW_COMPACTION and compacted into an exact-size
+                                      # arena. NO SHADER CHANGES AT ALL — `BLAS_SPLIT` was already compiled in (the
+                                      # lever is on by default), `tri_of(inst, prim) = blas_tri[chunk_base[inst] +
+                                      # prim]` was already the intersector's rule on both backends, and the tracer
+                                      # already bound both streams; M3b simply filled them with the single-chunk
+                                      # values. So this is one file, and the planner (`blas_split::plan`), the vertex
+                                      # WINDOWING (`plan_windows` / SPLIT_INDEX_CEILING — the RDNA4 index-value
+                                      # workaround, which ships here rather than staying D3D12-only because it is a
+                                      # property of the geometry desc, and because the defect was found on AMD
+                                      # hardware this backend also runs on) and every structural contract they satisfy
+                                      # are the SHARED pure code `--check` already gates.
+                                      # THE MEASUREMENT IS THE WHOLE POINT, and it reproduces the D3D12 rationale
+                                      # from the other API: BLAS scratch is sized by the LARGEST SINGLE GEOMETRY, so
+                                      # san-miguel-low-poly (5.6M tris) asks **665 MB of transient scratch as one
+                                      # BLAS and 7 MB as 198 chunks** — a 95x cut — while the COMPACTED result is the
+                                      # same size either way (650 vs 648 MB). That is the number the Intel
+                                      # device-removal note predicts (one 34.4M-tri BLAS asked 1891 MB and removed the
+                                      # device); nothing here has been run at that scale, but the shape is confirmed.
+                                      # BOTH ARMS COMPACT, and that is deliberate rather than incidental: the unarmed
+                                      # `--no-blas-split` arm goes through the SAME `build_blas_set`, because with it
+                                      # on a separate uncompacted path its size report would be a worst-case number
+                                      # sitting beside the split's compacted one, and the A/B those two lines invite
+                                      # would read a COMPACTION win as a SPLIT win (measured on the procedural scene
+                                      # before the refactor: 8 MB split vs 12 MB single, of which the entire
+                                      # difference was compaction — both arms read `compacted from 12`).
+                                      # THREE VULKAN SPELLINGS, all of them the same shape as D3D12's: the arena is
+                                      # one buffer with each structure created as a VIEW at a 256-byte-aligned offset
+                                      # (`VkAccelerationStructureCreateInfoKHR::offset`, the same number D3D12 spells
+                                      # `..._BYTE_ALIGNMENT`); the compacted sizes come from a
+                                      # `ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR` query pool
+                                      # (`cmd_write_acceleration_structures_properties` after the builds, read with
+                                      # `TYPE_64 | WAIT`) rather than D3D12's postbuild-info buffer; and builds run
+                                      # SERIALLY through one shared scratch with an AS_WRITE -> AS_READ|WRITE barrier
+                                      # between them, which IS the serialization the sharing requires and not an
+                                      # optimization to remove. ONE DELIBERATE ABSENCE: no VRAM pre-flight. That check
+                                      # exists on D3D12 because WDDM silently DEMOTES an over-budget commit to system
+                                      # memory and renders at a tenth the speed; here `vkAllocateMemory` returns
+                                      # OUT_OF_DEVICE_MEMORY and `Vk::buffer` makes it a loud failure, so the
+                                      # quiet-wrong outcome the pre-flight guards against does not exist
+                                      # (VK_EXT_memory_budget is the instrument if a predictive one is ever wanted).
+                                      # STILL NOT DONE, both because their consumer does not exist here:
+                                      # `--dxr-sbt`'s `refine_by_class` (the class index means something only to a
+                                      # ray-tracing PIPELINE's SBT, and this backend has RayQuery and nothing else)
+                                      # and `--foliage-sway`'s animated TLAS ring (D3D12's STATIC TLAS holds every
+                                      # chunk at identity, which is the rest pose every headless gate traces, so this
+                                      # builds exactly that and never calls `foliage::split_plan` — the two backends'
+                                      # PARTITIONS therefore differ chunk for chunk on a swaying scene and their
+                                      # IMAGES do not, because `tri_of` follows whatever partition it was handed).
+                                      # THE COVERAGE LEVER ALREADY EXISTED, which is the one place this was easier
+                                      # than M3h: `--blas-split N` is a CLI flag, so any scene reaches the multi-chunk
+                                      # path (procedural 80k tris reads 2 chunks at the 64k default, 230 at 512, 1811
+                                      # at 64). V6 gains the `--check-gpu`/`--check-dxr` anti-vacuity twin — an armed
+                                      # cap that produced ONE chunk on an OVER-cap scene FAILS (every hit lands in
+                                      # instance 0 and `chunk_base[0]` is 0, so a wrong arena offset, a wrong window
+                                      # and a wrong instance id all still read right), while an under-cap scene is a
+                                      # NOTE — plus a `V6 blas-split:` line carrying chunks, prims min/mean/max, and
+                                      # the compacted/uncompacted/scratch sizes.
+                                      # FR_SPLIT_AUDIT=1 IS PORTED (the bistro-dusk shard hunt's instrument): read
+                                      # blas_tri, chunk_base and the reordered index stream straight back and memcmp
+                                      # against the CPU plan, so "the GPU sees wrong remap DATA" is answerable without
+                                      # touching a shader — on both backends, because the question is about the
+                                      # STREAM and the two backends stream differently. It cost one bit in
+                                      # `vk::stage`: every staged buffer now carries TRANSFER_SRC, UNCONDITIONALLY
+                                      # rather than under the lever, because a diagnostic that only runs against a
+                                      # specially-built buffer set has a subject that is not the shipping
+                                      # configuration. Found by running it — the validation layer named the missing
+                                      # usage bit exactly, the `--gpu-debug` lesson yet again.
+                                      # MEASURED (RADV, 800x600, 18 arms, 0 failures): chunks at the 64k default read
+                                      # procedural 2, --stress 200 3, Sponza 10, vokselia 52, rungholt 161, smlp 198,
+                                      # the helmet 1 (under cap — the NOTE); compaction is 850 -> 648 MB on smlp,
+                                      # 1014 -> 674 on rungholt, 283 -> 185 on vokselia. EVERY SCENE'S RADIANCE A/B
+                                      # IS UNMOVED TO THE DIGIT from the pre-split recording (0.045 / 0.008 / 0.020 /
+                                      # 0.007 / 0.007 / 0.022 / 0.006%), and unmoved ACROSS caps (smlp reads 0.006%
+                                      # at 65536, at 4096, and at --no-blas-split). Both FR_VK_RES parities,
+                                      # --sw-rays, --no-ftree, --no-wide-levels and llvmpipe all pass; llvmpipe
+                                      # additionally EXERCISES the degenerate-compaction branch for free (it reports
+                                      # no size reduction, so every chunk takes the CLONE arm — `compacted from 7` at
+                                      # 7 MB).
+                                      # ONE REAL EFFECT, and it attributes cleanly: the split perturbs V7's same-seed
+                                      # image ONLY on CANDIDATE-LOOP scenes. vokselia at 52 chunks reads EXACT 0.00e0
+                                      # with 0 hot channels, and so do the helmet and the procedural scene at every
+                                      # cap — an opaque scene has no candidate loop, so re-partitioning changes
+                                      # nothing at all. The cutout/tint scenes move a handful of channels and the
+                                      # count grows with the chunk count: smlp 7.47e-9 / 0 hot at --no-blas-split ->
+                                      # 2.76e-8 / 2 hot at 198 chunks -> 6.32e-8 / 4 hot at 2053; rungholt 3.25e-9 / 0
+                                      # -> 5.99e-8 / 3. That is the DOCUMENTED two-intersector class with a second
+                                      # source added: an alpha/tint candidate loop's enumeration order depends on the
+                                      # acceleration structure's partition exactly as it already depended on TMin, so
+                                      # a triangle at a chunk boundary can be surfaced in a different order. It is why
+                                      # the gate is a bounded hot COUNT rather than an absolute limit (4 channels of
+                                      # 1.44M), and why M3c's recorded 7.47e-9/3.25e-9 are now the --no-blas-split
+                                      # numbers rather than the default ones.
+                                      # TEETH, three planted and exercised: every instance reporting InstanceID 0 (the
+                                      # M3b bug's exact shape) takes radiance 0.045% -> **17.932%** while the
+                                      # VISIBILITY gate stays perfectly clean at class-mismatch 0 — the reason that
+                                      # bug survived its first run, reproduced deliberately; unaligned arena offsets
+                                      # are named by validation (`offset (20288) must be a multiple of 256`); and
+                                      # rebasing a chunk's indices WITHOUT sliding its vertex window reads 341148 of
+                                      # 341393 hit pixels wrong at radiance 60.520%. A fourth (every chunk pointed at
+                                      # the first chunk's index slice) HUNG the build rather than failing, which is
+                                      # its own answer: garbage vertex ids make absurd AABBs.
+                                      # M3j — BC7, IN BOTH ARMS (2026-08-11), and the reason it is not
+                                      # "purely a memory question" the way the plan filed it. The
+                                      # session default is `Gpu(Fast)`, so a backend with only the ispc
+                                      # arm would have to choose, for its DEFAULT session, between a
+                                      # ~20-second encode stall and silently ignoring the flag — and
+                                      # D3D12's own rule is that neither is acceptable (an encoder that
+                                      # fails to construct falls back LOUDLY to RGBA8, never to an
+                                      # implicit CPU encode). So the GPU encoder is the port, and the
+                                      # CPU arm rides along as the independent cross-check it is there.
+                                      # THE KERNEL IS NOT PORTED. `shaders/bc7enc.hlsl` compiles to
+                                      # SPIR-V exactly as it compiles to DXIL, and the ONE thing a
+                                      # second host cost it is a byte-offset WINDOW (`src_off`/
+                                      # `dst_off`, ex-`_pad` plus one dword): D3D12 slides root SRV/UAV
+                                      # virtual addresses per band, while Vulkan binds one descriptor
+                                      # per buffer for a whole batch of levels and moves the window in
+                                      # the constants — a per-dispatch descriptor rebind would be a
+                                      # descriptor-set allocation per mip, and a dynamic-offset binding
+                                      # would make the DERIVED layout special-case one slot. D3D12
+                                      # passes 0 for both, which is exact integer arithmetic, so both
+                                      # hosts encode the same blocks (`Num32BitValues` 8 -> 9 is the
+                                      # whole D3D12-side change). `Quality::effort` moved to src/bc7.rs
+                                      # for the same reason: one kernel, two hosts, one table.
+                                      # THREE DIFFERENCES FROM THE D3D12 HOST, and only three.
+                                      # (a) NO BANDING — that path exists because an upload heap's rows
+                                      # are 256-byte-pitch-aligned and one 4K mip does not fit a ring;
+                                      # here the texture batch loop already guarantees a whole chain
+                                      # fits, so one dispatch covers a whole level at a TIGHT `mw * 4`
+                                      # source pitch and the kernel's own clamp edge-replicates the
+                                      # bottom and right edges (which is what makes a non-4-aligned mip
+                                      # legal). (b) THE CONSTANTS ARE A UNIFORM BUFFER — DXC has no flag
+                                      # to promote a cbuffer to push constants and `[[vk::push_constant]]`
+                                      # would be an HLSL edit — rewritten between dispatches with
+                                      # `vkCmdUpdateBuffer` and carrying the ladder's own lesson: BOTH
+                                      # barriers, because a per-dispatch constant block needs a
+                                      # WRITE-AFTER-READ edge as well as the read-after-write one. The
+                                      # price is that a batch's dispatches SERIALIZE, which is fine (a
+                                      # 4K level is a million blocks and fills the machine alone) and
+                                      # cheaper than a descriptor set per mip. (c) TIGHT BLOCK ROWS —
+                                      # `row_blocks` is `bw`, not the 256-byte-aligned `block_pitch`,
+                                      # because `vkCmdCopyBufferToImage` takes `bufferRowLength` in
+                                      # TEXELS with no pitch to honour, so the shear trap the kernel's
+                                      # header names cannot arise here. MEASURED, and worth not
+                                      # re-deriving: an explicit `blocks(w) * 4` row length is EXACTLY
+                                      # equivalent to 0 for a compressed image (a zero row length is
+                                      # "tightly packed per imageExtent", and that already rounds up to
+                                      # whole blocks) — the explicit form is documentation, not a fix.
+                                      # What is NOT free is the OFFSET: every staged level is padded to
+                                      # 16 B, and a 4-aligned one is a validation error naming the copy.
+                                      # NOTHING ABOUT THE DECISION IS RE-MADE: `bc7::should_compress` is
+                                      # called verbatim, carve-out included — alpha-masked cutout masks
+                                      # and height-carrying relief fields stay exact RGBA8 because the
+                                      # intersector `.Load()`s a hard threshold out of them, which is a
+                                      # VISIBILITY contract rather than a per-backend quality choice —
+                                      # and `Texture::srgb` picks `BC7_SRGB_BLOCK` vs `BC7_UNORM_BLOCK`
+                                      # exactly as it picks `_SRGB` vs `_UNORM`. `textureCompressionBC`
+                                      # is the second ENABLED-WHEN-PRESENT core feature beside
+                                      # `samplerAnisotropy`, and for the same reason: its absence lands
+                                      # on `--no-bc7`, a shipping arm, rather than on a degradation
+                                      # invented here. (On D3D12 neither is a feature bit at all —
+                                      # anisotropy is a static sampler and BC7 is a format — so this is
+                                      # one of the few places the two APIs' SHAPES differ rather than
+                                      # their spelling.) The staging ring gained `STORAGE_BUFFER` usage
+                                      # unconditionally, since the encoder reads it IN PLACE the way
+                                      # D3D12's arm reads its upload heap as a root SRV; found by
+                                      # running it and reading the validation layer, the FR_SPLIT_AUDIT
+                                      # lesson repeated one commit later.
+                                      # THE BATCH LOOP GAINED A SECOND BUDGET, and it is not the obvious
+                                      # one: a batch is bounded by the ring in SOURCE bytes and by the
+                                      # block buffer in ENCODED bytes, and encoded is NOT simply a
+                                      # quarter of source — a 1x1 mip is 4 raw bytes and a whole 16-byte
+                                      # block, so a table of tiny textures encodes to FOUR TIMES what it
+                                      # staged and would overrun a block buffer sized off the ring.
+                                      # V10 IS THE GATE, in two halves, and it exists because every
+                                      # other number in the suite is blind to the encoder. V6's radiance
+                                      # A/B is a 2% bar on a frame where textures are one term of the
+                                      # shading, and its texture anti-vacuity probe asks whether the
+                                      # table reached the shader, not whether its CONTENT survived —
+                                      # MEASURED: a kernel that ignores `src_off` moves that A/B to
+                                      # 1.132% and PASSES, while V10 reads 20.7 dB and fails. The
+                                      # STRUCTURAL half is synthetic (`--check-gpu`'s `bc7-gpu`
+                                      # transplanted, teeth for teeth: an all-even flat colour must
+                                      # round-trip BIT-EXACT through the hardware decoder, every block
+                                      # of a flat texture must be byte-identical to block 0, a gradient
+                                      # ramp must clear 30 dB at all four effort tiers, and a
+                                      # two-CLUSTER block must land within 6 LSB — which is what proves
+                                      # the mode-1 arm FIRED and that its partition/anchor tables agree
+                                      # with THIS hardware decoder), so it fires on every scene
+                                      # INCLUDING the untextured procedural default where the fidelity
+                                      # half has nothing to score. The FIDELITY half is M11's twin: the
+                                      # session's own arm over the scene's own textures, decoded back
+                                      # through `gfx::shaders::BC7_READ_HLSL` (moved out of gpu/trace.rs
+                                      # — two gates scoring one encoder against two hardware decoders
+                                      # must be reading the same text) into a plain BC7_UNORM image,
+                                      # never `_SRGB`: the kernel must see raw code values or the
+                                      # transfer function is charged to the encoder. RGB only, for M11's
+                                      # reason. The 25 dB bar is a WIRING bar — pitch/footprint/format
+                                      # errors land at 10-20 dB — and BOTH GATE PROBES ENCODE AT A
+                                      # NON-ZERO AND DIFFERENT src/dst WINDOW (16 and 32), because a
+                                      # gate that always passed 0 would score the kernel's arithmetic
+                                      # and never the one thing a second host added to it, and equal
+                                      # values would not separate a kernel that applied one offset to
+                                      # both.
+                                      # MEASURED (RADV, the 800x600 gate frame): DamagedHelmet 106.7 ->
+                                      # 42.7 MB (4 of 5 — the 5th is its n2h normal map, whose ALPHA is
+                                      # the relief field), Sponza 490.7 -> 230.7 (66 of 93),
+                                      # rungholt 42.7 -> 26.7 (1 of 2 — the other is its cutout
+                                      # atlas), vokselia 21.3 -> 21.3 (0 of 1: its ONE texture is the
+                                      # alpha-masked Minecraft atlas, so the carve-out excludes the
+                                      # whole table — a scene where BC7 is armed and correctly does
+                                      # nothing), san-miguel-low-poly 511.5 ->
+                                      # 405.6 (77 of 313 — the odd-dim carve-out, which is San Miguel's
+                                      # arbitrary-dim research scans and the same 63%-of-opaque-MB
+                                      # population the D3D12 note records). V10 structural reads flat
+                                      # bit-exact / ramp >= 39.6 dB at all four efforts / two-cluster
+                                      # 1 LSB on every scene and on llvmpipe; V10 fidelity reads worst
+                                      # 42.6 dB on the helmet and **32.0 dB on san-miguel** — the SAME
+                                      # worst-texture number D3D12's M11 records for its GPU arm at
+                                      # `fast`, one kernel scored through two vendors' decoders. The
+                                      # radiance A/B moves and stays tiny (helmet 0.020% unarmed ->
+                                      # 0.016% armed, both arms), which is the liveness signal: an
+                                      # encoder that produced nothing would leave it EXACTLY where
+                                      # `--no-bc7` does. AND llvmpipe READS THE SAME FIDELITY NUMBERS
+                                      # AS RADV TO THE DIGIT (helmet mean 0.414 LSB, max 82, worst 42.6
+                                      # dB): BC7 DECODE is spec-bit-exact, so identical numbers across
+                                      # two independent implementations say the ENCODER produced
+                                      # identical blocks — the M3e integrator result in another
+                                      # currency. Fifteen arms green (every scene, `--no-bc7`,
+                                      # `--bc7-cpu` on two scenes, `--bc7-quality slow`, `--sw-rays`,
+                                      # `FR_VK_STAGE=64k`, llvmpipe), zero validation errors.
+                                      # TEETH, three planted and exercised: a kernel ignoring `src_off`
+                                      # (V6 1.132% PASSES, V10 20.7 dB FAILS — the whole argument for
+                                      # the stage in one line), one ignoring `dst_off` (V6 2.604%, V10
+                                      # 18.4 dB), and staging offsets aligned to RGBA8's 4 instead of
+                                      # BC7's 16, which validation names exactly
+                                      # (VUID-vkCmdCopyBufferToImage-dstImage-07975). A fourth was
+                                      # planted and turned out to be a mathematical identity
+                                      # (`next_multiple_of(4)` IS `blocks(w) * 4` for every w), which is
+                                      # its own reminder that a tooth must be shown to bite.
                                       # V8 — THE HEMISPHERE BOUNCE TIERS, the last render-path arm the Vulkan
                                       # tracer did not have (M3e, 2026-08-11). The H key's AO and GI: the batched
                                       # hemi wavefront (root -> cell levels -> leaf rays) and the one cs_compose splat
@@ -6363,7 +6724,7 @@ cargo run --release -- --gpu --gpu-timing   # D3D12 timestamp queries around the
                                             # all (see Profiling)
 ```
 
-There are essentially no unit tests — the exception is **23 `#[cfg(test)]` SHADER-SOURCE gates, all of them in `gfx/shaders.rs`** (plus one field-coherence probe in `gfx/guides.rs`), run by `cargo test`, which CI runs alongside the executable suites. They assert ordering/monotonicity statements inside the HLSL that are load-bearing for soundness but that no CPU-only gate can reach (`--check-gpu`/`--check-dxr` need a real adapter). **They used to live in `gpu/trace.rs` and `gpu/dxr.rs`, i.e. inside `#[cfg(windows)]` modules, so a Linux `cargo test` reported "0 tests" and every one of these pins was simply absent** — they only ever assert things about `&'static str`s, so the platform gate was incidental, and moving the assembly to `gfx::shaders` in the Vulkan port's M1 is what un-stranded them (a test that cannot run where the developer works is a test that will rot). One packaging defect fell out of it and is fixed in `build.rs`: `intel_tex_2` ships precompiled objects referencing `__gxx_personality_v0` without asking for libstdc++, which `--release` hides via `--gc-sections` but which made ANY Linux `cargo test`/`cargo build` fail to link. The gates: the ftree overflow fallback rechecking stale distances before it lowers `best`, the empty-scene guards preceding the first `bvh_nodes[]` read, relief's full hardware interval + payload-carried logical bounds, and the continuation seam (LeafRec carries ONLY the opaque token, the leaf passes it through untouched, and the software provider validates it BEFORE its first `cut_pool[]` read — an ordering no CPU gate can see). Two of the 23 assert something else entirely and are flagged as such: `nrd_clean_room_tests` scans the four shader units we assemble for NVIDIA's distinctive NRD entry names — a LICENSE gate, not a soundness one, and the replacement for the physical impossibility the NRD submodule retired (see the `--nrd` entry). They are deliberately narrow — never assert formatting — and the live HLSL remains the executable specification. The same move retired one `--check` SKIP: **`gfx::frame::split_self_test`** (the dual-GPU tile-ownership arithmetic — the mask's bit math against the renderer's own midpoint-split rect geometry, the partition/complement contracts, the zero-share identity, and the `owns_px`-vs-`row_range` agreement sweep whose own doc records that nothing else checked it) is pure math that was hosted in `gpu/trace.rs`, so it never ran off Windows until `FrameCb` and `TileSplit` moved to `gfx::frame` — where they belong anyway, since the split IS 64 bits of that cbuffer. `gpu::dual::self_test` is the one gate that still SKIPs off Windows (it also drives `set_band` and a caps read, so it moves with `dual.rs`). **Otherwise `--check` is the test suite**: it renders a hybrid frame at **full depth and again through the depth-capped driver**, re-traces every pixel with a tmin=0 reference ray, and exits nonzero unless the `false-sky` and `tmin-overshoot` counters are exactly 0. In the capped pass, coarse (cell-flooded) pixels are excluded from every counter but must be > 0, and each capped tile's per-cell point samples (`KIND_LEAF`, see `sparse_fill`) ARE inside the gates like any leaf pixel and must also be > 0 whenever coarse pixels exist — proof the capped path ran (deterministic; no wall clock involved). It then warms a temporal cache with one frame and verifies five consumer passes the same way (static replay, forward dolly, dolly capped, dolly+yaw, pure yaw), asserting the temporal path demonstrably fired where that is structural (static: seeds and sky-tiles > 0; dolly and dolly-capped: seeds > 0; pure yaw: sky-tiles > 0). **`bvh::empty_self_test`** (the `empty-bvh` gate) covers the degenerate scene: a zero-triangle build must be an empty depth-0 hierarchy, and every scalar and cut-seeded traversal entry point must take its CLEAR-SPACE identity — `intersect`/`intersect_multi` `None`, `occluded`/`occluded_multi` `false`, `transmittance`/`transmittance_multi` exactly `Vec3A::ONE`, `nearest_geometry_distance_within` `None`, `refine_cut` empty — **without visiting a node**, which is what the gate actually asserts (`visits == 0`) and what a deliberately invalid `[u32::MAX]` root proves it does before dereferencing a caller-supplied id. That matters because the empty build is a COUNT-ZERO SENTINEL root, which is indistinguishable from an internal node to any consumer that reads it: on the GPU the same job is done at compile time by `trace::empty_defs`' `#define SCENE_EMPTY` (frustum.hlsli's `bound_query`/`refine_cut` and rt_sw.hlsli's three primitives return their identities ahead of the first `bvh_nodes[]` read; the wide tree instead ships one physically-present zero-occupancy root, see the two-tree bullet). The bounce integrators get the same treatment on a deterministic probe set: `sphcell::self_test` (closed-form Ω/PSA identities, exact partition, in-cell sampling), hemisphere AO and GI gates (`psa-viol`, `false-empty`, `tmin-overshoot`, `cut-miss` — all exactly 0) plus A/Bs against high-sample cosine references (AO: mean |Δ| < 0.02 and signed mean < 0.005 — the estimator is unbiased; GI: mean rel < 5% vs a reference running the same depth-1 policy `hemi::BOUNCE_Q` — that reference must integrate `sky::dome`, in lockstep with `hemi.rs`'s leaf miss, or it is scoring two different functions). The one-sky model has two closed-form gates: **`sh::self_test`** (basis orthonormality — projecting each band must return a unit coefficient, which pins every constant; the uniform-sky convention pin, radiance L in ⇒ exactly L out, which is what makes SH irradiance a drop-in for the old `AMBIENT · ao` and comparable to `hemi::gi`; accuracy vs a brute-force cosine-weighted reference, measured 0.035% mean / 0.188% worst; and projection determinism, since the byte-identical-build contract depends on it) and **`sky::self_test`** (the disc's radiance↔irradiance round-trip — the classic place to be off by 4π; cone sampling staying inside AND covering the disc; the disc test agreeing with the cone the sampler draws from; **the dome carrying no disc**, tested RELATIVE to the disc's own radiance since the Mie aureole legitimately peaks well above the dome's average; and the resulting ambient landing in a physically sane, blue-dominant band — the gate that pins `DOME_SCALE`). **Hemi sharing** gets its own family on 2×2 probe groups built under the renderer's exact predicate: the four zero-counters re-run PER MEMBER (each member re-validates the rep's folded empty claims, every leaf-ray tmin, and every recorded-cut traversal from ITS OWN apex), a paired same-seed shared-vs-unshared A/B (identical rng streams make common rays — fireflies included — cancel exactly; AO mean Δ < 0.005, GI rel Δ < 0.01; an unpaired construction was tried and measured the baseline estimator's firefly skew, not the sharing), same-seed share-on frame determinism and an fb-ao replay-vs-trace bit-identity pass (both with groups > 0 anti-vacuity), and `hemi-ao/gi (share off/on)` bench rows whose must-fires (groups > 0, fallbacks > 0, strictly fewer hemi queries) double as the KILL CRITERION guard: if share-on is not measurably faster on both the default scene and `--stress 5000`, the feature does not merge. Run it after any change to `frustum.rs`, `bvh.rs`, `render.rs`, `camera.rs`, `temporal.rs`, `hemi.rs`, `sky.rs`, `sh.rs`, `sphcell.rs`, or `shade.rs`. It also A/B benchmarks hybrid vs hemi-ao vs hemi-gi vs plain with node/ray counters and smoke-tests depth-capped dynamic frames at several caps. Three temporal-reuse gate families follow: **structure replay** (exact terminal pixel accounting; replay-vs-trace bit-identity of tbuf/info/accum at frame 0 AND at a warm jittered frame 1; a post-replay dolly verify on the frozen producer cache), the **claim ring** (exact pan-back must-fire ring hits — off the newest screen, answered verbatim by an older entry — plus a near-pose correctness pass), and the **query skip** (T1/T2 adoption must-fires; a 4-step dolly chain where the age cap must force requeries by step 4, every step reference-verified; and `dolly warm (adopt off/on)` A/B rows at preset q and 1-spp — the kill-criterion regression guard). **Multi-sampling** (`--spp`) gets its own `spp` gate family, at a FIXED spp=4 so a plain `--check` can never stop exercising it: the frame is rendered once per sample with `primary_sample = k` (the sample whose t lands in tbuf) and `verify_sampled` re-traces THAT sample's ray from tmin=0 — `false-sky`/`tmin-overshoot`/`hybrid-extra` exactly 0 for every k, which is the proof that an extra sample may ride the inherited t_start/cut (it is the same bug class, so it gets the same reference-ray proof); an accounting must-fire (primary rays exactly ×spp while frustum queries/nodes/tiles stay BIT-IDENTICAL — that inequality IS the amortization claim, and a regression there means multi-sampling started re-tracing the quadtree); a stability must-fire (mean inter-frame |Δ| strictly lower at spp=4 — if it isn't measurably quieter it isn't doing its job; structural, default scene); a pure-math distinctness gate (all MAX_SPP sub-pixel positions pairwise distinct — the Halton index must not wrap) plus a verify pass of the LAST sample at spp = MAX_SPP (the edge of the GPU's CB jitter table, invisible at spp=4); and an `spp=1|2|4|8|16` sweep whose printed cost-model fit (`ms(n) = F + m·n`) is where the "when do the returns stop" answer comes from. `--check-gpu` and `--check-dxr` carry the GPU halves (the same probe sweep — on the wavefront with the exact-zero gates AND the same-seed wavefront-vs-reference image A/B re-run at spp=4; on DXR as a per-sample CPU-vs-GPU t compare, which is what pins the CB's Halton jitter table to `dlss::jitter_for_sample`), plus interleaved-median spp bench rows (that row is warm-clock noisy — a cold first row can "measure" a physically impossible speedup). **The spp image A/B is gated RELATIVE to the image's own magnitude (mean |Δ| / mean |ref| < 1e-4), never absolutely** — and this is a correctness property of the gate, not a convenience. At spp=1 the two kernels are BIT-IDENTICAL; the divergence at spp>1 is per-sample fp rounding between two compile units' summations, which averages DOWN ~1/√N (the signature of independent rounding noise, not a bias) and scales with scene RADIANCE. So an absolute limit is a different limit on every scene: the original 1e-5 passed the default scene by 15% and failed `--stress 5000` outright (mean 1.46e-5) for no reason but that the stress field is brighter. The relative error is flat across scenes and vendors (default 1.95e-5, San Miguel 1.93e-5, stress 2.34e-5 NVIDIA / 2.69e-5 AMD — all at spp=4, the worst spp), so 1e-4 sits ~3.7× above the worst fp noise and ~100× below the ~1e-2 a real shading divergence produces. Gate-teeth are pinned: injecting a 0.1% error into the reference kernel's shade fails it at rel 1.02e-3 while the hot-channel count stays 0 — a systematic bias is invisible to the max/hot half and caught only by the relative mean, which is why BOTH halves exist. `--check --stress n` runs the same suite on the n-object stress field (deterministic sin-hash placement, `scene::stress_scene`) with the zero-counter gates intact but the "must fire" structural assertions skipped — those are tuned to the default scene's topology. Loaded OBJ scenes (`model.obj --check`) get the same structural skip: a real scene can lack the required features outright (a skyless view can't fire sky-tiles; a dense view legitimately overflows the replay recording arena), while the zero-counter gates run everywhere. **The rendered frame follows that same `structural` predicate, and this is a trap that bit once and is now closed by construction.** `check.png` / `check_gi.png` are TRACKED goldens — the *default* scene's frame, byte-compared by hand, and several features' bit-identity claims rest on nothing but a `git status` after a suite run. Every `--check` flavor used to write them, so `san-miguel-low-poly.obj --check` silently replaced the golden with San Miguel's frame and produced a `git status` that looks EXACTLY like a regression and is not one (the recovery is to re-run the plain `--check`, but only if you realize that is what happened). So a non-default scene now writes `check-<tag>.png` / `check-<tag>_gi.png` instead — `check-world`, `check-stress5000`, `check-san-miguel-low-poly`, `check-<stem>-tile2x2` — gitignored under `/check-*.png` (the goldens use `_`, the tagged files use `-`, which is what separates them), with the "wrote" line naming the files and saying the goldens were left alone. The asymmetry is deliberate and is not "never overwrite the golden": a DEFAULT-scene run still writes it under any lever, because a diff there is either a regression or a deliberate RE-BASELINE (the RTGI default flip was exactly that) and both are the signal you want. What can never be a golden is another scene's frame. **Consequence for A/B measurements on a loaded scene** (the `--no-slope-mips` liveness proof is one): the tagged file is gitignored, so "did the image move" is a hash compare between two runs, not a `git status` — which is the honest instrument anyway, since a scene with no committed baseline never had one.
+There are essentially no unit tests — the exception is **25 `#[cfg(test)]` SHADER-SOURCE gates, all of them in `gfx/shaders.rs`** (plus one field-coherence probe in `gfx/guides.rs`), run by `cargo test`, which CI runs alongside the executable suites. They assert ordering/monotonicity statements inside the HLSL that are load-bearing for soundness but that no CPU-only gate can reach (`--check-gpu`/`--check-dxr` need a real adapter). **They used to live in `gpu/trace.rs` and `gpu/dxr.rs`, i.e. inside `#[cfg(windows)]` modules, so a Linux `cargo test` reported "0 tests" and every one of these pins was simply absent** — they only ever assert things about `&'static str`s, so the platform gate was incidental, and moving the assembly to `gfx::shaders` in the Vulkan port's M1 is what un-stranded them (a test that cannot run where the developer works is a test that will rot). One packaging defect fell out of it and is fixed in `build.rs`: `intel_tex_2` ships precompiled objects referencing `__gxx_personality_v0` without asking for libstdc++, which `--release` hides via `--gc-sections` but which made ANY Linux `cargo test`/`cargo build` fail to link. The gates: the ftree overflow fallback rechecking stale distances before it lowers `best`, the empty-scene guards preceding the first `bvh_nodes[]` read, relief's full hardware interval + payload-carried logical bounds, and the continuation seam (LeafRec carries ONLY the opaque token, the leaf passes it through untouched, and the software provider validates it BEFORE its first `cut_pool[]` read — an ordering no CPU gate can see). Two of the 25 assert something else entirely and are flagged as such: `nrd_clean_room_tests` scans the four shader units we assemble for NVIDIA's distinctive NRD entry names — a LICENSE gate, not a soundness one, and the replacement for the physical impossibility the NRD submodule retired (see the `--nrd` entry). They are deliberately narrow — never assert formatting — and the live HLSL remains the executable specification. The same move retired one `--check` SKIP: **`gfx::frame::split_self_test`** (the dual-GPU tile-ownership arithmetic — the mask's bit math against the renderer's own midpoint-split rect geometry, the partition/complement contracts, the zero-share identity, and the `owns_px`-vs-`row_range` agreement sweep whose own doc records that nothing else checked it) is pure math that was hosted in `gpu/trace.rs`, so it never ran off Windows until `FrameCb` and `TileSplit` moved to `gfx::frame` — where they belong anyway, since the split IS 64 bits of that cbuffer. `gpu::dual::self_test` is the one gate that still SKIPs off Windows (it also drives `set_band` and a caps read, so it moves with `dual.rs`). **Otherwise `--check` is the test suite**: it renders a hybrid frame at **full depth and again through the depth-capped driver**, re-traces every pixel with a tmin=0 reference ray, and exits nonzero unless the `false-sky` and `tmin-overshoot` counters are exactly 0. In the capped pass, coarse (cell-flooded) pixels are excluded from every counter but must be > 0, and each capped tile's per-cell point samples (`KIND_LEAF`, see `sparse_fill`) ARE inside the gates like any leaf pixel and must also be > 0 whenever coarse pixels exist — proof the capped path ran (deterministic; no wall clock involved). It then warms a temporal cache with one frame and verifies five consumer passes the same way (static replay, forward dolly, dolly capped, dolly+yaw, pure yaw), asserting the temporal path demonstrably fired where that is structural (static: seeds and sky-tiles > 0; dolly and dolly-capped: seeds > 0; pure yaw: sky-tiles > 0). **`bvh::empty_self_test`** (the `empty-bvh` gate) covers the degenerate scene: a zero-triangle build must be an empty depth-0 hierarchy, and every scalar and cut-seeded traversal entry point must take its CLEAR-SPACE identity — `intersect`/`intersect_multi` `None`, `occluded`/`occluded_multi` `false`, `transmittance`/`transmittance_multi` exactly `Vec3A::ONE`, `nearest_geometry_distance_within` `None`, `refine_cut` empty — **without visiting a node**, which is what the gate actually asserts (`visits == 0`) and what a deliberately invalid `[u32::MAX]` root proves it does before dereferencing a caller-supplied id. That matters because the empty build is a COUNT-ZERO SENTINEL root, which is indistinguishable from an internal node to any consumer that reads it: on the GPU the same job is done at compile time by `trace::empty_defs`' `#define SCENE_EMPTY` (frustum.hlsli's `bound_query`/`refine_cut` and rt_sw.hlsli's three primitives return their identities ahead of the first `bvh_nodes[]` read; the wide tree instead ships one physically-present zero-occupancy root, see the two-tree bullet). The bounce integrators get the same treatment on a deterministic probe set: `sphcell::self_test` (closed-form Ω/PSA identities, exact partition, in-cell sampling), hemisphere AO and GI gates (`psa-viol`, `false-empty`, `tmin-overshoot`, `cut-miss` — all exactly 0) plus A/Bs against high-sample cosine references (AO: mean |Δ| < 0.02 and signed mean < 0.005 — the estimator is unbiased; GI: mean rel < 5% vs a reference running the same depth-1 policy `hemi::BOUNCE_Q` — that reference must integrate `sky::dome`, in lockstep with `hemi.rs`'s leaf miss, or it is scoring two different functions). The one-sky model has two closed-form gates: **`sh::self_test`** (basis orthonormality — projecting each band must return a unit coefficient, which pins every constant; the uniform-sky convention pin, radiance L in ⇒ exactly L out, which is what makes SH irradiance a drop-in for the old `AMBIENT · ao` and comparable to `hemi::gi`; accuracy vs a brute-force cosine-weighted reference, measured 0.035% mean / 0.188% worst; and projection determinism, since the byte-identical-build contract depends on it) and **`sky::self_test`** (the disc's radiance↔irradiance round-trip — the classic place to be off by 4π; cone sampling staying inside AND covering the disc; the disc test agreeing with the cone the sampler draws from; **the dome carrying no disc**, tested RELATIVE to the disc's own radiance since the Mie aureole legitimately peaks well above the dome's average; and the resulting ambient landing in a physically sane, blue-dominant band — the gate that pins `DOME_SCALE`). **Hemi sharing** gets its own family on 2×2 probe groups built under the renderer's exact predicate: the four zero-counters re-run PER MEMBER (each member re-validates the rep's folded empty claims, every leaf-ray tmin, and every recorded-cut traversal from ITS OWN apex), a paired same-seed shared-vs-unshared A/B (identical rng streams make common rays — fireflies included — cancel exactly; AO mean Δ < 0.005, GI rel Δ < 0.01; an unpaired construction was tried and measured the baseline estimator's firefly skew, not the sharing), same-seed share-on frame determinism and an fb-ao replay-vs-trace bit-identity pass (both with groups > 0 anti-vacuity), and `hemi-ao/gi (share off/on)` bench rows whose must-fires (groups > 0, fallbacks > 0, strictly fewer hemi queries) double as the KILL CRITERION guard: if share-on is not measurably faster on both the default scene and `--stress 5000`, the feature does not merge. Run it after any change to `frustum.rs`, `bvh.rs`, `render.rs`, `camera.rs`, `temporal.rs`, `hemi.rs`, `sky.rs`, `sh.rs`, `sphcell.rs`, or `shade.rs`. It also A/B benchmarks hybrid vs hemi-ao vs hemi-gi vs plain with node/ray counters and smoke-tests depth-capped dynamic frames at several caps. Three temporal-reuse gate families follow: **structure replay** (exact terminal pixel accounting; replay-vs-trace bit-identity of tbuf/info/accum at frame 0 AND at a warm jittered frame 1; a post-replay dolly verify on the frozen producer cache), the **claim ring** (exact pan-back must-fire ring hits — off the newest screen, answered verbatim by an older entry — plus a near-pose correctness pass), and the **query skip** (T1/T2 adoption must-fires; a 4-step dolly chain where the age cap must force requeries by step 4, every step reference-verified; and `dolly warm (adopt off/on)` A/B rows at preset q and 1-spp — the kill-criterion regression guard). **Multi-sampling** (`--spp`) gets its own `spp` gate family, at a FIXED spp=4 so a plain `--check` can never stop exercising it: the frame is rendered once per sample with `primary_sample = k` (the sample whose t lands in tbuf) and `verify_sampled` re-traces THAT sample's ray from tmin=0 — `false-sky`/`tmin-overshoot`/`hybrid-extra` exactly 0 for every k, which is the proof that an extra sample may ride the inherited t_start/cut (it is the same bug class, so it gets the same reference-ray proof); an accounting must-fire (primary rays exactly ×spp while frustum queries/nodes/tiles stay BIT-IDENTICAL — that inequality IS the amortization claim, and a regression there means multi-sampling started re-tracing the quadtree); a stability must-fire (mean inter-frame |Δ| strictly lower at spp=4 — if it isn't measurably quieter it isn't doing its job; structural, default scene); a pure-math distinctness gate (all MAX_SPP sub-pixel positions pairwise distinct — the Halton index must not wrap) plus a verify pass of the LAST sample at spp = MAX_SPP (the edge of the GPU's CB jitter table, invisible at spp=4); and an `spp=1|2|4|8|16` sweep whose printed cost-model fit (`ms(n) = F + m·n`) is where the "when do the returns stop" answer comes from. `--check-gpu` and `--check-dxr` carry the GPU halves (the same probe sweep — on the wavefront with the exact-zero gates AND the same-seed wavefront-vs-reference image A/B re-run at spp=4; on DXR as a per-sample CPU-vs-GPU t compare, which is what pins the CB's Halton jitter table to `dlss::jitter_for_sample`), plus interleaved-median spp bench rows (that row is warm-clock noisy — a cold first row can "measure" a physically impossible speedup). **The spp image A/B is gated RELATIVE to the image's own magnitude (mean |Δ| / mean |ref| < 1e-4), never absolutely** — and this is a correctness property of the gate, not a convenience. At spp=1 the two kernels are BIT-IDENTICAL; the divergence at spp>1 is per-sample fp rounding between two compile units' summations, which averages DOWN ~1/√N (the signature of independent rounding noise, not a bias) and scales with scene RADIANCE. So an absolute limit is a different limit on every scene: the original 1e-5 passed the default scene by 15% and failed `--stress 5000` outright (mean 1.46e-5) for no reason but that the stress field is brighter. The relative error is flat across scenes and vendors (default 1.95e-5, San Miguel 1.93e-5, stress 2.34e-5 NVIDIA / 2.69e-5 AMD — all at spp=4, the worst spp), so 1e-4 sits ~3.7× above the worst fp noise and ~100× below the ~1e-2 a real shading divergence produces. Gate-teeth are pinned: injecting a 0.1% error into the reference kernel's shade fails it at rel 1.02e-3 while the hot-channel count stays 0 — a systematic bias is invisible to the max/hot half and caught only by the relative mean, which is why BOTH halves exist. `--check --stress n` runs the same suite on the n-object stress field (deterministic sin-hash placement, `scene::stress_scene`) with the zero-counter gates intact but the "must fire" structural assertions skipped — those are tuned to the default scene's topology. Loaded OBJ scenes (`model.obj --check`) get the same structural skip: a real scene can lack the required features outright (a skyless view can't fire sky-tiles; a dense view legitimately overflows the replay recording arena), while the zero-counter gates run everywhere. **The rendered frame follows that same `structural` predicate, and this is a trap that bit once and is now closed by construction.** `check.png` / `check_gi.png` are TRACKED goldens — the *default* scene's frame, byte-compared by hand, and several features' bit-identity claims rest on nothing but a `git status` after a suite run. Every `--check` flavor used to write them, so `san-miguel-low-poly.obj --check` silently replaced the golden with San Miguel's frame and produced a `git status` that looks EXACTLY like a regression and is not one (the recovery is to re-run the plain `--check`, but only if you realize that is what happened). So a non-default scene now writes `check-<tag>.png` / `check-<tag>_gi.png` instead — `check-world`, `check-stress5000`, `check-san-miguel-low-poly`, `check-<stem>-tile2x2` — gitignored under `/check-*.png` (the goldens use `_`, the tagged files use `-`, which is what separates them), with the "wrote" line naming the files and saying the goldens were left alone. The asymmetry is deliberate and is not "never overwrite the golden": a DEFAULT-scene run still writes it under any lever, because a diff there is either a regression or a deliberate RE-BASELINE (the RTGI default flip was exactly that) and both are the signal you want. What can never be a golden is another scene's frame. **Consequence for A/B measurements on a loaded scene** (the `--no-slope-mips` liveness proof is one): the tagged file is gitignored, so "did the image move" is a hash compare between two runs, not a `git status` — which is the honest instrument anyway, since a scene with no committed baseline never had one. **AND THE GOLDENS ARE A WINDOWS CONTRACT.** The asymmetry above is what makes this bite off Windows: a DEFAULT-scene `--check` still writes them, so a Linux or macOS run overwrites the tracked pair — `git checkout -- check.png check_gi.png` after one, and never commit a headless platform's goldens. They differ legitimately: `sinf`/`cosf`/`expf`/`powf` come from the system libm and are permitted to differ between platforms, and the corpus uses them throughout (sky, clouds, GGX), so a cross-platform byte compare measures libm, not the renderer. Every byte-identity claim in this file (`--no-rtgi` reproducing the pre-RTGI image, the `--no-spec-aa` off arm, the capture-edit leak check) means *same platform, same binary lineage*. What DOES hold everywhere is the structural half — `false-sky`, `tmin-overshoot`, `claim-violation`, `hybrid-extra`, the coverage counters, and replay bit-identity are exact-zero on macOS as on Windows (measured, M0) — so a **counter** difference is a real failure and a **pixel** difference across platforms is not.
 
 **Build config.** `.cargo/config.toml` links with `rust-lld` (bundled with the rustup toolchain — nothing to install; mold is ELF-only and cannot link a PE binary, so it is not an option here). It must keep emitting a PDB: `debug = "line-tables-only"` exists so Tracy's sampler and PIX can symbolize release frames, so any link-arg that drops debug info is off the table. `release` is `lto = "thin"` + `codegen-units = 16` (was 1 until 2026-07-23 — cgu=1 serialized ThinLTO into a fat-LTO-shaped single pass; 16 measured a one-line-touch rebuild 198 → 45 s at a priced +1-2% CPU-tracer ms/frame, interleaved `--spin path` medians in the Cargo.toml comment — CPU numbers recorded before that date carry the offset). `[profile.quick]` (`lto = false`, `codegen-units = 16`) is an ITERATION-ONLY profile — a one-line touch rebuilds in ~25 s vs ~45 s under `release`, because the ThinLTO whole-program pass, not the linker, is the cost. **Never take a benchmark number from `quick`**: every measurement this project reports (the `--check` A/B bench rows, the hemi-share kill criterion, the adopt on/off regression guards) is only meaningful under `release`'s `lto`/`codegen-units`. Correctness gates are perf-independent and run fine there.
 
@@ -6444,7 +6805,7 @@ Game-like benchmark scenes come from the McGuire Computer Graphics Archive (http
 
 **glTF 2.0 scenes** (`src/gltf_loader.rs`; `.gltf`/`.glb` on the positional arg — same CLI slot as OBJ, so exclusivity/default camera/structural-skip/`--tile`/the scene cache all compose): materials carry REAL PBR data, so `matclass` is bypassed — baseColor/metallic/roughness factors + normal/metallicRoughness (roughness=G, metallic=B, one shared map)/emissive textures map straight onto the extended `Material`; KHR_materials_transmission → `transmission` (NO albedo lift — glTF baseColor is authored for tinting, unlike San Miguel's dark exporter Kd), KHR_materials_emissive_strength multiplies, sheen reads the raw KHR_materials_sheen JSON (no crate feature exists in gltf 1.4), KHR_materials_ior is logged (GLASS_IOR fixed), unlit → matte, Blend → Mask + note. The three glTF-vs-OBJ traps, all deliberate: **NO V flip** (glTF UVs are top-left origin — the convention our texels land in after the OBJ path's load-time flip), **no glass albedo lift**, and **OPAQUE materials must not cutout** (spec ignores their baseColor alpha; `alpha_masked` is cleared unless a MASK/BLEND material references the texture — junk JPG alpha would punch holes in walls). Node graph is FLATTENED (transforms baked; normals by inverse-transpose; negative-determinant nodes flip winding so geometric face normals keep agreeing); authored TANGENTs are ignored (one tangent source: shade.rs's on-the-fly derivation); COLOR_0/TEXCOORD_1/occlusionTexture/KHR_lights_punctual ignored (the engine's one sky — scattering dome + sun disc — is the lighting model); images decode through the texture.rs rayon pipeline (only slot-referenced images; GLB buffer views, external files, and base64 data URIs); external BUFFERS resolve through `gltf_loader::resolve_buffers` with the OBJ path's `.zst` sibling fallback — committed scenes carry `.bin.zst` (raw vertex/index buffers zstd ~2-3×, measured Intel Sponza 133.5 → 60.7 MB; textures are already-deflated PNG/JPG and stay as-is), a plain `.bin` still loads verbatim, and the sibling fallback is pinned by a `self_test` case. `gltf_loader::self_test` (run by `--check`, download-free — a GLB assembled in code) pins node flattening, the mirrored-winding flip, u16 index widening, the welded-normal fallback, and the factor mapping; real-scene gates are download-optional like san-miguel (Khronos glTF-Sample-Assets DamagedHelmet/Sponza, Intel Sponza, Bistro — .gitattributes already LFS-tracks `scenes/**/*.glb|bin|gltf|jpg|jpeg`). One `gltf:` summary line prints prim/tri/material/texture counts + everything skipped.
 
-**BC7 scene textures** (ON BY DEFAULT; `--no-bc7` kills, `--bc7-cpu` = the ispc A/B arm; `src/bc7.rs` owns the mode/predicate + the CPU arm over the `intel_tex_2` crate — prebuilt ISPC binaries, an ordinary static dep like `image`, so every `--check*` stays DLL-free): block-compresses the OPAQUE scene textures on upload, **GPU upload only** — the CPU samplers keep the exact RGBA8 texels, so the feature moves ONLY the statistical GPU-vs-CPU gates (measured San Miguel/Sponza/Bistro: albedo A/B 0.0001–0.0004 vs the 0.02 limit, radiance ≤ 0.007%) while class-mismatch/`t_viol`/alpha-rejections stay **bit-identical** — the carve-out proof. **The DEFAULT arm is a GPU compute encoder** (`Bc7Mode::Gpu(Fast)`; `src/gpu/bc7gpu.rs` + `shaders/bc7enc.hlsl`, fxc cs_5_0 — the bloom no-DXC precedent, so it exists before any tracer kernel and works in both Submit harnesses), dispatched per band inside `SceneGpu::new_uploaded`: the ring stages the RGBA8 source rows, the kernel (one thread per 4×4 block) writes `block_pitch`-strided blocks into a reused UAV buffer, `CopyTextureRegion` lands them in the committed BC7 mip — blocks never touch the CPU. Encoder shape: mode-6 (single-subset 7.7.7.7+P) PCA fit — covariance power iteration seeded from the largest-diagonal COLUMN, never a fixed vector ((1,1,1) is exactly perpendicular to an anti-correlated axis and collapsed red↔green blocks to near-solid, the measured max-198-LSB class) — plus 2 least-squares refinement rounds, plus a **mode-1 two-subset arm** (64 spec partitions ranked by 2-means SSE — an UPPER-bound predictor: rank with it, never prune — top-N full-fitted, lower-SSE mode wins): mode-6-only measured 26.4 dB worst on San Miguel's patterned plate vs ispc's 33.0 — the gap was the second subset, not the fit. `--bc7-quality` maps to effort tiers: ultrafast = mode-6 no-refit (26.3 dB), fast = + conditional mode-1 (top-4, only when mode-6 SSE > ~2.5 LSB RMS — 32.0 dB), basic/slow = mode-1 always at top-8/16 (32.5/32.8). MEASURED at `fast`: SM-lp 117 ms, Bistro 229 ms (2.1 Gtexel/s), Intel Sponza **282 ms at 3.8 Gtexel/s vs the ispc arm's ~20 s** (rates count every encoded level, mips included) — the 70× that made default-on affordable; there is still deliberately **no BC7 disk cache**. Determinism: the GPU arm claims per-(device, driver) only (per-block-independent kernel, no atomics) and NOTHING depends on more — no disk cache, and M11 runs the session's own encoder in-session; the CPU arm keeps its full determinism pin. Fallback ladder: `Bc7Enc::new` failure = LOUD line + uncompressed RGBA8 for the upload (never an implicit CPU-encode stall); in `--check-gpu` the same failure is a suite FAIL. `bc7::should_compress = !alpha_masked && !h2n && !n2h && 4-aligned dims`, all arms load-bearing: **alpha-masked cutout textures must stay RGBA8** — `alpha_nearest < 128`/`alpha_cutout` is a hard binary threshold on one texel, BC7 alpha lines reach only 4/8/16 levels per block (an authored 128 CANNOT be encoded and snaps across — a *visibility* divergence, and San Miguel's masks are antialiased), and the predicate mirrors `mat_cutout`'s (`trace.rs`) so the id set `.Load` can reach is exactly the RGBA8 set — their agreement IS the soundness argument (the GPU kernel excludes alpha by construction too: mode 6 pins alpha endpoints, mode 1 carries none — the ispc `opaque_*` twin); the 4-align arm is the D3D spec ("a block-compressed texture must be created as a multiple of size 4 in all dimensions" — odd dims measured working on the dev NVIDIA driver, but that is tolerance, not contract; free where it matters: Bistro/Sponza are 100% aligned, San Miguel keeps its odd-dim 63% of opaque MB as RGBA8). Mixed BC7+RGBA8 in the one `texs[]` table needs zero shader changes (SRV format reads back off the resource; the `_SRGB`/`_UNORM` role split carries over; the GPU arm's copy-out and the CPU arm's block-row staging both speak `d3d12::footprint_block`). Gating: `bc7::self_test` (in `--check`) pins the predicate/block math/CPU-arm determinism/`Bc7Mode` flag algebra; **every `--check-gpu` runs the `bc7-gpu` structural gate** (synthetic, fires even on the untextured procedural scene: an all-even flat color must round-trip the hardware decoder BIT-EXACT — representable exactly via e0 == e1, so any loss is wiring; every flat block byte-identical to block 0, the stride catch; a gradient ramp ≥ 30 dB at every effort tier; and a two-CLUSTER block whose small max error proves the mode-1 arm fired with partition/anchor tables + packing the hardware decoder agrees with); **M11** (armed + compressible textures) encodes with the session's arm, uploads as `BC7_UNORM`, `.Load`-decodes back (BC7 *decode* is spec-bit-exact) and per-texel diffs vs the CPU texels, worst-texture RGB PSNR ≥ 25 dB (a WIRING gate: pitch/footprint/format errors land ~10–20 dB; worst honest measured at `fast`: gpu 32.0 / cpu 33.0 on SM-lp, Bistro 41.9, Intel Sponza 37.4; `FR_BC7_DUMP=1` prints per-texture PSNRs). Touch bc7.rs, bc7gpu.rs, bc7enc.hlsl, the trace.rs texture upload loop, or `footprint_block` → run `--check` plus `san-miguel-low-poly.obj --check-gpu` and `--check-dxr` (defaults armed), `--check-gpu --bc7-cpu` (the ispc arm), and `--check-gpu --no-bc7` (the RGBA8 baseline).
+**BC7 scene textures** (ON BY DEFAULT; `--no-bc7` kills, `--bc7-cpu` = the ispc A/B arm; `src/bc7.rs` owns the mode/predicate + the CPU arm over the `intel_tex_2` crate — prebuilt ISPC binaries, an ordinary static dep like `image`, so every `--check*` stays DLL-free): block-compresses the OPAQUE scene textures on upload, **GPU upload only** — the CPU samplers keep the exact RGBA8 texels, so the feature moves ONLY the statistical GPU-vs-CPU gates (measured San Miguel/Sponza/Bistro: albedo A/B 0.0001–0.0004 vs the 0.02 limit, radiance ≤ 0.007%) while class-mismatch/`t_viol`/alpha-rejections stay **bit-identical** — the carve-out proof. **The DEFAULT arm is a GPU compute encoder** (`Bc7Mode::Gpu(Fast)`; `shaders/bc7enc.hlsl` with two hosts — `src/gpu/bc7gpu.rs` at fxc cs_5_0, the bloom no-DXC precedent, so it exists before any tracer kernel and works in both Submit harnesses; `src/vk/bc7.rs` at DXC cs_6_0, where DXC is the only compiler there is. The kernel is shared, and the ONE thing the second host cost it is a byte-offset window — `src_off`/`dst_off`, which D3D12 passes as 0 because it slides root SRV/UAV virtual addresses instead. `Quality::effort` lives in `src/bc7.rs` for the same reason: one kernel, one table), dispatched per band inside `SceneGpu::new_uploaded`: the ring stages the RGBA8 source rows, the kernel (one thread per 4×4 block) writes `block_pitch`-strided blocks into a reused UAV buffer, `CopyTextureRegion` lands them in the committed BC7 mip — blocks never touch the CPU. Encoder shape: mode-6 (single-subset 7.7.7.7+P) PCA fit — covariance power iteration seeded from the largest-diagonal COLUMN, never a fixed vector ((1,1,1) is exactly perpendicular to an anti-correlated axis and collapsed red↔green blocks to near-solid, the measured max-198-LSB class) — plus 2 least-squares refinement rounds, plus a **mode-1 two-subset arm** (64 spec partitions ranked by 2-means SSE — an UPPER-bound predictor: rank with it, never prune — top-N full-fitted, lower-SSE mode wins): mode-6-only measured 26.4 dB worst on San Miguel's patterned plate vs ispc's 33.0 — the gap was the second subset, not the fit. `--bc7-quality` maps to effort tiers: ultrafast = mode-6 no-refit (26.3 dB), fast = + conditional mode-1 (top-4, only when mode-6 SSE > ~2.5 LSB RMS — 32.0 dB), basic/slow = mode-1 always at top-8/16 (32.5/32.8). MEASURED at `fast`: SM-lp 117 ms, Bistro 229 ms (2.1 Gtexel/s), Intel Sponza **282 ms at 3.8 Gtexel/s vs the ispc arm's ~20 s** (rates count every encoded level, mips included) — the 70× that made default-on affordable; there is still deliberately **no BC7 disk cache**. Determinism: the GPU arm claims per-(device, driver) only (per-block-independent kernel, no atomics) and NOTHING depends on more — no disk cache, and M11 runs the session's own encoder in-session; the CPU arm keeps its full determinism pin. Fallback ladder: `Bc7Enc::new` failure = LOUD line + uncompressed RGBA8 for the upload (never an implicit CPU-encode stall); in `--check-gpu` the same failure is a suite FAIL. `bc7::should_compress = !alpha_masked && !h2n && !n2h && 4-aligned dims`, all arms load-bearing: **alpha-masked cutout textures must stay RGBA8** — `alpha_nearest < 128`/`alpha_cutout` is a hard binary threshold on one texel, BC7 alpha lines reach only 4/8/16 levels per block (an authored 128 CANNOT be encoded and snaps across — a *visibility* divergence, and San Miguel's masks are antialiased), and the predicate mirrors `mat_cutout`'s (`trace.rs`) so the id set `.Load` can reach is exactly the RGBA8 set — their agreement IS the soundness argument (the GPU kernel excludes alpha by construction too: mode 6 pins alpha endpoints, mode 1 carries none — the ispc `opaque_*` twin); the 4-align arm is the D3D spec ("a block-compressed texture must be created as a multiple of size 4 in all dimensions" — odd dims measured working on the dev NVIDIA driver, but that is tolerance, not contract; free where it matters: Bistro/Sponza are 100% aligned, San Miguel keeps its odd-dim 63% of opaque MB as RGBA8). Mixed BC7+RGBA8 in the one `texs[]` table needs zero shader changes (SRV format reads back off the resource; the `_SRGB`/`_UNORM` role split carries over; the GPU arm's copy-out and the CPU arm's block-row staging both speak `d3d12::footprint_block`). Gating: `bc7::self_test` (in `--check`) pins the predicate/block math/CPU-arm determinism/`Bc7Mode` flag algebra; **every `--check-gpu` runs the `bc7-gpu` structural gate** (synthetic, fires even on the untextured procedural scene: an all-even flat color must round-trip the hardware decoder BIT-EXACT — representable exactly via e0 == e1, so any loss is wiring; every flat block byte-identical to block 0, the stride catch; a gradient ramp ≥ 30 dB at every effort tier; and a two-CLUSTER block whose small max error proves the mode-1 arm fired with partition/anchor tables + packing the hardware decoder agrees with); **M11** (armed + compressible textures) encodes with the session's arm, uploads as `BC7_UNORM`, `.Load`-decodes back (BC7 *decode* is spec-bit-exact) and per-texel diffs vs the CPU texels, worst-texture RGB PSNR ≥ 25 dB (a WIRING gate: pitch/footprint/format errors land ~10–20 dB; worst honest measured at `fast`: gpu 32.0 / cpu 33.0 on SM-lp, Bistro 41.9, Intel Sponza 37.4; `FR_BC7_DUMP=1` prints per-texture PSNRs). **On Vulkan the same two arms run** (`src/vk/bc7.rs` + the three per-level arms in `src/vk/textures.rs`), gated by `--check-vk`'s V10 — the `bc7-gpu` structural gate and M11 transplanted, teeth for teeth, with both probes encoding at a NON-ZERO and DIFFERENT src/dst window so the one thing the second host added is actually scored. See the M3j block in the `--check-vk` entry for the differences (no banding, a uniform buffer instead of root constants, tight block rows) and for what V10 catches that the render gates provably do not (a kernel ignoring `src_off` leaves the radiance A/B at 1.132%, inside its 2% bar, while V10 reads 20.7 dB). Touch bc7.rs, bc7gpu.rs, vk/bc7.rs, bc7enc.hlsl, the trace.rs texture upload loop, `vk/textures.rs`, or `footprint_block` → run `--check` plus `san-miguel-low-poly.obj --check-gpu` and `--check-dxr` (defaults armed), `--check-gpu --bc7-cpu` (the ispc arm), and `--check-gpu --no-bc7` (the RGBA8 baseline); on Linux `--check-vk` on a textured scene in all three arms, and `--check-spirv` (the kernel and the decode probe are both in that corpus).
 
 ## Mip-mapping + trilinear + 16× anisotropic (all three renderers)
 

@@ -1120,11 +1120,12 @@ pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
 // (frustum kernels, M3), and the DXR BLAS/TLAS (every actual ray).
 // ---------------------------------------------------------------------------
 
-/// The material and BVH-node wire formats moved to `gfx::scene` (one mirror
-/// each of shade.hlsli's `Mat` and frustum.hlsli's `BvhNode`, read by both
-/// backends); re-exported so this file's `size_of::<GpuMat>()` accounting and
-/// its `GpuBvhNode { .. }` literal read as they always did.
-use crate::gfx::scene::{GpuBvhNode, GpuMat};
+/// The BVH-node wire format moved to `gfx::scene` (one mirror of
+/// frustum.hlsli's `BvhNode`, read by both backends); re-exported so this
+/// file's `GpuBvhNode { .. }` literal reads as it always did. `GpuMat` went
+/// with it and is no longer named here at all — the one place that needed its
+/// SIZE was the stream-byte accounting, which moved beside the struct.
+use crate::gfx::scene::GpuBvhNode;
 
 /// Bytes of reusable staging streamed per blocking submit — bounds the
 /// upload's transient commit to one chunk instead of a full second copy of
@@ -1135,12 +1136,11 @@ const STAGE_CHUNK: usize = 256 << 20;
 /// Steady-state byte total of the scene's buffer streams (excludes textures,
 /// acceleration structures, and the wavefront-only software trees — those
 /// live in `SwTreesGpu`) — sizes the staging ring and the init report.
-fn scene_stream_bytes(scene: &Scene) -> usize {
-    let v = scene.positions.len();
-    let t = scene.indices.len();
-    let m = scene.materials.len();
-    v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
-}
+///
+/// The arithmetic lives in `gfx::scene` beside the wire formats it is counting
+/// (`GpuMat`'s own size is a term), so both backends' rings are sized by one
+/// statement; this is the local name for it.
+use crate::gfx::scene::stream_bytes as scene_stream_bytes;
 
 /// The software acceleration structure(s) that ride t0 for the FRUSTUM
 /// queries (their only consumer — every actual ray is DXR RayQuery).
@@ -1604,7 +1604,7 @@ impl SceneGpu {
                 }
             }
         }
-        let gpu_effort = bc7_mode.quality().map(super::bc7gpu::effort).unwrap_or(1);
+        let gpu_effort = bc7_mode.quality().map(bc7::Quality::effort).unwrap_or(1);
 
         // Scene textures: RGBA8 Texture2Ds — _SRGB for color textures (the
         // per-texel decode of texture.rs::sample_bilinear in hardware) and
@@ -5430,23 +5430,10 @@ pub(crate) fn record_feed_dispatch(
 // M11: BC7 encode fidelity, measured on the GPU (runs whenever BC7 is armed
 // — the default — on a scene with compressible textures).
 
-/// The whole M11 kernel: `.Load` one texel of the BC7 SRV (legal on BC —
-/// returns the hardware-decoded value) and store it back as packed RGBA8.
-/// BC7 DECODE is required by the D3D spec to be bit-exact, so
-/// `round(load * 255)` recovers the decoder's exact 8-bit values — the diff
-/// against the CPU source texels then measures the ENCODER's loss and
-/// nothing else.
-const BC7_READ_HLSL: &str = r#"
-Texture2D<float4> src : register(t0);
-RWByteAddressBuffer dst : register(u0);
-cbuffer C : register(b0) { uint W; uint H; }
-[numthreads(8, 8, 1)]
-void cs_bc7_read(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= W || id.y >= H) return;
-    uint4 q = (uint4)round(saturate(src.Load(int3(int(id.x), int(id.y), 0))) * 255.0);
-    dst.Store((id.y * W + id.x) * 4u, q.x | (q.y << 8u) | (q.z << 16u) | (q.w << 24u));
-}
-"#;
+/// The M11 kernel is `gfx::shaders::BC7_READ_HLSL` — shared with the Vulkan
+/// backend's own fidelity gate, since two gates scoring one encoder against
+/// two hardware decoders must be reading the same thing.
+use crate::gfx::shaders::BC7_READ_HLSL;
 
 pub struct Bc7Fidelity {
     pub textures: usize,
@@ -5619,7 +5606,7 @@ pub fn bc7_fidelity(
                     th,
                     row_pitch as u32,
                     bc7::blocks(th),
-                    super::bc7gpu::effort(q),
+                    q.effort(),
                 );
                 enc.record_copy_out(l, &tex, 0, 0, fmt, tw, th);
                 unsafe {

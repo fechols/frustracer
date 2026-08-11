@@ -15,11 +15,13 @@
 //! the flag set, the register-space -> descriptor-set mapping it implies, and
 //! the measurement.
 
+pub mod bc7;
 pub mod device;
 pub mod headless;
 pub mod layout;
 pub mod reflect;
 pub mod scene;
 pub mod spirv;
+pub mod stage;
 pub mod textures;
 pub mod tracer;

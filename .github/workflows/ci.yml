@@ -83,3 +83,115 @@ jobs:
             check.png
             check_gi.png
           if-no-files-found: warn
+
+  # The Linux job is the DIRECT guard, and it exists because master shipped
+  # broken there: `gfx::frame::with_frame` grew two parameters, the D3D12 caller
+  # was updated, `src/vk/tracer.rs` was not, and a merge brought them together.
+  # Nothing could see it — CI was `windows-latest` only and `mod vk` is
+  # `#[cfg(unix)]`, so the ENTIRE Vulkan backend was outside CI's reach while
+  # being the port under active development. `ash` is a `cfg(unix)` dependency,
+  # so a plain build here compiles it and that class of break fails the job.
+  #
+  # DELIBERATELY NOT RUN: `--check-spirv` and `--check-vk`. Both degrade to a
+  # loud SKIP + exit 0 on a bare runner (no DXC drop, no Vulkan ICD), so adding
+  # them would turn a green badge into a claim about Vulkan that the run did not
+  # test — the vacuity this repo's gates are written to avoid. Making them real
+  # needs a cached `install-prerequisites.sh dxc` drop and a software ICD
+  # (mesa-vulkan-drivers gives llvmpipe, which `--check-vk` already passes on);
+  # that is worth doing, and it is a change to make on purpose, not a side
+  # effect of adding a build job.
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      # Same reasoning as the Windows job: no lfs, but submodules ARE required —
+      # build.rs's require_nrd() checks for the NRD SOURCE on every platform.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # No "Build NRD" step: build.rs gates the ARTIFACT half behind
+      # `#[cfg(windows)]`, and a build script compiles for the HOST.
+      - name: Build
+        run: cargo build --profile quick
+
+      - name: Unit tests
+        run: cargo test --profile quick
+
+      # See the macOS job's note on why these images are not expected to match
+      # the Windows job's byte for byte, and what must hold instead.
+      - name: Gates
+        run: |
+          cargo run --profile quick -- --check
+          cargo run --profile quick -- --check-dlss
+          cargo run --profile quick -- --check-xess
+          cargo run --profile quick -- --check-fsr
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: check-images-linux
+          path: |
+            check.png
+            check_gi.png
+          if-no-files-found: warn
+
+  # The macOS job exists because the tree now BUILDS there (M0), and the Vulkan
+  # port already taught this lesson once: a test that cannot run where the
+  # developer works is a test that will rot. Without this job, the one-line
+  # `-lc++` fix and the portability of every `cfg(not(windows))` path are
+  # guarded by nothing.
+  #
+  # What it covers is the DLL-free half — the CPU frustum tracer, the
+  # reference-ray verification, the temporal/replay families, ~20 pure-math
+  # module self-tests, and the shader-source gates. The D3D12 backend is
+  # `#[cfg(windows)] mod gpu`, so none of it compiles here; that is the point of
+  # the split, not a gap in the job.
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      # Same reasoning as the Windows job: no lfs (the flagless --check runs the
+      # PROCEDURAL scene), but submodules ARE required — build.rs's
+      # require_nrd() checks for the NRD SOURCE on every platform.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Deliberately NO "Build NRD" step, unlike the Windows job. build.rs gates
+      # the ARTIFACT half (SDKs\NRD\bin\NRD.dll) behind `#[cfg(windows)]`, and a
+      # build script compiles for the HOST — so that block is dead here and no
+      # DLL is needed. The source-submodule half above is what still applies.
+      - name: Build
+        run: cargo build --profile quick
+
+      - name: Unit tests
+        run: cargo test --profile quick
+
+      # NOTE for anyone reading a diff of these images against the Windows job's:
+      # they are NOT expected to match byte for byte. sinf/cosf/expf/powf come
+      # from the system libm and are permitted to differ between platforms, and
+      # the corpus uses them throughout (sky, clouds, GGX). What must hold is the
+      # STRUCTURAL half these gates assert — false-sky, tmin-overshoot,
+      # claim-violation and the coverage counters are exact-zero on every
+      # platform, and the A/Bs are tolerance-based. A counter difference is a
+      # real failure; a pixel difference across platforms is not.
+      - name: Gates
+        run: |
+          cargo run --profile quick -- --check
+          cargo run --profile quick -- --check-dlss
+          cargo run --profile quick -- --check-xess
+          cargo run --profile quick -- --check-fsr
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: check-images-macos
+          path: |
+            check.png
+            check_gi.png
+          if-no-files-found: warn
