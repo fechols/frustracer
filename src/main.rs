@@ -3818,8 +3818,12 @@ fn run_check_dxr(
 /// rather than as stale memory, which is what keeps a gate honest about what
 /// the session actually produced. The prev-Z lane and the six sig/sig2 lanes
 /// are FSR-RR extras the `GBufs` shape doesn't carry (their own gates read the
-/// raw bytes). Shared by --check-gpu (M7) and --check-dxr (T4).
-#[cfg(windows)]
+/// raw bytes). Shared by --check-gpu (M7), --check-dxr (T4) and --check-vk
+/// (V12) — which is why it spells the strides through `gfx::frame` rather than
+/// through `gpu::trace`'s re-export of them: the latter is `cfg(windows)` and
+/// was the ONLY thing keeping this function off Linux. A Vulkan-local copy
+/// would be the transcription hazard the derived descriptor layout exists to
+/// remove, on the one piece of code whose whole job is to agree with the wire.
 fn unpack_gbuf_bytes(
     core: &[u8],
     ext: Option<&[u8]>,
@@ -3828,8 +3832,8 @@ fn unpack_gbuf_bytes(
 ) -> dlss::GBufs {
     let fc = |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..][..4].try_into().unwrap());
     let g = dlss::GBufs::new(pw, ph);
-    let cl = gpu::trace::GBUF_STRIDE as usize / 4;
-    let el = gpu::trace::GBUF_EXT_STRIDE as usize / 4;
+    let cl = gfx::frame::GBUF_STRIDE as usize / 4;
+    let el = gfx::frame::GBUF_EXT_STRIDE as usize / 4;
     for i in 0..pw * ph {
         let c = i * cl;
         let e = ext.map(|b| (b, i * el));
@@ -15006,15 +15010,20 @@ fn run_check_vk_render(
             return false;
         }
     };
-    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("check-vk: FAIL V6 tracer init: {e}");
-            vt.destroy(hg);
-            vs.destroy(hg);
-            return false;
-        }
-    };
+    // No pack on THIS tracer, deliberately: V12 builds its own at odd dims with
+    // `gbuf_full`, so every number V6/V7/V8/V9 record stays unmoved BY
+    // CONSTRUCTION rather than by care — the `--check-gpu` M7 / `--check-dxr`
+    // T4 shape, which both build a second pipeline for exactly this reason.
+    let tg =
+        match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32, false) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V6 tracer init: {e}");
+                vt.destroy(hg);
+                vs.destroy(hg);
+                return false;
+            }
+        };
     // The texture line reports BYTES and SUBRESOURCES, not just a count: a run
     // that uploaded the table and one that uploaded a table of stubs have the
     // same count, and a chain that silently lost its mips has the same
@@ -15515,9 +15524,227 @@ fn run_check_vk_render(
         ok = false;
     }
 
+    // ---- V12: the G-buffer pack + prev-camera motion vectors ----
+    // Its own tracer, at its own odd dimensions, sharing `vs`/`vt` — the
+    // `--check-gpu` M7 shape. Everything above is finished with `tg` by now.
+    if !run_check_vk_gbuf(hg, sp, scene, bvh, &vs, &vt, cam0, structural) {
+        ok = false;
+    }
+
     tg.destroy(hg);
     vt.destroy(hg);
     vs.destroy(hg);
+    ok
+}
+
+/// V12 — THE G-BUFFER PACK AND THE PREV-CAMERA MOTION VECTORS.
+///
+/// The transplant of `--check-gpu`'s M7 / `--check-dxr`'s T4, and the first
+/// stage here whose subject is not the picture: it is the wire the vendor
+/// stack reads. Two things had never run on this backend before it —
+/// `FLAG_GBUF`, and `FLAG_HAS_PREV`. The second is the one worth naming,
+/// because it means **the cbuffer's four prev-camera rows have never been
+/// non-zero here**: a `-fvk-use-dx-layout` offset error anywhere in that block
+/// would have been invisible to V6 through V11, and `gbuf_write_hit`
+/// dereferences it directly (`prev_origin`, `prev_forward`, and
+/// `prev_right`/`prev_up` through `project_prev`).
+///
+/// A SECOND TRACER, not a flag on V6's, and the reason is attribution rather
+/// than tidiness: it keeps every number V6/V7/V8/V9 record unmoved BY
+/// CONSTRUCTION, and it keeps the ODD dimensions, which is what catches a
+/// stride or row assumption that 800x600 cannot. It shares the uploaded scene
+/// and textures, so the cost is one more DXC pass and the per-pixel buffers.
+///
+/// BOTH PACK HALVES ARM, matching M7's own `force_gbuf_ext(true)` and for its
+/// reason: the consumer here is a CPU readback rather than a feed kernel, and
+/// `dlss::mv_selftest` ANDs three arms of which the third
+/// (`dlss::sky_dir_check`) reads the NORMAL lane — which lives in ext. A
+/// core-only pack would fail that arm for a reason that has nothing to do with
+/// the pack, and splitting the function to dodge it would cost the property the
+/// whole transplant rests on: the EXACT existing gate, zero new tolerances.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_gbuf(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    vs: &vk::scene::VkScene,
+    vt: &vk::textures::VkTextures,
+    cam0: Camera,
+    structural: bool,
+) -> bool {
+    // Odd dims, `--check-gpu` M7's own.
+    let (pw, ph) = (533usize, 400usize);
+    let (near, far) = dlss::near_far(scene.diag);
+    // `rtgi: false` for M7's reason: under RTGI `prim.ao` is 0 everywhere,
+    // which vacuates the AO-bearing lanes a later feed gate will want.
+    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+
+    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, vs, vt, bvh, pw as u32, ph as u32, true)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V12 pack tracer init: {e}");
+            return false;
+        }
+    };
+
+    // The upscaler frame contract, verbatim: fresh 1-spp, accumulation off, and
+    // ZERO frame-uniform jitter, because `mv_selftest`'s reconstruction assumes
+    // samples sit on pixel centres.
+    let frame = |basis: camera::CamBasis,
+                 prev: Option<camera::CamBasis>,
+                 f: u32|
+     -> Result<(dlss::GBufs, Vec<f32>), String> {
+        let p = gfx::frame::FrameParams {
+            cam: basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some((0.0, 0.0)),
+            prev_cam: prev,
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        // `clear_sentinel` on, so an unwritten `info` texel stays detectable —
+        // this gate never reads `info`, but a frame that skipped the ladder
+        // must not be able to look like one that ran it.
+        tg.render_wavefront(hg, &p, true)?;
+        let core = hg.read_buffer(&tg.gbuf, pw * ph * gfx::frame::GBUF_STRIDE as usize)?;
+        let ext = hg.read_buffer(&tg.gbuf_ext, pw * ph * gfx::frame::GBUF_EXT_STRIDE as usize)?;
+        let tb = hg.read_buffer(&tg.tbuf, pw * ph * 4)?;
+        let t: Vec<f32> =
+            tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        Ok((unpack_gbuf_bytes(&core, Some(&ext), pw, ph), t))
+    };
+
+    let basis_a = cam0.basis(pw, ph);
+    let mut cam_b = cam0;
+    cam_b.pos += cam0.forward() * (0.02 * scene.diag);
+    let basis_b = cam_b.basis(pw, ph);
+
+    let mut ok = true;
+    let (ga, ta) = match frame(basis_a, None, 0) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V12 frame A: {e}");
+            tg.destroy(hg);
+            return false;
+        }
+    };
+    let (gb, _tb) = match frame(basis_b, Some(basis_a), 1) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V12 frame B: {e}");
+            tg.destroy(hg);
+            return false;
+        }
+    };
+
+    // Structural coverage on frame A: every pixel carries a positive view-Z
+    // (the pack writes ran everywhere), and sky depth is far BIT-EQUAL — the
+    // write helper stores the CB constant untouched, so this is an identity,
+    // never a tolerance.
+    let loadz = |g: &dlss::GBufs, i: usize| {
+        f32::from_bits(g.depth[i].load(std::sync::atomic::Ordering::Relaxed))
+    };
+    let (mut bad_z, mut sky_off, mut skies) = (0usize, 0usize, 0usize);
+    for i in 0..pw * ph {
+        let z = loadz(&ga, i);
+        if !(z > 0.0) {
+            bad_z += 1;
+        }
+        if !ta[i].is_finite() {
+            skies += 1;
+            if z.to_bits() != far.to_bits() {
+                sky_off += 1;
+            }
+        }
+    }
+
+    // Ext lane 7 = the FG guide pass's ripple tag. Legitimately VACUOUS on a
+    // scene with no water (D3D12's twin records it proven non-vacuous on
+    // rungholt at 1552 water px), so `rip_live` is reported, never required.
+    let (mut rip_bad, mut rip_live, mut rip_sky_bad) = (0usize, 0usize, 0usize);
+    for i in 0..pw * ph {
+        let a = dlss::ld16(&ga.ripple_amp[i]);
+        if !ta[i].is_finite() {
+            if a != 0.0 {
+                rip_sky_bad += 1;
+            }
+            continue;
+        }
+        if a == 0.0 {
+            continue;
+        }
+        if (a - scene::WATER_RIPPLE_AMP).abs() > 1e-3 {
+            rip_bad += 1;
+        } else {
+            rip_live += 1;
+        }
+    }
+
+    // ANTI-VACUITY, and it is not redundant with `mv_selftest`. That gate's
+    // geometry arm skips any pixel whose reprojection lands off-screen or on
+    // old sky, so an ALL-ZERO motion plane is not merely wrong — under a pure
+    // forward dolly most of its pixels still reproject on-screen and it would
+    // be scored, but a pack that was never written AT ALL reads as zeros and
+    // would trip the coverage arm first, reporting "the pack is broken" for
+    // what is really "the pack is absent". Counting the moved pixels separates
+    // those two, which is the M3d lesson (an operation that never happened
+    // compares clean).
+    let mut mv_live = 0usize;
+    for i in 0..pw * ph {
+        let (mx, my) = (dlss::ld16(&gb.mvec[i * 2]), dlss::ld16(&gb.mvec[i * 2 + 1]));
+        if mx != 0.0 || my != 0.0 {
+            mv_live += 1;
+        }
+    }
+
+    let mv_ok = dlss::mv_selftest(
+        &ga,
+        &basis_a,
+        &gb,
+        &basis_b,
+        &dlss::cam_matrices(&cam_b, pw, ph, near, far),
+        scene.diag,
+        far,
+    );
+    eprintln!(
+        "check-vk: V12 gbuf pack ({pw}x{ph}): view-z<=0 {bad_z} | sky-depth-off {sky_off} \
+         (sky px {skies}) | ripple-lane bad {rip_bad} sky-nonzero {rip_sky_bad} \
+         (water px {rip_live}) | mv non-zero {mv_live} | mv/depth/matrix {}",
+        if mv_ok { "OK" } else { "FAIL" },
+    );
+    if rip_bad != 0 || rip_sky_bad != 0 {
+        eprintln!("check-vk: FAIL V12 ripple lane (ext lane 7) carries unexpected values");
+        ok = false;
+    }
+    if !mv_ok || bad_z != 0 || sky_off != 0 {
+        eprintln!("check-vk: FAIL V12 G-buffer pack gates");
+        ok = false;
+    }
+    if mv_live * 100 < pw * ph {
+        eprintln!(
+            "check-vk: FAIL V12 motion plane is ~empty ({mv_live} px) — a 0.02*diag dolly moves \
+             the whole frame, so this reads as a pack that never ran rather than one that is wrong"
+        );
+        ok = false;
+    }
+    if structural && skies == 0 {
+        eprintln!("check-vk: FAIL V12 sky gate vacuous (no sky pixels on the default scene)");
+        ok = false;
+    }
+
+    tg.destroy(hg);
     ok
 }
 
