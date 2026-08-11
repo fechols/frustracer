@@ -6568,6 +6568,140 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # yet, so that lands with the presenter rather than being written now as
                                       # a field nothing reads — the caller proves the bit-equality, and V9 is
                                       # that caller.
+                                      # V11 — FSR3 UPSCALING OVER THE STOCK ffx_vk BACKEND (B1,
+                                      # 2026-08-11): the first VENDOR upscaler on this backend, and
+                                      # the first thing here that is not our own code running. B0
+                                      # compiled FidelityFX 1.1.4's seven backend-neutral TUs; B1
+                                      # adds the eighth (`src/backends/vk/ffx_vk.cpp`, one 233 KB
+                                      # unit — the frame-interpolation half stays uncompiled),
+                                      # `shim/ffx_fsr3_vk.cpp`, `src/vk/fsr3.rs`, and this gate. It
+                                      # is CPU-FED from `accum` + `GBufs::new_slim` — an upscaler is
+                                      # a function of the G-buffer and the CPU renderer produces one
+                                      # on every platform — so it needs no G-buffer pack from the
+                                      # Vulkan tracer and no presentation stage.
+                                      # PORTED FROM ../quinlight-player/cpp/fsr3_shim.cpp, the
+                                      # working reference (the same tree the DLSS/FG/XeSS shims and
+                                      # `ffx_msvc_compat.h` came from). THREE FACTS FROM IT THAT THE
+                                      # PUBLIC FFX HEADERS DO NOT STATE, each confirmed here: (1)
+                                      # `ffx_vk.cpp` does NOT link standalone — `nm` shows an
+                                      # undefined `ffxSetFrameGenerationConfigToSwapchainVK`, which
+                                      # lives in the FI swapchain TUs; a four-line stub is the whole
+                                      # cost of leaving that half out; (2) the FFX scratch buffer
+                                      # must be ZERO-INITIALISED (`calloc`) — `ffxGetInterfaceVK`
+                                      # reads a refCount at offset 0 BEFORE clearing and rejects
+                                      # non-zero as an already-live context; (3) the caller must
+                                      # create and pass THREE persistent shared images
+                                      # (dilatedDepth R32_SFLOAT, dilatedMotionVectors R16G16_SFLOAT,
+                                      # reconstructedPrevNearestDepth R32_UINT, all at render res,
+                                      # all resting GENERAL) — FFX's cross-frame temporal state,
+                                      # listed in the dispatch struct beside the genuinely optional
+                                      # reactive masks. Also: `fpMessage` is not optional in practice
+                                      # (without it creation failures collapse to a bare code), and
+                                      # FFX rebuilds its own views from the FfxResourceDescription's
+                                      # format and ignores the caller's, so those formats must name
+                                      # what was actually allocated.
+                                      # OUR DIVERGENCES FROM THE REFERENCE, each because this
+                                      # renderer's wire differs: R32 reversed-Z clip depth
+                                      # (`xess::view_z_to_clip_depth`) with ENABLE_DEPTH_INVERTED
+                                      # where quinlight feeds an R16 pseudo-depth and sets neither;
+                                      # AUTO_EXPOSURE deliberately OFF (our tonemap is anchored at a
+                                      # fixed paper white); a fixed 1000/60 ms clock rather than a
+                                      # wall one (the `nrd_gpu::NOMINAL_DT_MS` rule — a
+                                      # deterministic gate must not put a real timer into a vendor
+                                      # library's internal curves); and IMAGES OWNED IN RUST via
+                                      # `ash` rather than in the shim, so the shim calls only `ffx*`
+                                      # and image lifetime sits beside every other Vulkan resource.
+                                      # THE FIRST *LINKED* VULKAN DEPENDENCY IN THIS TREE, stated
+                                      # rather than discovered: `src/vk/` dlopens everything, but
+                                      # `ffx_vk.o` leaves nine `vk*` symbols undefined
+                                      # (vkCreateBuffer, vkGetPhysicalDeviceMemoryProperties,
+                                      # vkGetPhysicalDeviceFeatures2, ... — the list is in build.rs)
+                                      # so it needs the loader at link time. Scoped to
+                                      # `cfg(ffx_fsr3_src)`, so a bare checkout still links nothing.
+                                      # DO NOT delete the link-lib on the evidence of `ldd`: until
+                                      # something calls the shim, `--gc-sections` drops the objects
+                                      # and `--as-needed` then drops libvulkan from DT_NEEDED.
+                                      # THE GCC VECTORIZER WORKAROUND IS TWO FLAGS, both
+                                      # `flag_if_supported`: `-fno-tree-slp-vectorize` and
+                                      # `-fno-tree-vectorize`. `CreateBackendContextVK` zeroes a run
+                                      # of fields in an `alignas(32)` context carved from a 16-byte-
+                                      # aligned scratch buffer, and GCC at -O2+ folds them into an
+                                      # aligned 128-bit store on a misaligned address (#GP). This
+                                      # box is GCC 15.2, i.e. exactly the compiler concerned.
+                                      # DEVICE FEATURES GAINED FOR FFX AND FOR NOTHING OF OURS
+                                      # (`vk/device.rs`), all enabled-when-present: shaderFloat16 /
+                                      # shaderInt16 / shaderInt8 / 16-bit storage / storage-image
+                                      # extended+write-without-format, because **FFX selects its
+                                      # fp16 shader permutations from what the device SUPPORTS, not
+                                      # from what we ENABLED** — so a supported-but-unenabled
+                                      # feature is not a missing optimisation but SPIR-V the device
+                                      # rejects; and `VK_KHR_get_memory_requirements2`, which must
+                                      # be enabled EXPLICITLY even though it is core since 1.1 (we
+                                      # require 1.3), because FFX calls the KHR-suffixed alias whose
+                                      # proc-addr is null unless the extension name is enabled — a
+                                      # jump to zero inside context creation. Our own corpus declares
+                                      # none of these, and the bit-identical V6/V7/V9 gates are the
+                                      # proof: every recorded number is unmoved (V6 0.045%, V7
+                                      # 0.00e0/hot 0, V8 0.0067 / 3.02%, V9 all zero).
+                                      # TWO BUGS FOUND ON THE WAY, neither in FFX. (a)
+                                      # `mem_type_index` took the FIRST type satisfying the wanted
+                                      # flags without excluding `DEVICE_COHERENT_BIT_AMD`, which the
+                                      # spec forbids allocating from unless `deviceCoherentMemory`
+                                      # is enabled — latent since M2b, and reachable only by an
+                                      # allocation whose `memoryTypeBits` excluded the plain types.
+                                      # It is a rejection now. (b) `build_ffx_fsr3`'s
+                                      # `#[cfg(not(windows))]` describes the HOST, so
+                                      # cross-compiling TO Windows FROM Linux ran it and tried to
+                                      # build the FFX SDK with clang-cl — a latent B0 defect that
+                                      # could only surface once the SDK was actually fetched (the
+                                      # absent-sentinel check returned first before that). The guard
+                                      # is `CARGO_CFG_TARGET_OS` now, which is the question being
+                                      # asked; `tools/win-cross-check.sh` is what caught it.
+                                      # ONE KNOWN-ACCEPT, and it is a real cost: `VK_AMD_device_
+                                      # coherent_memory` is enabled when present PURELY to make
+                                      # FFX's own allocations legal. MEASURED on RADV STRIX_HALO,
+                                      # FFX allocates from memory type 7 (DEVICE_LOCAL |
+                                      # DEVICE_COHERENT_AMD) while types 0/1/3/4 are plain
+                                      # DEVICE_LOCAL and sit before it — the signature of a scan
+                                      # keeping the LAST match. That memory is uncached, so FFX's
+                                      # internal FSR3 working set lands in a slower class on AMD;
+                                      # nothing of ours follows it there (see (a)). Also unresolved
+                                      # and FFX's: validation WARNS that its own `rw_luma_history`
+                                      # shader declares Rgba8 against an RGBA16F view.
+                                      # WHAT V11 ASSERTS, AND WHAT IT DELIBERATELY DOES NOT.
+                                      # Asserted: the context creates, the dispatch returns FFX_OK,
+                                      # the output is finite and fully written, validation is clean.
+                                      # REPORTED ONLY: the quality comparison — and that is a defect
+                                      # in the obvious METRIC, not in the upscaler. Mean |d| against
+                                      # a CONVERGED reference rewards blur and punishes sharpening,
+                                      # and it is strongly scene-dependent (the `--spp` image-A/B
+                                      # lesson again): MEASURED, FSR3 beats a bilinear control on
+                                      # the procedural scene (0.01400 vs 0.01489) and LOSES on
+                                      # san-miguel (0.00569 vs 0.00379) with identical wiring,
+                                      # because san-miguel's 1-spp input is ~4x cleaner so FFX's own
+                                      # reconstruction bias dominates the noise it removes. The
+                                      # reset-every-frame and bogus-motion controls invert with it.
+                                      # Asserting any of them would make the gate a statement about
+                                      # which scene it was pointed at. OWED: a detail-preserving
+                                      # metric (the `--check-oidn` Laplacian shape), and settling
+                                      # AUTO_EXPOSURE/preExposure, which this arm leaves off and the
+                                      # reference always sets. `FR_VK_FSR3_JITTER=raw|neg` is the
+                                      # lever for the one convention the two FFX generations
+                                      # disagree about — `fsr::UPSCALE_MV_SIGN` (1,1) matches the
+                                      # reference exactly, but `fsr::JITTER_SIGN` is +1 here and the
+                                      # reference negates; MEASURED, neg is slightly better on
+                                      # san-miguel (0.00524 vs 0.00569) and neither arm changes any
+                                      # verdict, so it is recorded rather than flipped.
+                                      # SKIPS, both loud: no SDK on disk (the fetch command is
+                                      # named), and a SOFTWARE device — llvmpipe fails
+                                      # `ffxFsr3UpscalerContextCreate` outright, which is an
+                                      # environment fact, while RADV creates and dispatches.
+                                      # Touch shim/ffx_fsr3_vk.* / src/vk/fsr3.rs / build.rs's
+                                      # build_ffx_fsr3 / vk/device.rs's feature list -> run
+                                      # --check-vk on the procedural scene AND san-miguel, on
+                                      # llvmpipe, with the SDK moved aside (the degrade is the half
+                                      # nothing else covers), plus --check-fsr, --check-spirv,
+                                      # --check, cargo test and tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
