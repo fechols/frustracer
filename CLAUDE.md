@@ -3469,7 +3469,7 @@ cargo run --release -- --dual-gpu 4      # SPLIT THE FRAME ACROSS TWO ADAPTERS (
                                         # while an Intel SECONDARY needs 1600 — pass it
                                         # explicitly or every number is the Arc async-compile
                                         # fallback (recorded in abf7b28; no code guards it).
-                                        # Gates: dual::self_test + trace::split_self_test in
+                                        # Gates: dual::self_test + gfx::frame::split_self_test in
                                         # --check (payload/ring arithmetic, convergence to the
                                         # analytic optimum s* = T/(T(1+r)+K), the interfering-box
                                         # family, the PINNED-balancer sweep, the freeze family,

@@ -18156,19 +18156,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // the renderer's own midpoint-split rect geometry, at a power-of-two and
     // an odd resolution, plus the partition/complement contracts at every
     // split position. Pure and lever-independent — the blas-split rule.
-    // Both dual-GPU gates below are PURE math that happens to be hosted in the
-    // D3D12 backend (tile-split bit arithmetic; transfer byte addressing) —
-    // they move to the shared core with the rest of the layout math, and
-    // rejoin this suite on every platform when they do. Until then they SAY
-    // they were skipped, for the reason the comment below already gives: a
-    // gate that prints nothing reads exactly like a gate that was never wired.
-    #[cfg(not(windows))]
-    let split_ok = {
-        eprintln!("dual-gpu split self-test: SKIP (D3D12-hosted; pending the shared-core move)");
-        true
-    };
-    #[cfg(windows)]
-    let split_ok = match gpu::trace::split_self_test() {
+    // RUNS ON EVERY PLATFORM since `TileSplit` moved to `gfx::frame` with the
+    // cbuffer whose 64 bits it packs (the M1 layout slice); it was skipped off
+    // Windows for as long as it was hosted in the D3D12 backend, which is
+    // exactly how long its `owns_px`-vs-`row_range` agreement sweep was
+    // unreachable from a Linux `--check`.
+    let split_ok = match gfx::frame::split_self_test() {
         Ok(()) => {
             // Announce on success like every neighbouring self-test: a gate
             // that prints only on failure reads exactly like a gate that was
@@ -18188,9 +18181,14 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // Pure and lever-independent (the blas-split rule). This is the level
     // below the split gate — a wrong offset here renders a plausible image
     // with one displaced stripe, which is far harder to attribute than a hole.
+    // Still D3D12-hosted: unlike the split gate above, `dual::self_test` also
+    // exercises the recording halves (`DxrGpu::set_band`, the arm policy's
+    // caps read), so it moves with `dual.rs` rather than with the layout math.
+    // It SAYS it was skipped — a gate that prints nothing reads exactly like a
+    // gate that was never wired.
     #[cfg(not(windows))]
     let dual_ok = {
-        eprintln!("dual-gpu transfer self-test: SKIP (D3D12-hosted; pending the shared-core move)");
+        eprintln!("dual-gpu transfer self-test: SKIP (D3D12-hosted; pending its own move)");
         true
     };
     #[cfg(windows)]
