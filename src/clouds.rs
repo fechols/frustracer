@@ -1210,10 +1210,10 @@ pub fn self_test() -> Result<(), String> {
         let d = dir_at(i, 2000);
         // The off arm must be j-independent too — sweep a phase alongside.
         let j = if i % 2 == 0 { 0.5 } else { 0.137 };
-        let r = crate::sky::radiance(o, d, &sun, 5e-4, 1.0, 0.0, 0, &off, j);
+        let r = crate::sky::radiance(o, d, &sun, 5e-4, 1.0, 0.0, 0, &off, j, 1.0);
         let want = crate::sky::dome(d, sun.dir, 1.0)
             + crate::sky::disc(d, &sun, 5e-4)
-            + crate::sky::stars(d, 5e-4, 0.0, 0);
+            + crate::sky::stars(d, 5e-4, 0.0, 0, 1.0);
         if r != want {
             return Err(format!("clouds off is not bit-identical at {d:?}: {r:?} vs {want:?}"));
         }
@@ -1282,10 +1282,10 @@ pub fn self_test() -> Result<(), String> {
     // with clouds enabled (the per-ray None arm), and below the horizon band
     // the layer is structurally absent.
     for d in [clear, Vec3A::new(0.8, CLOUD_MIN_DY * 0.5, 0.6).normalize(), Vec3A::new(0.6, -0.4, 0.7).normalize()] {
-        let r = crate::sky::radiance(o, d, &sun, 5e-4, 1.0, 0.0, 0, &on, 0.5);
+        let r = crate::sky::radiance(o, d, &sun, 5e-4, 1.0, 0.0, 0, &on, 0.5, 1.0);
         let want = crate::sky::dome(d, sun.dir, 1.0)
             + crate::sky::disc(d, &sun, 5e-4)
-            + crate::sky::stars(d, 5e-4, 0.0, 0);
+            + crate::sky::stars(d, 5e-4, 0.0, 0, 1.0);
         if along(o, d, &sun, amb_k(d), &on, 0.5).is_none() && r != want {
             return Err(format!("cloud-free ray is not bit-identical at {d:?}"));
         }

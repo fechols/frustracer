@@ -95,7 +95,8 @@
 use ash::vk;
 
 use crate::gfx::frame::{
-    fb_mode_of, FrameCb, FrameParams, CB_STRIDE, HEMI_BATCH, HEMI_MAX_DEPTH,
+    fb_mode_of, FrameCb, FrameParams, CB_STRIDE, GBUF_EXT_STRIDE, GBUF_STRIDE, HEMI_BATCH,
+    HEMI_MAX_DEPTH,
 };
 use crate::gfx::shaders as gs;
 use crate::scene::Scene;
@@ -221,6 +222,18 @@ pub struct VkTracer {
     pub accum: Buffer,
     pub tbuf: Buffer,
     pub info: Buffer,
+    /// The G-buffer pack, `dlss::GBufs` interleaved on the GPU: CORE at u15
+    /// (16 B/px — mv.xy | view_z | prev_z) and the guide/signal half at u32
+    /// (72 B/px). Full-size only when `gbuf_full`; otherwise a stride-sized
+    /// minimum, exactly as D3D12 sizes them, because `FLAG_GBUF` is the ONLY
+    /// thing standing between the stores and an out-of-bounds write — a
+    /// storage buffer bound with `WHOLE_SIZE` has no bounds check, and the
+    /// alternative stand-in (`VkScene::dummy`) is SIXTEEN BYTES.
+    pub gbuf: Buffer,
+    pub gbuf_ext: Buffer,
+    /// Whether the two above are full-size. Read by `write_cb` — it is what
+    /// arms `FLAG_GBUF`, so it cannot drift from the allocation above.
+    gbuf_full: bool,
     counters: Buffer,
     cloud_lod: Buffer,
     cloud_shadow: Buffer,
@@ -246,6 +259,9 @@ pub struct VkTracer {
     sets: Vec<vk::DescriptorSet>,
     layouts: Layouts,
     pipes: [vk::Pipeline; 4], // reference, resolve, sky_lod, cloud_shadow
+    /// `cs_feed_xess`, under `TracerOpts::feed`. `None` is what makes
+    /// `record_feed` refuse rather than dispatch a null pipeline.
+    feed_pipe: Option<vk::Pipeline>,
     wave: Option<Wave>,
     hemi: Option<Hemi>,
     cb_base: FrameCb,
@@ -260,6 +276,33 @@ pub struct VkTracer {
     /// whole tree allocate the same buffers, and only a byte total tells them
     /// apart (the `--check-spirv` assembled-bytes lesson).
     pub staged: (u64, u32),
+}
+
+/// What this tracer is BUILT to do, as opposed to what a frame asks it for.
+///
+/// A struct rather than more positionals, and the reason is written into
+/// `new`'s own comment history: the argument list reached nine with the pack
+/// (B2), that comment warned the pile was the hazard and that the next flag
+/// had to be decided at the same site, and the feed (B3) is that next flag.
+/// Both fields are CONSTRUCTION properties for the same underlying reason —
+/// each sizes or compiles something a per-frame choice could then outrun.
+#[derive(Clone, Copy, Default)]
+pub struct TracerOpts {
+    /// Size the G-buffer pack full and arm `FLAG_GBUF` on every frame this
+    /// tracer records — the D3D12 `TraceGpu::new` argument of the same name.
+    /// The buffers are sized by it, so it cannot be a per-frame choice without
+    /// the stores outrunning their allocation; with `gbuf_full` false the pair
+    /// is ONE stride and the flag is the only thing between the ext store and
+    /// an out-of-bounds write of the whole screen.
+    pub gbuf_full: bool,
+    /// Compile `cs_feed_xess` and carry its three storage-image bindings.
+    ///
+    /// OPTIONAL rather than always-on because the map is derived: compiling
+    /// the unit unconditionally would move V5's slot count (46 -> 49) and every
+    /// tracer's descriptor-pool sizing, i.e. it would move recorded numbers for
+    /// stages that never dispatch a feed. It IMPLIES `gbuf_full` — the kernel
+    /// reads the pack — and `new` forces that rather than trusting the caller.
+    pub feed: bool,
 }
 
 const P_REFERENCE: usize = 0;
@@ -297,9 +340,16 @@ impl VkTracer {
         bvh: &crate::bvh::Bvh,
         rw: u32,
         rh: u32,
+        opts: TracerOpts,
     ) -> Result<VkTracer, String> {
         let vkd = &hg.vk;
         let d = &vkd.device;
+        // The feed kernel reads `gbuf`, so a feed over a stride-sized pack
+        // would read one texel's worth of allocation for every pixel. FORCED
+        // rather than asserted: the two flags are not independent, and the
+        // caller that gets it wrong is asking for the feed, which is the
+        // stronger request.
+        let gbuf_full = opts.gbuf_full || opts.feed;
 
         // ONE assembly for both units, from the shipping entry point — the
         // snapshots come back with it, so the buffers below are SIZED against
@@ -347,6 +397,14 @@ impl VkTracer {
             (&srcs.wavefront, "cs_clear_h", "wf-clear-h"),
             (&srcs.leaf_fb, "cs_leaf", "wf-leaf-fb"),
         ];
+        // The feed. ONE entry point of the several `feed.hlsl` declares, which
+        // is what keeps its footprint to three bindings: DXC drops every
+        // `feed_*` declaration `cs_feed_xess` does not reference, so the unit
+        // contributes exactly u16 (RGBA16F colour), u18 (R32F reversed-Z clip
+        // depth) and u19 (RG16F mvec). Its other two inputs — `accum` at u0 and
+        // `gbuf` at u15, the latter from `trace_common.hlsli` — are the SAME
+        // declarations the tracer already binds, so they join no new slot.
+        let feed_units: [(&str, &str, &str); 1] = [(&srcs.feed, "cs_feed_xess", "feed-xess")];
         // Nothing turns these off today (see `Wave`'s doc). The flags stay
         // because the compile/allocate/write sites all key off them, so a
         // future gate — a device floor, a memory ceiling — is one expression
@@ -368,6 +426,7 @@ impl VkTracer {
             .iter()
             .chain(wave_units.iter().take(if want_wave { 9 } else { 0 }))
             .chain(hemi_units.iter().take(if want_hemi { 8 } else { 0 }))
+            .chain(feed_units.iter().take(if opts.feed { 1 } else { 0 }))
             .collect();
         for (src, entry, tag) in all {
             let w = sp.compile(src, entry, "cs_6_5", tag, false)?;
@@ -399,6 +458,7 @@ impl VkTracer {
         let mut pipes = [vk::Pipeline::null(); 4];
         let mut wpipes = [vk::Pipeline::null(); 9];
         let mut hpipes = [vk::Pipeline::null(); 8];
+        let mut feed_pipe: Option<vk::Pipeline> = None;
         {
             let mut built: Vec<vk::Pipeline> = Vec::new();
             let mut make = |i: usize, entry: &str| -> Result<vk::Pipeline, String> {
@@ -422,6 +482,13 @@ impl VkTracer {
                         hpipes[j] = make(base + j, entry)?;
                     }
                 }
+                if opts.feed {
+                    // Its index is the END of `all`, which is where the chain
+                    // above put it — the same positional agreement the wave
+                    // and hemi blocks rely on.
+                    let i = units.len() + wave_units.len() + hemi_units.len();
+                    feed_pipe = Some(make(i, feed_units[0].1)?);
+                }
                 Ok(())
             })();
             if let Err(e) = r {
@@ -441,6 +508,16 @@ impl VkTracer {
         let accum = vkd.buffer(px * 12, sb, false)?;
         let tbuf = vkd.buffer(px * 4, sb, false)?;
         let info = vkd.buffer(px * 4, sb, false)?;
+        // The pack. Full-size only under `gbuf_full`; otherwise ONE stride, the
+        // D3D12 sizing verbatim (gpu/trace.rs's `committed_buffer` pair). The
+        // ext half is allocated whenever the core one is, NOT only when a
+        // guide-consuming kind is wired — D3D12's own reason applies here
+        // unchanged: the consumer arrives after construction, so the buffer
+        // must always be able to receive the stores, and `FLAG_GBUF_EXT` gates
+        // the WRITES, which is where the cost is.
+        let gbuf = vkd.buffer(if gbuf_full { px * GBUF_STRIDE } else { GBUF_STRIDE }, sb, false)?;
+        let gbuf_ext =
+            vkd.buffer(if gbuf_full { px * GBUF_EXT_STRIDE } else { GBUF_EXT_STRIDE }, sb, false)?;
         let counters = vkd.buffer(u64::from(gs::CTR_TOTAL) * 4, sb, false)?;
         // The amortized cloud lattice: one float4 per point, one point of
         // border past each far edge — `TraceGpu::new`'s sizing verbatim,
@@ -701,6 +778,9 @@ impl VkTracer {
             accum,
             tbuf,
             info,
+            gbuf,
+            gbuf_ext,
+            gbuf_full,
             counters,
             cloud_lod,
             cloud_shadow,
@@ -715,6 +795,7 @@ impl VkTracer {
             sets,
             layouts,
             pipes,
+            feed_pipe,
             wave,
             hemi,
             cb_base,
@@ -846,6 +927,14 @@ impl VkTracer {
             (0, Reg::U, 1, &self.tbuf),
             (0, Reg::U, 2, &self.info),
             (0, Reg::U, 3, &self.counters),
+            // The pack. Bound in EVERY variant and whether or not `gbuf_full`
+            // is set: an unarmed tracer's pair is stride-sized rather than
+            // absent, so binding them costs nothing and is strictly better
+            // than letting them fall through to a 16-byte dummy that a
+            // mis-set `FLAG_GBUF` would then overrun. The flag is still the
+            // safety boundary — this just removes one way to be unlucky.
+            (0, Reg::U, 15, &self.gbuf),
+            (0, Reg::U, 32, &self.gbuf_ext),
             (1, Reg::T, 0, &vs.uv_buf),
             (1, Reg::T, 1, &vs.indices),
             (1, Reg::T, 2, &vs.tri_mat),
@@ -973,6 +1062,106 @@ impl VkTracer {
         unsafe { d.update_descriptor_sets(&writes, &[]) };
     }
 
+    /// Point `cs_feed_xess`'s three output registers at an upscaler's input
+    /// images. The Vulkan spelling of D3D12's `trace::wire_feed_targets` — the
+    /// shared, owner-independent half both tracers wrap — and deliberately the
+    /// same shape: the tracer BINDS views it does not own, so image lifetime
+    /// stays beside every other resource of whoever created them
+    /// (`vk::fsr3::Fsr3` today).
+    ///
+    /// `views` is (colour u16, depth u18, mvec u19), named by ROLE at the call
+    /// site rather than by index, because the three formats differ (RGBA16F /
+    /// R32F / RG16F) and a swapped pair is exactly the class a derived layout
+    /// cannot catch — every one of them is a `STORAGE_IMAGE` to Vulkan.
+    ///
+    /// GUARDED ON THE MAP, the `--sw-rays` TLAS rule: a tracer built without
+    /// `TracerOpts::feed` compiled no unit declaring these registers, so the
+    /// layout has no such bindings, and a write to a binding the layout lacks
+    /// is not a harmless no-op. Calling this on an unfed tracer is therefore
+    /// inert rather than undefined.
+    ///
+    /// Rebinding mid-session is legal for `bind_textures`' reason:
+    /// `VkHeadless::run` fences every submit, so nothing is ever pending
+    /// against these sets.
+    pub fn wire_feed(&self, hg: &VkHeadless, views: [vk::ImageView; 3]) {
+        let d = &hg.vk.device;
+        // EVERY set-0 variant, not just the terminal one: `record_feed` binds
+        // the terminal variant today, but a variant that silently lacked the
+        // targets would be a latent trap for whichever pass reaches for them
+        // next, and the write is three descriptors.
+        let mut all: Vec<&[vk::DescriptorSet]> = vec![&self.sets];
+        if let Some(w) = &self.wave {
+            all.push(&w.sets_a);
+            all.push(&w.sets_b);
+        }
+        if let Some(h) = &self.hemi {
+            all.push(&h.sets_a);
+            all.push(&h.sets_b);
+        }
+        let infos: Vec<[vk::DescriptorImageInfo; 1]> = views
+            .iter()
+            .map(|v| {
+                [vk::DescriptorImageInfo::default()
+                    .image_view(*v)
+                    .image_layout(vk::ImageLayout::GENERAL)]
+            })
+            .collect();
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+        for sets in &all {
+            for (i, reg) in [16u32, 18, 19].iter().enumerate() {
+                let b = binding_of(Reg::U, *reg);
+                if !self.map.entries.contains_key(&(0, b)) {
+                    continue;
+                }
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(sets[0])
+                        .dst_binding(b)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&infos[i]),
+                );
+            }
+        }
+        if std::env::var_os("FR_VK_MAP").is_some() {
+            eprintln!(
+                "check-vk:   wire_feed <- {} write(s) over {} set-0 variant(s)",
+                writes.len(),
+                all.len()
+            );
+        }
+        if !writes.is_empty() {
+            unsafe { d.update_descriptor_sets(&writes, &[]) };
+        }
+    }
+
+    /// Record `cs_feed_xess`: fan this frame's pack + `accum` out into the
+    /// images `wire_feed` bound. One thread per pixel, 8x8 groups — the
+    /// kernel's own `[numthreads]`.
+    ///
+    /// Recorded rather than run, so the caller can put it in the SAME command
+    /// buffer as the upscaler dispatch that consumes its output — D3D12's
+    /// "trace -> feed -> upscale on one list" shape.
+    ///
+    /// The feed's registers all live in the shared base of every variant
+    /// (`accum` u0, `gbuf` u15, `FrameCb` b0, plus the three targets), so this
+    /// binds the TERMINAL variant and needs no variant of its own.
+    ///
+    /// # Safety
+    /// `cmd` must be in the recording state, and `write_cb` must have run for
+    /// THIS frame: the kernel reads `rw`/`rh`/`CAM_NEAR`/`CAM_FAR` out of the
+    /// frame constants, so a stale block feeds right values for a wrong frame.
+    pub unsafe fn record_feed(&self, d: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), String> {
+        let pipe = self.feed_pipe.ok_or("this tracer was not built with TracerOpts::feed")?;
+        unsafe {
+            barrier(d, cmd);
+            self.bind(d, cmd, &self.sets);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            d.cmd_dispatch(cmd, self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            barrier(d, cmd);
+        }
+        Ok(())
+    }
+
     /// Write (or rewrite) the `texs[]` array.
     ///
     /// Found by KIND, not by register: it is the corpus's one unbounded
@@ -1036,12 +1225,24 @@ impl VkTracer {
 
     /// The per-frame cbuffer, written host-side before the submit.
     fn write_cb(&self, hg: &VkHeadless, p: &FrameParams) -> Result<(), String> {
-        // EVERY capture/bridge flag is off, and each for the same structural
-        // reason rather than as a default: this backend writes no G-buffer
-        // pack and wires no denoiser, so `gbuf_full` is false and the six that
-        // are gated on it (`fsr_sig`, `gbuf_ext`, `nrd_sig`, `sky_ext_skip`,
-        // `remod_exact`, and the FSR-RR half of the rest) could not arm even
-        // if asked. `nrd_rejitter` and `rclamp` live in `cs_nrd_out`, which is
+        // `gbuf_full` and `gbuf_ext` follow the ALLOCATION (the field is set by
+        // the constructor argument that sized the two buffers), which is what
+        // keeps `FLAG_GBUF` from ever arming over a stride-sized pack — a
+        // storage buffer has no bounds check, so that flag is memory safety
+        // and not an optimization (gfx/frame.rs's own note on it).
+        //
+        // The ext half arms WITH the core one rather than on demand, matching
+        // `--check-gpu` M7's `force_gbuf_ext(true)` and for its reason: the
+        // consumer here is a CPU readback, not a feed kernel, and
+        // `dlss::mv_selftest`'s sky arm reads the normal lane, which lives in
+        // ext. Core-only would fail that arm for a reason unrelated to the
+        // pack.
+        //
+        // The rest stay off, each structurally rather than as a default:
+        // `fsr_sig` is a shade-side export this backend does not capture (so
+        // `core.w`/the sig lanes stay 0, and `unpack_gbuf_bytes` drops them
+        // anyway), `nrd_sig`/`sky_ext_skip`/`remod_exact` need a wired
+        // denoiser, and `nrd_rejitter`/`rclamp` live in `cs_nrd_out`, which is
         // not compiled here at all.
         //
         // A POSITIONAL PILE THIS LONG IS A HAZARD, and this call site is the
@@ -1050,8 +1251,9 @@ impl VkTracer {
         // only a Linux build could see. When the next one lands, decide it
         // HERE too — a wrong `false` would be silent where the missing
         // argument was loud.
+        let g = self.gbuf_full;
         let mut cb =
-            self.cb_base.with_frame(p, false, false, false, false, false, false, false, (false, false));
+            self.cb_base.with_frame(p, g, false, g, false, false, false, false, (false, false));
         cb.cloud_grid = if self.cloud_shadow_n == 0 || !p.clouds.enabled {
             [0.0; 4]
         } else {
@@ -1676,6 +1878,7 @@ impl VkTracer {
                 .iter()
                 .chain(self.wave.iter().flat_map(|w| w.pipes.iter()))
                 .chain(self.hemi.iter().flat_map(|h| h.pipes.iter()))
+                .chain(self.feed_pipe.iter())
             {
                 d.destroy_pipeline(*p, None);
             }
@@ -1691,6 +1894,8 @@ impl VkTracer {
             &self.accum,
             &self.tbuf,
             &self.info,
+            &self.gbuf,
+            &self.gbuf_ext,
             &self.counters,
             &self.cloud_lod,
             &self.cloud_shadow,
@@ -1812,7 +2017,7 @@ fn create_image(vkd: &crate::vk::device::Vk, rw: u32, rh: u32) -> Result<Image, 
 
 /// IEEE binary16 -> f32. The one decode the readback needs; the tree's other
 /// f16 sites (`dlss::ld16`) live on the D3D12 side of a `#[cfg]`.
-fn half_from_bits(h: u16) -> f32 {
+pub(crate) fn half_from_bits(h: u16) -> f32 {
     let s = ((h >> 15) & 1) as u32;
     let e = ((h >> 10) & 0x1f) as u32;
     let m = (h & 0x3ff) as u32;

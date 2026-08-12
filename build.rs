@@ -62,6 +62,22 @@ fn require_nrd() {
 /// re-fetch or a re-checkout, never both.
 #[cfg(not(windows))]
 fn build_ffx_fsr3() {
+    // THE GUARD MUST BE ON THE *TARGET*, AND `cfg!` IS NOT. Inside a build
+    // script `cfg!(windows)` describes the HOST the script was compiled for, so
+    // the `#[cfg(not(windows))]` on this function only says "not built ON
+    // Windows" — cross-compiling TO Windows from Linux still runs it, and then
+    // tries to build the FSR3 SDK with clang-cl for a platform that upscales
+    // through ffx-api v2.3.0 and wants none of this.
+    //
+    // A latent defect since B0 that could only surface once the SDK was
+    // actually fetched: with `SDKs/FidelityFX-SDK` absent, the sentinel check
+    // below returned first and the cross-compile never got here.
+    // `CARGO_CFG_TARGET_OS` is the target, which is the question being asked.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        return;
+    }
+
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let sdk = manifest.join("SDKs/FidelityFX-SDK/sdk");
     let shaders = manifest.join("SDKs/FidelityFX-SDK-prebuilt/shaders/vk");
@@ -94,11 +110,26 @@ fn build_ffx_fsr3() {
         return;
     }
 
-    // The backend-NEUTRAL translation units only. `ffx_vk.cpp` (Vulkan) and the
-    // hand-written Metal `FfxInterface` land beside these when their backends
-    // do, because each needs an API's headers that the other platform lacks —
-    // and ffx_vk.cpp additionally needs GCC's vectorizer disabled (an alignment
-    // UB in CreateBackendContextVK that miscompiles into a segfault at -O2+).
+    // THE VULKAN BACKEND IS ONLY BUILT WHERE ITS HEADERS ARE. `ffx_vk.cpp`
+    // includes <vulkan/vulkan.h>, which comes from the distro's vulkan-headers
+    // package rather than from anything this repository fetches — so it gets
+    // the same warn-and-skip treatment as the two halves above rather than a
+    // hard failure, and the whole FSR3 arm stands down instead of half-building.
+    // (macOS will take the hand-written Metal `FfxInterface` here instead.)
+    let vk_header = std::path::Path::new("/usr/include/vulkan/vulkan.h");
+    let want_vk = target_os == "linux" && vk_header.exists();
+    if target_os == "linux" && !want_vk {
+        println!(
+            "cargo:warning=<vulkan/vulkan.h> not found at {} — FSR3 disabled for the \
+             Vulkan backend (install your distribution's vulkan-headers package)",
+            vk_header.display()
+        );
+        return;
+    }
+
+    // The backend-NEUTRAL translation units. The per-backend half — `ffx_vk.cpp`
+    // for Vulkan, a hand-written Metal `FfxInterface` later — lands beside them
+    // below, because each needs an API's headers the other platform lacks.
     let src = sdk.join("src");
     let units = [
         "components/fsr3upscaler/ffx_fsr3upscaler.cpp",
@@ -139,7 +170,56 @@ fn build_ffx_fsr3() {
         b.file(src.join(u));
     }
     b.file(manifest.join("shim/ffx_fsr3.cpp"));
+
+    if want_vk {
+        // `ffx_vk.cpp`'s own sources include each other by bare name from this
+        // directory, exactly as the neutral units do from theirs.
+        b.include(src.join("backends/vk"));
+        b.file(src.join("backends/vk/ffx_vk.cpp"));
+        b.file(manifest.join("shim/ffx_fsr3_vk.cpp"));
+
+        // AN ALIGNMENT UB IN THE SDK, and the one thing here that is a crash
+        // rather than a compile error. `CreateBackendContextVK` zeroes a run of
+        // fields in an `alignas(32)` EffectContext carved out of a 16-byte-aligned
+        // scratch buffer; at -O2+ the compiler folds those writes into an aligned
+        // 128-bit store on a misaligned address and takes a #GP. Disabling
+        // SLP/loop vectorization keeps them scalar. Perf impact is nil — these are
+        // init and record paths, not arithmetic kernels — and `flag_if_supported`
+        // is what keeps clang and MSVC out of it, so no compiler test is needed.
+        // Do not remove either flag without reproducing the segfault first.
+        b.flag_if_supported("-fno-tree-slp-vectorize");
+        b.flag_if_supported("-fno-tree-vectorize");
+    }
+
     b.compile("ffx_fsr3");
+
+    if want_vk {
+        // THE TREE'S FIRST *LINKED* VULKAN DEPENDENCY, and it is worth saying so:
+        // `src/vk/` deliberately links nothing (`libvulkan.so.1` is dlopen'd
+        // through `ash` and every entry point resolved by symbol, which is what
+        // keeps every `--check*` DLL-free). `ffx_vk.cpp` resolves MOST of Vulkan
+        // through the `vkGetDeviceProcAddr` we hand it, but not all of it —
+        // measured, `nm` on the object leaves nine undefined:
+        //
+        //   vkCreateBuffer                        vkGetPhysicalDeviceFeatures
+        //   vkEnumerateDeviceExtensionProperties  vkGetPhysicalDeviceFeatures2
+        //   vkGetDeviceProcAddr                   vkGetPhysicalDeviceMemoryProperties
+        //   vkGetPhysicalDeviceProperties         vkGetPhysicalDeviceProperties2
+        //   (+ ffxSetFrameGenerationConfigToSwapchainVK, stubbed in our shim)
+        //
+        // so the loader is needed at LINK time. Scoped to `cfg(ffx_fsr3_src)` —
+        // a bare checkout, which is what that policy actually protects, still
+        // links nothing.
+        //
+        // DO NOT "CLEAN THIS UP" ON THE EVIDENCE OF `ldd`: until something in
+        // Rust actually calls `frshim_fsr3vk_*`, `--gc-sections` drops these
+        // objects and `--as-needed` then drops libvulkan from DT_NEEDED, so the
+        // link looks superfluous while being load-bearing the moment the shim
+        // gains its first caller.
+        println!("cargo:rustc-link-lib=dylib=vulkan");
+        println!("cargo:rerun-if-changed=shim/ffx_fsr3_vk.cpp");
+        println!("cargo:rerun-if-changed=shim/ffx_fsr3_vk.h");
+    }
 
     println!("cargo:rustc-cfg=ffx_fsr3_src");
 

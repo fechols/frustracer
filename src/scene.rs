@@ -362,6 +362,49 @@ impl Material {
 // is why the sun used to reflect as a SQUARE. The light is now `sky::Sun`: a
 // disc at infinity, part of the one sky sphere. See src/sky.rs.
 
+/// The scene's emitter magnitudes at gain 1 — what `apply_light_gain` scales
+/// FROM.
+///
+/// It exists so the gain is ABSOLUTE. Applying a ratio against the live values
+/// instead would compound its own rounding over a session's thousands of
+/// controller steps, and would make "the same EV" mean something slightly
+/// different depending on how the session got there — which is exactly the
+/// property the `--check` linearity gate needs to be able to state.
+///
+/// Each producer captures what IT produces, so no capture can go stale against
+/// its own source: `apply_tod_lit` captures the sun and the dome scale,
+/// `refresh_sky_sh` captures the SH (deliberately separate — the interactive
+/// scrub throttles re-projection at `SH_TOD_STEP`, so the two legitimately
+/// disagree mid-scrub), and `finalize_scalars` captures the emissive cluster
+/// colours right after deriving them.
+#[derive(Clone, Copy)]
+pub struct LightCanon {
+    /// `Scene::sun` before the gain — both `e_over_pi` AND the cached disc
+    /// `radiance`, which is never re-derived downstream.
+    pub sun: crate::sky::Sun,
+    /// `Scene::sky_scale` before the gain.
+    pub sky_scale: f32,
+    /// `Scene::sky_sh` before the gain.
+    pub sky_sh: crate::sh::Sh9,
+    /// `EmissiveLights::lights[i].color` before the gain. Only the colour is
+    /// gained — `rc2` and `r_infl2` deliberately are NOT, which is what keeps
+    /// each cluster's reach and per-pixel scan cost invariant under the
+    /// aperture (contrast `EL_BOOST`, which lands inside `derive_parts` and so
+    /// doubles `r_infl2` with it).
+    pub el: [[f32; 3]; crate::emissive::MAX_EMISSIVE_LIGHTS],
+}
+
+impl Default for LightCanon {
+    fn default() -> Self {
+        LightCanon {
+            sun: crate::sky::Sun::new(Vec3A::Y),
+            sky_scale: 1.0,
+            sky_sh: crate::sh::Sh9::ZERO,
+            el: [[0.0; 3]; crate::emissive::MAX_EMISSIVE_LIGHTS],
+        }
+    }
+}
+
 pub struct Scene {
     pub positions: Vec<Vec3A>,
     pub normals: Vec<Vec3A>,
@@ -409,6 +452,23 @@ pub struct Scene {
     /// Star visibility (`sky::stars`' gate): exactly 0.0 in an untouched
     /// session, ramping to 1.0 after sunset. Derived, never serialized.
     pub night: f32,
+    /// The light-gain currently APPLIED to this scene's emitters — the
+    /// `--autoexp-mode lights` aperture (`apply_light_gain`). Exactly 1.0 in
+    /// every headless run and in the default tonemap arm, which is what makes
+    /// the whole feature structurally unreachable there (the `apply_tod`
+    /// precedent). Derived, never serialized.
+    ///
+    /// Five of the six emitter families carry the gain in their own values, so
+    /// they need no consumer changes at all; this field is what the two that
+    /// CANNOT read it (the emissive DISPLAY add, whose magnitude lives in the
+    /// serialized material stream, and the star field, whose constants are
+    /// mirrored HLSL literals) multiply by. It rides the cbuffer as
+    /// `FrameCb::light_gain`.
+    pub light_gain: f32,
+    /// The UNGAINED light values `apply_light_gain` scales from, so the gain is
+    /// absolute and idempotent rather than a compounding ratio. Derived, never
+    /// serialized; each producer captures what it produces (see `LightCanon`).
+    pub light_canon: LightCanon,
     /// Wind-swayed foliage (src/foliage.rs): the ONE cell partition every
     /// consumer shares — the CPU intersector's per-triangle displacement,
     /// the BVH build sweep, and the GPU BLAS split — plus the per-frame
@@ -691,6 +751,8 @@ impl SceneBuilder {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            light_gain: 1.0,
+            light_canon: LightCanon::default(),
             sway: None,
             sway_regions: Vec::new(),
             diag: 0.0,
@@ -1340,6 +1402,8 @@ pub fn spray_self_test() -> Result<(), String> {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            light_gain: 1.0,
+            light_canon: LightCanon::default(),
             sway: None,
             sway_regions: Vec::new(),
             diag: 1.0,
@@ -1512,6 +1576,8 @@ pub fn coincident_self_test() -> Result<(), String> {
                 sky_sh: crate::sh::Sh9::ZERO,
                 sky_scale: 1.0,
                 night: 0.0,
+                light_gain: 1.0,
+                light_canon: LightCanon::default(),
                 sway: None,
                 sway_regions: Vec::new(),
                 diag: 1.0,
@@ -1556,6 +1622,21 @@ pub fn coincident_self_test() -> Result<(), String> {
 /// `SceneBuilder::finish` and `tile_scene`: replication changes the bounds,
 /// and every epsilon in the tracer is scale-relative to `diag`.
 pub fn finalize_scalars(scene: &mut Scene) {
+    // THIS FUNCTION CAPTURES `light_canon`, so it must see an UNGAINED scene —
+    // and nothing about its signature says so. Every call site is load-time
+    // (the loaders, the world merge, the sidecar, `tile_scene`, the self-tests),
+    // all of which run before `session()` can tick the controller, and the ONE
+    // live scene edit that exists — the Y/Z frustum snapshot — deliberately
+    // rebuilds only the BVH. But capturing a GAINED value here would compound
+    // the gain permanently and silently, which is the exact class of bug the
+    // sun clobber below already was, so state the precondition rather than
+    // leave it merely true today. (`apply_tod_lit` is the other capture site
+    // and legitimately runs gained — it recomputes the sun from the hour first,
+    // so what it captures is canonical by construction.)
+    debug_assert_eq!(
+        scene.light_gain, 1.0,
+        "finalize_scalars captures the CANONICAL lights and must not run on a gained scene"
+    );
     let mut mn = Vec3A::splat(f32::INFINITY);
     let mut mx = Vec3A::splat(f32::NEG_INFINITY);
     // The content AABB in the same pass: every loader pushes the standard
@@ -1594,6 +1675,12 @@ pub fn finalize_scalars(scene: &mut Scene) {
     // byte-deterministic; emissive-free scenes pay O(materials) and keep
     // the structural count-0 off state. One loud line iff lights exist.
     scene.emissive = crate::emissive::derive(scene, crate::emissive::budget());
+    // The ungained cluster colours, captured beside the derivation that
+    // produced them (see `LightCanon`). Only the colour is gained — `r_infl2`
+    // stays put so the aperture cannot move any cluster's reach or cost.
+    for i in 0..scene.emissive.count as usize {
+        scene.light_canon.el[i] = scene.emissive.lights[i].color;
+    }
     if scene.emissive.count > 0 {
         let total: f32 = (0..scene.emissive.count as usize)
             .map(|i| {
@@ -1612,6 +1699,22 @@ pub fn finalize_scalars(scene: &mut Scene) {
     }
 
     derive_detail_scales(scene);
+    // The UNGAINED sun and dome scale, captured before the SH projection that
+    // consumes them. This is the ONE funnel every load path runs (cold, warm
+    // sidecar, tile replication, world merge), and it is the only place a
+    // flagless session's sun is ever known to be canonical: `apply_tod_lit`,
+    // the other capture site, is structurally unreachable without `--tod`.
+    //
+    // MISSING THIS CLOBBERS THE SUN. `refresh_sky_sh` ends by re-applying the
+    // live gain, which writes the canon back over `scene.sun` — so an
+    // uncaptured canon replaces the scene's real sun with `LightCanon`'s
+    // straight-up placeholder at load, in EVERY session including headless
+    // ones. It shipped that way for one build and `check.png` is what caught
+    // it; the light-gain A/B gate could not, because it renders both of its
+    // arms from the already-clobbered scene. `--check`'s canon-agreement
+    // assertion is the guard that would.
+    scene.light_canon.sun = scene.sun;
+    scene.light_canon.sky_scale = scene.sky_scale;
     refresh_sky_sh(scene);
 }
 
@@ -1627,11 +1730,27 @@ pub fn finalize_scalars(scene: &mut Scene) {
 /// field's smooth mean (`sky::star_glow`, gated by `scene.night`), which is
 /// what gives night a moon-independent ambient floor. `gather` is bitwise
 /// `dome` whenever `night == 0`, so every day session is untouched.
+/// Under `--autoexp-mode lights` this projects the CANONICAL dome
+/// (`light_canon.sky_scale`, and gain 1.0 for the star half) and lets
+/// `apply_light_gain` scale the result. Projecting the gained sky instead
+/// would bake the gain into the coefficients and then gain them a second time
+/// — the one ordering hazard in the feature, removed here by construction
+/// rather than by call-site discipline.
 pub fn refresh_sky_sh(scene: &mut Scene) {
     let sun = scene.sun.dir;
-    let scale = scene.sky_scale;
+    let scale = scene.light_canon.sky_scale;
     let night = scene.night;
-    scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::gather(d, sun, scale, night));
+    scene.light_canon.sky_sh = crate::sh::Sh9::project(|d| crate::sky::gather(d, sun, scale, night, 1.0));
+    // Re-gain ONLY the coefficients this function just produced — deliberately
+    // NOT a whole `apply_light_gain`. That shortcut clobbered the sun for one
+    // build: this runs on every load path, `apply_light_gain` writes the sun
+    // FROM the canon, and on a flagless session nothing had captured the canon
+    // yet (`apply_tod_lit` is unreachable without `--tod`), so every session
+    // silently traded its real sun for LightCanon's straight-up placeholder.
+    // Scoping the re-gain to this function's own output makes that
+    // unrepresentable, and leaves an uncaptured canon VISIBLE to `--check`'s
+    // canon-agreement gate instead of hiding it by making the two agree.
+    scene.sky_sh = scene.light_canon.sky_sh.scaled(scene.light_gain);
 }
 
 /// Texel-equivalent world size for materials with NO albedo texture, as a
@@ -1776,6 +1895,72 @@ pub fn apply_tod_lit(scene: &mut Scene, hour: f32) {
     // Stars fade in once the sun is well below the horizon.
     let t = ((-dir.y - 0.05) / 0.10).clamp(0.0, 1.0);
     scene.night = t * t * (3.0 - 2.0 * t);
+    // This function is the AUTHORITY on the ungained sun and dome scale, so it
+    // captures them; re-applying the live gain afterwards is what keeps a TOD
+    // scrub and the aperture composable (a scrub writes every moving frame,
+    // and without this it would silently drop the gain until the controller
+    // next moved — which the deadband can make a long time).
+    scene.light_canon.sun = scene.sun;
+    scene.light_canon.sky_scale = scene.sky_scale;
+    let g = scene.light_gain;
+    apply_light_gain(scene, g);
+}
+
+/// Scale every emitter in the scene by `g` — the `--autoexp-mode lights`
+/// aperture (src/autoexp.rs). ABSOLUTE and idempotent: it always writes from
+/// `Scene::light_canon`, never from the live values, so repeated application
+/// cannot compound and `apply_light_gain(s, 4.0)` followed by
+/// `apply_light_gain(s, 2.0)` lands exactly where a single `2.0` would.
+///
+/// The renderer is linear in emitted radiance, so this reproduces the tonemap
+/// arm's pre-curve multiply — `--check`'s `light-gain` gate is that claim,
+/// tested directly against `accum`.
+///
+/// FIVE of the six emitter families are carried by the values this writes, so
+/// they reach BOTH renderers with no consumer change at all (the `EL_BOOST`
+/// "parity holds BY DATA" precedent — the GPU reads `sun_e`/`sun_l`/`sky_sh`/
+/// `sky_scale`/`el_b` straight out of the cbuffer). The two that cannot are
+/// the emissive DISPLAY add and the star field; they read `Scene::light_gain`,
+/// which this also sets.
+///
+/// WHAT IS DELIBERATELY NOT SCALED, and why it matters: `EmissiveLight::rc2`
+/// and `r_infl2`. The influence radius is derived ONCE at load from
+/// `EL_MIN_E`, so leaving it alone keeps every cluster's reach, its per-pixel
+/// scan cost, its shadow-ray count and `emissive::cull_tile`'s sets invariant
+/// under the aperture. That is the opposite of `EL_BOOST`, which lands inside
+/// `derive_parts` and therefore doubles `r_infl2` along with the power.
+///
+/// `g == 1.0` restores the canonical values BITWISE (a branch, never `* 1.0`),
+/// which is what makes the tonemap arm and every headless path structurally
+/// the pre-feature renderer.
+pub fn apply_light_gain(scene: &mut Scene, g: f32) {
+    let c = scene.light_canon;
+    scene.light_gain = g;
+    if g == 1.0 {
+        scene.sun = c.sun;
+        scene.sky_scale = c.sky_scale;
+        scene.sky_sh = c.sky_sh;
+        for i in 0..scene.emissive.count as usize {
+            scene.emissive.lights[i].color = c.el[i];
+        }
+        return;
+    }
+    // The sun carries TWO magnitudes: the irradiance the direct loop samples
+    // and the disc radiance a ray sees. `radiance` is cached rather than
+    // re-derived downstream (sky::Sun's own note), so both must move.
+    scene.sun = crate::sky::Sun {
+        e_over_pi: c.sun.e_over_pi * g,
+        radiance: c.sun.radiance * g,
+        ..c.sun
+    };
+    scene.sky_scale = c.sky_scale * g;
+    // Projection is linear, so scaling nine coefficients IS the projection of
+    // the scaled dome — never re-project here (`Sh9::scaled`'s note).
+    scene.sky_sh = c.sky_sh.scaled(g);
+    for i in 0..scene.emissive.count as usize {
+        let e = c.el[i];
+        scene.emissive.lights[i].color = [e[0] * g, e[1] * g, e[2] * g];
+    }
 }
 
 /// The interactive TOD path's SH re-projection quantum, in game hours
@@ -1787,6 +1972,162 @@ pub fn apply_tod_lit(scene: &mut Scene, hour: f32) {
 /// shadows, sky_scale, and night never quantize (apply_tod_lit runs every
 /// write).
 pub const SH_TOD_STEP: f32 = 0.05;
+
+/// Closed-form gates on the scene light gain (`--autoexp-mode lights`), run by
+/// `--check`. Pure, DLL-free, scene-independent — it builds its own light set.
+///
+/// What it pins, in the order the properties matter:
+///  1. `g == 1.0` restores the canonical values BITWISE (the structural-off
+///     contract every headless bit-identity claim rests on).
+///  2. The gain is ABSOLUTE, not compounding — repeated application, and any
+///     order of applications, lands exactly where a single one would. This is
+///     what makes "the same EV" mean the same thing however the session got
+///     there, which the linearity gate needs in order to state anything.
+///  3. Every magnitude scales, and BOTH of the sun's do (`radiance` is cached,
+///     never re-derived downstream, so a fix that moved only `e_over_pi` would
+///     leave the disc behind and no arithmetic gate would notice).
+///  4. REACH IS INVARIANT: `r_infl2` and `rc2` must not move under any gain.
+///     That is what keeps each emissive cluster's per-pixel scan cost, shadow
+///     ray count and `emissive::cull_tile` sets independent of the aperture —
+///     the deliberate difference from `EL_BOOST`, which lands inside
+///     `derive_parts` and grows reach with the power.
+pub fn light_gain_self_test() -> Result<(), String> {
+    use crate::emissive::EmissiveLight;
+    let mut sc = procedural_scene();
+    // A synthetic cluster set: the derivation is emissive::derive's business,
+    // this gate is about what the gain does to it.
+    sc.emissive.count = 2;
+    for (i, (c, r)) in [([1.0f32, 2.0, 3.0], 7.0f32), ([0.25, 0.5, 0.75], 3.0)].iter().enumerate() {
+        sc.emissive.lights[i] = EmissiveLight { pos: [0.0; 3], rc2: 0.5, color: *c, r_infl2: *r };
+        sc.light_canon.el[i] = *c;
+    }
+    sc.light_canon.sun = sc.sun;
+    sc.light_canon.sky_scale = sc.sky_scale;
+    sc.light_canon.sky_sh = sc.sky_sh;
+    let canon = sc.light_canon;
+
+    let snapshot = |s: &Scene| {
+        let mut v: Vec<u32> = Vec::new();
+        for x in s.sun.e_over_pi.to_array().iter().chain(s.sun.radiance.to_array().iter()) {
+            v.push(x.to_bits());
+        }
+        v.push(s.sky_scale.to_bits());
+        for c in &s.sky_sh.c {
+            for x in c.to_array() {
+                v.push(x.to_bits());
+            }
+        }
+        for i in 0..s.emissive.count as usize {
+            for x in s.emissive.lights[i].color {
+                v.push(x.to_bits());
+            }
+        }
+        v.push(s.light_gain.to_bits());
+        v
+    };
+    let base = snapshot(&sc);
+    // Anti-vacuity: the canonical set must actually carry light, or every
+    // "scales by g" assertion below is 0 == 0.
+    if !(canon.sun.e_over_pi.max_element() > 0.0
+        && canon.sun.radiance.max_element() > 0.0
+        && canon.sky_scale > 0.0)
+    {
+        return Err("light-gain gate is vacuous: the canonical sun/dome carry no light".into());
+    }
+
+    // (1) The structural off state, bitwise, from BOTH directions — arriving
+    // at 1.0 from a gained state must restore, not merely leave alone.
+    apply_light_gain(&mut sc, 1.0);
+    if snapshot(&sc) != base {
+        return Err("apply_light_gain(1.0) is not bitwise inert".into());
+    }
+    apply_light_gain(&mut sc, 4.0);
+    apply_light_gain(&mut sc, 1.0);
+    if snapshot(&sc) != base {
+        return Err("apply_light_gain: 4.0 then 1.0 did not restore the canonical values".into());
+    }
+
+    // (2) Absolute, not compounding: any path to g lands on the same bits.
+    apply_light_gain(&mut sc, 2.0);
+    let once = snapshot(&sc);
+    for path in [[4.0f32, 2.0].as_slice(), &[0.5, 8.0, 2.0], &[2.0, 2.0, 2.0]] {
+        apply_light_gain(&mut sc, 1.0);
+        for &g in path {
+            apply_light_gain(&mut sc, g);
+        }
+        if snapshot(&sc) != once {
+            return Err(format!("apply_light_gain compounded along {path:?}"));
+        }
+    }
+
+    // (3) Every magnitude scales, both of the sun's included. Powers of two so
+    // the products are EXACT in f32 — this is a bit compare, not a tolerance.
+    for g in [0.25f32, 0.5, 2.0, 4.0] {
+        apply_light_gain(&mut sc, g);
+        if sc.light_gain != g {
+            return Err(format!("light_gain field is {} after applying {g}", sc.light_gain));
+        }
+        let want = |a: glam::Vec3A, b: glam::Vec3A| -> bool {
+            a.to_array().iter().zip(b.to_array().iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+        };
+        if !want(sc.sun.e_over_pi, canon.sun.e_over_pi * g) {
+            return Err(format!("sun.e_over_pi did not scale by {g}"));
+        }
+        if !want(sc.sun.radiance, canon.sun.radiance * g) {
+            return Err(format!("sun.radiance did not scale by {g} (the cached disc magnitude)"));
+        }
+        if sc.sky_scale.to_bits() != (canon.sky_scale * g).to_bits() {
+            return Err(format!("sky_scale did not scale by {g}"));
+        }
+        for (i, (a, b)) in sc.sky_sh.c.iter().zip(canon.sky_sh.c.iter()).enumerate() {
+            if !want(*a, *b * g) {
+                return Err(format!("sky_sh coefficient {i} did not scale by {g}"));
+            }
+        }
+        for i in 0..sc.emissive.count as usize {
+            for k in 0..3 {
+                if sc.emissive.lights[i].color[k].to_bits()
+                    != (canon.el[i][k] * g).to_bits()
+                {
+                    return Err(format!("emissive cluster {i} channel {k} did not scale by {g}"));
+                }
+            }
+        }
+        // (4) REACH: untouched by any gain, which is the whole cost argument.
+        for i in 0..sc.emissive.count as usize {
+            let l = &sc.emissive.lights[i];
+            if l.r_infl2.to_bits() != [7.0f32, 3.0][i].to_bits() || l.rc2 != 0.5 {
+                return Err(format!(
+                    "gain {g} moved emissive cluster {i}'s REACH \
+                     (r_infl2 {} rc2 {}) — the aperture must not change any \
+                     cluster's cost or cull set",
+                    l.r_infl2, l.rc2
+                ));
+            }
+        }
+    }
+    apply_light_gain(&mut sc, 1.0);
+
+    // The SH scale is the one place a linear identity replaces a re-projection
+    // (Sh9::project is a 16,384-point quadrature — the 235 -> 17 fps stall), so
+    // pin the identity itself: scaling coefficients IS projecting the scaled
+    // field. Compared as f32 bits at a power of two, again exactly.
+    let sun_d = sc.sun.dir;
+    let proj_scaled = crate::sh::Sh9::project(|d| crate::sky::gather(d, sun_d, 2.0, 0.0, 1.0));
+    let scaled_proj =
+        crate::sh::Sh9::project(|d| crate::sky::gather(d, sun_d, 1.0, 0.0, 1.0)).scaled(2.0);
+    for (i, (a, b)) in proj_scaled.c.iter().zip(scaled_proj.c.iter()).enumerate() {
+        let rel = (*a - *b).abs().max_element() / b.abs().max_element().max(1e-12);
+        if !(rel < 1e-5) {
+            return Err(format!(
+                "SH scaling is not the projection of the scaled dome at coefficient {i}: rel {rel}"
+            ));
+        }
+    }
+
+    eprintln!("light-gain self-test: OK");
+    Ok(())
+}
 
 /// Closed-form time-of-day gates, run by `--check`. No rng, no DLLs. Pins the
 /// arc's anchors, the fade's identities (the bit-identity guards), the sunset
@@ -1914,14 +2255,14 @@ pub fn tod_self_test() -> Result<(), String> {
         let z = (i as f32 + 0.5) / 2000.0; // upper hemisphere
         let r = (1.0 - z * z).max(0.0).sqrt();
         let d = Vec3A::new(r * a.cos(), z, r * a.sin());
-        if sky::stars(d, 5e-4, 0.0, 7) != Vec3A::ZERO {
+        if sky::stars(d, 5e-4, 0.0, 7, 1.0) != Vec3A::ZERO {
             return Err("stars are not exactly zero by day (night = 0)".into());
         }
-        let s = sky::stars(d, 5e-4, 1.0, 7);
+        let s = sky::stars(d, 5e-4, 1.0, 7, 1.0);
         if !s.is_finite() || s.min_element() < 0.0 {
             return Err(format!("stars({d:?}) = {s:?} — must be finite, non-negative"));
         }
-        if s != sky::stars(d, 5e-4, 1.0, 7) {
+        if s != sky::stars(d, 5e-4, 1.0, 7, 1.0) {
             return Err("star field is not deterministic".into());
         }
         sum += s;
@@ -2135,6 +2476,8 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         sky_sh: crate::sh::Sh9::ZERO,
         sky_scale: base.sky_scale,
         night: base.night,
+        light_gain: 1.0,
+        light_canon: LightCanon::default(),
         // Tiling re-derives the content box, so a stale partition would be
         // wrong; the caller re-attaches (foliage::attach) after tile_scene.
         sway: None,

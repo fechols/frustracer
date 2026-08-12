@@ -67,6 +67,17 @@ pub struct AutoExpGpu {
     /// Which slot windows hold an uncollected copy (Cell: the present recorder
     /// takes `&self`).
     pending: [Cell<bool>; FRAMES_IN_FLIGHT],
+    /// The SCENE LIGHT GAIN, in stops, that the frame in each slot window was
+    /// RENDERED with — `autoexp::light_gain_ev`, exactly 0.0 outside
+    /// `--autoexp-mode lights`.
+    ///
+    /// It has to be per SLOT rather than a single current value: the readback
+    /// lands FRAMES_IN_FLIGHT frames after the record, and under the lights
+    /// arm the aperture is an input to the renderer, so de-gaining a
+    /// 2-frame-old measurement with today's gain would leave a small closed
+    /// servo loop exactly where the design says there is none. Paired with
+    /// `pending` so a slot's value and its gain can never come apart.
+    gain_ev: [Cell<f32>; FRAMES_IN_FLIGHT],
 }
 
 impl AutoExpGpu {
@@ -199,6 +210,7 @@ impl AutoExpGpu {
             result,
             readback,
             pending: std::array::from_fn(|_| Cell::new(false)),
+            gain_ev: std::array::from_fn(|_| Cell::new(0.0)),
         })
     }
 
@@ -242,6 +254,7 @@ impl AutoExpGpu {
         src_h: u32,
         inv_samples: f32,
         slot: usize,
+        gain_ev: f32,
     ) {
         let tx = src_w.div_ceil(TILE);
         let ty = src_h.div_ceil(TILE);
@@ -304,16 +317,20 @@ impl AutoExpGpu {
             )]);
         }
         self.pending[slot].set(true);
+        self.gain_ev[slot].set(gain_ev);
     }
 
     /// Collect `slot`'s value — call BEFORE recording into the same slot, at a
     /// point where `D3d::begin_frame`'s fence wait has retired that slot's
     /// frame (the gputime contract; `fullscreen_to_backbuffer` qualifies).
     /// Maps the 4-byte sub-range and unmaps with an empty written range.
-    pub fn collect(&self, slot: usize) -> Option<f32> {
+    /// Returns `(mean log2-luminance, the gain in stops that frame was
+    /// rendered with)` — the caller de-gains through `autoexp::degain`.
+    pub fn collect(&self, slot: usize) -> Option<(f32, f32)> {
         if !self.pending[slot].replace(false) {
             return None;
         }
+        let gain_ev = self.gain_ev[slot].get();
         let begin = slot * 4;
         let range = D3D12_RANGE { Begin: begin, End: begin + 4 };
         let mut ptr = std::ptr::null_mut();
@@ -322,6 +339,6 @@ impl AutoExpGpu {
         unsafe {
             self.readback.resource.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
         }
-        v.is_finite().then_some(v)
+        v.is_finite().then_some((v, gain_ev))
     }
 }

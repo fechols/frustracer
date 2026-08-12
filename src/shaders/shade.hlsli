@@ -1376,7 +1376,11 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float3 ecol = el_b[ei].xyz;
                 float elum = dot(ecol, EL_LUM_W);
                 if (elum <= 0.0) continue;
-                float einv = min(1.0 / (ed2 + el_a[ei].w), EL_E_MAX / elum);
+                // The ceiling scales with the scene light gain, exactly as
+                // emissive::irradiance does: el_b arrives PRE-gained, so a
+                // fixed bound would clip a gained value against an ungained
+                // one and go sub-linear where an emitter is brightest.
+                float einv = min(1.0 / (ed2 + el_a[ei].w), EL_E_MAX * scene_light_gain() / elum);
                 float ex = 1.0 - ed2 / er2;
                 float3 ee = ecol * (einv * ex * ex);
                 float3 evis = ABL_TQ_SHADOW(
@@ -1569,6 +1573,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             if (SHADE_MAT_EMISTEX(mat)) {
                 emis *= tex_sample(mat.emissive_tex, map_uv, filt);
             }
+            // The scene light gain reaches emissive surfaces HERE (shade.rs's
+            // twin): `mat.emissive` lives in the material stream, which
+            // apply_light_gain cannot rescale per frame — and an emitter left
+            // un-gained while its surroundings brighten reads as the emitter
+            // DIMMING as the aperture opens. Exactly 1.0 by default.
+            emis *= scene_light_gain();
             total += tput * emis;
             if (in_refl) prim.ind_s += tput * emis;
         }

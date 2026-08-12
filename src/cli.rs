@@ -599,6 +599,19 @@ pub struct Opts {
     /// a full outlier is exempted from. 1.0 presents it at exactly its
     /// unboosted brightness; 0.0 is the structural off state.
     pub autoexp_guard_strength: f32,
+    /// `--autoexp-mode tonemap|lights` (DEFAULT `lights` since 2026-08-11, the
+    /// user's call after a feel-test): WHERE the aperture is spent. `lights`
+    /// scales every emitter in the scene (`scene::apply_light_gain`);
+    /// `tonemap` is the pre-feature presentation-curve multiply, and is now
+    /// the opt-out AND the A/B arm. The renderer's linearity in emitted
+    /// radiance makes them the same image — see `autoexp::Mode` for what
+    /// genuinely differs (denoiser clamps see the gained signal; the spike
+    /// guard is structurally absent, so it is inert in a default session). The
+    /// default is DUPLICATED in autoexp.rs's MODE initializer and settings.rs's
+    /// menu-row `Cycle { default_ix }` — flip all three in lockstep.
+    /// Interactive-only: headless paths never tick the controller, so both
+    /// arms hold their identity there and no gate moves either way.
+    pub autoexp_mode: crate::autoexp::Mode,
     /// `--no-water` clears (`scene::set_water`). Keys the cache lever word.
     pub water: bool,
     /// `--no-coincident-cull` clears (`scene::set_coincident_cull`): keep
@@ -956,6 +969,7 @@ pub fn defaults() -> Opts {
         exposure_bias: 0.0,
         autoexp_guard: true,
         autoexp_guard_strength: 1.0,
+        autoexp_mode: crate::autoexp::Mode::Lights,
         water: true,
         coincident_cull: true,
         heightfield: false,
@@ -1472,6 +1486,17 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         std::process::exit(2);
                     });
                 opts.autoexp_guard_strength = k;
+            }
+            // WHERE the aperture is spent. An illegal value exits 2 rather
+            // than falling back: an A/B lever that silently measured the other
+            // arm is the failure the FR_LEAF rule exists to prevent, and this
+            // one's whole purpose is to be compared against its sibling.
+            "--autoexp-mode" => {
+                let m = args.next().unwrap_or_default();
+                opts.autoexp_mode = crate::autoexp::Mode::parse(&m).unwrap_or_else(|| {
+                    eprintln!("--autoexp-mode needs tonemap|lights (got '{m}')");
+                    std::process::exit(2);
+                });
             }
             // --no-water: the fountain classifies as generic glassware (the
             // pre-water-class look) instead of the water refinement (blue-green
@@ -2763,6 +2788,18 @@ pub fn usage() {
                 eprintln!("  --autoexp-spike-guard  the default, spelled explicitly (later flags win)");
                 eprintln!("  --autoexp-spike-strength K  how much boost a full outlier is exempted from");
                 eprintln!("                (0..=1, default 1 = presented exactly as if auto-exposure were off)");
+                eprintln!("  --autoexp-mode tonemap|lights  WHERE the aperture is spent (default LIGHTS)");
+                eprintln!("                lights  = the EV becomes a gain on every emitter in the scene: sun/moon,");
+                eprintln!("                sky dome + its SH ambient, stars, fireflies, emissive — both their");
+                eprintln!("                lighting AND their own glow, since an emitter that stayed put while the");
+                eprintln!("                scene brightened would read as DIMMING. The renderer is linear in emitted");
+                eprintln!("                radiance, so it is the same image the tonemap arm makes; what changes is");
+                eprintln!("                that the denoisers/upscalers integrate the BRIGHTENED signal, so their");
+                eprintln!("                absolute clamps act at presented brightness.");
+                eprintln!("                tonemap = a multiply at the presentation curve (the pre-feature arm, and");
+                eprintln!("                the A/B partner). It is also the ONLY arm the --autoexp-spike-guard exists");
+                eprintln!("                in: the guard relaxes a per-PIXEL display exposure, and a global light");
+                eprintln!("                gain has no per-pixel lever, so the guard is inert under `lights`.");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
                 eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
                 eprintln!("  --no-coincident-cull  keep transmissive faces exactly coincident with opaque faces");
@@ -2868,7 +2905,7 @@ fn lever_snapshot() -> String {
     format!(
         "mips={} aniso={} h2n={} n2h={} smips={} saa={} tint={} spray={} depth={} detail={} dao={} \
          dstr={} daostr={} duntex={} \
-         ambb={} rtgi={} aexp={} ebias={} aguard={} agstr={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
+         ambb={} rtgi={} aexp={} ebias={} aguard={} agstr={} amode={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
          elcluster={} cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
@@ -2890,6 +2927,7 @@ fn lever_snapshot() -> String {
         crate::autoexp::bias(),
         crate::autoexp::guard(),
         crate::autoexp::guard_strength(),
+        crate::autoexp::mode().as_str(),
         scene::water_enabled(),
         scene::coincident_cull_enabled(),
         bvh::height_armed(),
@@ -2955,6 +2993,8 @@ pub fn self_test() -> Result<(), String> {
         "--no-autoexp-spike-guard",
         "--autoexp-spike-strength",
         "0.25",
+        "--autoexp-mode",
+        "tonemap",
         "--exposure-bias",
         "1.5",
         "--no-water",
@@ -3088,6 +3128,16 @@ pub fn self_test() -> Result<(), String> {
         // A field, not a process global — the purity gate's lever_snapshot
         // additionally proves the parse never called set_sbt_mode.
         ("dxr_sbt", o.dxr_sbt == 3),
+        // Default LIGHTS: "moved" therefore means the argv above departed to
+        // TONEMAP. Keeping the old `== Lights` here after the default flipped
+        // would have made this row pass on a parser that ignored the flag
+        // entirely — the vacuity the whole `did it take its flag` table exists
+        // to prevent. A field, not a process global: lever_snapshot
+        // additionally proves the parse never called autoexp::set_mode, which
+        // matters more here than usual, since `--check` runs
+        // autoexp::self_test and a parse that moved the LIVE mode would have
+        // that gate scoring the wrong arm.
+        ("autoexp_mode", o.autoexp_mode == crate::autoexp::Mode::Tonemap),
         ("waveviz", o.waveviz == 2),
         ("foliage_sway", !o.foliage_sway),
         ("foliage_amp", o.foliage_amp == 2.0),
@@ -3111,6 +3161,42 @@ pub fn self_test() -> Result<(), String> {
     }
     if parse_argv(&["--emissive-lights", "--no-emissive-lights"]).opts.emissive_lights {
         return Err("--emissive-lights --no-emissive-lights must disarm".into());
+    }
+    // --autoexp-mode's vocabulary, both directions (an A/B lever that could
+    // only be armed and not disarmed is half a lever).
+    for (argv, want) in [
+        (vec!["--autoexp-mode", "lights"], crate::autoexp::Mode::Lights),
+        (vec!["--autoexp-mode", "tonemap"], crate::autoexp::Mode::Tonemap),
+        (vec!["--autoexp-mode", "lights", "--autoexp-mode", "tonemap"], crate::autoexp::Mode::Tonemap),
+        (vec!["--autoexp-mode", "tonemap", "--autoexp-mode", "lights"], crate::autoexp::Mode::Lights),
+    ] {
+        let got = parse_argv(&argv).opts.autoexp_mode;
+        if got != want {
+            return Err(format!("{argv:?} resolved autoexp-mode {got:?}, want {want:?}"));
+        }
+    }
+    // The three duplicated defaults must agree. This one is the tripwire: a
+    // flip that moved autoexp.rs's static and cli.rs's field but forgot
+    // settings.rs would leave a settings FILE silently re-selecting the other
+    // arm on every launch that has one.
+    if defaults().autoexp_mode != crate::autoexp::Mode::Lights {
+        return Err("the default autoexp-mode must be lights".into());
+    }
+    let row = crate::settings::menu_items()
+        .iter()
+        .find(|i| i.id == "autoexp_mode")
+        .ok_or("settings.rs has no autoexp_mode row")?;
+    match row.control {
+        crate::settings::Control::Cycle { options, default_ix } => {
+            if options.get(default_ix).copied() != Some(defaults().autoexp_mode.as_str()) {
+                return Err(format!(
+                    "settings.rs's autoexp_mode default is {:?}, cli.rs's is {:?}",
+                    options.get(default_ix),
+                    defaults().autoexp_mode.as_str()
+                ));
+            }
+        }
+        _ => return Err("autoexp_mode's menu row is no longer a Cycle".into()),
     }
     if parse_argv(&["--no-aniso", "--aniso", "8"]).opts.aniso != 8 {
         return Err("--no-aniso --aniso 8 must land on 8".into());

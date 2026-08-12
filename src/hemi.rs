@@ -296,6 +296,7 @@ fn capture_cell(
                     b,
                     c,
                     5u32.saturating_sub(depth),
+                    cx.scene.light_gain,
                 )
             }
         }
@@ -661,7 +662,7 @@ fn open_hemisphere(
         None => acc.open.x = PI,
         Some(g) => {
             for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
-                acc.open += sky_cell(cx.n, g.sun, cx.scene.sky_scale, cx.scene.night, a, b, c, 4);
+                acc.open += sky_cell(cx.n, g.sun, cx.scene.sky_scale, cx.scene.night, a, b, c, 4, cx.scene.light_gain);
             }
         }
     }
@@ -716,6 +717,7 @@ fn cell(
                     b,
                     c,
                     5u32.saturating_sub(depth),
+                    cx.scene.light_gain,
                 )
             }
         }
@@ -862,7 +864,7 @@ fn leaf_rays(
                 // star field is the opposite case (nothing else delivers it and
                 // its mean is ~1e-3), so `gather` carries it in — see sky.rs's
                 // star row.
-                None => crate::sky::gather(d, g.sun, cx.scene.sky_scale, cx.scene.night),
+                None => crate::sky::gather(d, g.sun, cx.scene.sky_scale, cx.scene.night, cx.scene.light_gain),
                 Some(h) => shade::shade(
                     cx.scene,
                     cx.accel.bvh,
@@ -950,6 +952,7 @@ fn sky_cell(
     b: Vec3A,
     c: Vec3A,
     levels: u32,
+    gain: f32,
 ) -> Vec3A {
     let cen = sphcell::centroid(a, b, c);
     if levels > 0 {
@@ -972,7 +975,7 @@ fn sky_cell(
             let (mab, mbc, mca) = sphcell::midpoints(a, b, c);
             let mut sum = Vec3A::ZERO;
             for [ca, cb, cc] in [[a, mab, mca], [mab, b, mbc], [mca, mbc, c], [mab, mbc, mca]] {
-                sum += sky_cell(n, sun, scale, night, ca, cb, cc, levels - 1);
+                sum += sky_cell(n, sun, scale, night, ca, cb, cc, levels - 1, gain);
             }
             return sum;
         }
@@ -981,7 +984,7 @@ fn sky_cell(
     // sky.rs's star row). It adds no sharp feature for the refinement above to
     // chase — it is near-constant over the whole upper hemisphere — so the
     // `coarse`/`near_aureole` budget is unaffected.
-    crate::sky::gather(cen, sun, scale, night) * sphcell::psa(a, b, c, n)
+    crate::sky::gather(cen, sun, scale, night, gain) * sphcell::psa(a, b, c, n)
 }
 
 /// Reference-ray re-validation of an empty-cell claim: directions strictly

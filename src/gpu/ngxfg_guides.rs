@@ -1777,7 +1777,7 @@ pub fn self_test() -> std::result::Result<(), String> {
     // an empty table's blend returns the input BIT-identically — the
     // structural-off proof the kernel's `if (ffc != 0)` guard mirrors.
     for (en, night, cnt) in [(true, 0.0f32, 8u32), (false, 1.0, 8), (true, 1.0, 0)] {
-        let ff = Fireflies::new(en, cnt, night, fcmin, fcmax, 5.0);
+        let ff = Fireflies::new(en, cnt, night, fcmin, fcmax, 5.0, 1.0);
         let t = ff_guide_rows(
             &ff, &ff, rw as f32, rh as f32, cam.fov_y, org, fwd, &world_to_clip,
             &world_to_clip,
@@ -1804,8 +1804,8 @@ pub fn self_test() -> std::result::Result<(), String> {
     // >= 5 px, rather than the gate silently passing on nothing.
     {
         let bake_at = |dt: f32| {
-            let cur = Fireflies::new(true, 6, 1.0, fcmin, fcmax, 9.0);
-            let prv = Fireflies::new(true, 6, 1.0, fcmin, fcmax, 9.0 - dt);
+            let cur = Fireflies::new(true, 6, 1.0, fcmin, fcmax, 9.0, 1.0);
+            let prv = Fireflies::new(true, 6, 1.0, fcmin, fcmax, 9.0 - dt, 1.0);
             ff_guide_rows(
                 &cur, &prv, rw as f32, rh as f32, cam.fov_y, org, fwd, &world_to_clip,
                 &world_to_clip,

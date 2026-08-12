@@ -222,6 +222,12 @@ opt_fields! {
         pub autoexp_guard: bool,
         /// --autoexp-spike-strength, 0..=1 (live, display-stage — no reset)
         pub autoexp_guard_strength: f32,
+        /// --autoexp-mode: "lights" (default) | "tonemap" — WHERE the
+        /// aperture is spent. Live: the session's controller tick writes
+        /// whichever destination the mode names and restores the other to its
+        /// identity, so the flip needs no reset of its own (the scene half
+        /// carries the TOD block's frame=0, histories kept).
+        pub autoexp_mode: String,
         /// --no-clouds inverse (live: frame=0, histories kept)
         pub clouds: bool,
         /// --no-fireflies inverse (live: frame=0, histories kept)
@@ -1214,6 +1220,12 @@ fn apply_with(
             warn("effects.exposure_bias", &v.to_string());
         }
     }
+    if let Some(v) = &e.autoexp_mode {
+        match crate::autoexp::Mode::parse(v) {
+            Some(m) => opts.autoexp_mode = m,
+            None => warn("effects.autoexp_mode", v),
+        }
+    }
     if let Some(v) = e.autoexp_guard {
         opts.autoexp_guard = v;
     }
@@ -1431,6 +1443,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("exposure_bias", "exposure bias (EV)", "Effects", Live, StepF { min: -8.0, max: 8.0, step: 0.5, default: 0.0 }, acc_f32!(effects.exposure_bias)),
             item!("autoexp_spike_guard", "auto-exposure spike guard", "Effects", Live, Toggle { default: true }, acc_bool!(effects.autoexp_guard)),
             item!("autoexp_spike_strength", "spike guard strength", "Effects", Live, StepF { min: 0.0, max: 1.0, step: 0.1, default: 1.0 }, acc_f32!(effects.autoexp_guard_strength)),
+            item!("autoexp_mode", "auto-exposure spends", "Effects", Live, Cycle { options: &["tonemap", "lights"], default_ix: 1 }, acc_str!(effects.autoexp_mode)),
             item!("clouds", "volumetric clouds", "Effects", Live, Toggle { default: true }, acc_bool!(effects.clouds)),
             item!("fireflies", "fireflies (night)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.fireflies)),
             item!("fireflies_count", "firefly count", "Effects", Live, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.fireflies_count)),
@@ -1548,6 +1561,7 @@ pub struct LiveView {
     pub exposure_bias: f32,
     pub autoexp_guard: bool,
     pub autoexp_guard_strength: f32,
+    pub autoexp_mode: &'static str,
     pub clouds: bool,
     pub fireflies: bool,
     pub fireflies_count: u32,
@@ -1578,6 +1592,8 @@ pub enum MenuFx {
     Quality(u32),
     SetTod(f32),
     ToggleBloom,
+    /// `--autoexp-mode`'s live flip — see the drain handler in main.rs.
+    AutoExpMode(crate::autoexp::Mode),
     ToggleAutoExp,
     ExposureBias(f32),
     ToggleAutoExpGuard,
@@ -1618,6 +1634,7 @@ pub fn menu_value(item: &MenuItem, s: &Settings, live: &LiveView) -> String {
             "exposure_bias" => format!("{:+.1} EV", live.exposure_bias),
             "autoexp_spike_guard" => onoff(live.autoexp_guard),
             "autoexp_spike_strength" => format!("{:.1}", live.autoexp_guard_strength),
+            "autoexp_mode" => live.autoexp_mode.to_string(),
             "clouds" => onoff(live.clouds),
             "fireflies" => onoff(live.fireflies),
             "fireflies_count" => live.fireflies_count.to_string(),
@@ -1790,6 +1807,7 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "exposure_bias" => |o: &Opts| o.exposure_bias.to_string(),
         "autoexp_spike_guard" => |o: &Opts| onoff(o.autoexp_guard),
         "autoexp_spike_strength" => |o: &Opts| o.autoexp_guard_strength.to_string(),
+        "autoexp_mode" => |o: &Opts| o.autoexp_mode.as_str().to_string(),
         "clouds" => |o: &Opts| onoff(o.clouds),
         "fireflies" => |o: &Opts| onoff(o.fireflies),
         "fireflies_count" => |o: &Opts| o.fireflies_count.to_string(),
@@ -1968,6 +1986,17 @@ pub fn menu_adjust(item: &MenuItem, dir: i32, s: &mut Settings, live: &LiveView)
             "autoexp" => {
                 (item.set)(s, &onoff(!live.autoexp));
                 MenuFx::ToggleAutoExp
+            }
+            "autoexp_mode" => {
+                // Two options, so `dir` is immaterial — a cycle either way is
+                // the other arm.
+                let m = if live.autoexp_mode == "lights" {
+                    crate::autoexp::Mode::Tonemap
+                } else {
+                    crate::autoexp::Mode::Lights
+                };
+                (item.set)(s, m.as_str());
+                MenuFx::AutoExpMode(m)
             }
             "exposure_bias" => {
                 let (min, max, step) = match &item.control {
