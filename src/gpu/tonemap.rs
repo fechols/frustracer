@@ -13,6 +13,18 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::gfx::shaders::{BLIT_HLSL, TONEMAP_HLSL, WAVEVIZ_HLSL};
 
+// The fullscreen entry-point names below are LITERALS because `s!` builds a
+// NUL-terminated PCSTR at compile time and cannot take a `&str` const — so
+// unlike the two DXC consumers (`--check-spirv` and the Vulkan display stage)
+// this file cannot simply read `gfx::shaders::GFX_VS`/`GFX_PS`. This is the
+// same guarantee by the only route that call site allows: a mismatch is a
+// BUILD failure here rather than a run-time compiler diagnostic on whichever
+// backend was edited second.
+const _: () = {
+    assert!(matches!(crate::gfx::shaders::GFX_VS.as_bytes(), b"vsmain"));
+    assert!(matches!(crate::gfx::shaders::GFX_PS.as_bytes(), b"psmain"));
+};
+
 pub struct Passes {
     pub root_sig: ID3D12RootSignature,
     pub blit_pso: ID3D12PipelineState,

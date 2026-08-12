@@ -827,6 +827,24 @@ pub const HUD_HLSL: &str = include_str!("../shaders/hud.hlsl");
 pub const BLOOM_HLSL: &str = include_str!("../shaders/bloom.hlsl");
 pub const AUTOEXP_HLSL: &str = include_str!("../shaders/autoexp.hlsl");
 
+/// The entry-point names every fullscreen pair above spells, in ONE place.
+///
+/// All four display shaders (`blit`, `tonemap`, `waveviz`, `hud`) use this
+/// pair, and three separate places compile them: `gpu/tonemap.rs` at
+/// `vs_5_0`/`ps_5_0` through fxc, `--check-spirv` at `vs_6_0`/`ps_6_0` through
+/// DXC, and the Vulkan display stage, which consumes what the second emits.
+/// That is the shape which quietly acquires a typo — a wrong entry name is a
+/// compile error NOWHERE, it is a compiler diagnostic at run time on whichever
+/// backend was edited last, while the other two keep working.
+///
+/// The two DXC consumers read these consts directly. **The fxc one cannot**:
+/// windows-rs's `s!` builds a NUL-terminated `PCSTR` at compile time and
+/// therefore needs a literal, not a `&str` const — so `gpu/tonemap.rs` keeps
+/// its literals and carries a `const _` assertion that they match these, which
+/// is the same guarantee reached the only way that call site allows.
+pub const GFX_VS: &str = "vsmain";
+pub const GFX_PS: &str = "psmain";
+
 // The GPU BC7 encoder — a scene-upload pass, not a display one, but the same
 // fxc tier for the same reason (it must run before the tracer's kernels).
 pub const BC7ENC_HLSL: &str = include_str!("../shaders/bc7enc.hlsl");

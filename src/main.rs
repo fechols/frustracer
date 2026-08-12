@@ -14202,7 +14202,13 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         let jobs: Vec<(String, String)> = match shape {
             Shape::Lib(t) => vec![(String::new(), t.clone())],
             Shape::Gfx => {
-                vec![("vsmain".into(), "vs_6_0".into()), ("psmain".into(), "ps_6_0".into())]
+                // The names come from `gfx::shaders`, which is where the
+                // Vulkan display stage reads them too — so this gate and its
+                // consumer cannot drift onto different entry points.
+                vec![
+                    (sh::GFX_VS.to_string(), "vs_6_0".into()),
+                    (sh::GFX_PS.to_string(), "ps_6_0".into()),
+                ]
             }
             Shape::Compute(t) => {
                 let e = compute_entries(src);
@@ -14447,6 +14453,16 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V18: the display stage — the first thing here that DRAWS. ----
+    //
+    // Top level for V11's reason, one better: it owns its pipelines, its
+    // images and its descriptor set, and it needs neither a scene nor a
+    // tracer. That is also what makes it reachable on a device with no surface
+    // support at all, and therefore in CI on llvmpipe.
+    if !run_check_vk_display(&hg, &sp) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
@@ -14466,6 +14482,355 @@ fn run_check_vk(
 
     println!("CHECK-VK {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// V18 — the display stage: `tonemap.hlsl` and `blit.hlsl` DRAWN, and scored.
+///
+/// `--check-gpu`'s M12 transplanted, with ZERO new tolerances: the same ramp,
+/// the same three wires at the same limits, the same f16-rounded oracle, the
+/// same relative-above-1.0 metric. What it proves here is one step further
+/// than it proves there, because the whole graphics path underneath it is new:
+/// a `VkPipelineRenderingCreateInfo` pipeline, a derived layout carrying a
+/// sampler and a uniform buffer, a colour attachment with a real layout
+/// lifecycle, and a fullscreen triangle whose winding is the opposite of the
+/// one D3D12 rasterizes.
+///
+/// TWO ARMS M12 DOES NOT HAVE, and the first is the reason this gate is not
+/// simply M12 with the formats renamed.
+///
+/// **THE BLIT EXACT-IDENTITY ARM IS MANDATORY**, because M12's ramp is
+/// geometric and therefore SMOOTH: neighbouring texels differ by 0.88% in
+/// radiance, which the tone curve compresses further. MEASURED, over the
+/// geometric span (indices 2..n, i.e. excluding the two special leading
+/// entries) for a ONE-PIXEL horizontal shift: worst per-channel error 2.02e-3,
+/// against an `sdr` tolerance of 3.92e-3 — **invisible, and not marginally so;
+/// ALL 2045 ramp texels are individually within tolerance of their own
+/// neighbour.** The 10-bit wires do catch it, at 2.02e-3 against 1.08e-3, but
+/// by under 2x and only because their quantum is smaller — not by design, and
+/// not with room to spare.
+///
+/// So the ramp is a curve gate that happens to be weak evidence about the pixel
+/// MAPPING, and a wrong `SV_Position` convention, a half-texel offset or a
+/// transposed row length is exactly the class it is weak about. D3D12 does not
+/// have this hole because its rasterizer was known-good for years before M12
+/// was written; this backend had never rasterized anything. `blit.hlsl` is
+/// twelve lines of `src.Load(int3(pos.xy, 0)).rgb` with alpha forced to 1, so
+/// over a per-pixel pattern it is an EXACT byte identity with no tolerance to
+/// hide in — and a spatial slip of one pixel breaks it at essentially every
+/// texel rather than at none of them.
+///
+/// The pattern is `k/255` per channel with `k` a hash of (pixel, channel), and
+/// the round trip is exact by construction rather than by luck: f16 carries 11
+/// significant bits, so the worst error in representing `k/255` is ~1.2e-1 of a
+/// UNORM8 step — an eighth of the rounding boundary — and the pixel shader does
+/// no arithmetic at all. Per CHANNEL rather than per pixel so a swizzle is
+/// caught too, which the ramp's own per-channel tint cannot do (it is monotone
+/// in all three).
+///
+/// **ALPHA IS A FREE COVERAGE WITNESS.** Both pixel shaders write 1.0
+/// unconditionally and the M12 oracle compares RGB only, so "alpha is at
+/// maximum everywhere" answers a question no colour comparison can: did the
+/// draw cover this pixel at all. It costs nothing — the bytes are already read
+/// back — and it is what separates "the tone curve is wrong" from "the triangle
+/// missed", which a black frame reports identically.
+///
+/// The per-stage validation delta is V16's pattern: the first thing in this
+/// backend to create a graphics pipeline should name itself rather than
+/// surfacing in the suite-wide sweep as an unattributed count.
+#[cfg(unix)]
+fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use ash::vk as avk;
+    use vk::display;
+
+    // Both are FACTS recorded at device open rather than assumptions, and both
+    // are read here rather than discovered at `vkCmdDraw`: 1.3 mandates dynamic
+    // rendering so the first is universally true on this floor, and the queue
+    // family is PREFERRED-not-required to carry GRAPHICS, so the second is the
+    // one that can genuinely fail. A compute-only queue makes a draw illegal,
+    // which is an environment fact and therefore a SKIP.
+    if !hg.vk.info.dynamic_rendering {
+        println!(
+            "check-vk: SKIP V18 (no dynamicRendering — a graphics pipeline with a null \
+             renderPass needs it ENABLED, not merely supported)"
+        );
+        return true;
+    }
+    if !hg.vk.info.graphics_queue {
+        println!(
+            "check-vk: SKIP V18 (the chosen queue family is compute-only — vkCmdDraw on it \
+             is illegal, so this stage has nowhere to run)"
+        );
+        return true;
+    }
+
+    let ve0 = vk::device::validation_errors();
+    let mut ok = true;
+
+    // ---- M12's fixture, verbatim. ----
+    const TW: u32 = 64;
+    const TH: u32 = 32;
+    const RAMP_LO: f32 = 1e-3;
+    const RAMP_HI: f32 = 6.0e4;
+    let n = (TW * TH) as usize;
+    let span = (n - 3) as f32;
+    let radiance = |i: usize| -> f32 {
+        match i {
+            0 => 0.0,
+            1 => 1.0, // exactly the HDR knee: must be reproduced, not rolled off
+            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+        }
+    };
+    // Anti-vacuity, M12's own: the claim is that the ramp spans the sun-disc
+    // range, so assert it gets there rather than trusting the arithmetic.
+    let top = radiance(n - 1);
+    if !(top >= 4.4e4 && top <= 65504.0) {
+        eprintln!("check-vk: FAIL V18 ramp tops out at {top:.0} — must span the sun-disc range");
+        ok = false;
+    }
+    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
+
+    // The blit arm's pattern: a per-(pixel, channel) byte, spread by a cheap
+    // integer mix so neighbours are uncorrelated — a shifted image must not be
+    // able to look like an unshifted one.
+    let pat_byte = |i: usize, c: usize| -> u8 {
+        let mut h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(c as u32 * 40_503);
+        h ^= h >> 15;
+        h = h.wrapping_mul(2_246_822_519);
+        h ^= h >> 13;
+        (h & 0xff) as u8
+    };
+    let pattern: Vec<f32> =
+        (0..n * 3).map(|k| f32::from(pat_byte(k / 3, k % 3)) / 255.0).collect();
+
+    let vkd = &hg.vk;
+    let src = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        avk::Format::R16G16B16A16_SFLOAT,
+        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V18 source image: {e}");
+            return false;
+        }
+    };
+
+    // The three wires. Two DISTINCT formats, so two pipeline sets — the
+    // attachment format is baked into the pipeline by dynamic rendering, and
+    // sdr10/hdr10 differ only in `ToneParams`, which is a cbuffer value.
+    //
+    // Vulkan's `A2B10G10R10_UNORM_PACK32` is D3D12's `R10G10B10A2_UNORM`: R in
+    // the low ten bits, A in the top two. The names suggest the opposite order
+    // and the memory layout agrees — which is what lets M12's unpacking cross
+    // over unchanged.
+    let wires: [(&str, avk::Format, tone::ToneParams, f32); 3] = [
+        ("sdr", avk::Format::B8G8R8A8_UNORM, tone::ToneParams::SDR, 1.0 / 255.0 + 1e-6),
+        (
+            "sdr10",
+            avk::Format::A2B10G10R10_UNORM_PACK32,
+            tone::ToneParams::SDR,
+            1.0 / 1023.0 + 1e-4,
+        ),
+        (
+            "hdr10",
+            avk::Format::A2B10G10R10_UNORM_PACK32,
+            tone::ToneParams::hdr10(200.0, 1000.0),
+            // ~2 ten-bit LSBs + DXC pow/exp slop through the ST 2084 pair.
+            // Never widen past 5e-3 without investigating — a wiring or
+            // constant error moves this by tens of percent.
+            2.5e-3,
+        ),
+    ];
+
+    // Build one `Passes` per distinct format and keep them; rebuilding per wire
+    // would triple the DXC cost for nothing.
+    let mut built: Vec<(avk::Format, display::Passes)> = Vec::new();
+    let get = |fmt: avk::Format, built: &mut Vec<(avk::Format, display::Passes)>| -> bool {
+        if built.iter().any(|(f, _)| *f == fmt) {
+            return true;
+        }
+        match display::Passes::new(hg, sp, fmt) {
+            Ok(p) => {
+                p.bind_source(vkd, src.view);
+                built.push((fmt, p));
+                true
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V18 display passes ({fmt:?}): {e}");
+                false
+            }
+        }
+    };
+    for (_, fmt, _, _) in wires {
+        if !get(fmt, &mut built) {
+            src.destroy(vkd);
+            for (_, p) in &built {
+                p.destroy(vkd);
+            }
+            return false;
+        }
+    }
+
+    // One render + readback, shared by every arm below.
+    let run = |passes: &display::Passes,
+               fmt: avk::Format,
+               tonemap: bool,
+               p: display::Params|
+     -> Result<Vec<u8>, String> {
+        let dst = display::Image::new(
+            vkd,
+            TW,
+            TH,
+            fmt,
+            avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        let r = (|| -> Result<Vec<u8>, String> {
+            passes.set_params(vkd, p)?;
+            hg.run(|d, cmd| passes.record(d, cmd, &dst, tonemap))?;
+            display::read_target(hg, &dst, 4)
+        })();
+        dst.destroy(vkd);
+        r
+    };
+
+    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
+        eprintln!("check-vk: FAIL V18 ramp upload: {e}");
+        ok = false;
+    }
+
+    for (label, fmt, tp, tol) in wires {
+        let passes = &built.iter().find(|(f, _)| *f == fmt).unwrap().1;
+        // Bloom OFF, exactly as M12 passes it: the glare arm is a cbuffer-
+        // uniform branch, so a zero strength makes the t1 tap structurally
+        // dead and the gate scores the curve alone.
+        let params = display::Params::new(tp, 1.0, (0.0, 0.0, 0.0));
+        let got = match run(passes, fmt, true, params) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V18 render ({label}): {e}");
+                ok = false;
+                continue;
+            }
+        };
+        let mut worst = 0.0f32;
+        let mut worst_at = 0.0f32;
+        let mut alpha_bad = 0usize;
+        for i in 0..n {
+            let px = &got[i * 4..i * 4 + 4];
+            // Feed the oracle what the SHADER reads: the source is a real
+            // RGBA16F texture, so the f32 ramp is f16-rounded on the way in.
+            // Comparing against the exact f32 would charge the port for the
+            // wire's rounding — a step of 32 radiance at the top of this ramp.
+            let q = |v: f32| half::f16::from_f32(v).to_f32();
+            let c = glam::Vec3A::new(q(ramp[i * 3]), q(ramp[i * 3 + 1]), q(ramp[i * 3 + 2]));
+            let want = tone::map(c, tp);
+            // `passes.fmt` rather than the loop's `fmt`: they are equal by
+            // construction, and decoding with the one the PIPELINE was built
+            // for is what keeps that a fact rather than an assumption.
+            let have = display::decode(px, passes.fmt);
+            for ch in 0..3 {
+                let w = want[ch];
+                let d = (have[ch] - w).abs() / (1.0f32).max(w.abs());
+                if d > worst {
+                    worst = d;
+                    worst_at = radiance(i);
+                }
+            }
+            if display::decode_alpha(px, passes.fmt) < 1.0 {
+                alpha_bad += 1;
+            }
+        }
+        if worst > tol {
+            eprintln!(
+                "check-vk: FAIL V18 tonemap PS ({label}) vs tone::map — \
+                 worst {worst:.2e} > {tol:.2e} at radiance {worst_at:.3}"
+            );
+            ok = false;
+        } else if alpha_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V18 tonemap PS ({label}) — {alpha_bad}/{n} px with alpha below \
+                 maximum: the draw did not cover them"
+            );
+            ok = false;
+        } else {
+            println!("check-vk: V18 tonemap PS ({label}) == tone::map (worst {worst:.2e})");
+        }
+    }
+
+    // ---- The blit exact-identity arm. ----
+    if let Err(e) = display::upload_rgba16f(hg, &src, &pattern) {
+        eprintln!("check-vk: FAIL V18 pattern upload: {e}");
+        ok = false;
+    }
+    let bfmt = avk::Format::B8G8R8A8_UNORM;
+    // 8-bit ONLY, and that is a precision argument rather than a shortcut: a
+    // UNORM8 step is ~8x the worst f16 representation error for these values,
+    // so the round trip is exact with room to spare, while at ten bits the two
+    // are the same size and an exact bar would be measuring f16 rather than the
+    // rasterizer. The mapping this arm tests is format-independent.
+    let passes = &built.iter().find(|(f, _)| *f == bfmt).unwrap().1;
+    match run(passes, bfmt, false, display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0)))
+    {
+        Ok(got) => {
+            let mut bad = 0usize;
+            let mut first: Option<(usize, [u8; 3], [u8; 3])> = None;
+            let mut alpha_bad = 0usize;
+            for i in 0..n {
+                let px = &got[i * 4..i * 4 + 4];
+                // B8G8R8A8 in memory: B, G, R, A.
+                let have = [px[2], px[1], px[0]];
+                let want = [pat_byte(i, 0), pat_byte(i, 1), pat_byte(i, 2)];
+                if have != want {
+                    bad += 1;
+                    if first.is_none() {
+                        first = Some((i, want, have));
+                    }
+                }
+                if px[3] != 255 {
+                    alpha_bad += 1;
+                }
+            }
+            if bad > 0 {
+                let (i, w, h) = first.unwrap();
+                eprintln!(
+                    "check-vk: FAIL V18 blit identity — {bad}/{n} texels differ; first at \
+                     ({}, {}) want {w:?} got {h:?}. A smooth ramp cannot see this: it is the \
+                     pixel MAPPING, not the curve.",
+                    i as u32 % TW,
+                    i as u32 / TW
+                );
+                ok = false;
+            } else if alpha_bad > 0 {
+                eprintln!(
+                    "check-vk: FAIL V18 blit identity — {alpha_bad}/{n} px with alpha != 255"
+                );
+                ok = false;
+            } else {
+                println!(
+                    "check-vk: V18 blit identity EXACT over {n} texels x 3 ch (the pixel \
+                     mapping, which the tonemap ramp is too smooth to score)"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V18 blit render: {e}");
+            ok = false;
+        }
+    }
+
+    for (_, p) in &built {
+        p.destroy(vkd);
+    }
+    src.destroy(vkd);
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!("check-vk: FAIL V18 {ve} validation error(s) in the display stage");
+        ok = false;
+    }
+    ok
 }
 
 /// V10 — the BC7 encoder, scored through the hardware decoder.

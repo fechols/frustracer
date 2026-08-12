@@ -379,6 +379,13 @@ jobs:
       #   * CHECK-VK PASSED is necessary but NOT sufficient: a device without
       #     ray query skips V6 (and V7/V8/V9 follow) and still passes, i.e. the
       #     tracer gates would silently not run. Forbid those four by name.
+      #   * V18 joins them, and it is the one stage whose CI coverage was
+      #     EARNED rather than assumed: the display stage renders into an image
+      #     it owns and needs no surface, so it runs on llvmpipe — measured,
+      #     including the blit arm's EXACT byte identity, which two independent
+      #     rasterizers agreeing on the pixel mapping is a stronger statement
+      #     than either one passing alone. It skips only on a device that
+      #     cannot draw at all, which this runner is not.
       #   * V11/V13 are PERMITTED to skip: FSR3 on a software device is a
       #     documented environment fact, not a degraded run.
       #
@@ -393,9 +400,9 @@ jobs:
           cargo run --profile quick -- --check-vk 2>&1 | tee vk.log
           grep -q "CHECK-VK PASSED" vk.log \
             || { echo "::error::--check-vk did not run (no summary line — it skipped)"; exit 1; }
-          if grep -qE "SKIP (V6|V7|V8|V9)" vk.log; then
-            echo "::error::--check-vk passed vacuously — the tracer stages skipped:"
-            grep -E "SKIP (V6|V7|V8|V9)" vk.log
+          if grep -qE "SKIP (V6|V7|V8|V9|V18)" vk.log; then
+            echo "::error::--check-vk passed vacuously — the tracer or display stages skipped:"
+            grep -E "SKIP (V6|V7|V8|V9|V18)" vk.log
             exit 1
           fi
 
@@ -408,31 +415,28 @@ jobs:
             vk.log
           if-no-files-found: warn
 
-  # THE METAL PROBE — manual only, and the `if` is the whole point: it is skipped
-  # on push and pull_request, so it can never touch the badge.
+  # THE METAL JOB — the only REAL GPU coverage this workflow has, because
+  # macos-latest is macos-26-arm64 and the Linux/Windows runners have no GPU at
+  # all. --check-fsr3 is staged like --check-vk (U0 pure staging math | U1 the
+  # transpiled metallib table | U2 a real Metal device | U3 an FSR3 context |
+  # U4 one scored upscale); --check-metalfx is its Apple-scaler twin.
   #
-  # It exists because macos-latest is macos-26-arm64 — Apple silicon, and the
-  # ONLY runner in this workflow with a GPU. --check-fsr3 is staged like
-  # --check-vk (U0 pure staging math | U1 the transpiled metallib table | U2 a
-  # real Metal device | U3 an FSR3 context | U4 one scored upscale), so U2-U4
-  # would be the first real-GPU coverage this project has ever had in CI.
-  #
-  # THREE UNKNOWNS, and one run's log answers all three at once:
-  #   1. Is `xcrun metal` on the image? Xcode 16.3 split the Metal toolchain
-  #      into a separately downloadable component and the image manifest does
-  #      not list it. generate_fsr3_metallibs needs it, plus spirv-cross.
-  #   2. Does a Metal device enumerate inside the runner VM? (U2.)
-  #   3. Do U3/U4 hold there, given the SDK fetch below?
-  #
-  # DELIBERATELY UNGUARDED, unlike check-vulkan: this run's job is to REPORT.
-  # --check-fsr3 skips loudly and exits 0 when the toolchain is absent and fails
-  # only on a real defect, and build.rs prints enumerated-vs-emitted metallib
-  # counts as a cargo:warning — so a skipped stage here is the finding, not a
-  # failure to hide. Promoting this to a push-triggered, guarded job once the
-  # three answers are in is a one-line change.
+  # It landed as a `workflow_dispatch`-only probe because three things had to be
+  # true and none was answerable without running. Run 31626195554 answered all
+  # three, which is why the `if` is gone:
+  #   1. `xcrun metal` IS on the image — an already-installed MobileAsset
+  #      cryptex (MetalToolchain-v17.6.109.0, metal 32023.883), despite Xcode
+  #      16.3 having split the toolchain out and the manifest not listing it. So
+  #      build.rs transpiles 80/80 non-wave64 permutations, 0 failed.
+  #   2. A Metal device DOES enumerate in the runner VM: "Apple Paravirtual
+  #      device | unified true". Note `system_profiler SPDisplaysDataType`
+  #      prints NOTHING for it — U2 is the authoritative probe, not the system
+  #      tool.
+  #   3. U3/U4 hold: 11 pipelines built of 80 metallibs offered, and a scored
+  #      321x181 -> 642x362 upscale at energy 1.000x. 6m21s all in, which is
+  #      less than this workflow's other macOS job costs.
   check-metal:
     runs-on: macos-latest
-    if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -449,26 +453,101 @@ jobs:
       - name: spirv-cross
         run: brew install spirv-cross
 
-      # The FSR3 SDK source — a 189 MB tarball, ~19 MB kept. U3/U4 need it; U0/U1
-      # do not, so an absent SDK still answers unknowns 1 and 2.
+      # The FSR3 SDK source — a 189 MB tarball of which ~19 MB is kept (four
+      # paths). Cached on FFX_SRC_TAG now that this runs per push rather than by
+      # hand; the installer's own `skip` sentinel makes a hit a no-op, so the
+      # cache and the script agree on what "installed" means by construction.
+      - name: FFX source version
+        id: ffxver
+        run: echo "tag=$(sed -n 's/^FFX_SRC_TAG=//p' install-prerequisites.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: SDKs/FidelityFX-SDK
+          key: ffx-src-${{ runner.os }}-${{ steps.ffxver.outputs.tag }}
+
       - name: FidelityFX SDK 1.1.4 source
         run: ./install-prerequisites.sh fsr3src
 
-      # The three unknowns, asked directly and before anything can obscure them.
-      # `|| true` throughout: a missing tool is an ANSWER here, not an error.
+      # Kept from the probe, because it is what makes a FUTURE image change
+      # readable: if the Metal toolchain ever leaves the image, the guard below
+      # fails on a metallib table of zero and this step is where you see WHY in
+      # one line instead of inferring it. `|| true` throughout — a missing tool
+      # is an answer, and the guard is what turns it into a failure.
       - name: Probe the toolchain and the GPU
         run: |
           echo "--- xcode ---";       xcodebuild -version || true
           echo "--- xcrun metal ---"; xcrun -f metal || true
           xcrun metal --version || true
           echo "--- spirv-cross ---"; brew list --versions spirv-cross || true
-          echo "--- GPU ---";         system_profiler SPDisplaysDataType || true
 
       # build.rs reports the metallib table as cargo:warning lines (enumerated vs
       # emitted, and the first failure if any) — expect 80 of the 200 committed
-      # permutation files. Zero emitted means unknown 1 is answered "no".
+      # permutation files, which is what a working `xcrun metal` + spirv-cross
+      # produce. Zero emitted is the toolchain being gone.
       - name: Build
         run: cargo build --profile quick
 
-      - name: Gate (Metal FSR3)
-        run: cargo run --profile quick -- --check-fsr3
+      # THE VALIDATION LAYERS ARE OFF, AND THAT IS A RECORDED FINDING RATHER
+      # THAN AN OVERSIGHT. Both gates print a NOTE asking to be re-run with
+      # MTL_DEBUG_LAYER=1 and MTL_SHADER_VALIDATION=1, and the argument for it
+      # is good (main.rs's cold-dispatch comment: the layer zero-fills
+      # allocations, so FFX's UNINITIALIZED-tagged temporals stop carrying
+      # per-allocation residue and the accumulating-channel count drops to
+      # exactly zero — asserted as a BOUND, so zero passes, i.e. validation
+      # cannot make that check vacuous). It was tried, in run 31629382154:
+      #
+      #   Metal API Validation Enabled / Metal GPU Validation Enabled
+      #   check-fsr3: U1 metallib table OK — 80 permutations, 1148 KiB
+      #   check-fsr3: U2 device — Apple Paravirtual device | unified true
+      #   check-fsr3: U3 context created — 11 pipelines built of 80 offered
+      #   check-fsr3: FAIL U4 the output is uniformly zero — the dispatch wrote nothing
+      #
+      # So the whole pipeline builds under validation and then produces NOTHING,
+      # where the identical unvalidated run upscales at energy 1.000x. That is
+      # either a real defect in the FSR3 Metal backend of exactly the class
+      # those NOTEs enumerate (texture usage flags / storage modes) or an
+      # artifact of GPU validation on a PARAVIRTUAL device — and which one it is
+      # has not been established. Until it is, the job runs the configuration
+      # that is PROVEN to exercise the GPU, because a red gate nobody has
+      # diagnosed protects less than a green one that demonstrably ran. Do not
+      # re-enable these without the answer; the first step toward it is arming
+      # the two layers SEPARATELY, since only one of them is implicated.
+      #
+      # THE GUARDS ARE ASYMMETRIC, deliberately. Unlike --check-vk, whose
+      # summary is unreachable after a SKIP, these gates skip a stage and still
+      # print PASSED — so PASSED alone would go green on an image that lost the
+      # Metal toolchain or the GPU. --check-fsr3 is guarded HARD on its U4 line,
+      # because U1-U4 are PROVEN to run here. --check-metalfx is guarded only on
+      # PASSED for now: MTLFXTemporalScalerDescriptor.supportsDevice on a
+      # PARAVIRTUAL device is not something any run has reported yet, so a hard
+      # X3 guard could fail for an environment fact rather than a defect. Read
+      # the first runs, then tighten it to `check-metalfx: X3 upscale`.
+      #
+      # BOTH GATES RUN BEFORE ANY GUARD IS EVALUATED. The first draft asserted
+      # after each, so the fsr3 failure above exited the step and --check-metalfx
+      # never ran at all — one gate's failure hid the other's whole result, on
+      # the very run that was meant to tell us what MetalFX does on this device.
+      - name: Gates (Metal)
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          cargo run --profile quick -- --check-fsr3    2>&1 | tee fsr3.log    || rc=1
+          cargo run --profile quick -- --check-metalfx 2>&1 | tee metalfx.log || rc=1
+          grep -q "check-fsr3: PASSED" fsr3.log \
+            || { echo "::error::--check-fsr3 did not pass"; rc=1; }
+          grep -q "check-fsr3: U4 upscale" fsr3.log \
+            || { echo "::error::--check-fsr3 did not run a real upscale — the GPU half skipped:"; grep -E "SKIP U[0-9]" fsr3.log || true; rc=1; }
+          grep -q "check-metalfx: PASSED" metalfx.log \
+            || { echo "::error::--check-metalfx did not pass"; rc=1; }
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: check-metal-logs
+          path: |
+            fsr3.log
+            metalfx.log
+          if-no-files-found: warn
