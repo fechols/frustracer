@@ -530,28 +530,12 @@ impl Fsr3 {
             let rc = std::cell::Cell::new(0i32);
             let ferr: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
             hg.run(|d, cmd| {
-                for i in [&self.color, &self.depth, &self.motion] {
-                    transition(
-                        d,
-                        cmd,
-                        i,
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::ImageLayout::GENERAL,
-                    );
-                }
+                self.bracket(d, cmd, true);
                 if let Err(e) = feed(d, cmd) {
                     *ferr.borrow_mut() = Some(e);
                     return;
                 }
-                for i in [&self.color, &self.depth, &self.motion] {
-                    transition(
-                        d,
-                        cmd,
-                        i,
-                        vk::ImageLayout::GENERAL,
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    );
-                }
+                self.bracket(d, cmd, false);
                 rc.set(self.record_ffx(cmd, &dp));
             })?;
             if let Some(e) = ferr.borrow_mut().take() {
@@ -561,6 +545,129 @@ impl Fsr3 {
                 return Err(format!("frshim_fsr3vk_dispatch failed ({})", rc.get()));
             }
             Ok(())
+        }
+    }
+
+    /// Move the three INPUT images between their resting layout and the one a
+    /// `RWTexture2D` store requires. `to_general` = entering the write window.
+    ///
+    /// ONE spelling, because it is a contract with two parties and both of them
+    /// are easy to satisfy accidentally. `wire_feed` declares those three
+    /// descriptors `GENERAL` (`vk/tracer.rs`), so ANY kernel that stores to
+    /// u16/u18/u19 needs the window open; and `shim/ffx_fsr3_vk.cpp` declares
+    /// them `FFX_RESOURCE_STATE_COMPUTE_READ`, while `ffx_vk` emits no barrier
+    /// when its own tracked state already matches — so FFX reads them assuming
+    /// `SHADER_READ_ONLY_OPTIMAL` and would emit nothing to correct us. Resting
+    /// them in `GENERAL` "to simplify" is therefore the same defect in the
+    /// mirror direction, not a simplification.
+    ///
+    /// The closing hop is ALSO the memory dependency between our store and
+    /// FFX's load (`transition` is ALL_COMMANDS / MEMORY_WRITE -> MEMORY_READ |
+    /// MEMORY_WRITE), which is the second reason a caller should reach for
+    /// `frame_fed`/`write_inputs` rather than hand-rolling the sequence: a bare
+    /// `hg.run` needs a barrier somebody has to remember.
+    #[cfg(ffx_fsr3_vk)]
+    fn bracket(&self, d: &ash::Device, cmd: vk::CommandBuffer, to_general: bool) {
+        let (from, to) = if to_general {
+            (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL)
+        } else {
+            (vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        };
+        for i in [&self.color, &self.depth, &self.motion] {
+            transition(d, cmd, i, from, to);
+        }
+    }
+
+    /// Zero the COLOUR input plane, recorded into a command buffer that is
+    /// already inside the write window (`bracket(.., true)` — the image must be
+    /// in `GENERAL`, which `VK_IMAGE_LAYOUT_GENERAL` is a legal clear
+    /// destination for, so no transition of its own).
+    ///
+    /// The composed frame's dependency probe and nothing else: dropped in
+    /// between our recompose and FFX's read, it asks whether FFX consumed OUR
+    /// plane or something it had cached. A gate that only compares two
+    /// plausible pictures cannot tell those apart.
+    #[cfg(ffx_fsr3_vk)]
+    pub fn clear_color_in_place(&self, d: &ash::Device, cmd: vk::CommandBuffer) {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        unsafe {
+            d.cmd_clear_color_image(
+                cmd,
+                self.color.img,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { float32: [0.0; 4] },
+                &[range],
+            );
+            // TRANSFER -> COMPUTE: the clear must land before FFX's first read.
+            // Deterministic by construction; omitting it would make the probe a
+            // race, which is a strictly worse tooth than a wrong answer.
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    /// `frame_fed`'s bracket WITHOUT the upscale — for a recorder that WRITES
+    /// the three input planes but does not consume them this frame.
+    ///
+    /// THIS EXISTS BECAUSE ITS ABSENCE WAS A REAL DEFECT. The bridge gates
+    /// (V14's passthrough, V15's engine) dispatch `cs_nrd_out`, which stores to
+    /// `u16` — and `u16` is not one of the tracer's own bridge planes but THIS
+    /// object's colour image (the derived map prints the binding once, under
+    /// two names: `feed_color/nrd_color_out`). `VkTracer::nrd_lay_out` covers
+    /// the seven planes the tracer owns and cannot cover this one, so those
+    /// gates were storing to an image resting in `SHADER_READ_ONLY_OPTIMAL`
+    /// through a descriptor declaring `GENERAL`.
+    ///
+    /// THE VALIDATION LAYER DOES NOT REPORT THAT, and it is not for want of
+    /// looking — two plants settled it: an illegal layout ON the descriptor
+    /// fires at `vkUpdateDescriptorSets`, and a wrong barrier `oldLayout` fires
+    /// twice over, including the runtime `vkQueueSubmit(): ... expects VkImage
+    /// ... to be in layout ...`. So the layer tracks actual layouts and checks
+    /// descriptor legality; what it does not do is compare a storage-image
+    /// descriptor's DECLARED layout against the image's ACTUAL one. On RADV the
+    /// two layouts coincide for these formats, so the writes landed and every
+    /// gate stayed green — a spec violation that neither the hardware nor the
+    /// armed instrument could surface, which is exactly the class that needs a
+    /// structural fix rather than a gate.
+    pub fn write_inputs<F>(&self, hg: &VkHeadless, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer) -> Result<(), String>,
+    {
+        #[cfg(not(ffx_fsr3_vk))]
+        {
+            let _ = (hg, f);
+            Err("FSR3 was not compiled into this binary".into())
+        }
+        #[cfg(ffx_fsr3_vk)]
+        {
+            let ferr: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+            hg.run(|d, cmd| {
+                self.bracket(d, cmd, true);
+                if let Err(e) = f(d, cmd) {
+                    *ferr.borrow_mut() = Some(e);
+                    // Close the window anyway: the images must be found where
+                    // every other path expects them even when the caller's
+                    // recording failed, and this is a RECORDING error — the
+                    // command buffer still submits.
+                }
+                self.bracket(d, cmd, false);
+            })?;
+            match ferr.borrow_mut().take() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
     }
 

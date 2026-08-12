@@ -7673,6 +7673,109 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # if the device lacks the derivatives extension),
                                       # --check-nrd, --check-spirv, --check-fsr and
                                       # tools/win-cross-check.sh
+                                      # V16 — THE COMPOSED FRAME (B5a, 2026-08-12): trace ->
+                                      # nrd_pack -> ReBLUR -> nrd_out -> FSR3, in one frame. Every
+                                      # stage before it stopped one step short, and the gap had a
+                                      # sharp shape: V13 upscales but has NO denoiser in its frame
+                                      # (its FFX history is built entirely from raw 1-spp colour),
+                                      # while V14/V15 denoise and stop at `read_input`, a readback
+                                      # of the plane. `frame_fed` — the only thing in this tree
+                                      # that dispatches FFX — appeared exactly ONCE in main.rs,
+                                      # inside V13. **So until now, if `cs_nrd_out` had written
+                                      # into a plane FFX never reads, every V13, V14 and V15
+                                      # assertion would still have passed.** It is D3D12's own
+                                      # `present_trace_fsr3` ordering, including the rule that an
+                                      # NRD frame runs NO feed dispatch (the folded `cs_nrd_pack`
+                                      # owns the mvec/depth guides, `cs_nrd_out` owns the colour) —
+                                      # the fold end to end, which only this stage can score.
+                                      # THE LAYOUT DEFECT IT FIXED, and the instrument finding
+                                      # that came with it: `Fsr3`'s three INPUT images rest in
+                                      # SHADER_READ_ONLY_OPTIMAL (a contract with the shim —
+                                      # ffx_fsr3_vk.cpp declares them COMPUTE_READ and ffx_vk
+                                      # emits no barrier when its tracked state already matches),
+                                      # and `wire_feed` declares those descriptors GENERAL. But
+                                      # u16 is ONE binding under two names — the derived map
+                                      # prints `feed_color/nrd_color_out` — and it is the
+                                      # UPSCALER's image, not one of the seven `nrd_lay_out`
+                                      # covers. So V14/V15 were dispatching `cs_nrd_out` against an
+                                      # image resting in SRO through a descriptor claiming
+                                      # GENERAL. **The validation layer does not report that, and
+                                      # not for want of looking**: two plants settled it — an
+                                      # illegal layout ON the descriptor fires 10 errors at
+                                      # `vkUpdateDescriptorSets`, and a wrong barrier `oldLayout`
+                                      # fires 20 including the runtime `vkQueueSubmit(): ... expects
+                                      # VkImage ... to be in layout ...`, so the layer both tracks
+                                      # actual layouts AND checks descriptor legality; what it does
+                                      # not do is compare a storage-image descriptor's DECLARED
+                                      # layout against the image's ACTUAL one. On RADV the two
+                                      # coincide for these formats, so every write landed and every
+                                      # gate stayed green — a spec violation neither the hardware
+                                      # nor the armed instrument could surface, i.e. the class that
+                                      # needs a structural fix rather than a gate. `Fsr3::bracket`
+                                      # is that fix in ONE spelling, with `write_inputs` as
+                                      # `frame_fed`'s bracket minus the dispatch for recorders that
+                                      # write the planes without upscaling them (V14, V15). It
+                                      # moved NO number — a layout transition preserves contents,
+                                      # and V13/V14/V15 read digit-for-digit identical after it.
+                                      # THE STRONG ARM IS THE DEPENDENCY PROBE, not the picture:
+                                      # "how much should a denoise change an upscale" has no
+                                      # principled answer and any bar for it would be a new
+                                      # tolerance, while "did FFX read the plane our recompose
+                                      # wrote" does — zero the colour plane BETWEEN `cs_nrd_out`
+                                      # and the dispatch and require the output to move past a
+                                      # MEASURED floor. THE FLOOR IS WHY THE PROBE USES ONE
+                                      # WARMED CONTEXT: three FRESH contexts read a control drift
+                                      # of 994206 of 1440000 channels — two identical runs
+                                      # disagreeing on 69% of the image — because FFX declares
+                                      # essentially every internal resource
+                                      # FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED and `ffx_vk`
+                                      # skips the init copy for that type, so a reset frame's
+                                      # untouched texels hold PER-ALLOCATION residue by contract
+                                      # (the Metal backend records the same thing from the other
+                                      # side). One context makes the allocations identical; one
+                                      # discarded warm-up makes the residue identical too. After
+                                      # that the control reads EXACTLY 0.
+                                      # MEASURED (RADV, 400x300 -> 800x600, 8 frames): procedural
+                                      # denoised-vs-fed rel 0.02849, differs 998202/1440000, **lap
+                                      # 0.0030 vs fed 0.0047** (the denoise SURVIVES the upscale —
+                                      # a different claim from V15's "the denoise happened"),
+                                      # control drift 0, clearing our recompose moves
+                                      # 1440000/1440000. smlp 0.00376 / lap 0.0013 vs 0.0018,
+                                      # rungholt 0.00303 / same lap pair, `--sw-rays` 0.03500. Both
+                                      # FR_VK_RES parities green; llvmpipe SKIPs through V13's
+                                      # software-device arm.
+                                      # THREE TEETH FIRED, and they SEPARATE: T2 (drop
+                                      # `record_nrd_out`) reads `colour 120000 8-byte runs, depth 0
+                                      # words` — the two sentinels distinguishing "the recompose
+                                      # never ran" from "the fold never ran", which is why the
+                                      # sentinel is checked BEFORE the all-black histogram (an
+                                      # unwritten plane presents as a black frame, and that is the
+                                      # symptom while the sentinel is the cause); T3 (leave
+                                      # `wire_feed` pointed elsewhere) collapses the probe to
+                                      # `0/1440000` **while the main arm stays green**, which is
+                                      # the class a derived layout provably cannot catch since
+                                      # every plane is STORAGE_IMAGE to Vulkan; T4 (move the clear
+                                      # BEFORE the recompose, where it gets overwritten) also
+                                      # `0/1440000`, proving the probe measures a dependency on our
+                                      # FINAL write rather than a coincidence. A per-stage
+                                      # validation delta (`validation_errors()` snapshotted at
+                                      # entry/exit) makes V16 name itself, since the suite
+                                      # otherwise reads that global once at the end and a layout
+                                      # regression would surface unattributed.
+                                      # KNOWN LIMIT, stated rather than implied: on RADV GENERAL
+                                      # and SRO are the same hardware state for these formats, so
+                                      # no value-scoring gate on this box can see the layout class
+                                      # — the layer is the only instrument, and it is blind to this
+                                      # specific comparison. The fix is therefore structural (one
+                                      # bracket, one spelling, one call site) and the claim is not
+                                      # "a gate would have caught it".
+                                      # Touch `Fsr3::{bracket, write_inputs, clear_color_in_place}`
+                                      # / `run_check_vk_compose` / `compose_probe` -> run --check
+                                      # (goldens byte-identical — B5a touches no shading path),
+                                      # cargo test, --check-vk on procedural + san-miguel-low-poly
+                                      # + rungholt, both FR_VK_RES parities, --sw-rays, llvmpipe,
+                                      # --check-spirv, --check-fsr, --check-nrd and
+                                      # tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

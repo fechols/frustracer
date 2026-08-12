@@ -16336,10 +16336,503 @@ fn run_check_vk_feed(
         ok = false;
     }
 
+    // ---- V16: the COMPOSED frame — the denoiser and the upscaler in one. ----
+    // After V15 because it needs everything V15 proved, and on its own FFX
+    // contexts because the ones above carry history from a different route.
+    if ok
+        && !run_check_vk_compose(
+            hg, &tg, scene, &basis, cam0, q, rw, rh, ow, oh, near, far, nrd_path, structural,
+        )
+    {
+        ok = false;
+    }
+    // Leave the tracer's feed registers where V13 pointed them, so nothing
+    // above depends on V16 having run — the "left as found" rule V14 follows
+    // for the sig bit.
+    tg.wire_feed(hg, fed.feed_views());
+
     fed.destroy(hg);
     cpu.destroy(hg);
     tg.destroy(hg);
     ok
+}
+
+/// V16 — THE COMPOSED FRAME: trace -> pack -> ReBLUR -> recompose -> FSR3.
+///
+/// EVERY STAGE BEFORE THIS ONE STOPS ONE STEP SHORT OF IT, and the shape of the
+/// gap is worth stating because it bounds what a green suite has ever meant.
+/// V13 upscales, but there is no denoiser in its frame at all — its FFX history
+/// is built entirely from raw 1-spp colour. V14 and V15 denoise, but they stop
+/// at `read_input`: a readback of the plane. `frame_fed` — the only thing in
+/// this tree that dispatches FFX — appears exactly once in `main.rs`, inside
+/// V13. So the sharpest way to put it is this: **until now, if `cs_nrd_out`
+/// had written into a plane FFX never reads, every V13, V14 and V15 assertion
+/// would still have passed.**
+///
+/// That is also the D3D12 arrangement this closes: `present_trace_fsr3` runs
+/// `trace -> nrd_pack -> engine -> nrd_out -> upscale` on ONE list and runs NO
+/// feed dispatch when the denoiser is armed, because the folded `cs_nrd_pack`
+/// owns the mvec/depth guides and `cs_nrd_out` owns the colour. This stage is
+/// that ordering, and the fold end to end is a thing only it can score.
+///
+/// TWO ARMS, ONE RENDERER — V13's shape one stage up. The same tracer, the same
+/// pose, the same jitter sequence, the same FFX settings; the arms differ in
+/// exactly what writes the three input planes, so anything that moves is the
+/// composition and not taste. Two FFX contexts rather than one run twice, for
+/// V13's own reason: FSR3 is TEMPORAL, and one context would carry the first
+/// route's history into the second.
+///
+/// THE STRONG ARM IS THE DEPENDENCY PROBE, not the picture. "How much should a
+/// denoise change an upscale" has no principled answer and any bar for it would
+/// be a new tolerance; "did FFX read the plane our recompose wrote" does, and
+/// V15 already established its arithmetic — zero the plane between the two and
+/// require the output to move by more than the run-to-run floor, with the floor
+/// MEASURED by a second identical run rather than assumed away.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_compose(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    ow: usize,
+    oh: usize,
+    near: f32,
+    far: f32,
+    nrd_path: &str,
+    structural: bool,
+) -> bool {
+    let lib = std::path::Path::new(nrd_path).join(nrd::LIB_FILE);
+    if !lib.exists() {
+        println!(
+            "check-vk: SKIP V16 ({} not found); run `{}`",
+            lib.display(),
+            nrd::INSTALLER
+        );
+        return true;
+    }
+    let Some(planes) = tg.nrd_plane_handles() else {
+        eprintln!("check-vk: FAIL V16 the tracer carries no bridge planes");
+        return false;
+    };
+    let mut eng = match vk::nrd::VkNrd::new(hg, nrd_path, rw as u32, rh as u32, &planes) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V16 {e}");
+            return false;
+        }
+    };
+
+    // The validation delta, attributed. `validation_errors()` is a monotonic
+    // global read ONCE at the end of the suite, so a layout regression here
+    // would surface as an unattributed total; this stage is the one whose
+    // defect class is layer-only, so it names itself.
+    let ve0 = vk::device::validation_errors();
+
+    let mk = || {
+        vk::fsr3::Fsr3::new(
+            hg,
+            (rw as u32, rh as u32),
+            (ow as u32, oh as u32),
+            vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+        )
+    };
+    let (den, pln) = match (mk(), mk()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            let e = a.err().or(b.err()).unwrap_or_default();
+            if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+                println!("check-vk: SKIP V16 on a software device ({e})");
+            } else {
+                eprintln!("check-vk: FAIL V16 fsr3 context: {e}");
+                eng.destroy(hg);
+                return false;
+            }
+            eng.destroy(hg);
+            return true;
+        }
+    };
+
+    const FRAMES: u32 = 8;
+    const POISON: u8 = 0xee;
+    let rs = gfx::denoise::reblur_settings();
+    let mut ok = true;
+
+    let run = (|| -> Result<(), String> {
+        // Both arms poisoned, so a plane that is never written is provable
+        // rather than merely suspicious. A composed frame that silently ran the
+        // FEED path produces a completely plausible picture — the sentinel is
+        // what separates "denoised" from "plausible".
+        den.poison_inputs(hg, POISON)?;
+        pln.poison_inputs(hg, POISON)?;
+
+        let mut sent_color = 0usize;
+        let mut sent_depth = 0usize;
+
+        for f in 0..FRAMES {
+            let jit = dlss::jitter_for(f);
+            let p = gfx::frame::FrameParams {
+                cam: *basis,
+                frame: f,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                prev_cam: Some(*basis),
+                q,
+                verify: false,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: cam0.fov_y,
+                dt_ms: gfx::denoise::NOMINAL_DT_MS,
+                reset: f == 0,
+            };
+            let reset = f == 0;
+            let (pw, phh) = eng.prev_size();
+            let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+            let cs = gfx::denoise::common_settings(
+                &mats,
+                &mats,
+                dlss::jitter_for(f),
+                dlss::jitter_for(f.saturating_sub(1)),
+                rw as u32,
+                rh as u32,
+                pw,
+                phh,
+                far,
+                gfx::denoise::NOMINAL_DT_MS,
+                f,
+                reset,
+                false,
+            );
+
+            // ONE trace, consumed by BOTH arms — which is what makes the
+            // comparison about the composition rather than about two renders.
+            tg.render_wavefront(hg, &p, true)?;
+
+            // THE COMPOSED ARM. No `record_feed` anywhere in it: the folded
+            // pack wrote the depth and mvec guides, the recompose wrote the
+            // colour. That absence is the D3D12 rule, and scoring it end to end
+            // is a thing no earlier stage can do.
+            tg.wire_feed(hg, den.feed_views());
+            let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+            den.frame_fed(
+                hg,
+                |d, cmd| {
+                    unsafe {
+                        r1 = tg.record_nrd_pack(d, cmd);
+                        r2 = eng.record(d, cmd, &cs, &rs);
+                        r3 = tg.record_nrd_out(d, cmd);
+                    }
+                    // A failure inside must not be swallowed: `record` can fail
+                    // before recording anything, and the frame would then be
+                    // pack -> out, i.e. the passthrough, which upscales
+                    // perfectly well and is not what this stage claims to test.
+                    r2.clone()
+                },
+                dp,
+            )?;
+            r1?;
+            r2?;
+            r3?;
+
+            // THE PLAIN ARM: the same trace through the ordinary feed.
+            tg.wire_feed(hg, pln.feed_views());
+            let mut rf = Ok(());
+            pln.frame_fed(
+                hg,
+                |d, cmd| {
+                    rf = unsafe { tg.record_feed(d, cmd) };
+                    rf.clone()
+                },
+                dp,
+            )?;
+            rf?;
+
+            if f == 0 {
+                // Frame 0 is where a sentinel means something: after it, an
+                // unwritten plane holds the previous frame rather than 0xEE.
+                let c = den.read_input(hg, 0)?;
+                let d = den.read_input(hg, 1)?;
+                sent_color = c.chunks_exact(8).filter(|w| w.iter().all(|&b| b == POISON)).count();
+                sent_depth = d
+                    .chunks_exact(4)
+                    .filter(|w| u32::from_le_bytes((*w).try_into().unwrap()) == 0xeeee_eeee)
+                    .count();
+            }
+        }
+
+        let a = den.read_output(hg)?;
+        let b = pln.read_output(hg)?;
+        // `read_output` hands back linear f32 RGB — three per pixel, not four.
+        let lum = |v: &[f32], i: usize| {
+            0.2126 * v[i * 3] + 0.7152 * v[i * 3 + 1] + 0.0722 * v[i * 3 + 2]
+        };
+        let nch = a.len().min(b.len());
+
+        let mut finite = true;
+        let mut nonzero = 0usize;
+        let mut differs = 0usize;
+        let (mut sum_d, mut sum_a) = (0f64, 0f64);
+        for i in 0..nch {
+            if !a[i].is_finite() {
+                finite = false;
+            }
+            if a[i] != 0.0 {
+                nonzero += 1;
+            }
+            if a[i].to_bits() != b[i].to_bits() {
+                differs += 1;
+            }
+            sum_d += (a[i] - b[i]).abs() as f64;
+            sum_a += a[i].abs() as f64;
+        }
+        let rel = if sum_a > 0.0 { sum_d / sum_a } else { 0.0 };
+
+        // The Laplacian at OUTPUT res — "the denoise survived the upscale",
+        // which is a different claim from V15's "the denoise happened".
+        let lap = |v: &[f32]| -> f64 {
+            let mut s = 0f64;
+            for y in 1..oh - 1 {
+                for x in 1..ow - 1 {
+                    let c = lum(v, y * ow + x);
+                    let n = lum(v, (y - 1) * ow + x)
+                        + lum(v, (y + 1) * ow + x)
+                        + lum(v, y * ow + x - 1)
+                        + lum(v, y * ow + x + 1);
+                    s += (4.0 * c - n).abs() as f64;
+                }
+            }
+            s / ((ow - 2) * (oh - 2)) as f64
+        };
+        let (lap_d, lap_p) = (lap(&a), lap(&b));
+
+        eprintln!(
+            "check-vk: V16 composed frame {rw}x{rh} -> {ow}x{oh} over {FRAMES} frames: \
+             denoised-vs-fed rel {rel:.5} | differs {differs}/{nch} | lap {lap_d:.4} vs fed \
+             {lap_p:.4} | finite {finite} | non-zero ch {nonzero}"
+        );
+
+        if !finite {
+            return Err("the composed output carries non-finite channels".into());
+        }
+        // THE SENTINEL BEFORE THE HISTOGRAM, deliberately: an unwritten plane
+        // usually presents as a black frame, and "0 of 1440000 channels are
+        // non-zero" is the symptom while this is the cause. Checked in the
+        // order that names the bug.
+        if sent_color > 0 || sent_depth > 0 {
+            return Err(format!(
+                "sentinel SURVIVED the composed frame — colour {sent_color} 8-byte runs, depth \
+                 {sent_depth} words. Colour means `cs_nrd_out` never wrote; depth means the \
+                 folded `cs_nrd_pack` never wrote its guide, which no feed dispatch was there \
+                 to cover"
+            ));
+        }
+        if nonzero * 2 < nch {
+            return Err(format!("only {nonzero} of {nch} channels are non-zero"));
+        }
+        if differs == 0 {
+            return Err(
+                "the composed and fed routes produced a BIT-IDENTICAL image — the denoiser is \
+                 not in the composed frame"
+                    .into(),
+            );
+        }
+        if structural && !(lap_d < lap_p) {
+            return Err(format!(
+                "the composed output is not smoother than the fed one ({lap_d:.4} vs {lap_p:.4}) \
+                 — the denoise did not survive the upscale"
+            ));
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V16 {e}");
+        ok = false;
+    }
+
+    // ---- the dependency probe ----
+    if ok {
+        match compose_probe(hg, tg, &mut eng, scene, basis, cam0, q, rw, rh, ow, oh, near, far, &rs)
+        {
+            Ok((ctl, moved, len)) => {
+                let floor = (ctl.max(1)) * 20;
+                eprintln!(
+                    "check-vk: V16   ffx dependency: control drift {ctl} ch | clearing our \
+                     recompose moved {moved}/{len} ch of the upscaled output"
+                );
+                if moved < floor || moved * 100 < len {
+                    eprintln!(
+                        "check-vk: FAIL V16 zeroing the plane our recompose wrote barely moved \
+                         the upscale ({moved} vs a floor of {floor}) — FFX is not reading it"
+                    );
+                    ok = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V16 dependency probe: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!(
+            "check-vk: FAIL V16 {ve} validation error(s) inside this stage — the composed \
+             recording is the one whose defect class only the layer can see"
+        );
+        ok = false;
+    }
+
+    den.destroy(hg);
+    pln.destroy(hg);
+    eng.destroy(hg);
+    ok
+}
+
+/// V16's dependency probe: does FFX consume the plane our recompose wrote?
+///
+/// ONE context, WARMED, then three reset frames on one re-traced pose: two
+/// identical (which MEASURE the floor — assuming a floor is how a probe ends up
+/// asserting its own noise) and a third that zeroes the colour plane between
+/// `cs_nrd_out` and the FFX dispatch.
+///
+/// THE WARM-UP AND THE SHARED CONTEXT ARE BOTH LOAD-BEARING, and the first
+/// draft had neither. Three FRESH contexts read a control drift of **994206 of
+/// 1440000 channels** — two identical runs disagreeing on 69% of the image,
+/// which makes any floor built from it unsatisfiable. That is not
+/// non-determinism: FFX declares essentially every internal resource
+/// `FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED` and `ffx_vk` skips the init copy
+/// for exactly that type, so texels a reset frame never writes hold
+/// PER-ALLOCATION residue by contract (the Metal backend records the same
+/// thing, from the other side). One context makes the allocations identical;
+/// one discarded warm-up run makes the residue identical too, because after it
+/// the internal resources hold this pose's own output rather than whatever the
+/// allocator handed over.
+///
+/// Returns (control drift, moved, channels).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn compose_probe(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    eng: &mut vk::nrd::VkNrd,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    ow: usize,
+    oh: usize,
+    near: f32,
+    far: f32,
+    rs: &nrd::ReblurSettings,
+) -> Result<(usize, usize, usize), String> {
+    let jit = dlss::jitter_for(0);
+    let p = gfx::frame::FrameParams {
+        cam: *basis,
+        frame: 0,
+        accumulate: false,
+        jitter: false,
+        frame_jitter: Some(jit),
+        prev_cam: Some(*basis),
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+    let dp = vk::fsr3::Dispatch {
+        jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+        mv_scale: fsr::UPSCALE_MV_SIGN,
+        near_far: (near, far),
+        fov_y: cam0.fov_y,
+        dt_ms: gfx::denoise::NOMINAL_DT_MS,
+        reset: true,
+    };
+    let (pw, phh) = eng.prev_size();
+    let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+    let cs = gfx::denoise::common_settings(
+        &mats,
+        &mats,
+        jit,
+        jit,
+        rw as u32,
+        rh as u32,
+        pw,
+        phh,
+        far,
+        gfx::denoise::NOMINAL_DT_MS,
+        0,
+        true,
+        false,
+    );
+
+    let f = vk::fsr3::Fsr3::new(
+        hg,
+        (rw as u32, rh as u32),
+        (ow as u32, oh as u32),
+        vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+    )?;
+
+    let mut once = |clear: bool| -> Result<Vec<f32>, String> {
+        tg.render_wavefront(hg, &p, true)?;
+        tg.wire_feed(hg, f.feed_views());
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        let rec = f.frame_fed(
+            hg,
+            |d, cmd| {
+                unsafe {
+                    r1 = tg.record_nrd_pack(d, cmd);
+                    r2 = eng.record(d, cmd, &cs, rs);
+                    r3 = tg.record_nrd_out(d, cmd);
+                }
+                if clear {
+                    // BETWEEN the recompose and the dispatch. Moving it after
+                    // the dispatch is the tooth that proves this measures a
+                    // dependency and not a coincidence.
+                    f.clear_color_in_place(d, cmd);
+                }
+                r2.clone()
+            },
+            dp,
+        );
+        rec.and(r1).and(r2).and(r3)?;
+        f.read_output(hg)
+    };
+
+    let out = (|| -> Result<(usize, usize, usize), String> {
+        let _warm = once(false)?;
+        let ctl_a = once(false)?;
+        let ctl_b = once(false)?;
+        let zeroed = once(true)?;
+        let n = ctl_a.len().min(ctl_b.len()).min(zeroed.len());
+        let ctl = (0..n).filter(|&i| ctl_a[i].to_bits() != ctl_b[i].to_bits()).count();
+        let moved = (0..n).filter(|&i| ctl_a[i].to_bits() != zeroed[i].to_bits()).count();
+        Ok((ctl, moved, n))
+    })();
+    f.destroy(hg);
+    out
 }
 
 /// V15 — A REAL NRD ENGINE, running ReBLUR between the bridge's two halves.
@@ -16439,11 +16932,16 @@ fn run_check_vk_nrd(
             replay: false,
         };
         tg.render_wavefront(hg, &p, true)?;
+        // `write_inputs` for V14's reason — `cs_nrd_out` stores to the ENGINE's
+        // colour image, which only this bracket puts in `GENERAL`.
         let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
-        hg.run(|d, cmd| unsafe {
-            r1 = tg.record_nrd_pack(d, cmd);
-            r2 = mid(d, cmd);
-            r3 = tg.record_nrd_out(d, cmd);
+        fed.write_inputs(hg, |d, cmd| {
+            unsafe {
+                r1 = tg.record_nrd_pack(d, cmd);
+                r2 = mid(d, cmd);
+                r3 = tg.record_nrd_out(d, cmd);
+            }
+            Ok(())
         })?;
         r1?;
         r2?;
@@ -16776,11 +17274,21 @@ fn run_check_vk_bridge(
 
         // The sequence, on ONE command buffer — `nrd_frame_step`'s ordering:
         // pack -> engine -> recompose.
+        //
+        // Through `write_inputs` rather than a bare `hg.run`, because
+        // `cs_nrd_out` stores to `u16` and that is the ENGINE's colour image,
+        // not one of the tracer's own bridge planes: without the bracket it is
+        // written while resting in `SHADER_READ_ONLY_OPTIMAL` through a
+        // descriptor declaring `GENERAL`. See `Fsr3::write_inputs` for why no
+        // gate on this box could see that.
         let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
-        hg.run(|d, cmd| unsafe {
-            r1 = tg.record_nrd_pack(d, cmd);
-            r2 = tg.record_nrd_passthrough(d, cmd);
-            r3 = tg.record_nrd_out(d, cmd);
+        fed.write_inputs(hg, |d, cmd| {
+            unsafe {
+                r1 = tg.record_nrd_pack(d, cmd);
+                r2 = tg.record_nrd_passthrough(d, cmd);
+                r3 = tg.record_nrd_out(d, cmd);
+            }
+            Ok(())
         })?;
         r1?;
         r2?;
