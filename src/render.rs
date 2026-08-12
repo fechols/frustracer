@@ -1752,6 +1752,7 @@ fn shade_traced(
                 ctx.frame,
                 &ctx.clouds,
                 crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, tr.k, ctx.spp()),
+                ctx.scene.light_gain,
             );
             // Firefly glow against the open sky — a miss has no depth to
             // test (t_max ∞). Guarded like the hit arm.
@@ -2028,6 +2029,7 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
                 ctx.frame,
                 &ctx.clouds,
                 j,
+                ctx.scene.light_gain,
             );
             // Firefly glow against a proven-empty tile — the feature's most
             // visible case (a firefly on the night sky), still ZERO rays:
@@ -2090,6 +2092,7 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
                         ctx.frame,
                         &ctx.clouds,
                         crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, k, spp),
+                        ctx.scene.light_gain,
                     );
                     // Each extra sample carries its own glow along its own
                     // direction, exactly like a leaf pixel's sample loop.

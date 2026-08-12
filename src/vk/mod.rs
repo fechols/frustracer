@@ -17,6 +17,7 @@
 
 pub mod bc7;
 pub mod device;
+pub mod fsr3;
 pub mod headless;
 pub mod layout;
 pub mod reflect;

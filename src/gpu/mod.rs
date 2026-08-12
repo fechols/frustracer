@@ -804,7 +804,11 @@ pub struct GpuContext {
     /// frame's tonemap source, FRAMES_IN_FLIGHT frames old) — stashed by
     /// `fullscreen_to_backbuffer`, consumed by main's controller via
     /// `take_meter`. Cell: the present recorder is `&self`.
-    meter: std::cell::Cell<Option<f32>>,
+    meter: std::cell::Cell<Option<(f32, f32)>>,
+    /// The scene light gain in STOPS that frames recorded from now on carry
+    /// (`set_light_gain_ev`). Stamped into the meter's ring beside each
+    /// measurement so the controller can subtract it back out.
+    light_gain_ev: f32,
     blit: upload::BlitUpload,
     hdr: upload::HdrUpload,
     /// The HUD/menu overlay (gpu/hud.rs): window-sized premultiplied RGBA8,
@@ -1761,6 +1765,7 @@ impl GpuContext {
             bloom,
             autoexp: aexp_gpu,
             meter: std::cell::Cell::new(None),
+            light_gain_ev: 0.0,
             blit,
             hdr,
             hud,
@@ -6049,11 +6054,25 @@ impl GpuContext {
         self.tone.exposure = e;
     }
 
+    /// Auto-exposure, `--autoexp-mode lights`: the scene light gain in STOPS
+    /// that the frames being recorded from now on are rendered with
+    /// (`autoexp::light_gain_ev`, exactly 0.0 in the default tonemap arm).
+    ///
+    /// It is not used to light anything — the gain reaches the renderer
+    /// through `Scene` and the cbuffer's `el_meta.y`. It is recorded ALONGSIDE
+    /// each metered frame so the controller can subtract it back out when the
+    /// readback lands, which is what keeps the measurement open-loop.
+    pub fn set_light_gain_ev(&mut self, ev: f32) {
+        self.light_gain_ev = ev;
+    }
+
     /// Auto-exposure: the newest collected meter value (mean log2-luminance of
     /// a presented frame's tonemap source, FRAMES_IN_FLIGHT frames old),
     /// stashed by `fullscreen_to_backbuffer`. Take-semantics so the controller
     /// never folds one measurement twice.
-    pub fn take_meter(&self) -> Option<f32> {
+    /// Returns `(mean log2-luminance, the gain in stops that frame was
+    /// rendered with)`; the caller de-gains through `autoexp::degain`.
+    pub fn take_meter(&self) -> Option<(f32, f32)> {
         self.meter.take()
     }
 
@@ -7193,7 +7212,15 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 );
                 unsafe { self.d3d.list.ResourceBarrier(&[transition(src, psr, npsr)]) };
-                self.autoexp.record(&self.d3d.list, srv_slot, sw, sh, inv_samples, hud_slot);
+                self.autoexp.record(
+                    &self.d3d.list,
+                    srv_slot,
+                    sw,
+                    sh,
+                    inv_samples,
+                    hud_slot,
+                    self.light_gain_ev,
+                );
                 unsafe { self.d3d.list.ResourceBarrier(&[transition(src, npsr, psr)]) };
             }
         }

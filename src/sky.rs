@@ -422,7 +422,14 @@ pub(crate) fn hash01(h: u32) -> f32 {
 /// energy-conserving in the footprint (the `disc()` AA argument taken to the
 /// point limit), so stars neither crawl at 1 spp nor change brightness with
 /// render resolution.
-pub fn stars(d: Vec3A, half_angle: f32, night: f32, twinkle: u32) -> Vec3A {
+/// `gain` is the scene light gain (`Scene::light_gain`, 1.0 in every default
+/// and headless session) — the star field is the one emitter family with no
+/// scale channel of its own (the dome has `sky_scale`, the sun has
+/// `e_over_pi`), so `--autoexp-mode lights` reaches it here. It multiplies the
+/// final radiance, which is exactly equivalent to scaling `STAR_E` and
+/// `STAR_L_MAX` together — `min(a, C)·g == min(a·g, C·g)` for `g > 0` — so the
+/// near-field clamp keeps its relative meaning and linearity stays exact.
+pub fn stars(d: Vec3A, half_angle: f32, night: f32, twinkle: u32, gain: f32) -> Vec3A {
     if night <= 0.0 || d.y <= 0.0 {
         return Vec3A::ZERO;
     }
@@ -485,7 +492,7 @@ pub fn stars(d: Vec3A, half_angle: f32, night: f32, twinkle: u32) -> Vec3A {
     let tw = 0.75 + 0.25 * hash01(pcg_mix(seed ^ pcg_mix(twinkle >> 3)));
 
     let l = (STAR_E * tier / (std::f32::consts::TAU * sigma * sigma)).min(STAR_L_MAX);
-    tint * (l * g * tw * night * rise(d.y, 0.0, 0.05))
+    tint * (l * g * tw * night * rise(d.y, 0.0, 0.05) * gain)
 }
 
 /// The star field's smooth MEAN — the representation GATHER paths integrate,
@@ -513,13 +520,17 @@ pub fn stars(d: Vec3A, half_angle: f32, night: f32, twinkle: u32) -> Vec3A {
 /// re-emission rather than part of the flux budget, matching `dome`'s own
 /// convention, which is why the normalization is over the upper hemisphere
 /// alone.
-pub fn star_glow(d: Vec3A, night: f32) -> Vec3A {
+///
+/// `gain` is the scene light gain, exactly as in `stars` — and it must be the
+/// SAME value there, or the "points and mean are one field with identical
+/// energy" invariant would hold at gain 1 and nowhere else.
+pub fn star_glow(d: Vec3A, night: f32, gain: f32) -> Vec3A {
     if night <= 0.0 {
         return Vec3A::ZERO;
     }
     let l = STAR_FLUX * (STAR_AMBIENT_K / std::f32::consts::TAU);
     let t = ((d.y + 0.05) / 0.10).clamp(0.0, 1.0);
-    l * ((GROUND_ALBEDO + (1.0 - GROUND_ALBEDO) * t) * night)
+    l * ((GROUND_ALBEDO + (1.0 - GROUND_ALBEDO) * t) * night * gain)
 }
 
 /// What GATHER paths integrate: the scattering dome plus the star field's mean.
@@ -534,14 +545,21 @@ pub fn star_glow(d: Vec3A, night: f32) -> Vec3A {
 /// `hemi::sky_cell`, hemi's GI leaf miss, and both `--check` GI reference
 /// estimators — the references in lockstep with hemi or the A/B would be
 /// scoring two different functions.
+///
+/// The two halves take the scene light gain by DIFFERENT routes, and the
+/// asymmetry is real rather than sloppy: the dome already has a brightness
+/// channel, so `scale` (`Scene::sky_scale`) arrives pre-gained; the star field
+/// has none, so it takes `gain` explicitly. The one place that must pass
+/// `1.0` is `scene::refresh_sky_sh`, which projects the CANONICAL sky and lets
+/// `apply_light_gain` scale the coefficients afterwards.
 #[inline]
-pub fn gather(d: Vec3A, sun: Vec3A, scale: f32, night: f32) -> Vec3A {
+pub fn gather(d: Vec3A, sun: Vec3A, scale: f32, night: f32, gain: f32) -> Vec3A {
     let dm = dome(d, sun, scale);
     if night <= 0.0 {
         // BITWISE the pre-feature gather. A branch, deliberately not `+ 0.0`.
         return dm;
     }
-    dm + star_glow(d, night)
+    dm + star_glow(d, night, gain)
 }
 
 /// What an escaping ray SEES: the infinity backdrop (dome + disc + stars)
@@ -577,9 +595,13 @@ pub fn radiance(
     twinkle: u32,
     cl: &crate::clouds::Clouds,
     j: f32,
+    gain: f32,
 ) -> Vec3A {
     let dm = dome(d, sun.dir, scale);
-    let backdrop = dm + disc(d, sun, half_angle) + stars(d, half_angle, night, twinkle);
+    // The dome and the disc arrive PRE-gained (`scale` is `Scene::sky_scale`
+    // and `sun` carries a scaled `radiance`); only the stars need telling.
+    // `gain` is last in every signature in this module that takes one.
+    let backdrop = dm + disc(d, sun, half_angle) + stars(d, half_angle, night, twinkle, gain);
     if !cl.enabled {
         return backdrop;
     }
@@ -790,7 +812,7 @@ pub fn self_test() -> Result<(), String> {
         ));
     }
     // ...and the disc really is there for the paths that SHOULD see it.
-    if radiance(Vec3A::ZERO, sun.dir, &sun, 0.0, 1.0, 0.0, 0, &crate::clouds::Clouds::off(), 0.5)
+    if radiance(Vec3A::ZERO, sun.dir, &sun, 0.0, 1.0, 0.0, 0, &crate::clouds::Clouds::off(), 0.5, 1.0)
         .max_element()
         < sun.radiance.max_element()
     {
@@ -894,7 +916,12 @@ pub fn self_test() -> Result<(), String> {
         ("night", Vec3A::new(-3.0, 6.0, -2.0), MOON_DOME_FRAC, 1.0, 0.010, 0.045),
     ] {
         let sd = sd.normalize();
-        let f = |d: Vec3A| gather(d, sd, scale, night);
+        // `gain` 1.0 — the CANONICAL sky, which is exactly what
+        // `scene::refresh_sky_sh` projects (`apply_light_gain` scales the
+        // coefficients afterwards, and `Sh9::scaled` is exact because
+        // projection is linear). Passing anything else here would score a
+        // field the shipping projection never produces.
+        let f = |d: Vec3A| gather(d, sd, scale, night, 1.0);
         let sh_r = crate::sh::Sh9::project(f);
 
         // ANTI-VACUITY, and the half that matters: a pass proves nothing if the
@@ -966,11 +993,11 @@ pub fn self_test() -> Result<(), String> {
         let z = 1.0 - 2.0 * (i as f32 + 0.5) / 2000.0;
         let r = (1.0 - z * z).max(0.0).sqrt();
         let d = Vec3A::new(r * a.cos(), z, r * a.sin());
-        if star_glow(d, 0.0) != Vec3A::ZERO {
+        if star_glow(d, 0.0, 1.0) != Vec3A::ZERO {
             return Err(format!("star_glow({d:?}) is not exactly zero by day"));
         }
         for &scale in &[1.0f32, MOON_DOME_FRAC] {
-            if gather(d, sun.dir, scale, 0.0) != dome(d, sun.dir, scale) {
+            if gather(d, sun.dir, scale, 0.0, 1.0) != dome(d, sun.dir, scale) {
                 return Err(format!("gather != dome bitwise at night = 0, d = {d:?}"));
             }
         }
@@ -1008,7 +1035,7 @@ pub fn self_test() -> Result<(), String> {
         let r = (1.0 - z * z).max(0.0).sqrt();
         let d = Vec3A::new(r * a.cos(), z, r * a.sin());
         if d.y > 0.0 {
-            integ += star_glow(d, 1.0);
+            integ += star_glow(d, 1.0, 1.0);
         }
     }
     integ *= 4.0 * std::f32::consts::PI / GN as f32;
@@ -1027,15 +1054,15 @@ pub fn self_test() -> Result<(), String> {
     // GROUND_ALBEDO times the above-band value, and no step at the horizon —
     // a discontinuity there rings under order-2 truncation and would put
     // negative lobes in the ambient (the reason `dome` blends at all).
-    let above = star_glow(Vec3A::Y, 1.0);
-    let below = star_glow(Vec3A::NEG_Y, 1.0);
+    let above = star_glow(Vec3A::Y, 1.0, 1.0);
+    let below = star_glow(Vec3A::NEG_Y, 1.0, 1.0);
     if (below - above * GROUND_ALBEDO).abs().max_element() > 1e-12 {
         return Err(format!("star_glow below the horizon is {below:?}, want {above:?} * albedo"));
     }
-    let mut prev = star_glow(Vec3A::new(0.0, -1.0, 0.0), 1.0).x;
+    let mut prev = star_glow(Vec3A::new(0.0, -1.0, 0.0), 1.0, 1.0).x;
     for i in 0..=400 {
         let y = -0.2 + 0.4 * i as f32 / 400.0;
-        let v = star_glow(Vec3A::new((1.0f32 - y * y).max(0.0).sqrt(), y, 0.0), 1.0);
+        let v = star_glow(Vec3A::new((1.0f32 - y * y).max(0.0).sqrt(), y, 0.0), 1.0, 1.0);
         if !v.is_finite() || v.min_element() < 0.0 {
             return Err(format!("star_glow at y = {y} is {v:?} — must be finite, non-negative"));
         }
@@ -1057,7 +1084,7 @@ pub fn self_test() -> Result<(), String> {
     let moon_dir = Vec3A::new(-6.0, 10.0, -4.0).normalize();
     let night_dome = crate::sh::Sh9::project(|d| dome(d, moon_dir, MOON_DOME_FRAC));
     let night_gather =
-        crate::sh::Sh9::project(|d| gather(d, moon_dir, MOON_DOME_FRAC, 1.0));
+        crate::sh::Sh9::project(|d| gather(d, moon_dir, MOON_DOME_FRAC, 1.0, 1.0));
     let e_moon = night_dome.irradiance(Vec3A::Y);
     let e_night = night_gather.irradiance(Vec3A::Y);
     let lift = e_night - e_moon;

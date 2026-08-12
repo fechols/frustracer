@@ -16,13 +16,23 @@
 //! offset toward what the displayed image's mean log2-luminance asks for, and
 //! hands the result to the presentation curve as `tone::ToneParams::exposure`.
 //!
+//! WHERE the aperture is spent is a lever — `--autoexp-mode tonemap|lights`,
+//! see `Mode`. The default `tonemap` arm is the presentation-curve multiply
+//! described above and below; the `lights` arm spends the same EV upstream, as
+//! a gain on every emitter in the scene (`scene::apply_light_gain`). The two
+//! compute the same image because the rendering equation is linear in emitted
+//! radiance, which `--check`'s `light-gain` gate proves; they differ in what
+//! the gain passes through, and in that the lights arm has no spike guard.
+//!
 //! Structure, in the bloom discipline (display-stage, gate-blind by
 //! construction):
 //! - The MEASUREMENT is open-loop: meters read the pre-glare, PRE-exposure
 //!   tonemap source (linear radiance), and exposure exists only in the
 //!   presentation curve downstream — no servo feedback, no oscillation mode.
 //!   GPU sessions meter with a small reduction pass (gpu/autoexp.rs); the
-//!   CPU-presented arms use `meter_accum`/`meter_hdr` below.
+//!   CPU-presented arms use `meter_accum`/`meter_hdr` below. The lights arm
+//!   keeps that property by SUBTRACTING the gain the measured frame was
+//!   rendered with (`degain`) — without it the loop closes.
 //! - The CONTROLLER (`step`) lives in `session()`'s frame loop only, so every
 //!   headless path (`--check*`, `--spin`, `--cinematic`) never adapts and the
 //!   exposure they see is exactly 1.0 — no gate, `check.png`, or benchmark
@@ -255,6 +265,81 @@ pub fn bias() -> f32 {
     f32::from_bits(BIAS.load(Ordering::Relaxed))
 }
 
+/// WHERE the aperture is spent — `--autoexp-mode tonemap|lights`.
+///
+/// The rendering equation is LINEAR in emitted radiance, so scaling every
+/// emitter by `g` scales every path's radiance by `g` exactly: the two arms
+/// compute the same image, and `--check`'s `light-gain` gate proves it. What
+/// differs is everything the gain passes THROUGH on the way:
+///
+/// - `Tonemap` (the default, and the shipped behaviour bit-for-bit): the EV
+///   becomes `tone::ToneParams::exposure`, a pre-curve multiply at the
+///   presentation stage. The renderer never sees it, so the upscalers and
+///   denoisers integrate an un-gained scene and their ABSOLUTE clamps
+///   (`--fsr-max-radiance`, NRD/FRD's firefly caps) sit at a fixed scene
+///   brightness rather than at the presented one.
+/// - `Lights`: the EV becomes `Scene`-level light magnitudes (see
+///   `scene::apply_light_gain`) and the presentation curve stays at exactly
+///   1.0. The denoisers then see the brightened signal — arguably the right
+///   place for their clamps to act — at the cost of making every EV move a
+///   LIGHTING change the temporal histories must absorb (they do; it is the
+///   TOD-scrub class) and of losing the SPIKE GUARD, which is inherently
+///   display-stage: it works by relaxing a per-PIXEL display exposure toward
+///   1.0, and a global light gain has no per-pixel lever. That last point is
+///   why this is an A/B lever and not a replacement.
+///
+/// Exactly one destination is armed at a time, structurally:
+/// `display_exposure(ev) * light_gain(ev) == exposure(ev)` with the other
+/// factor exactly 1.0 (self_test arm 15).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// The aperture is a pre-curve multiply at the tonemap (the default).
+    Tonemap,
+    /// The aperture is a gain on every emitter in the scene.
+    Lights,
+}
+
+impl Mode {
+    /// The CLI/settings vocabulary — one parser, so `cli.rs` and a settings
+    /// file cannot disagree about what the words mean.
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s {
+            "tonemap" => Some(Mode::Tonemap),
+            "lights" => Some(Mode::Lights),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Tonemap => "tonemap",
+            Mode::Lights => "lights",
+        }
+    }
+}
+
+/// `--autoexp-mode` (consumed once by main's lever block, flipped live by the
+/// settings menu — the bloom shape). DEFAULT `Lights` since 2026-08-11 (the
+/// user's call, after a feel-test); `--autoexp-mode tonemap` is the opt-out and
+/// the A/B arm. Like `ENABLED`, the default is DUPLICATED in cli.rs's
+/// `defaults()` and settings.rs's menu-row `Cycle { default_ix }`; flip all
+/// three in lockstep, and `cli::self_test` pins that they agree.
+///
+/// CONSEQUENCE OF THE DEFAULT, stated because nothing else will say it: the
+/// SPIKE GUARD is now unreachable in a default session. Its arming test is
+/// `exposure > 1.0`, and this arm holds display exposure at exactly 1.0 — so
+/// `--autoexp-spike-guard`, itself default-ON, is inert unless the session also
+/// passes `--autoexp-mode tonemap`. That is inherent, not an oversight: the
+/// guard withholds a per-PIXEL share of a display multiply, and a global light
+/// gain has no per-pixel lever to withhold.
+static MODE: AtomicU32 = AtomicU32::new(Mode::Lights as u32);
+
+pub fn set_mode(m: Mode) {
+    MODE.store(m as u32, Ordering::Relaxed);
+}
+pub fn mode() -> Mode {
+    if MODE.load(Ordering::Relaxed) == Mode::Lights as u32 { Mode::Lights } else { Mode::Tonemap }
+}
+
 /// `--no-autoexp-spike-guard` kills, `--autoexp-spike-guard` spells the
 /// default. DEFAULT ON, and — like `ENABLED` — the default is DUPLICATED in
 /// cli.rs's `defaults()` and settings.rs's menu-row `Toggle { default }`; flip
@@ -379,19 +464,72 @@ pub fn step(ev: f32, measured_log2: f32, dt: f32) -> f32 {
     ev + (desired - ev) * gain
 }
 
-/// The EV -> linear scale the presentation curve consumes
-/// (`tone::ToneParams::exposure`). Exactly 1.0 when auto is off and the bias is
-/// 0 — the structural off state every bit-identity claim rests on (`exp2` is
-/// not trusted to return 1.0-exactly-by-luck; the zero case short-circuits,
-/// the `cinematic::exposure_scale` idiom). Bias composes additively in stops
-/// and applies even with auto off — a manual exposure lever for free.
+/// The session's total aperture in STOPS: the controller's eased EV when auto
+/// is on, plus the manual bias, which applies even with auto off (a free manual
+/// exposure lever). Mode-independent — this is the aperture, not where it is
+/// spent.
+pub fn ev_total(ev: f32) -> f32 {
+    (if enabled() { ev } else { 0.0 }) + bias()
+}
+
+/// Stops -> linear scale, with the structural off state every bit-identity
+/// claim in this feature rests on: exactly 0 stops returns exactly 1.0, because
+/// `exp2` is not trusted to return 1.0-by-luck (the `cinematic::exposure_scale`
+/// idiom).
+#[inline]
+fn scale_of(stops: f32) -> f32 {
+    if stops == 0.0 { 1.0 } else { stops.exp2() }
+}
+
+/// The session's total aperture as a linear scale, whichever arm spends it.
+/// `display_exposure(ev) * light_gain(ev) == exposure(ev)` by construction.
 pub fn exposure(ev: f32) -> f32 {
-    let e = if enabled() { ev } else { 0.0 } + bias();
-    if e == 0.0 {
-        1.0
-    } else {
-        e.exp2()
+    scale_of(ev_total(ev))
+}
+
+/// The aperture in stops as the SCENE will carry it — `ev_total` under
+/// `Mode::Lights`, and exactly 0.0 otherwise. Kept in stops as well as a scale
+/// because the meter de-gain below is an additive correction in log space.
+pub fn light_gain_ev(ev: f32) -> f32 {
+    match mode() {
+        Mode::Lights => ev_total(ev),
+        Mode::Tonemap => 0.0,
     }
+}
+
+/// What `scene::apply_light_gain` multiplies every emitter by. Exactly 1.0 in
+/// the tonemap arm, so that arm's scene is bitwise the pre-feature one.
+pub fn light_gain(ev: f32) -> f32 {
+    scale_of(light_gain_ev(ev))
+}
+
+/// What the presentation curve consumes (`tone::ToneParams::exposure`).
+/// Exactly 1.0 in the lights arm, so that arm's tonemap is bitwise the
+/// pre-exposure one — and therefore the SPIKE GUARD, whose own arming test is
+/// `exposure > 1.0`, is structurally absent there (see `Mode`).
+pub fn display_exposure(ev: f32) -> f32 {
+    scale_of(ev_total(ev) - light_gain_ev(ev))
+}
+
+/// Undo the light gain a measured frame was RENDERED with, so the controller
+/// stays open-loop.
+///
+/// This is the one thing the lights arm genuinely has to add. Today's meter
+/// reads a frame the aperture never touched, so `step`'s ask is a statement
+/// about the SCENE. Under `Mode::Lights` the gain feeds the renderer, so a
+/// frame rendered at `2^e` measures `log2(L) + e` and feeding that back would
+/// close a servo loop around a `FRAMES_IN_FLIGHT`-delayed measurement.
+/// Subtracting the stops that frame was rendered with recovers `log2(L)`
+/// exactly, which makes the controller mathematically identical to today's —
+/// so its convergence, deadband and clamp gates transfer unchanged (arm 16).
+///
+/// `gain_ev` is the value `light_gain_ev` returned when that frame was
+/// RECORDED, not the current one — the GPU meter's readback lands
+/// `FRAMES_IN_FLIGHT` frames later, so `gpu::autoexp` carries it per ring slot.
+/// The 0.0 case returns the measurement BITWISE (a branch, never `- 0.0`),
+/// which is what keeps the tonemap arm's controller untouched.
+pub fn degain(measured_log2: f32, gain_ev: f32) -> f32 {
+    if gain_ev == 0.0 { measured_log2 } else { measured_log2 - gain_ev }
 }
 
 /// Rec.709 luma of one linear RGB pixel, clamped non-negative. The ONE weight
@@ -679,16 +817,21 @@ pub fn meter_accum(accum: &[std::sync::atomic::AtomicU32], samples: u32) -> f32 
 /// `--no-auto-exposure --check` still proves the on arm and a default `--check`
 /// still proves the off arm, and the run's own lever state survives this test).
 pub fn self_test() -> Result<(), String> {
-    struct Restore(bool, f32, bool, f32);
+    struct Restore(bool, f32, bool, f32, Mode);
     impl Drop for Restore {
         fn drop(&mut self) {
             set_enabled(self.0);
             set_bias(self.1);
             set_guard(self.2);
             set_guard_strength(self.3);
+            set_mode(self.4);
         }
     }
-    let _restore = Restore(enabled(), bias(), guard(), guard_strength());
+    let _restore = Restore(enabled(), bias(), guard(), guard_strength(), mode());
+    // Every arm below (1)-(14) is about the aperture's MAGNITUDE, which is
+    // mode-independent — pin the default arm so they read the same whichever
+    // way the session's lever sits. (15)/(16) drive the lever themselves.
+    set_mode(Mode::Tonemap);
 
     // (1) The structural off state: disabled + unbiased is EXACTLY 1.0, for
     // any EV the controller might hold — the bit-identity contract.
@@ -927,6 +1070,93 @@ pub fn self_test() -> Result<(), String> {
         if !g.is_finite() || !(1.0..=4.0 + f32::EPSILON * 4.0).contains(&g) {
             return Err(format!("guard_plane px {i}: {g} outside [1, 4]"));
         }
+    }
+
+    // (15) The MODE split. Exactly one destination is armed, and the split is
+    // exact rather than approximate: the product of the two must reproduce the
+    // total aperture BITWISE (they partition `ev_total` additively in stops,
+    // and one side is always exactly 0 stops -> exactly 1.0).
+    set_enabled(true);
+    set_bias(0.0);
+    for m in [Mode::Tonemap, Mode::Lights] {
+        set_mode(m);
+        if Mode::parse(m.as_str()) != Some(m) {
+            return Err(format!("Mode vocabulary does not round-trip for {m:?}"));
+        }
+        for ev in [-2.0f32, -0.5, 0.0, 1.0, 2.0] {
+            let (d, l, tot) = (display_exposure(ev), light_gain(ev), exposure(ev));
+            let idle = if m == Mode::Lights { d } else { l };
+            if idle.to_bits() != 1.0f32.to_bits() {
+                return Err(format!("{m:?} ev {ev}: the idle destination must be exactly 1.0, got {idle}"));
+            }
+            if (d * l).to_bits() != tot.to_bits() {
+                return Err(format!(
+                    "{m:?} ev {ev}: display {d} * light {l} = {} != exposure {tot} bitwise",
+                    d * l
+                ));
+            }
+        }
+    }
+    // The bias reaches the lights arm too — a `--no-auto-exposure
+    // --exposure-bias 2 --autoexp-mode lights` session is "make the scene
+    // physically 4x brighter", and that is a feature, not an accident.
+    set_mode(Mode::Lights);
+    set_enabled(false);
+    set_bias(2.0);
+    if light_gain(9.0) != 4.0 || display_exposure(9.0).to_bits() != 1.0f32.to_bits() {
+        return Err(format!(
+            "lights arm must carry the bias with auto off: gain {}, display {}",
+            light_gain(9.0),
+            display_exposure(9.0)
+        ));
+    }
+    set_bias(0.0);
+    set_enabled(true);
+
+    // (16) THE DE-GAIN IDENTITY — what keeps the lights arm's controller
+    // open-loop. A frame rendered at gain g measures log2(L) + log2(g), so
+    // de-gaining must recover a controller ask identical to the one today's
+    // arm produces from the same scene. Identical BITWISE at the anchors, and
+    // identical in the ask across a sweep — if this drifts, the two arms settle
+    // at different EVs and the whole equivalence claim is void.
+    let scene_log2 = -5.25f32; // some dark enclosure
+    for ev_f in [0.0f32, 0.5, 1.0, 2.0, -1.5] {
+        set_mode(Mode::Lights);
+        let gain_ev = light_gain_ev(ev_f);
+        let measured = scene_log2 + gain_ev; // what the meter would read
+        let recovered = degain(measured, gain_ev);
+        if (recovered - scene_log2).abs() > 1e-5 {
+            return Err(format!(
+                "degain: rendered at {gain_ev} stops, measured {measured}, recovered {recovered} != {scene_log2}"
+            ));
+        }
+        // The controller must then take the same step it takes in the tonemap
+        // arm, which never de-gains at all.
+        set_mode(Mode::Tonemap);
+        let plain = step(0.3, degain(scene_log2, light_gain_ev(ev_f)), 1.0 / 60.0);
+        set_mode(Mode::Lights);
+        let lit = step(0.3, recovered, 1.0 / 60.0);
+        if (plain - lit).abs() > 1e-5 {
+            return Err(format!("degain: controller diverged at {ev_f} stops ({plain} vs {lit})"));
+        }
+    }
+    // The 0-stop case is BITWISE, never `- 0.0` — that is what leaves the
+    // tonemap arm's controller textually and numerically untouched.
+    for m in [Mode::Tonemap, Mode::Lights] {
+        set_mode(m);
+        for v in [-5.25f32, 0.0, 3.0, -0.0] {
+            if degain(v, 0.0).to_bits() != v.to_bits() {
+                return Err(format!("{m:?}: degain({v}, 0.0) must be bitwise inert"));
+            }
+        }
+    }
+    // TEETH: without the subtraction the loop is closed, and it must provably
+    // land somewhere else — otherwise arm (16) would pass on a no-op.
+    set_mode(Mode::Lights);
+    let naive = step(0.3, scene_log2 + 2.0, 1.0 / 60.0);
+    let correct = step(0.3, scene_log2, 1.0 / 60.0);
+    if (naive - correct).abs() < 1e-3 {
+        return Err("degain teeth: a NON-de-gained measurement must move the controller".into());
     }
 
     eprintln!("autoexp self-test: OK");

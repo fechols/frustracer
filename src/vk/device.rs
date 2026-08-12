@@ -177,7 +177,23 @@ pub fn mem_type_index(
     want: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
     (0..props.memory_type_count).find(|&i| {
-        type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want)
+        let f = props.memory_types[i as usize].property_flags;
+        // DEVICE_COHERENT_BIT_AMD IS A REJECTION, NOT A PREFERENCE. The spec
+        // forbids allocating from a memory type carrying it unless the
+        // `deviceCoherentMemory` feature is enabled, which this backend does
+        // not enable (it is an uncached, markedly slower class of memory that
+        // exists for debugging device faults — nothing here wants it).
+        //
+        // A latent bug since M2b, and one that could only ever surface as
+        // somebody else's allocation: this picks the FIRST type satisfying
+        // `want`, and on RADV the device-coherent types sort AFTER the plain
+        // ones for every request the tracer makes — so it took an allocation
+        // whose `memoryTypeBits` excluded the plain ones (FSR3's, in V11) to
+        // reach index 7 and trip VUID-vkAllocateMemory-deviceCoherentMemory-02790.
+        if f.contains(vk::MemoryPropertyFlags::DEVICE_COHERENT_AMD) {
+            return false;
+        }
+        type_bits & (1 << i) != 0 && f.contains(want)
     })
 }
 
@@ -247,6 +263,60 @@ pub struct DeviceInfo {
     /// the SAFE direction rather than degrading it. A device without it gets
     /// one loud line and uncompressed textures.
     pub texture_compression_bc: bool,
+    /// THE SMALL-TYPES FAMILY, and it exists for a reason this backend's own
+    /// shaders do not have: **FidelityFX picks its fp16 shader permutations
+    /// from what the device SUPPORTS, not from what we ENABLED.** FFX ships a
+    /// 16-bit twin of all ten FSR3 pass families and its
+    /// `GetDeviceCapabilitiesVK` reads `shaderFloat16` straight off the
+    /// physical device — so on any device that advertises it, FFX hands our
+    /// logical device SPIR-V declaring a capability we never turned on, and
+    /// pipeline creation feeds fp16 modules to a device without the feature.
+    ///
+    /// So these are enabled whenever present, like `sampler_anisotropy` and
+    /// `texture_compression_bc` above, and for the same reason each of those
+    /// is: the alternative is not a degradation but a broken configuration.
+    /// Our OWN corpus declares none of them (nothing is compiled with
+    /// `-enable-16bit-types`), which is what makes enabling them free — and
+    /// what the bit-identical V6/V7/V9 image gates are the proof of.
+    pub shader_int16: bool,
+    pub shader_float16: bool,
+    pub shader_int8: bool,
+    pub storage_16bit: bool,
+    /// FFX's passes write storage images through format-agnostic stores and
+    /// use extended storage formats. Probed rather than asked for blind: these
+    /// are core feature BITS, so enabling one a device lacks fails
+    /// `vkCreateDevice` outright — which would take out every `--check-vk`
+    /// stage on a device that merely cannot run the feature they are for.
+    pub storage_image_extended: bool,
+    pub storage_image_write_without_format: bool,
+    /// `VK_AMD_device_coherent_memory`, enabled for a third party's benefit and
+    /// for nothing of ours — the one entry in this struct that exists to make
+    /// somebody else's mistake legal rather than to use a capability.
+    ///
+    /// MEASURED on RADV STRIX_HALO: FidelityFX's Vulkan backend allocates its
+    /// internal FSR3 resources from memory type 7, which is
+    /// `DEVICE_LOCAL | DEVICE_COHERENT_AMD`, while types 0/1/3/4 are plain
+    /// `DEVICE_LOCAL` and sit before it. Reaching past all four is the
+    /// signature of a scan that keeps the LAST match instead of the first, and
+    /// the spec forbids allocating from such a type unless this feature is on
+    /// (VUID-vkAllocateMemory-deviceCoherentMemory-02790). We cannot change
+    /// FFX's choice from outside, so the alternatives are to enable the feature
+    /// or to run undefined behaviour and a failing validation gate.
+    ///
+    /// KNOWN-ACCEPT, and it is a real cost rather than a formality: device-
+    /// coherent memory is uncached, so FFX's internal resources land in a
+    /// markedly slower class on AMD hardware. Nothing of OURS follows it there
+    /// — `mem_type_index` rejects those types outright — so the blast radius is
+    /// exactly FSR3's own working set. Worth re-measuring against a future SDK.
+    pub device_coherent_memory: bool,
+    /// `VK_KHR_get_memory_requirements2`, which must be enabled EXPLICITLY
+    /// even though it is core since Vulkan 1.1 and this backend requires 1.3.
+    /// Core promotion is not enough: `CreateBackendContextVK` calls the
+    /// `KHR`-SUFFIXED alias `vkGetBufferMemoryRequirements2KHR`
+    /// unconditionally, and the loader resolves that name to a non-null
+    /// proc-addr only when the extension is in `enabledExtensionNames`.
+    /// Without it FFX calls through a null pointer during context creation.
+    pub get_memory_requirements2: bool,
 }
 
 impl DeviceInfo {
@@ -554,25 +624,72 @@ impl Vk {
             f12 = f12.buffer_device_address(true);
         }
 
-        // The two CORE features this backend enables, both ENABLED-WHEN-PRESENT
-        // and neither required, because each one's absence lands on a shipping
-        // arm rather than on a degradation invented here: `--aniso 1` is the
+        // THE SMALL-TYPES FAMILY, for FidelityFX rather than for our own
+        // shaders — see `DeviceInfo`'s field docs: FFX selects its fp16 shader
+        // permutations from what the device SUPPORTS, so a supported-but-not-
+        // enabled feature is not a missing optimisation but SPIR-V the device
+        // will reject. Enabled whenever present, like the two below; our own
+        // corpus declares none of them, so on any device this is inert for
+        // everything except FFX, which is what the bit-identical V6/V7/V9
+        // image gates are the proof of.
+        //
+        // `VK_KHR_get_memory_requirements2` rides along and is the one that
+        // bites hardest if forgotten: core since 1.1 (we require 1.3), but FFX
+        // calls the KHR-suffixed alias, whose proc-addr is null unless the
+        // extension name is enabled — a jump to zero inside context creation
+        // rather than an error code.
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+        if info.storage_16bit {
+            f11 = f11.storage_buffer16_bit_access(true).uniform_and_storage_buffer16_bit_access(true);
+        }
+        if info.shader_float16 {
+            f12 = f12.shader_float16(true);
+        }
+        if info.shader_int8 {
+            f12 = f12.shader_int8(true);
+        }
+        if info.get_memory_requirements2 {
+            exts.push(ash::khr::get_memory_requirements2::NAME.as_ptr());
+        }
+        // Enabled so FFX's own allocations are legal rather than UB — see the
+        // field doc. Our selector refuses these memory types, so this changes
+        // nothing about what this backend allocates.
+        let mut fdc = vk::PhysicalDeviceCoherentMemoryFeaturesAMD::default();
+        if info.device_coherent_memory {
+            exts.push(ash::amd::device_coherent_memory::NAME.as_ptr());
+            fdc = fdc.device_coherent_memory(true);
+        }
+
+        // The CORE features this backend enables, all ENABLED-WHEN-PRESENT and
+        // none required, because each one's absence lands on a shipping arm
+        // rather than on a degradation invented here: `--aniso 1` is the
         // isotropic ray-cone lod path VERBATIM, and `--no-bc7` is RGBA8
         // uploads. On D3D12 neither is a feature bit at all — anisotropy is a
         // static sampler and BC7 is a format — so this is the one place the
         // two APIs' shapes genuinely differ rather than merely spell.
+        //
+        // The last two are FFX's again: its fp16 passes write storage images
+        // through format-agnostic stores and use extended formats, both of
+        // which are core feature bits rather than anything a shader declares.
         let core = vk::PhysicalDeviceFeatures::default()
             .sampler_anisotropy(info.sampler_anisotropy)
-            .texture_compression_bc(info.texture_compression_bc);
+            .texture_compression_bc(info.texture_compression_bc)
+            .shader_int16(info.shader_int16)
+            .shader_storage_image_extended_formats(info.storage_image_extended)
+            .shader_storage_image_write_without_format(info.storage_image_write_without_format);
 
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&exts)
             .enabled_features(&core)
+            .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13);
         if rt {
             dci = dci.push_next(&mut fas).push_next(&mut frq);
+        }
+        if info.device_coherent_memory {
+            dci = dci.push_next(&mut fdc);
         }
         let device = unsafe { instance.create_device(phys, &dci, None) }
             .map_err(|e| format!("vkCreateDevice on {}: {e}", info.name))?;
@@ -598,10 +715,13 @@ impl Vk {
         unsafe { instance.get_physical_device_properties2(p, &mut props2) };
         let props = props2.properties;
 
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut feats2 =
-            vk::PhysicalDeviceFeatures2::default().push_next(&mut f12).push_next(&mut f13);
+        let mut feats2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut f11)
+            .push_next(&mut f12)
+            .push_next(&mut f13);
         unsafe { instance.get_physical_device_features2(p, &mut feats2) };
         // Copied out because `feats2` holds `&mut f12`/`&mut f13`: reading it
         // inside the initializer below would keep that borrow alive across the
@@ -653,6 +773,20 @@ impl Vk {
             sampler_anisotropy: core_feats.sampler_anisotropy != 0,
             max_anisotropy: props.limits.max_sampler_anisotropy,
             texture_compression_bc: core_feats.texture_compression_bc != 0,
+            shader_int16: core_feats.shader_int16 != 0,
+            shader_float16: f12.shader_float16 == vk::TRUE,
+            shader_int8: f12.shader_int8 == vk::TRUE,
+            // Both halves, because FFX's 16-bit permutations address 16-bit
+            // data in both storage and uniform buffers; enabling one without
+            // the other is a configuration nothing here would want.
+            storage_16bit: f11.storage_buffer16_bit_access == vk::TRUE
+                && f11.uniform_and_storage_buffer16_bit_access == vk::TRUE,
+            storage_image_extended: core_feats.shader_storage_image_extended_formats != 0,
+            storage_image_write_without_format: core_feats
+                .shader_storage_image_write_without_format
+                != 0,
+            device_coherent_memory: has_ext(ash::amd::device_coherent_memory::NAME),
+            get_memory_requirements2: has_ext(ash::khr::get_memory_requirements2::NAME),
         };
 
         // Hard requirements, each traceable to a decision already made.
