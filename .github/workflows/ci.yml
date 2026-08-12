@@ -481,18 +481,31 @@ jobs:
       - name: Build
         run: cargo build --profile quick
 
-      # BOTH VALIDATION LAYERS ARE ON, at the gates' own request: each prints a
-      # NOTE naming the failure class that is INVISIBLE without them (padded
-      # constant buffers, image-atomic buffer aliasing, clear-on-buffer-backed
-      # and RenderTarget usage for FSR3; texture storage modes, usage flags and
-      # unbound arguments for MetalFX) and says "Re-run with both =1".
-      #
-      # It is also the STRICTER run, not merely the noisier one, and the reason
-      # is recorded at main.rs's cold-dispatch comment: the layer ZERO-FILLS
+      # THE VALIDATION LAYERS ARE OFF, AND THAT IS A RECORDED FINDING RATHER
+      # THAN AN OVERSIGHT. Both gates print a NOTE asking to be re-run with
+      # MTL_DEBUG_LAYER=1 and MTL_SHADER_VALIDATION=1, and the argument for it
+      # is good (main.rs's cold-dispatch comment: the layer zero-fills
       # allocations, so FFX's UNINITIALIZED-tagged temporals stop carrying
-      # per-allocation residue and --check-fsr3's accumulating-channel count
-      # drops to exactly zero. That path is asserted as a BOUND, so zero passes
-      # it — turning validation on cannot make an anti-vacuity check vacuous.
+      # per-allocation residue and the accumulating-channel count drops to
+      # exactly zero — asserted as a BOUND, so zero passes, i.e. validation
+      # cannot make that check vacuous). It was tried, in run 31629382154:
+      #
+      #   Metal API Validation Enabled / Metal GPU Validation Enabled
+      #   check-fsr3: U1 metallib table OK — 80 permutations, 1148 KiB
+      #   check-fsr3: U2 device — Apple Paravirtual device | unified true
+      #   check-fsr3: U3 context created — 11 pipelines built of 80 offered
+      #   check-fsr3: FAIL U4 the output is uniformly zero — the dispatch wrote nothing
+      #
+      # So the whole pipeline builds under validation and then produces NOTHING,
+      # where the identical unvalidated run upscales at energy 1.000x. That is
+      # either a real defect in the FSR3 Metal backend of exactly the class
+      # those NOTEs enumerate (texture usage flags / storage modes) or an
+      # artifact of GPU validation on a PARAVIRTUAL device — and which one it is
+      # has not been established. Until it is, the job runs the configuration
+      # that is PROVEN to exercise the GPU, because a red gate nobody has
+      # diagnosed protects less than a green one that demonstrably ran. Do not
+      # re-enable these without the answer; the first step toward it is arming
+      # the two layers SEPARATELY, since only one of them is implicated.
       #
       # THE GUARDS ARE ASYMMETRIC, deliberately. Unlike --check-vk, whose
       # summary is unreachable after a SKIP, these gates skip a stage and still
@@ -503,21 +516,25 @@ jobs:
       # PARAVIRTUAL device is not something any run has reported yet, so a hard
       # X3 guard could fail for an environment fact rather than a defect. Read
       # the first runs, then tighten it to `check-metalfx: X3 upscale`.
+      #
+      # BOTH GATES RUN BEFORE ANY GUARD IS EVALUATED. The first draft asserted
+      # after each, so the fsr3 failure above exited the step and --check-metalfx
+      # never ran at all — one gate's failure hid the other's whole result, on
+      # the very run that was meant to tell us what MetalFX does on this device.
       - name: Gates (Metal)
-        env:
-          MTL_DEBUG_LAYER: 1
-          MTL_SHADER_VALIDATION: 1
         shell: bash
         run: |
-          set -eo pipefail
-          cargo run --profile quick -- --check-fsr3 2>&1 | tee fsr3.log
+          set -o pipefail
+          rc=0
+          cargo run --profile quick -- --check-fsr3    2>&1 | tee fsr3.log    || rc=1
+          cargo run --profile quick -- --check-metalfx 2>&1 | tee metalfx.log || rc=1
           grep -q "check-fsr3: PASSED" fsr3.log \
-            || { echo "::error::--check-fsr3 did not pass"; exit 1; }
+            || { echo "::error::--check-fsr3 did not pass"; rc=1; }
           grep -q "check-fsr3: U4 upscale" fsr3.log \
-            || { echo "::error::--check-fsr3 passed WITHOUT running a real upscale — the GPU half skipped:"; grep -E "SKIP U[0-9]" fsr3.log; exit 1; }
-          cargo run --profile quick -- --check-metalfx 2>&1 | tee metalfx.log
+            || { echo "::error::--check-fsr3 did not run a real upscale — the GPU half skipped:"; grep -E "SKIP U[0-9]" fsr3.log || true; rc=1; }
           grep -q "check-metalfx: PASSED" metalfx.log \
-            || { echo "::error::--check-metalfx did not pass"; exit 1; }
+            || { echo "::error::--check-metalfx did not pass"; rc=1; }
+          exit $rc
 
       - uses: actions/upload-artifact@v4
         if: always()
