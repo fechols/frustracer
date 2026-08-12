@@ -15,6 +15,53 @@ on:
 jobs:
   check:
     runs-on: windows-latest
+    # `target-cpu=native` AND A BUILD CACHE ARE INCOMPATIBLE ON A MIXED FLEET,
+    # and this is the fix for a red that could not retry its way out.
+    # `.cargo/config.toml` sets `-C target-cpu=native` (measured -9.1% ms/frame,
+    # and right for a build-machine-specific binary); rust-cache restores
+    # `target/*/deps/`, which holds compiled PROC-MACRO `.so`/`.dll`s that rustc
+    # `dlopen`s into ITSELF. A serde_derive built on a runner with a wider ISA
+    # and loaded by rustc on a narrower one is `SIGILL: illegal instruction`
+    # inside `DeriveProcMacro::expand`, and the crate never compiles.
+    #
+    # IT FIRED ON check-vulkan, 6 of its last 10 runs, while every sibling job
+    # compiled the same commit on the same OS — a different job, so a different
+    # cache key, so a different blob. THE ALTERNATION IS THE PROOF, not the
+    # recurrence: a red run and a green one 43 seconds apart both logged
+    # `Restored from cache key "v0-rust-check-vulkan-Linux-x64-e8b3ee54-4a6f9706"
+    # full match: true`. Same bytes, opposite outcome, so the variable is the
+    # RUNNER and not the artifact.
+    #
+    # AND IT CANNOT SELF-HEAL. GitHub cache keys are write-once: a red job skips
+    # the save (rust-cache's `post-if: success() || CACHE_ON_FAILURE`, and that
+    # input defaults false), and a GREEN job logs "Cache up-to-date" and saves
+    # nothing either. The poisoned entry outlives every re-run until its key
+    # changes, which is what this does.
+    #
+    # WHY THE ENV VAR AND NOT `.cargo/config.toml`: rust-cache hashes every
+    # CARGO*/CC*/CFLAGS*/CXX*/CMAKE*/RUST* env var into the MIDDLE key segment,
+    # and assigns its PREFIX-MATCH fallback from that segment BEFORE appending
+    # the lockfile hash. So RUSTFLAGS changes both the key and the fallback,
+    # while `.cargo/config.toml` feeds only the LAST segment — editing it would
+    # leave the fallback prefix matching and restore the same poisoned deps.
+    # Nothing is lost by replacing `[build] rustflags` wholesale: that table
+    # holds only `rustflags`, and the Windows `rust-lld` linker is a
+    # `[target.*]` key RUSTFLAGS does not touch. It reaches proc macros only
+    # because nothing here passes `--target`; if that changes, so does this.
+    #
+    # x86-64-v3 is the spelling `.cargo/config.toml:6` already names as the
+    # portable one, so CI compiles what a distributed binary would. `native` on
+    # an Intel runner enables AVX-512, which the AMD half of the fleet lacks;
+    # v3 is AVX2/BMI2/FMA, which both halves have. If a hosted runner ever lands
+    # below it the failure is a first-run SIGILL on all three x64 jobs at once —
+    # loud, deterministic, and one token from `x86-64-v2`.
+    #
+    # NOT ON THE macOS JOBS, which are arm64: `native` resolves to apple-m1/m2/m3
+    # there and `apple-m2` enables +bf16,+i8mm, so the same bug is LATENT — but
+    # no x86 literal is valid on aarch64, nothing has fired, and a guess does not
+    # belong in a fix commit. Named here rather than silently left out.
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
     steps:
       # lfs defaults to false, and that is deliberate: the flagless --check runs
       # on the PROCEDURAL scene, and assets/{bunny,teapot}.obj are plain git. So
@@ -119,6 +166,12 @@ jobs:
   # effect of adding a build job.
   check-linux:
     runs-on: ubuntu-latest
+    # Same reasoning as the Windows job: x64 + rust-cache + `target-cpu=native`
+    # is a proc-macro object that only runs on the machine that built it. This
+    # job has not gone red, which is luck about which runner last wrote its
+    # cache rather than a difference in exposure.
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
     steps:
       # Same reasoning as the Windows job: no lfs, but submodules ARE required —
       # build.rs's require_nrd() checks for the NRD SOURCE on every platform.
@@ -274,7 +327,15 @@ jobs:
   # spirv-val) and --check-vk (a device consuming it — V0 pure logic, V1 device,
   # V3 the indirect-dispatch chain the whole wavefront design rests on, V6/V7
   # the reference and wavefront tracers scored against the CPU, V8 the hemi
-  # tiers, V9 replay, V10 BC7, V12 the G-buffer pack, V15 NRD).
+  # tiers, V9 replay, V10 BC7, V12 the G-buffer pack, V18 the display stage).
+  #
+  # NOT V14-V17, and this line used to say "V15 NRD" and be wrong. Those four
+  # live inside `run_check_vk_feed`, whose first statement is
+  # `if !vk::fsr3::built()` -> print `SKIP V13` -> return, and this job never
+  # installs the FidelityFX source. So four stages vanish behind ONE V13 line:
+  # the green reference run printed 49 `check-vk:` lines and not one mentions
+  # V14, V15, V16 or V17. The guard below says so out loud rather than letting
+  # this list imply otherwise.
   #
   # SEPARATE FROM check-linux ON PURPOSE. It adds apt, a network fetch and a
   # device gate, and none of that should be able to slow or destabilise the job
@@ -296,6 +357,10 @@ jobs:
     # anyone has measured, and an unbounded software-raytracing job can burn a
     # lot of minutes before anyone looks.
     timeout-minutes: 25
+    # Same reasoning as the Windows job — and this is the job it fired on, six
+    # times in ten, alternating with greens off one identical cache entry.
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -306,8 +371,15 @@ jobs:
 
       # Every Linux build needs libNRD.so (require_nrd), so this job pays the
       # same NRD step as check-linux. Same key by construction, so the two share
-      # one cache: whichever job misses first builds it. It also makes V15 — the
-      # Vulkan NRD gate — real here for free.
+      # one cache: whichever job misses first builds it.
+      #
+      # IT DOES NOT MAKE V15 REAL, which this comment used to claim and 40bc4e8's
+      # message repeated. V15's missing-library skip is never REACHED: V17, V14,
+      # V15 and V16 all sit behind `run_check_vk_feed`'s `fsr3::built()` early
+      # return, and this job installs NRD but not the FidelityFX source, so the
+      # build prints "FSR3 disabled for the Vulkan/Metal backends" and none of
+      # the four runs. libNRD.so is still required to BUILD at all
+      # (require_nrd), which is why the step stays.
       - name: NRD version
         id: nrdver
         run: echo "sha=$(git -C SDKs/NRD-src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -330,11 +402,22 @@ jobs:
       # on PATH, so apt satisfies S3 with something the image pins for us.
       #   mesa-vulkan-drivers is lavapipe; vulkan-tools is for reading
       # `vulkaninfo` out of a failed run.
+      #   AND vulkan-validationlayers, WITHOUT WHICH THIS JOB HAS BEEN RUNNING
+      # THE SUITE UNVALIDATED AND SAYING SO IN A LINE NOBODY READS. `Vk::new`
+      # asks for VK_LAYER_KHRONOS_validation, does not find it, prints
+      # "continuing UNVALIDATED", and the run ends on `check-vk: NOTE validation
+      # was NOT armed`. This backend depends on that layer more than on any
+      # other instrument: V5's own recorded HONEST LIMIT is that a dropped
+      # binding exits 0 without it, and V18's VS/PS-swap tooth is named ONLY by
+      # the layer because RADV segfaults instead of erroring. Armed-and-unread
+      # is the --gpu-debug lesson; unarmed entirely is worse. The dev box runs
+      # armed, so this was a silent local-vs-CI asymmetry.
       - name: Vulkan + SPIR-V tooling
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            spirv-tools mesa-vulkan-drivers libvulkan1 vulkan-tools
+            spirv-tools mesa-vulkan-drivers libvulkan1 vulkan-tools \
+            vulkan-validationlayers
 
       # DXC — the SPIR-V compiler for the corpus, pinned by this repository
       # (12 MB tarball; the component fetches the 25 MB Windows zip alongside it
@@ -386,8 +469,31 @@ jobs:
       #     rasterizers agreeing on the pixel mapping is a stronger statement
       #     than either one passing alone. It skips only on a device that
       #     cannot draw at all, which this runner is not.
-      #   * V11/V13 are PERMITTED to skip: FSR3 on a software device is a
-      #     documented environment fact, not a degraded run.
+      #   * V11/V13 are PERMITTED to skip, and the reason that actually FIRES
+      #     here is the FFX SOURCE, not the device: this job installs no
+      #     FidelityFX SDK, so `fsr3::built()` is false and V13 returns before
+      #     it can reach its software-device arm. Both spellings are honest;
+      #     only the first is what the log shows.
+      #
+      #   * NOTHING ELSE CAN BE FORBIDDEN HONESTLY, and the list is exhaustive.
+      #     V1/V2 return BEFORE the summary, so the grep above already covers
+      #     them; V0/V3/V4/V5/V10/V12 have no skip path at all; V11/V13 are
+      #     entitled. Adding `SKIP V15` would assert coverage this job does not
+      #     have and would NEVER FIRE — the exact vacuity this block exists to
+      #     prevent.
+      #
+      #   * SO THE REAL GAP IS SILENCE, NOT A SKIP LINE, and a forbid-list
+      #     structurally cannot see it: V14-V17 print NOTHING here (see the NRD
+      #     step's comment). The loop below asserts the POSITIVE for the
+      #     thirteen stages MEASURED to run on llvmpipe. It subsumes the
+      #     forbid-list — a skipping stage prints `SKIP V6`, not `V6 ` — and it
+      #     is the only shape that catches a stage that goes quiet. The
+      #     trailing space in the pattern is load-bearing: without it `V1`
+      #     matches `V18`.
+      #
+      #   * And validation must be ARMED, not merely requested. The layer is
+      #     installed above; a run without it reports the NOTE and gates less
+      #     than this job claims.
       #
       # `set -eo pipefail` is required for `| tee` to keep the gate's exit code.
       - name: Gates (SPIR-V + Vulkan)
@@ -405,6 +511,12 @@ jobs:
             grep -E "SKIP (V6|V7|V8|V9|V18)" vk.log
             exit 1
           fi
+          for s in V0 V1 V2 V3 V4 V5 V6 V7 V8 V9 V10 V12 V18; do
+            grep -q "check-vk: $s " vk.log \
+              || { echo "::error::--check-vk printed no $s line at all — that stage did not run and did not say so"; exit 1; }
+          done
+          grep -q "check-vk: validation clean" vk.log \
+            || { echo "::error::--check-vk ran UNVALIDATED — the layer is the only instrument for a whole class of defects here"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         if: always()
