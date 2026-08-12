@@ -36,7 +36,7 @@
 //! What made the translation free is worth recording so nobody re-derives
 //! it: `-fvk-{b,t,u,s}-shift` maps HLSL register spaces onto Vulkan descriptor
 //! sets without touching a declaration, and `-fvk-use-dx-layout` keeps the
-//! 4608-byte `FrameCb` byte-compatible so ONE Rust packer serves both backends
+//! 5632-byte `FrameCb` byte-compatible so ONE Rust packer serves both backends
 //! — at the cost of requiring `scalarBlockLayout` on the Vulkan device, which
 //! is core in 1.2. The one permanent exception is `workgraph.hlsl`: a
 //! `VK_AMDX_shader_enqueue` translation exists, but that extension is a vendor

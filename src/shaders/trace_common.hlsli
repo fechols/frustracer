@@ -268,6 +268,17 @@ cbuffer Frame : register(b0) {
     // (4^3 = 64 tiles, an 8x8 grid) — deeper would need more rows, and 1/64
     // is already finer than the balancer can usefully act on.
     uint4 split;
+    // Cluster row c (src/emissive.rs): xyz = the power-weighted mean emitter
+    // normal stored UNNORMALIZED so its length IS the mean resultant length R,
+    // w = that same R. Appended LAST so no offset above moves.
+    //
+    // The emission lobe is `f = 1 - R + saturate(dot(v, w))` for `w` the unit
+    // direction FROM the light TO the receiver — attenuation-only, since
+    // saturate(dot(v,w)) <= |v| = R gives f <= 1. That bound is why r_infl2,
+    // the exact-zero window and el_tile_culled's exactness argument all stand
+    // unchanged. R == 0 BRANCHES to exactly 1.0 (never a computed * 1.0), so
+    // an isotropic cluster runs the pre-lobe instruction stream.
+    float4 el_c[MAX_EMISSIVE_LIGHTS];
 }
 
 #define SCENE_EPS  (sun_e.w)
