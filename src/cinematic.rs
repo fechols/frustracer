@@ -1021,6 +1021,20 @@ pub fn resolve_shots(
 /// 1000 is the HDR10 convention and what consumer displays tone-map from.
 pub const HDR_MASTER_NITS: f32 = 1000.0;
 
+/// Quality for the inline animated WebP, the one clip a GitHub README can
+/// actually play. NOT a size knob: the whole point of the page is to show what
+/// the tracer produces, and at the old 72 the compressor's own ringing sat on
+/// top of ray-traced detail — grain, cavity shadows, foliage edges — so the
+/// reader could not tell the renderer's output from the encoder's. 95 is
+/// visually transparent on this content at roughly 3x the bytes, which is the
+/// trade the media set is meant to make. Truly lossless was measured out for
+/// animation: hundreds of frames of 1-spp-derived detail defeats the frame
+/// differencing and lands in the tens of megabytes per clip.
+///
+/// Pinned to a FLOOR by `self_test` rather than an exact value, so retuning
+/// upward is free and a silent slide back toward artifacts is not.
+pub const INLINE_WEBP_Q: u32 = 95;
+
 /// Encode a linear-RGB image (post-glare, the same signal the SDR PNG is made
 /// from) to 16-bit PQ / Rec.2020 — the wire format for an HDR10 still or an
 /// HDR10 video frame.
@@ -1141,7 +1155,8 @@ pub fn ffmpeg_cmds(
                 s("-y"), s("-framerate"), fps.to_string(), s("-start_number"), s("0"),
                 s("-i"), pattern,
                 s("-vf"), format!("scale={inline_w}:-2:flags=lanczos"),
-                s("-c:v"), s("libwebp"), s("-lossless"), s("0"), s("-q:v"), s("72"),
+                s("-c:v"), s("libwebp"), s("-lossless"), s("0"),
+                s("-q:v"), INLINE_WEBP_Q.to_string(),
                 s("-compression_level"), s("6"), s("-loop"), s("0"), s("-an"),
                 format!("{dir}/{name}.webp"),
             ],
@@ -1675,6 +1690,17 @@ pub fn self_test() -> Result<(), String> {
         // renderable by a browser nor welcome in a clone.
         if !webp.iter().any(|a| a.starts_with("scale=1280")) {
             return Err("inline webp must downscale a 4K capture".into());
+        }
+        // A FLOOR, not an equality: the clip exists to show ray-traced detail,
+        // and below ~90 the encoder's ringing is visible on exactly the grain
+        // and contact shadows the page is advertising. Retuning up stays free.
+        let q = webp
+            .windows(2)
+            .find(|w| w[0] == "-q:v")
+            .and_then(|w| w[1].parse::<u32>().ok())
+            .ok_or("inline webp must set an explicit -q:v")?;
+        if q < 90 {
+            return Err(format!("inline webp quality {q} is below the visually-transparent floor"));
         }
 
         // HDR10: the transfer/primaries tags are what stop a player treating
