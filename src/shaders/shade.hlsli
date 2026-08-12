@@ -871,7 +871,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    float cone_w0, float cone_spread, bool aniso, bool cam_lights,
                    uint2 el_mask,
                    out float3 amb_w, out float3 amb_o, out float3 amb_n,
-                   out PrimSurf prim
+                   out float3 amb_tail, out PrimSurf prim
 #ifdef DXR_SBT_RECURSE
                    , uint depth0
 #endif
@@ -879,6 +879,10 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
     amb_w = 0.0;
     amb_o = 0.0;
     amb_n = 0.0;
+    // The SH*AO tail this surface used, if it computed one -- the GI ladder's
+    // correction hook (see the sampled arm's export). Zero under
+    // split_ambient, where the caller supplies the ambient itself.
+    amb_tail = 0.0;
     prim = (PrimSurf)0;
     float3 total = 0.0;
     float3 tput = 1.0;
@@ -1553,6 +1557,23 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // subexpression, same tree; the off arm's DAG identity is what
             // the same-seed byte gates verify.
             float3 amb_t = amb_irradiance(n, n_s) * ao;
+            if (lap == 0u) {
+                // THE GI LADDER'S CORRECTION HOOK: hand the caller this
+                // surface's ambient WEIGHT and the TAIL it is about to fold in,
+                // so shade_full can add a rouletted `amb_w * (G - amb_tail)/p`
+                // over it without re-deriving either. The tail is exported
+                // PRE-CAVITY and the weight carries dcav, so `amb_w * amb_tail`
+                // reproduces this arm's own fold exactly -- the same split the
+                // split_ambient arm above makes, for the same reason.
+                //
+                // Dead stores in every caller that runs no correction, which
+                // DXC removes: the unarmed instruction stream is unchanged.
+                amb_tail = amb_t;
+                amb_w = tput * kd * kt;
+                if (dh < 0.0 && (flags & FLAG_DETAIL_AO)) amb_w *= dcav;
+                amb_o = p;
+                amb_n = n;
+            }
             // FLAG_REMOD_EXACT, the SAMPLED-ambient arm's blend site: the two
             // diffuse sub-terms are known here, so weight their factors before
             // the cavity is applied below (the weight asks "how much of the
@@ -1567,9 +1588,20 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // NRD path (the split-ambient arm leaves prim.ao at 0 under RTGI,
             // so the bridge's ao*amb term vanishes); this arm only runs in a
             // non-RTGI NRD session.
+#ifndef RTGI_CORR_L0
             if (lap == 0u && (flags & FLAG_REMOD_EXACT)) {
                 prim.m_d = remod_blend(diffuse_d, prim.m_d, amb_t, prim.amb_k);
             }
+#else
+            // DEFERRED at rung 0.5, where shade_full adds a rouletted
+            // correction that shares amb_t's factor (prim.amb_k): the blend
+            // weights by ENERGY, and blending twice is not the three-way
+            // blend -- b(b(A,B),C) != b(A,B+C) unless the weights are carried
+            // through. So `prim.m_d` goes back as the unblended `sk` and
+            // shade_full runs the single correct blend against the SUMMED
+            // ambient energy. Nothing else in the tree defines RTGI_CORR_L0,
+            // so every other rung compiles the line above verbatim.
+#endif
             if (dh < 0.0 && (flags & FLAG_DETAIL_AO)) amb_t *= dcav;
             float3 c = tput * (kd * kt * (diffuse_d + amb_t) + direct_s);
             total += c;
@@ -1885,15 +1917,87 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
 // entry. Flag-off frames pass split_ambient=false — value-identical to the
 // pre-feature call (the runtime lever); fb frames clear the flag (the hemi
 // tiers take precedence).
+#ifdef RTGI_CORR
+// ONE rouletted GI correction over an already-computed SH*AO tail (shade.rs's
+// ambient-tier roulette arm is the twin, and the CPU is the source of truth).
+//
+// With probability p = RTGI_CORR, gather from (o, n) and return the
+// 1/p-WEIGHTED DELTA over `tail`; otherwise return exactly zero. Returning the
+// DELTA rather than the ambient is what makes the terminated path add
+// literally nothing to a color that already carries `amb_w * tail` -- a BRANCH,
+// never a computed weight.
+//
+//     E[tail + delta] = tail + p*(G - tail)/p = G
+//
+// i.e. unbiased for the DETERMINISTIC rung above, with the variance riding on
+// (G - tail)^2 instead of G^2 because the tail is a control variate. A plain
+// coin flip between the rungs would deliver only p of the correction.
+//
+// The gather's own hit is a LEAF -- 1 shadow, 1 AO, no reflections, no further
+// gather -- which is BOUNCE_Q, and it is the same integrand the deterministic
+// arm computes one rung up. That shared definition is what the unbiasedness
+// gate's self-oracling rests on.
+float3 rtgi_correction(float3 o, float3 n, float3 tail, inout uint rng) {
+    // The RUNTIME half of the arming (FLAG_RTGI_CORR): the compile define says
+    // this rung EXISTS, the flag says this FRAME wants it. A gate that pins
+    // Quality{rtgi_bounces: 0.0} clears the bit and gets no gather, no rng
+    // draw and no fold -- the per-Quality pin every composition gate relies on.
+    if ((flags & FLAG_RTGI_CORR) == 0u) return 0.0;
+    // ONE draw for the decision, then the gather's own two -- so a continued
+    // lane's stream is LONGER than a terminated one's, exactly as on the CPU.
+    // Lanes have independent streams by construction, and nothing downstream
+    // reads a POSITION in one.
+    float u = rng_next(rng);
+    if (u >= RTGI_CORR) return 0.0;
+    float gr1 = rng_next(rng);
+    float gr2 = rng_next(rng);
+    float3 gt1, gt2;
+    onb(n, gt1, gt2);
+    float3 gd = cosine_dir(n, gt1, gt2, gr1, gr2);
+#ifdef HAVE_COUNTERS
+    uint _gc;
+    // WHICH level this correction is: with RTGI compiled in, the deterministic
+    // gather already spent level 0 and this is level 1; without it, this IS the
+    // level-0 gather (rung 0.5). Mirrors the CPU's `depth == 0` split, so the
+    // rung signature the must-fires read means the same thing on both.
+#ifdef RTGI_CORR_L0
+    InterlockedAdd(counters[CTR_RTGI_RAYS], 1u, _gc);
+#else
+    InterlockedAdd(counters[CTR_RTGI_RAYS2], 1u, _gc);
+#endif
+#endif
+    HitInfo gh;
+    float3 g;
+    if (ABL_TRACE_GI(o, gd, 0.0, FLT_MAX, gh)) {
+        float3 w4, o4, n4, t4;
+        PrimSurf ps_unused2; // gather rays never capture (secondary-ray rule)
+        g = shade_split(o, gd, gh, rng, 1u, 1u, false, false,
+                        0.0, HEMI_CONE_SPREAD, false, false,
+                        uint2(0xffffffffu, 0xffffffffu), w4, o4, n4, t4, ps_unused2
+#ifdef DXR_SBT_RECURSE
+#ifdef RTGI_CORR_L0
+                        , 1u
+#else
+                        , 2u
+#endif
+#endif
+        );
+    } else {
+        g = sky_gather(gd);
+    }
+    return (g - tail) * (1.0 / RTGI_CORR);
+}
+#endif
+
 float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_mask,
                   out PrimSurf prim) {
-    float3 w, o, n;
+    float3 w, o, n, at;
     // Camera rays (and their reflection/glass continuations) resolve their
     // footprint anisotropically when the session asks for it — FLAG_ANISO.
 #ifdef RTGI
     bool rtgi = (flags & FLAG_RTGI) != 0u;
     float3 c = shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                           rtgi, 0.0, pixel_cone, true, true, el_mask, w, o, n, prim
+                           rtgi, 0.0, pixel_cone, true, true, el_mask, w, o, n, at, prim
 #ifdef DXR_SBT_RECURSE
                            // The DEPTH-0 root: chs_shade's recursion-tagged
                            // continuations bypass this entry and call shade_split
@@ -1919,11 +2023,11 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
         float3 li;
         bool bhit = ABL_TRACE_GI(o, bd, 0.0, FLT_MAX, bh);
         if (bhit) {
-            float3 w3, o3, n3;
+            float3 w3, o3, n3, t3;
             PrimSurf ps_unused; // bounce rays never capture (secondary-ray rule)
             li = shade_split(o, bd, bh, rng, 1u, 1u, false, false,
                              0.0, HEMI_CONE_SPREAD, false, false,
-                             uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, ps_unused
+                             uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, t3, ps_unused
 #ifdef DXR_SBT_RECURSE
                              // The bounce surface shades at depth 1 (the
                              // CPU's `depth + 1`), so its glass chain keeps
@@ -1932,6 +2036,16 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
                              , 1u
 #endif
             );
+#if defined(RTGI_CORR) && !defined(RTGI_CORR_L0)
+            // THE SECOND BOUNCE (rungs 1.5 and 2): roulette a real gather over
+            // the tail the bounce surface just used. SEQUENTIAL with the call
+            // above, never nested inside it -- that is what keeps the peak
+            // register footprint max(one shade_split, another) rather than
+            // their sum, and it is why both use the identical thinnest call
+            // shape. A MISSED bounce has no surface and no tail, so it is
+            // correctly outside this block.
+            li += w3 * rtgi_correction(o3, n3, t3, rng);
+#endif
         } else {
             li = sky_gather(bd);
         }
@@ -1972,14 +2086,38 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
     }
     return c;
 #else
-    return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                       false, 0.0, pixel_cone, true, true, el_mask, w, o, n, prim
+    float3 c = shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
+                           false, 0.0, pixel_cone, true, true, el_mask, w, o, n, at, prim
 #ifdef DXR_SBT_RECURSE
-                       // The DEPTH-0 root: chs_shade's recursion-tagged
-                       // continuations bypass this entry and call shade_split
-                       // with the payload's own depth.
-                       , 0u
+                           // The DEPTH-0 root: chs_shade's recursion-tagged
+                           // continuations bypass this entry and call shade_split
+                           // with the payload's own depth.
+                           , 0u
 #endif
     );
+#ifdef RTGI_CORR_L0
+    // RUNG 0.5: no deterministic gather ran, so the primary took the SAMPLED
+    // arm and `c` already carries `w * at`. Roulette a real gather over it --
+    // the same correction the level-1 site above applies, one level up.
+    float3 corr = rtgi_correction(o, n, at, rng);
+    c += w * corr;
+    if ((flags & FLAG_NRD_GI) != 0u) {
+        // The correction is the noisy half and MUST reach the denoiser. Unlike
+        // the RTGI arm, `prim.ao` is REAL here (the sampled arm ran), so the
+        // bridge's D = dd + ao*amb already carries the TAIL and this adds only
+        // the delta -- which is why the fold is `corr`, not the whole ambient.
+        //
+        // The blend is done HERE rather than in the sampled arm, and against
+        // the SUMMED ambient energy: shade_split deferred it under
+        // RTGI_CORR_L0 precisely so this one blend sees both sub-terms at once
+        // (a two-step blend is not the three-way one). `prim.m_d` arrives as
+        // the unblended sk.
+        if (flags & FLAG_REMOD_EXACT) {
+            prim.m_d = remod_blend(prim.direct_d, prim.m_d, at + corr, prim.amb_k);
+        }
+        prim.direct_d += corr;
+    }
+#endif
+    return c;
 #endif
 }

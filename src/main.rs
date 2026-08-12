@@ -725,9 +725,35 @@ fn main() {
         eprintln!("detail-untex-scale: untextured detail ×{}", opts.detail_untex_scale);
     }
     scene::set_amb_bump(opts.amb_bump);
-    shade::set_rtgi(opts.rtgi);
-    if !opts.rtgi {
+    shade::set_rtgi_bounces(opts.rtgi_bounces);
+    // FR_RTGI_NOWEIGHT=1 — the naive-coin-flip repro arm (loud on departure,
+    // the FR_ABL idiom). Biased by construction; it exists so the bias is
+    // reproducible on demand and so the unbiasedness gate has teeth.
+    if std::env::var("FR_RTGI_NOWEIGHT").as_deref() == Ok("1") {
+        shade::set_rtgi_rr_noweight(true);
+        eprintln!(
+            "FR_RTGI_NOWEIGHT=1 — rouletted gathers taken UNWEIGHTED (biased: \
+             the naive coin flip, delivering only p of the correction)"
+        );
+    }
+    // DEFAULT 1.0 — only a DEPARTURE prints, the lever-line convention, so a
+    // flagless session's stderr is exactly what it was before the ladder.
+    if opts.rtgi_bounces <= 0.0 {
         eprintln!("rtgi: OFF — flat SH×AO ambient (the pre-RTGI renderer)");
+    } else if opts.rtgi_bounces != 1.0 {
+        let det = opts.rtgi_bounces.floor();
+        let pr = opts.rtgi_bounces - det;
+        if pr > 0.0 {
+            eprintln!(
+                "rtgi: {} bounces — {det} deterministic + a {:.0}% rouletted gather \
+                 over the SH×AO tail (unbiased for {})",
+                opts.rtgi_bounces,
+                pr * 100.0,
+                det + 1.0
+            );
+        } else {
+            eprintln!("rtgi: {} deterministic bounces", opts.rtgi_bounces);
+        }
     }
     autoexp::set_enabled(opts.autoexp);
     // DEFAULT ON — only a DEPARTURE prints, the lever-line convention.
@@ -2326,12 +2352,28 @@ fn run_check_dxr(
     let mut sum_c = [0.0f64; 3];
     let mut sum_g = [0.0f64; 3];
     let mut sum_abs = 0.0f64;
+    // NON-FINITE and NEGATIVE are DIFFERENT failures and were being counted as
+    // one, which meant neither was precisely asserted. A NaN or Inf is always a
+    // defect. A negative sample is not: the GI ladder's stochastic rungs
+    // estimate the ambient as `tail + (G - tail)/p`, an UNBIASED estimator of a
+    // non-negative quantity, and an unbiased estimator of a non-negative
+    // quantity may legitimately sample below zero — here exactly when
+    // `G < tail*(1 - p)`, so the frequency climbs as p falls. MEASURED on this
+    // scene, of 1.44M samples: 131 at p = 0.25, 12 at 0.5, 2 at 0.75, while the
+    // radiance mean stays flat at 0.044-0.053% — i.e. the image is right and
+    // the tail is real. Clamping them away would remove the negative tail and
+    // BIAS the mean, which is the one thing the ladder must not do (its own
+    // `rtgi-rr` gate would catch it), so the samples stand and the bound is on
+    // HOW MANY rather than on whether.
     let mut nonfinite = 0usize;
+    let mut negative = 0usize;
     for i in 0..px * 3 {
         let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
         let g = gpu_acc[i] * inv;
-        if !g.is_finite() || g < 0.0 {
+        if !g.is_finite() {
             nonfinite += 1;
+        } else if g < 0.0 {
+            negative += 1;
         }
         sum_c[i % 3] += c as f64;
         sum_g[i % 3] += g as f64;
@@ -2343,12 +2385,25 @@ fn run_check_dxr(
         mean_rel = mean_rel.max(rel);
     }
     eprintln!(
-        "check-dxr: radiance A/B over {AB_FRAMES} frames: per-channel mean rel diff {:.3}% | mean abs px diff {:.4} | non-finite {nonfinite}",
+        "check-dxr: radiance A/B over {AB_FRAMES} frames: per-channel mean rel diff {:.3}% | mean abs px diff {:.4} | non-finite {nonfinite} | negative {negative}",
         mean_rel * 100.0,
         sum_abs / (px * 3) as f64
     );
     if nonfinite > 0 {
-        eprintln!("check-dxr: FAIL non-finite or negative HDR samples");
+        eprintln!("check-dxr: FAIL non-finite HDR samples");
+        ok = false;
+    }
+    // A stochastic rung may sample negative (see above); no other configuration
+    // may, and even an armed one only in the tail — 0.1% of samples is two
+    // orders above the worst measured and still catches a sign error, which
+    // would flip a large POPULATION rather than a fringe.
+    let neg_ok = crate::gfx::frame::rtgi_corr_p(shade::rtgi_bounces()) > 0.0
+        && negative <= px * 3 / 1000;
+    if negative > 0 && !neg_ok {
+        eprintln!(
+            "check-dxr: FAIL {negative} negative HDR samples — legitimate only in a \
+             stochastic GI rung's tail (--rtgi-bounces with a fractional part)"
+        );
         ok = false;
     }
     if mean_rel > 0.02 {
@@ -2488,7 +2543,7 @@ fn run_check_dxr(
         let (near, far) = dlss::near_far(scene.diag);
         // rtgi pinned OFF — the --check-gpu twin's composition-gate rule
         // (prim.ao == 0 under RTGI would vacuate the AO must-fires).
-        let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+        let uq = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
         let dxr_gbuf_frame = |hg: &mut gpu::trace::HeadlessGpu,
                               dg2: &gpu::dxr::DxrGpu,
                               basis: camera::CamBasis,
@@ -5685,16 +5740,35 @@ fn run_check_gpu(
     // must count exactly 0 (the define is omitted, so a nonzero count means
     // the bump escaped its guard). Same --cam caveat class: a pose with no
     // hit pixel would trip the must-fire.
-    let rtgi_rays = ctrs[gpu::trace::CTR_RTGI_RAYS as usize];
-    if shade::rtgi_enabled() {
-        eprintln!("check-gpu: rtgi bounce rays: {rtgi_rays}");
-        if rtgi_rays == 0 {
-            eprintln!("check-gpu: FAIL rtgi armed but the wavefront frame traced 0 bounce rays");
+    //
+    // Scored as the LADDER'S RUNG SIGNATURE, the pair (level-0, level-1):
+    // rungs 0.5 and 1 agree about level 0 and differ in nothing a level-0-only
+    // gate can see, so the single-counter form would have read them as the same
+    // session. The zero arms are the teeth — each rung's blocks are COMPILE
+    // defines, so a count on a rung that omits them means a define escaped its
+    // guard and reached a unit it should not have.
+    let rtgi_n = shade::rtgi_bounces();
+    let rtgi_l0 = ctrs[gpu::trace::CTR_RTGI_RAYS as usize];
+    let rtgi_l1 = ctrs[gpu::trace::CTR_RTGI_RAYS2 as usize];
+    eprintln!(
+        "check-gpu: rtgi gathers at --rtgi-bounces {rtgi_n}: level-0 {rtgi_l0} + level-1 {rtgi_l1}"
+    );
+    for (live, got, what) in
+        [(rtgi_n > 0.0, rtgi_l0, "level-0"), (rtgi_n > 1.0, rtgi_l1, "level-1")]
+    {
+        if live && got == 0 {
+            eprintln!(
+                "check-gpu: FAIL rung {rtgi_n} traced 0 {what} gathers \
+                 (the wavefront frame runs fb OFF, so that rung must fire)"
+            );
+            ok = false;
+        } else if !live && got != 0 {
+            eprintln!(
+                "check-gpu: FAIL {got} {what} gathers at --rtgi-bounces {rtgi_n} \
+                 (that rung's block must be compiled out)"
+            );
             ok = false;
         }
-    } else if rtgi_rays != 0 {
-        eprintln!("check-gpu: FAIL {rtgi_rays} rtgi bounce rays under --no-rtgi (RTGI must be compiled out)");
-        ok = false;
     }
     // Opaque-continuation anti-vacuity and reuse accounting. These counters
     // fire once per CONSUMED non-root LeafRec, not once per ray; the ray total
@@ -7597,7 +7671,7 @@ fn run_check_gpu(
         // gate's anti-vacuity and as "no live AO term" to the composite's.
         // The runtime flag derives from p.q, so this is per-pass, no global.
         // Armed coverage lives in the wavefront soundness/rtgi gates above.
-        let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+        let uq = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
         // One fresh 1-spp wavefront frame at the upscaler contract
         // (accumulate off, frame-uniform zero jitter), pack read back into a
         // CPU GBufs so the CPU gate consumes it unmodified. Returns the pack
@@ -9786,7 +9860,7 @@ fn run_check_gpu(
                             // the whole `ao * amb` term drops out of D_in, and
                             // what remains is exactly what shade captured.
                             if crate::shade::rtgi_enabled() {
-                                let q9 = Quality { rtgi: true, ..Quality::upscaler_1spp() };
+                                let q9 = Quality { rtgi_bounces: 1.0, ..Quality::upscaler_1spp() };
                                 let p9 = gpu::trace::FrameParams {
                                     sway_prev_time: None,
                                     cam: basis_b,
@@ -12065,7 +12139,7 @@ fn run_check_gpu(
                 // other two). Stands down under --no-rtgi: the shade block
                 // the flag gates never compiled.
                 if crate::shade::rtgi_enabled() {
-                    let gq = Quality { rtgi: true, ..Quality::upscaler_1spp() };
+                    let gq = Quality { rtgi_bounces: 1.0, ..Quality::upscaler_1spp() };
                     let pg = gpu::trace::FrameParams {
                         sway_prev_time: None,
                         cam: basis_b,
@@ -14490,7 +14564,7 @@ fn run_check_vk_fsr3(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -15846,9 +15920,9 @@ fn run_check_vk_gbuf(
     // Odd dims, `--check-gpu` M7's own.
     let (pw, ph) = (533usize, 400usize);
     let (near, far) = dlss::near_far(scene.diag);
-    // `rtgi: false` for M7's reason: under RTGI `prim.ao` is 0 everywhere,
+    // `rtgi_bounces: 0.0` for M7's reason: under RTGI `prim.ao` is 0 everywhere,
     // which vacuates the AO-bearing lanes a later feed gate will want.
-    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+    let q = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
 
     let tg = match vk::tracer::VkTracer::new(
         hg,
@@ -16076,9 +16150,9 @@ fn run_check_vk_feed(
     let (rw, rh) = (ow / 2, oh / 2);
     const FRAMES: u32 = 8;
     let (near, far) = dlss::near_far(scene.diag);
-    // `rtgi: false` for V12's reason (M7's): under RTGI `prim.ao` is 0
+    // `rtgi_bounces: 0.0` for V12's reason (M7's): under RTGI `prim.ao` is 0
     // everywhere, which vacuates lanes a feed gate wants.
-    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+    let q = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
 
     let tg = match vk::tracer::VkTracer::new(
         hg,
@@ -17443,7 +17517,10 @@ fn run_check_vk_wavefront(
         scene.any_height && bvh::height_on(),
         ctr(gs::CTR_HEIGHT_REJ),
     );
-    arm(&mut ok, "rtgi bounce rays", shade::rtgi_enabled(), ctr(gs::CTR_RTGI_RAYS));
+    // The ladder's rung signature, both halves (see --check-gpu's twin).
+    let rtgi_n = shade::rtgi_bounces();
+    arm(&mut ok, "rtgi level-0 gathers", rtgi_n > 0.0, ctr(gs::CTR_RTGI_RAYS));
+    arm(&mut ok, "rtgi level-1 gathers", rtgi_n > 1.0, ctr(gs::CTR_RTGI_RAYS2));
 
     // ---- the continuation frontier, under `--sw-rays` ----
     //
@@ -19183,7 +19260,7 @@ fn fsr3_upscale_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -19602,7 +19679,7 @@ fn fsr_frame_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -20392,7 +20469,7 @@ fn mv_check_at(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -20862,7 +20939,7 @@ fn run_check_xess(
             ao_samples: 2,
             reflections: true,
             fb: shade::FrustumBounce::OFF,
-            rtgi: false,
+            rtgi_bounces: 0.0,
             emissive_display: true,
         };
         // Accumulate several jittered frames per side: two single 1-spp
@@ -21119,7 +21196,7 @@ fn run_check_nppd(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -23389,7 +23466,7 @@ fn run_cinematic_gpu(
                             upscaler_defaults(
                                 &mut o,
                                 matches!(u.name, "xess" | "fsr3").then_some(u.name),
-                                dn_slot.is_some() && opts.rtgi,
+                                dn_slot.is_some() && opts.rtgi_bounces > 0.0,
                             );
                             emissive::set_enabled(o.emissive_lights);
                         }
@@ -23709,7 +23786,7 @@ fn run_cinematic_gpu(
                                                 jit,
                                                 reset,
                                                 sun_cur,
-                                                p.q.rtgi && primv.nrd_sig(),
+                                                p.q.rtgi_bounces > 0.0 && primv.nrd_sig(),
                                                 &|| match &*armv {
                                                     CineArm::Wave(tg) => tg.record_nrd_pack(l, 0),
                                                     CineArm::Dxr(dg) => dg.record_nrd_pack(l, 0),
@@ -24184,7 +24261,7 @@ fn run_frd_lab(
     });
     // rtgi pinned OFF (the F4 harness rule): the streak is specular, and the
     // sampled-AO tier keeps the dd fold's inputs live.
-    let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+    let uq = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
     let (near, far) = dlss::near_far(scene.diag);
     let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -27756,27 +27833,42 @@ fn run_check(
         }
     };
 
-    // REAL-TIME GI liveness (the alpha-rej/el-cull shape), snapshotted before
-    // the first stats.clear() like el-cull above: an armed session's verify
-    // phases must have traced bounce rays (every hybrid pass with fb OFF
-    // bounces at each hit pixel — a hitless --cam pose is the documented
-    // caveat class), and --no-rtgi must count exactly 0 (the arm is
-    // Quality-gated, so a stray ray means a constructor stopped reading the
-    // lever).
+    // REAL-TIME GI liveness across THE LADDER (the alpha-rej/el-cull shape),
+    // snapshotted before the first stats.clear() like el-cull above.
+    //
+    // The PAIR (level-0 gathers, level-1-and-deeper gathers) is the rung
+    // SIGNATURE, and asserting both halves is what stops a rung passing by
+    // accident: rungs 0.5 and 1 agree about level 0 and differ in nothing a
+    // level-0-only gate can see, so the old single-counter form would have read
+    // them as the same session.
+    //
+    //     rung 0        -> (0, 0)
+    //     rungs 0.5, 1  -> (>0, 0)
+    //     rungs 1.5, 2  -> (>0, >0)
+    //
+    // Every hybrid pass with fb OFF gathers at each hit pixel, so an armed
+    // session's verify phases must fire; a hitless --cam pose is the documented
+    // caveat class. The zero arms are the teeth: the tier is Quality-gated, so
+    // a stray ray means a constructor stopped reading the lever, and a level-1
+    // ray below rung 1.5 means a gather started recursing on its own.
     let rtgi_ok = {
-        let rays = stats.rtgi_rays.load(Relaxed);
-        if shade::rtgi_enabled() {
-            eprintln!("check: rtgi bounce rays {rays}");
-            if rays == 0 {
-                eprintln!("check: FAIL rtgi armed but the verify phases traced 0 bounce rays");
+        let n = shade::rtgi_bounces();
+        let l0 = stats.rtgi_rays.load(Relaxed);
+        let l1 = stats.rtgi_rays2.load(Relaxed);
+        eprintln!("check: rtgi gathers at --rtgi-bounces {n}: level-0 {l0} + level-1 {l1}");
+        let mut rok = true;
+        let mut want = |live: bool, got: u64, what: &str| {
+            if live && got == 0 {
+                eprintln!("check: FAIL rung {n} traced 0 {what} gathers (that rung is dead code)");
+                rok = false;
+            } else if !live && got != 0 {
+                eprintln!("check: FAIL {got} {what} gathers at --rtgi-bounces {n}");
+                rok = false;
             }
-            rays > 0
-        } else if rays != 0 {
-            eprintln!("check: FAIL {rays} rtgi bounce rays under --no-rtgi");
-            false
-        } else {
-            true
-        }
+        };
+        want(n > 0.0, l0, "level-0");
+        want(n > 1.0, l1, "level-1");
+        rok
     };
 
     // RTGI estimator/wiring A/B (structural — default scene). The unpaired
@@ -27790,7 +27882,7 @@ fn run_check(
     // fb.gi accumulation of the same view. Both estimate the same integral
     // through the same BOUNCE_Q policy and everything OUTSIDE the ambient
     // tier is identical by construction (same q otherwise; both arms drop
-    // emissive NEE; recursion shades rtgi: false either way), so the trimmed
+    // emissive NEE; recursion shades rtgi_bounces: 0.0 either way), so the trimmed
     // per-pixel relative-luminance means differ only by estimator noise —
     // while a kd double-fold (≈−15%), a π factor (+200%), or a disc-carrying
     // miss (firefly-scale) blow the bounds. Trim per the unpaired-A/B
@@ -27798,10 +27890,10 @@ fn run_check(
     // so the gate keeps its teeth under a `--no-rtgi --check` (the CPU arm
     // is Quality-gated, not lever-gated — the amb-bump save/restore pattern
     // without the global).
-    let rtgi_ab_ok = if structural {
-        const RTGI_AB_FRAMES: u32 = 32;
-        const GI_AB_FRAMES: u32 = 4;
-        let render_mean = |bq: Quality, n: u32| -> Vec<f32> {
+    // Shared by the two RTGI gates below: an n-frame accumulation of one
+    // Quality, returned as the per-channel mean. ONE frame loop, so neither
+    // gate can be measuring its own harness.
+    let render_mean = |bq: Quality, n: u32| -> Vec<f32> {
             for f in 0..n {
                 let ctx = FrameCtx {
                     sway_mv: None,
@@ -27839,26 +27931,21 @@ fn run_check(
                 };
                 render::render_frame(&ctx, true);
             }
-            // accum holds the n-frame SUM (frame 0 stores, later frames add).
-            (0..rw * rh * 3)
-                .map(|i| f32::from_bits(accum[i].load(Relaxed)) / n as f32)
-                .collect()
-        };
-        let mut bq_rtgi = q;
-        bq_rtgi.fb = shade::FrustumBounce::OFF;
-        bq_rtgi.rtgi = true;
-        let mut bq_gi = q;
-        bq_gi.fb = shade::FrustumBounce { ao: false, gi: true, depth: q.fb.depth };
-        bq_gi.rtgi = false;
-        let img_rtgi = render_mean(bq_rtgi, RTGI_AB_FRAMES);
-        let img_gi = render_mean(bq_gi, GI_AB_FRAMES);
+        // accum holds the n-frame SUM (frame 0 stores, later frames add).
+        (0..rw * rh * 3)
+            .map(|i| f32::from_bits(accum[i].load(Relaxed)) / n as f32)
+            .collect()
+    };
+    // The trimmed per-pixel relative-luminance statistic both RTGI gates score
+    // on (the unpaired-A/B firefly discipline -- the canopy lesson).
+    let rel_stats = |img: &[f32], reference: &[f32]| -> (f64, f64, f64, f64) {
         let lum = |b: &[f32], i: usize| {
             0.2126 * b[i * 3] + 0.7152 * b[i * 3 + 1] + 0.0722 * b[i * 3 + 2]
         };
         let mut rels: Vec<f64> = (0..rw * rh)
             .map(|i| {
-                let lg = lum(&img_gi, i);
-                ((lum(&img_rtgi, i) - lg) / lg.max(0.05)) as f64
+                let lg = lum(reference, i);
+                ((lum(img, i) - lg) / lg.max(0.05)) as f64
             })
             .collect();
         // total_cmp: a NaN rel must FAIL (it sorts past +inf into the kept
@@ -27868,18 +27955,131 @@ fn run_check(
         let kept = &rels[cut..rels.len() - cut];
         let mean_signed = kept.iter().sum::<f64>() / kept.len() as f64;
         let mean_abs = kept.iter().map(|r| r.abs()).sum::<f64>() / kept.len() as f64;
+        (mean_abs, mean_signed, rels[0], rels[rels.len() - 1])
+    };
+
+    let rtgi_ab_ok = if structural {
+        const RTGI_AB_FRAMES: u32 = 32;
+        const GI_AB_FRAMES: u32 = 4;
+        let mut bq_rtgi = q;
+        bq_rtgi.fb = shade::FrustumBounce::OFF;
+        bq_rtgi.rtgi_bounces = 1.0;
+        let mut bq_gi = q;
+        bq_gi.fb = shade::FrustumBounce { ao: false, gi: true, depth: q.fb.depth };
+        bq_gi.rtgi_bounces = 0.0;
+        let img_rtgi = render_mean(bq_rtgi, RTGI_AB_FRAMES);
+        let img_gi = render_mean(bq_gi, GI_AB_FRAMES);
+        let (mean_abs, mean_signed, worst_lo, worst_hi) = rel_stats(&img_rtgi, &img_gi);
         eprintln!(
             "check: rtgi-vs-hemi-gi A/B ({RTGI_AB_FRAMES}f vs {GI_AB_FRAMES}f): \
              trimmed mean rel {mean_abs:.4} signed {mean_signed:+.4} \
-             (raw worst {:+.2}/{:+.2})",
-            rels[0],
-            rels[rels.len() - 1]
+             (raw worst {worst_lo:+.2}/{worst_hi:+.2})"
         );
         let ok = mean_abs < 0.08 && mean_signed.abs() < 0.02;
         if !ok {
             eprintln!("check: FAIL rtgi ambient disagrees with the hemi GI tier");
         }
         ok
+    } else {
+        true
+    };
+
+    // THE UNBIASEDNESS GATE — the ladder's own correctness property, and the
+    // only thing in the suite that can see whether the roulette's 1/p weight
+    // is RIGHT rather than merely present.
+    //
+    // It is SELF-ORACLING, which is what makes it strong: a stochastic rung
+    // estimates EXACTLY the deterministic rung above it (the roulette's
+    // expectation is the gather it rouletttes, and both arms compute that
+    // gather through the same `shade::rtgi_gather`), so the oracle is another
+    // SHIPPING setting rather than a synthetic reference that could drift away
+    // from the thing it is meant to score.
+    //
+    //     mean(0.5) -> mean(1)     the correction at level 0
+    //     mean(1.5) -> mean(2)     the correction at level 1
+    //
+    // BOTH arms, because the correction runs at two different depths and the
+    // level-1 failure modes are invisible at level 0: the emissive-display
+    // double count (`gather_q`'s inherited flag) can only happen where `el` has
+    // already been dropped, and a budget that failed to decrement can only show
+    // where there is a budget left to spend.
+    //
+    // TEETH: `FR_RTGI_NOWEIGHT`'s naive coin flip — take the gather outright
+    // instead of the 1/p-weighted delta — delivers only p of the correction and
+    // MUST blow both bounds. Without that arm, a roulette that never fired
+    // would pass by agreeing with the tail it never departed from, which is the
+    // exact shape of "the flag reached the pack but changed nothing".
+    let rtgi_rr_ok = if structural {
+        // The stochastic arms carry the roulette's own variance on top of the
+        // 1-spp gather noise both arms share, so they get the longer run; the
+        // deterministic oracle converges faster.
+        const RR_FRAMES: u32 = 96;
+        const DET_FRAMES: u32 = 32;
+        // THE SIGNED MEAN IS THE VERDICT, and picking it over the absolute one
+        // is the whole difference between a gate that works and one that
+        // reports confidently on noise. Both arms are 1-spp estimates, so
+        // `mean_abs` is dominated by per-pixel VARIANCE (~1-1.5% here) and the
+        // bias being hunted is the same size — MEASURED, the absolute statistic
+        // reads 0.0149 unbiased against 0.0248 biased and cannot separate them,
+        // while the signed statistic reads +0.0004 against -0.0194 and
+        // separates them by fifty times. Bias cancels nothing in a signed mean
+        // and everything in an absolute one; this is the `--spp` gate's own
+        // lesson ("a systematic bias is invisible to the max/hot half") from the
+        // other side.
+        //
+        // MEASURED (deterministic — `render::primary_seed` is a pure function
+        // of pixel/frame/sample, so these repeat exactly): weighted +0.0004 on
+        // BOTH arms; naive -0.0194 at level 0 and -0.0056 at level 1, the
+        // smaller figure because a second bounce is a smaller share of the
+        // image than a first. The bound sits 6x above the honest reading and
+        // 2.2x below the weaker teeth. Never widen it to pass — a wider bound
+        // stops the naive arm failing, which is the one thing this gate is for.
+        const RR_SIGNED: f64 = 0.0025;
+        // The absolute statistic is kept as a LOOSE sanity bound only: it
+        // catches a catastrophic divergence (a rung rendering something else
+        // entirely) and is deliberately not the verdict.
+        const RR_ABS: f64 = 0.05;
+        let arm = |budget: f32, n: u32| -> Vec<f32> {
+            let mut bq = q;
+            bq.fb = shade::FrustumBounce::OFF;
+            bq.rtgi_bounces = budget;
+            render_mean(bq, n)
+        };
+        let was_naive = shade::rtgi_rr_noweight();
+        let mut rrok = true;
+        for (lo, hi) in [(0.5f32, 1.0f32), (1.5, 2.0)] {
+            let det = arm(hi, DET_FRAMES);
+            shade::set_rtgi_rr_noweight(false);
+            let (ma, ms, wlo, whi) = rel_stats(&arm(lo, RR_FRAMES), &det);
+            // The teeth, same pose and same frame count — only the weight
+            // differs, so the verdict is attributable to the weight alone.
+            shade::set_rtgi_rr_noweight(true);
+            let (na, ns, _, _) = rel_stats(&arm(lo, RR_FRAMES), &det);
+            shade::set_rtgi_rr_noweight(was_naive);
+            eprintln!(
+                "check: rtgi-rr unbiasedness {lo} vs {hi} ({RR_FRAMES}f vs {DET_FRAMES}f): \
+                 trimmed mean rel {ma:.4} signed {ms:+.4} (raw worst {wlo:+.2}/{whi:+.2}) \
+                 | naive-coin-flip arm {na:.4} signed {ns:+.4}"
+            );
+            if !(ms.abs() < RR_SIGNED && ma < RR_ABS) {
+                eprintln!(
+                    "check: FAIL rung {lo} does not estimate rung {hi} \
+                     (signed {ms:+.4} vs {RR_SIGNED}) — the roulette weight is wrong"
+                );
+                rrok = false;
+            }
+            // The teeth, scored on the SAME statistic as the verdict: a biased
+            // estimator must be one this gate would have rejected.
+            if ns.abs() < RR_SIGNED {
+                eprintln!(
+                    "check: FAIL the naive coin flip at rung {lo} would have PASSED \
+                     (signed {ns:+.4}) — the gate cannot tell a biased estimator \
+                     from an unbiased one, so it proves nothing"
+                );
+                rrok = false;
+            }
+        }
+        rrok
     } else {
         true
     };
@@ -28923,7 +29123,7 @@ fn run_check(
             ao_samples: 1,
             reflections: true,
             fb: shade::FrustumBounce::OFF,
-            rtgi: shade::rtgi_enabled(),
+            rtgi_bounces: shade::rtgi_bounces(),
             emissive_display: true,
         };
         for (label, bq, cuts_opt) in [
@@ -29136,6 +29336,7 @@ fn run_check(
         ("el-cull", el_cull_ok),
         ("rtgi", rtgi_ok),
         ("rtgi-ab", rtgi_ab_ok),
+        ("rtgi-rr", rtgi_rr_ok),
         ("tod", tod_ok),
         ("light-gain", light_gain_ok),
         ("light-gain-ab", light_gain_ab_ok),
@@ -29783,7 +29984,7 @@ fn run_window(
         // (the 2026-08-10 narrowing — dn_kind is post-conflict-resolution
         // truth here, and the fold additionally needs the RTGI arm).
         // wired()'s Quin/Rr/Fsr4/Plain arms all fall to None — see the fn.
-        let dn_fold = dn_kind(&o).is_some() && o.rtgi;
+        let dn_fold = dn_kind(&o).is_some() && o.rtgi_bounces > 0.0;
         upscaler_defaults(
             &mut o,
             match gpu.wired() {
@@ -33791,7 +33992,7 @@ fn session(
                 ao_samples: 1,
                 reflections: true,
                 fb: shade::FrustumBounce::OFF,
-                rtgi: shade::rtgi_enabled(),
+                rtgi_bounces: shade::rtgi_bounces(),
                 emissive_display: true,
             }
         } else if moved && !use_budget {

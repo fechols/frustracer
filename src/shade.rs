@@ -30,14 +30,33 @@ pub struct Quality {
     pub ao_samples: u32,
     pub reflections: bool,
     pub fb: FrustumBounce,
-    /// REAL-TIME GI: one cosine-sampled bounce ray per pixel per frame IS the
-    /// ambient term (shaded at `hemi::BOUNCE_Q` — its SH×AO ambient is the
-    /// tail standing in for deeper bounces), replacing `amb_irradiance × AO`.
-    /// Primary path only (`depth == 0`); the still-frame fb tiers take
-    /// precedence. Session-armed via `set_rtgi` (`--no-rtgi`), read by the
+    /// REAL-TIME GI, as a BOUNCE BUDGET rather than a switch — the ladder
+    /// `--rtgi-bounces 0 | 0.5 | 1 | 1.5 | 2` (`shade::rtgi_bounces`).
+    ///
+    /// `>= 1.0` takes the DETERMINISTIC arm: one cosine-sampled gather IS the
+    /// ambient (shaded at `hemi::BOUNCE_Q`, whose SH×AO ambient is the tail
+    /// standing in for deeper bounces), and the hit shades with the budget
+    /// DECREMENTED BY ONE — so the field is itself the recursion bound. It
+    /// replaced a `depth == 0` gate, which could only ever express "one" and
+    /// which said nothing about the reflection/glass children that must not
+    /// inherit a budget at all.
+    ///
+    /// A FRACTIONAL remainder is the stochastic rung: the sampled SH×AO tail
+    /// is kept as a control variate and a real gather is rouletted over it at
+    /// that probability — unbiased for the next rung up, at that fraction of
+    /// its ray cost (see the ambient tier's roulette arm for the estimator).
+    /// `0.0` is the flat SH×AO ambient, i.e. the pre-RTGI renderer.
+    ///
+    /// ONE field, deliberately not a bool beside a probability:
+    /// `Quality { rtgi_bounces: 0.0, .. }` pins the whole tier off in a single
+    /// token, so the dozen gates that need a deterministic AO ambient cannot be
+    /// left half-pinned by a session lever they never heard of.
+    ///
+    /// The still-frame fb tiers take precedence. Session-armed via
+    /// `set_rtgi_bounces` (`--rtgi-bounces`, `--no-rtgi`), read by the
     /// constructors below so every session path inherits ONE decision — check
     /// harnesses pin the field per pass instead of mutating process state.
-    pub rtgi: bool,
+    pub rtgi_bounces: f32,
     /// May this invocation's shading add material emissive to the display
     /// color? TRUE everywhere except the RTGI bounce while cluster NEE is
     /// live that frame (the NEE-keep rule, 2026-08-08 — the XeSS feel-test:
@@ -52,17 +71,48 @@ pub struct Quality {
     pub emissive_display: bool,
 }
 
-/// Session lever for real-time GI (the `scene::amb_bump` lever shape):
-/// DEFAULT ON, `--no-rtgi` clears (main's lever block). Read by the `Quality`
-/// constructors — never inside `shade()` itself.
-static RTGI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Session lever for real-time GI (the `scene::amb_bump` lever shape): the
+/// BOUNCE BUDGET `--rtgi-bounces N`, DEFAULT 1.0 — one deterministic bounce,
+/// the pre-ladder renderer — and 0.0 under `--no-rtgi`. Read by the `Quality`
+/// constructors, never inside `shade()` itself, which takes its budget from
+/// the Quality it was handed.
+static RTGI_BOUNCES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
 
-pub fn set_rtgi(on: bool) {
-    RTGI.store(on, std::sync::atomic::Ordering::Relaxed);
+pub fn set_rtgi_bounces(n: f32) {
+    RTGI_BOUNCES.store(n.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+pub fn rtgi_bounces() -> f32 {
+    f32::from_bits(RTGI_BOUNCES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Does this session run the DETERMINISTIC level-0 gather? The `RTGI` compile
+/// define and every gate that means "is the bounce tier structurally live" key
+/// on this. FALSE at rung 0.5, which arms `RTGI_CORR` instead — so a gate that
+/// means "is ANY GI gather live" must read `rtgi_bounces() > 0.0` (the ladder's
+/// must-fires do), and one that means "is the SECOND bounce live" `> 1.0`.
 pub fn rtgi_enabled() -> bool {
-    RTGI.load(std::sync::atomic::Ordering::Relaxed)
+    rtgi_bounces() >= 1.0
+}
+
+/// The unbiasedness gate's TEETH, and the interactive A/B behind it
+/// (`FR_RTGI_NOWEIGHT=1`): take a rouletted gather OUTRIGHT instead of the
+/// 1/p-weighted delta — which is exactly the naive "average a 1-bounce image
+/// and a 2-bounce image" design the ladder exists to avoid. It delivers only
+/// `p` of the correction, so it is BIASED by construction, and the gate
+/// asserts it FAILS the bound the weighted form passes. Without that arm a
+/// roulette that never fired at all would pass the gate by agreeing with the
+/// tail it never departed from.
+static RTGI_RR_NOWEIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_rtgi_rr_noweight(on: bool) {
+    RTGI_RR_NOWEIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn rtgi_rr_noweight() -> bool {
+    RTGI_RR_NOWEIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Quality {
@@ -76,7 +126,7 @@ impl Quality {
                 ao_samples: 0,
                 reflections: false,
                 fb: FrustumBounce { depth: 2, ..FrustumBounce::OFF },
-                rtgi: rtgi_enabled(),
+                rtgi_bounces: rtgi_bounces(),
                 emissive_display: true,
             },
             3 => Quality {
@@ -84,7 +134,7 @@ impl Quality {
                 ao_samples: 4,
                 reflections: true,
                 fb: FrustumBounce { depth: 4, ..FrustumBounce::OFF },
-                rtgi: rtgi_enabled(),
+                rtgi_bounces: rtgi_bounces(),
                 emissive_display: true,
             },
             _ => Quality {
@@ -92,7 +142,7 @@ impl Quality {
                 ao_samples: 2,
                 reflections: true,
                 fb: FrustumBounce { depth: 3, ..FrustumBounce::OFF },
-                rtgi: rtgi_enabled(),
+                rtgi_bounces: rtgi_bounces(),
                 emissive_display: true,
             },
         }
@@ -111,8 +161,9 @@ impl Quality {
             fb: FrustumBounce::OFF,
             // RTGI rides the upscaler contract: the bounce is per-frame
             // stochastic noise the temporal integrator launders, exactly like
-            // the 1-spp shadow/AO rays.
-            rtgi: rtgi_enabled(),
+            // the 1-spp shadow/AO rays — and so, one rung up, is the roulette's
+            // own continue/terminate decision.
+            rtgi_bounces: rtgi_bounces(),
             emissive_display: true,
         }
     }
@@ -128,7 +179,7 @@ impl Quality {
             fb: FrustumBounce::OFF,
             // RTGI stays ON while moving — the bounce IS the ambient (the arm
             // never reads ao_samples), and accumulation/denoisers converge it.
-            rtgi: self.rtgi,
+            rtgi_bounces: self.rtgi_bounces,
             emissive_display: true,
         }
     }
@@ -693,6 +744,102 @@ fn tri_grads_from(
         return None;
     }
     Some((gu, gv))
+}
+
+/// ONE cosine-sampled GI gather at a shading point: draw a direction about the
+/// GEOMETRIC normal, trace, and shade the hit at `gq` — or `sky::gather` on a
+/// miss, which carries NO sun disc (the once-per-path rule: `direct_d` already
+/// delivers the sun with its own shadow ray, and the hemi GI leaf takes the
+/// identical arm for the identical reason).
+///
+/// Shared by BOTH rungs of the ladder — the deterministic arm
+/// (`rtgi_bounces >= 1`) and the stochastic arm's continued path — so the two
+/// can never disagree about what "the gather at this level" means. That shared
+/// definition is exactly what the unbiasedness gate rests on: the roulette's
+/// expectation is the deterministic rung's value only if both compute the same
+/// integrand from the same draws.
+///
+/// Cosine importance sampling makes the single sampled radiance the estimate of
+/// the irradiance-convention ambient directly (no π — the `irradiance()`
+/// L-in-L-out convention), so a fresh draw per frame converges to the true
+/// gathered GI under accumulation and reads as laundered noise to the temporal
+/// denoisers (the 1-spp contract).
+#[allow(clippy::too_many_arguments)]
+fn rtgi_gather(
+    scene: &Scene,
+    bvh: &Bvh,
+    p: Vec3A,
+    n: Vec3A,
+    gq: &Quality,
+    rng: &mut fastrand::Rng,
+    sun: Vec3A,
+    cl: &crate::clouds::Clouds,
+    depth: u32,
+    ls: &mut LocalStats,
+) -> Vec3A {
+    let (t1, t2) = onb(n);
+    let r1 = rng.f32();
+    let r2 = rng.f32();
+    let dir = cosine_dir(n, t1, t2, r1, r2);
+    ls.secondary_rays += 1;
+    // Level 0 vs level 1-and-deeper: the pair the ladder's must-fires read as
+    // its rung signature (stats.rs).
+    if depth == 0 {
+        ls.rtgi_rays += 1;
+    } else {
+        ls.rtgi_rays2 += 1;
+    }
+    let bray = Ray::new(p, dir);
+    // FR_ABL=nogi: drop the ray AND the shade behind it (the norefl shape — a
+    // recursive consumer's cost probe removes the whole continuation): the
+    // gather degrades to the unoccluded sky. The draws above still ran, so the
+    // stream and the sample directions are unchanged.
+    let bhit = if abl().nogi {
+        None
+    } else {
+        bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut ls.ray_nodes)
+    };
+    match bhit {
+        Some(bh) => shade(
+            scene,
+            bvh,
+            &bray,
+            &bh,
+            None,
+            gq,
+            rng,
+            sun,
+            cl,
+            Cone::bounce(),
+            depth + 1,
+            ls,
+            None,        // secondaries never capture prim
+            VisCtl::Off, // bounce rays never share visibility
+            None,        // no hemi share off the fb tiers
+            None,        // fireflies don't light bounce surfaces (the stars rule)
+            None,        // bounce surfaces take no cluster NEE (the hemi rule)
+        ),
+        None => crate::sky::gather(dir, sun, scene.sky_scale, scene.night, scene.light_gain),
+    }
+}
+
+/// The quality a GI gather's hit shades at: hemi's leaf policy, with the bounce
+/// budget the caller chose and the emissive display-add INHERITED rather than
+/// recomputed.
+///
+/// That inheritance is load-bearing at rung 2, where the deterministic arm runs
+/// at depth 1 as well: there `el` is already `None` (the gather passes no
+/// cluster NEE down), so a bare `el.is_none()` would read TRUE and re-enable
+/// the emissive add on the second bounce even though NEE is live and delivering
+/// it — a double count. Anding with the parent's decision keeps the NEE-keep
+/// rule correct at every level while staying exactly `el.is_none()` at depth 0,
+/// where every session's primary Quality has `emissive_display: true`.
+fn gather_q(q: &Quality, el: Option<&crate::emissive::EmissiveLights>, budget: f32) -> Quality {
+    Quality {
+        emissive_display: q.emissive_display && el.is_none(),
+        rtgi_bounces: budget,
+        ..crate::hemi::BOUNCE_Q
+    }
 }
 
 /// Whitted-style shading. Secondary rays (shadow / AO / reflection) always use
@@ -1443,77 +1590,34 @@ pub fn shade(
         let (t1, t2) = onb(n);
         let accel = crate::ftree::Accel::of(bvh);
         crate::hemi::gi(scene, accel, p, n, t1, t2, q.fb.depth, sun, cl, depth, hemi_share, rng, None, ls)
-    } else if q.rtgi && depth == 0 && !q.fb.ao {
-        // REAL-TIME GI: one cosine-sampled bounce ray IS the ambient. Cosine
-        // importance sampling makes the single sampled radiance the estimate
-        // of the irradiance-convention ambient directly (no π — the
-        // `irradiance()` L-in-L-out convention), so a fresh draw per frame
-        // converges to the true gathered GI under accumulation and reads as
-        // laundered noise to the temporal denoisers (the 1-spp contract).
-        // The bounce hit shades at hemi's leaf policy (`BOUNCE_Q`: 1 shadow +
-        // 1 AO + SH×AO ambient — the tail standing in for deeper bounces);
-        // the miss is `sky::gather` — NO sun disc (the once-per-path rule:
-        // direct_d already delivers the sun with its own shadow ray, and the
-        // hemi GI leaf takes the identical arm for the identical reason).
-        // Primary path only (`depth == 0` — belt to BOUNCE_Q's `rtgi: false`
-        // braces); the still-frame fb tiers take precedence (fb.gi above,
-        // fb.ao via the guard here). Runs IDENTICALLY under VisCtl
-        // Off/Capture/Apply — it reads and writes no VisRecord field, and
-        // both arms draw the same stream, so no burn is needed and the
-        // adaptive same-seed alignment holds per-pixel. `prim.ao` stays 0.0
-        // (the fb.gi precedent: real RGB irradiance is not an AO scalar —
-        // the GI term rides FSR's exact-remainder residual). NOTE the GPU
-        // twin diverges here BY DESIGN under FLAG_NRD_GI (shade.hlsli's
-        // shade_full): NRD sessions are GPU-tracer-only, and there the
-        // bounce folds into prim.direct_d (+ its t into ao_t) so ReBLUR's
-        // diffuse input carries the GI — this CPU capture never feeds NRD,
-        // so it keeps the residual arm verbatim.
-        let (t1, t2) = onb(n);
-        let r1 = rng.f32();
-        let r2 = rng.f32();
-        let dir = cosine_dir(n, t1, t2, r1, r2);
-        ls.secondary_rays += 1;
-        ls.rtgi_rays += 1;
-        let bray = Ray::new(p, dir);
-        // FR_ABL=nogi: drop the ray AND the bounce shade behind it (the
-        // norefl shape — a recursive consumer's cost probe removes the whole
-        // continuation): ambient degrades to the unoccluded sky gather.
-        let bhit = if abl().nogi {
-            None
-        } else {
-            bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut ls.ray_nodes)
-        };
-        // The NEE-keep rule (2026-08-08, the XeSS feel-test): when cluster
-        // NEE is live this frame (`el` Some — the camera path's arming), the
-        // bounce must NOT re-deliver emitter-as-emitter transport, so its
-        // whole subtree shades with the emissive display-add suppressed
-        // (propagates through the chain via the recursion's `..*q`). NEE
-        // unarmed keeps the add — the bounce is then the only delivery
-        // (integrated by RR/accumulation; a TAA upscaler's neighborhood
-        // clamp rejects it, the documented known-accept).
-        let bq = Quality { emissive_display: el.is_none(), ..crate::hemi::BOUNCE_Q };
-        match bhit {
-            Some(bh) => shade(
-                scene,
-                bvh,
-                &bray,
-                &bh,
-                None,
-                &bq,
-                rng,
-                sun,
-                cl,
-                Cone::bounce(),
-                depth + 1,
-                ls,
-                None,          // secondaries never capture prim
-                VisCtl::Off,   // bounce rays never share visibility
-                None,          // no hemi share off the fb tiers
-                None,          // fireflies don't light bounce surfaces (the stars rule)
-                None,          // bounce surfaces take no cluster NEE (the hemi rule)
-            ),
-            None => crate::sky::gather(dir, sun, scene.sky_scale, scene.night, scene.light_gain),
-        }
+    } else if q.rtgi_bounces >= 1.0 && !q.fb.ao {
+        // REAL-TIME GI, DETERMINISTIC RUNG: one cosine-sampled gather IS the
+        // ambient (`rtgi_gather`). The hit shades at hemi's leaf policy with
+        // the budget DECREMENTED — so at `--rtgi-bounces 2` this same arm runs
+        // again one level down and the second bounce is real, while at 1 the
+        // child gets 0.0 and its SH×AO tail closes the path exactly as it
+        // always has. The budget IS the recursion bound: nothing else needs to
+        // know the depth, and the reflection/glass children (which set 0.0
+        // explicitly) can never inherit one.
+        //
+        // The still-frame fb tiers take precedence (fb.gi above, fb.ao via the
+        // guard here). Runs IDENTICALLY under VisCtl Off/Capture/Apply — it
+        // reads and writes no VisRecord field, and both arms draw the same
+        // stream, so no burn is needed and the adaptive same-seed alignment
+        // holds per-pixel. `prim.ao` stays 0.0 (the fb.gi precedent: real RGB
+        // irradiance is not an AO scalar — the GI term rides FSR's
+        // exact-remainder residual). NOTE the GPU twin diverges here BY DESIGN
+        // under FLAG_NRD_GI (shade.hlsli's shade_full): NRD sessions are
+        // GPU-tracer-only, and there the bounce folds into prim.direct_d
+        // (+ its t into ao_t) so ReBLUR's diffuse input carries the GI — this
+        // CPU capture never feeds NRD, so it keeps the residual arm verbatim.
+        //
+        // The NEE-keep rule (2026-08-08, the XeSS feel-test) rides `gather_q`:
+        // when cluster NEE is live this frame the gather must NOT re-deliver
+        // emitter-as-emitter transport, so its whole subtree shades with the
+        // emissive display-add suppressed.
+        let bq = gather_q(q, el, q.rtgi_bounces - 1.0);
+        rtgi_gather(scene, bvh, p, n, &bq, rng, sun, cl, depth, ls)
     } else {
         let mut ao = 1.0;
         if q.fb.ao {
@@ -1589,7 +1693,67 @@ pub fn shade(
         // split reserves the geometric normal for visibility. Through
         // amb_irradiance so bumped normals get a first-order sky response
         // (the order-2 SH alone is too smooth to show texel relief).
-        amb_irradiance(&scene.sky_sh, n, n_s) * ao
+        let tail = amb_irradiance(&scene.sky_sh, n, n_s) * ao;
+        // THE STOCHASTIC RUNG (`--rtgi-bounces 0.5`, `1.5`): Russian roulette
+        // on the DELTA OVER THE TAIL.
+        //
+        // `tail` already approximates the transport a real gather at this level
+        // would compute, so continuing with probability `pr` and weighting the
+        // difference by 1/pr is UNBIASED for that gather:
+        //
+        //     E[A] = (1-pr)*tail + pr*(tail + (G - tail)/pr) = G
+        //
+        // while the variance rides on (G - tail)^2 instead of G^2. That is the
+        // whole reason to roulette the DELTA and not the term: the tail is a
+        // control variate, and it is exactly as good as the SH×AO
+        // approximation is at this surface — small in the open, largest in
+        // enclosures, which is where the samples are worth spending. A plain
+        // coin flip between the two rungs would instead deliver half the
+        // gather, i.e. bias, which is the trap this arm exists to avoid.
+        //
+        // The temporal integrators launder the per-pixel decision exactly as
+        // they launder the 1-spp shadow/AO rays. `G` comes from the SAME
+        // `rtgi_gather` the deterministic arm calls, which is what makes the
+        // expectation land on the next rung up rather than merely near it.
+        //
+        // A BRANCH, never a computed weight (frd_temporal.hlsl's rule): at
+        // budget 0 this is today's expression BITWISE and draws nothing, which
+        // is what keeps rungs 0 and 1 byte-identical to the pre-ladder
+        // renderer. The fb tiers take precedence exactly as in the
+        // deterministic arm above.
+        if q.rtgi_bounces <= 0.0 || q.fb.ao {
+            tail
+        } else {
+            let pr = q.rtgi_bounces.min(1.0);
+            // ONE draw for the decision, then the gather's own — so a continued
+            // pixel's stream is LONGER than a terminated one's. Sound because
+            // the decision is a pure function of this pixel's own stream:
+            // VisCtl Capture and Apply take the same branch at the same
+            // position (the deterministic arm's own no-burn argument), and
+            // pixels have independent streams by construction
+            // (render::primary_seed). Nothing downstream of the ambient tier
+            // reads a POSITION in the stream, only values.
+            let u = rng.f32();
+            if u >= pr {
+                tail
+            } else {
+                // The gather's own hit is a LEAF (budget 0.0): the quantity
+                // this rung estimates is "the deterministic gather whose
+                // ambient is the tail", which is exactly what the rung above
+                // computes. Letting it recurse would estimate a different
+                // integral and quietly break the unbiasedness gate's oracle.
+                let gq = gather_q(q, el, 0.0);
+                let g = rtgi_gather(scene, bvh, p, n, &gq, rng, sun, cl, depth, ls);
+                if rtgi_rr_noweight() {
+                    // The naive coin flip — the gate's teeth (see the lever).
+                    // `tail + (g - tail)` IS `g`, so take it directly rather
+                    // than writing the identity out.
+                    g
+                } else {
+                    tail + (g - tail) / pr
+                }
+            }
+        }
     };
 
     // Detail cavity AO — AFTER the PrimarySurface captures (prim.ao,
@@ -1725,9 +1889,9 @@ pub fn shade(
                     // path), mirroring hemi's recursion-free leaf policy —
                     // otherwise every glossy pixel would pay a second full
                     // hemisphere integration (and shaft build) at depth 1.
-                    // rtgi: false for parity with the GPU's lap-0-only shape
+                    // rtgi_bounces: 0.0 for parity with the GPU's lap-0-only shape
                     // (the depth gate already makes inheritance inert).
-                    let rq = Quality { fb: FrustumBounce::OFF, rtgi: false, ..*q };
+                    let rq = Quality { fb: FrustumBounce::OFF, rtgi_bounces: 0.0, ..*q };
                     // The child cone starts at this hit's width — reflected
                     // hits read footprints grown by the full path length.
                     let rcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
@@ -1868,7 +2032,7 @@ pub fn shade(
         if tput > 1e-3 && !abl().noglass {
             let tray = Ray::new(torig, tdir);
             ls.secondary_rays += 1;
-            let rq = Quality { fb: FrustumBounce::OFF, rtgi: false, ..*q };
+            let rq = Quality { fb: FrustumBounce::OFF, rtgi_bounces: 0.0, ..*q };
             let tcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
             // Does the continuation travel INSIDE the medium? Entering
             // crosses in; TIR (only possible on the exit attempt) stays in; a

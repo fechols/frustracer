@@ -392,9 +392,13 @@ pub(crate) const BOUNCE_Q: shade::Quality = shade::Quality {
     ao_samples: 1,
     reflections: false,
     fb: shade::FrustumBounce::OFF,
-    // Bounce hits never re-bounce (RTGI's own leaf policy included): the
-    // SH×AO ambient above IS the tail. Keeps both GI tiers recursion-bounded.
-    rtgi: false,
+    // A ZERO bounce budget: a hit shaded at this policy never gathers again,
+    // the SH×AO ambient above IS its tail. Keeps both GI tiers
+    // recursion-bounded, and keeps the hemi fb.gi leaf (which shades at this
+    // same const) at exactly one bounce however the RTGI ladder is set -- that
+    // tier is the `rtgi-ab` gate's oracle. The RTGI arms override the budget
+    // per call via `shade::gather_q`; they never mutate this.
+    rtgi_bounces: 0.0,
     // The hemi gather DELIVERS emissive transport (fb.gi drops the cluster
     // NEE instead); the RTGI bounce overrides this per frame via struct
     // update when NEE is live (the NEE-keep rule — see Quality's field doc).
