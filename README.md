@@ -159,9 +159,9 @@ that will bite you silently).
 ## INSERT DISK ONE — build it and fly
 
 ```powershell
-git clone https://github.com/fechols/frustracer
+git clone --recurse-submodules https://github.com/fechols/frustracer
 Set-Location .\frustracer
-.\install-prerequisites.bat dxc
+.\install-prerequisites.bat dxc nrd
 cargo run --release
 ```
 
@@ -169,35 +169,64 @@ That boots **THE WORLD**: seven curated benchmark scenes merged into one
 34.4-million-triangle archipelago. Fly with **WASD**, look with the **left
 mouse button**, and press **F1** for the heads-up display.
 
+`--recurse-submodules` and the `nrd` component are both load-bearing, and the
+build fails loudly without either: the first checks out NRD's source, the second
+compiles it. See
+[what building actually requires](#building-requires-exactly-one-component) —
+everything else on that line really is optional.
+
 ### What you need
 
 | | |
 |---|---|
-| **OS** | Windows 10/11, x64 for the renderer proper — the interactive window, both GPU backends (D3D12 compute-wavefront and DXR) and every vendor upscaler/denoiser are Windows-only. Linux and macOS build and run **headless**: the CPU frustum tracer and the DLL-free gate suite (`--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, plus `--check-nrd`'s math half). A **Vulkan** backend is in progress on Linux and traces correctly under `--check-vk`, with no presentation stage yet. On **macOS** (13.0+ — the MetalFX framework is linked unconditionally) the Metal work so far is two upscalers over one CPU-rendered G-buffer, headless and gated: FSR 3.1 through a hand-written Metal `FfxInterface` (`--check-fsr3`, needs the FidelityFX SDK source at build time) and Apple's MetalFX temporal scaler (`--check-metalfx`, needs nothing — it runs on a bare clone). Where both are built they cross-check each other on byte-identical inputs. There is no Metal tracer and no presentation stage. |
-| **Toolchain** | Rust (stable) + MSVC build tools & the Windows SDK — `build.rs` compiles a few small C++ shims. CMake, because SDL3 builds from source. |
+| **OS** | **Windows 10/11, x64** for the renderer proper — the interactive window, both D3D12 backends (compute-wavefront and DXR), DLSS, XeSS, NRD and frame generation. **Linux** runs a **Vulkan** backend, headless: the wavefront quadtree, the hemisphere bounce tiers, structure replay, BC7, `--blas-split`, FSR 3.1 upscaling and NRD denoising all run and are gated by `--check-vk` — there is no presentation stage yet, so there is no window. On **macOS** (13.0+ — the MetalFX framework is linked unconditionally) the Metal work so far is two upscalers over one CPU-rendered G-buffer, headless and gated: FSR 3.1 through a hand-written Metal `FfxInterface` (`--check-fsr3`, needs the FidelityFX SDK source at build time) and Apple's MetalFX temporal scaler (`--check-metalfx`, needs nothing — it runs on a bare clone). Where both are built they cross-check each other on byte-identical inputs. There is no Metal tracer and no presentation stage. The DLL-free suite (`--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-spirv`) runs on all three; `--check-nrd`'s instance gate is real on Windows and Linux and skips on macOS, which has no NRD consumer. |
+| **Toolchain** | Rust (stable) + a C++ toolchain — `build.rs` compiles a few small C++ shims (MSVC build tools & the Windows SDK on Windows; clang or GCC elsewhere). **CMake**, because SDL3 and NRD both build from source. |
 | **git-lfs** | Only if you want the scenes. `git lfs install` once per clone, or you get pointer files. |
 | **GPU** | D3D12 feature level 12_0. NVIDIA/AMD start in DXR when available; Intel RT 1.1 adapters start in the compute-wavefront tracer. `--cpu` selects the CPU tracer explicitly. |
 
 The source code is MIT-licensed. Scene assets retain their upstream terms; see
 [LICENSE](LICENSE) before redistributing a checkout or binary bundle.
 
-**Building never needs any SDK.** The vendored headers are enough, and the
-vendor libraries are `LoadLibrary`'d at runtime, so a bare checkout compiles and
-passes the whole DLL-free gate suite. `install-prerequisites.bat` fetches the
-optional runtimes (~700 MB for all of them) from each vendor's own release page.
-The one exception is **DLSS** (ray reconstruction + frame generation): it builds
-against NVIDIA's non-redistributable DLSS SDK, so it exists only in a build made
-with `FRUSTRACER_DLSS_SDK` pointing at one. Without it everything else still
-works — the upscaler chain simply starts at FSR4 / XeSS / FSR 3.1.
+### Building requires exactly one component
+
+**NRD, and nothing else.** Every other vendor library is `LoadLibrary`'d at
+runtime against committed headers, so `install-prerequisites` fetches *optional*
+runtimes (~700 MB for all of them, from each vendor's own release page) and a
+checkout without them still compiles and passes the whole DLL-free gate suite.
+
+NRD is different because it is the **default denoiser** and NVIDIA ships no
+binaries for it. It is a git submodule that compiles locally — CMake plus a C++
+compiler, ~18 s for both variants on Linux — and `build.rs` **fails the build**
+rather than degrade, because a tree that cannot produce it is a tree whose
+default session would silently render undenoised. So a clone needs
+`--recurse-submodules` (or
+`git submodule update --init SDKs/NRD-src`) and one installer component:
+
+```powershell
+.\install-prerequisites.bat nrd     # Windows: SDKs\NRD\bin\NRD.dll
+```
+```bash
+./install-prerequisites.sh nrd      # Linux: SDKs/NRD/bin/libNRD.so
+```
+
+Both messages `build.rs` prints name the exact command, so this is loud rather
+than mysterious. macOS is exempt — nothing there consumes an NRD artifact.
+
+The other exception runs the opposite way: **DLSS** (ray reconstruction + frame
+generation) builds against NVIDIA's non-redistributable SDK, so it exists only
+in a build made with `FRUSTRACER_DLSS_SDK` pointing at one. Nothing fetches it,
+and without it everything else still works — the upscaler chain simply starts at
+FSR4 / XeSS / FSR 3.1.
 
 ### If you only have five minutes
 
-No scene data, no SDKs, no waiting:
+No scene data, no vendor runtimes, one short local build:
 
 ```powershell
 $env:GIT_LFS_SKIP_SMUDGE = "1"
-git clone https://github.com/fechols/frustracer
+git clone --recurse-submodules https://github.com/fechols/frustracer
 Set-Location .\frustracer
+.\install-prerequisites.bat nrd     # the one required component; compiles locally
 
 # Procedural scene: no downloaded benchmark worlds required.
 cargo run --release -- --no-world
@@ -205,6 +234,55 @@ cargo run --release -- --no-world
 # Headless CPU correctness suite.
 cargo run --release -- --check
 ```
+
+### On Linux
+
+Same tree, same suite, no window. On this box `--check` reproduces the Windows
+goldens byte for byte — though that is a measurement rather than a contract,
+since `sinf`/`expf`/`powf` come from the system libm and are permitted to
+differ. The *structural* half (the exact-zero soundness counters, replay
+bit-identity) holds everywhere:
+
+```bash
+git clone --recurse-submodules https://github.com/fechols/frustracer
+cd frustracer
+./install-prerequisites.sh nrd      # required, as above
+cargo run --release -- --check      # the CPU suite; no GPU, no DLLs
+```
+
+The Vulkan backend needs two more host-native components — DXC for SPIR-V
+codegen and SPIRV-Tools to validate it — plus a Vulkan 1.3 device with
+`scalarBlockLayout` (a software ICD such as llvmpipe is enough for everything
+except the vendor upscaler):
+
+```bash
+./install-prerequisites.sh dxc spirv
+cargo run --release -- --check-spirv   # the whole shader corpus -> SPIR-V, validated
+cargo run --release -- --check-vk      # device, tracer, hemi tiers, replay, BC7, FSR3, NRD
+```
+
+There is no window on Linux yet, but there is a picture: `--cinematic` has a
+Vulkan arm, so the GPU tracer renders stills and camera-spline sequences
+straight to PNG (and to PQ/EXR under `--cinematic-hdr`, and to video through the
+ffmpeg lines it prints). NRD denoises and FSR 3.1 reconstructs each frame; GI
+shots take the accumulation path, which is the one thing a live session could
+never do anyway.
+
+```bash
+cargo run --release -- --cinematic hero --gpu          # a still, Vulkan-traced
+cargo run --release -- --cinematic orbit --gpu         # a sequence + the ffmpeg commands
+cargo run --release -- --cinematic hero --gpu --cinematic-gi   # moving camera WITH bounce GI
+```
+
+Every arm hands the same linear image to the same tone curve, so the Vulkan and
+CPU captures agree on level to a fraction of a step — but they are not
+bit-identical and cannot be, being different tracers with different
+reconstruction. Foliage sway has no Vulkan arm yet and renders at the rest pose,
+which the run says out loud.
+
+`FR_VK_DEVICE=<index|name>` picks the adapter, `FR_VK_MAP=1` prints the derived
+register map, and `FR_VK_VALIDATION=0` opts out of the validation layer (which
+is armed by default, and which several of the gates' teeth depend on).
 
 ### Intel Arc / B70 validation recipe
 
@@ -215,7 +293,7 @@ The four flows are `.\demo-intel.ps1 demo`, `check`, `bench`, and
 software-root traversal in fresh processes. Expanded commands:
 
 ```powershell
-.\install-prerequisites.bat dxc
+.\install-prerequisites.bat dxc nrd
 cargo build --release
 
 # Dependency-light interactive algorithm demo.
@@ -285,11 +363,20 @@ camera.
 
 ![A lap of the archipelago](docs/media/tour.webp)
 
+### ▶ [Watch the lap at 60 fps — 1920×804, 10-bit AV1](https://fechols.github.io/frustracer/media/tour-av1.mp4)
+
 *A lap of the world, sunrise to moonlit night. Every frame is lit by the
 always-on real-time bounce — this is the one clip on the page that is **not**
 a hemisphere-GI capture, so the light filling the arcades and streets is the
-same single cosine bounce per pixel a live session gets. Rendered with
-`--cinematic`; the full 4K60 version is on the
+same single cosine bounce per pixel a live session gets.*
+
+*Two copies, because a README can only auto-play an image: GitHub strips
+`<video>` from a rendered README, so the loop above is a 30 fps animated WebP
+and the link is the real thing — the same lap at **60 fps, three times the
+pixels, and a sky never quantized to 8 bits**, in fewer bytes than the loop.
+(The loop's own gradients are dithered, which halves its widest visible band;
+10 bits is how the video avoids the problem rather than masking it.) Rendered
+with `--cinematic`; the 4K60 HDR10 master is on the
 [releases page](../../releases).*
 
 ---
@@ -449,6 +536,11 @@ each one's A/B is how its cost was measured in the first place.
 
 ![Wind through San Miguel's ficus](docs/media/foliage.webp)
 
+### ▶ [Watch the wind at 60 fps — 10-bit AV1](https://fechols.github.io/frustracer/media/foliage-av1.mp4)
+
+*The loop above plays everywhere at 30 fps; the link is the 60 fps version, which
+is where the individual leaves actually resolve.*
+
 *Wind in the leaves — and the leaves are **geometry**, not a shader trick. Leaf and
 bark triangles are welded and grouped into **plants** at load — 2,048 of them across
 the world's seven islands — then bucketed by locality into 3,086 cells, 7.3 M
@@ -511,9 +603,12 @@ cargo run --release -- --cinematic hero --cinematic-island san-miguel \
                         --cinematic-gi --cinematic-res 2560x1072 \
                         --cinematic-samples 320 --cinematic-hdr
 
-# the wind in the leaves: a locked-off clip, because a still cannot show it
+# the wind in the leaves: a locked-off clip, because a still cannot show it.
+# 240 frames at 60 fps, so one render feeds both the 60 fps AV1 and, at every
+# 2nd frame, the 30 fps loop
 cargo run --release -- --cinematic foliage --cinematic-gi \
-                        --cinematic-res 1280x536 --cinematic-samples 32
+                        --cinematic-res 1280x536 --cinematic-samples 32 \
+                        --cinematic-frames 240 --cinematic-fps 60
 
 # the lap, as released: 4K, 60 fps, HDR10. No --cinematic-gi, so this one
 # reconstructs through the upscaler chain at 100% scale — see below
@@ -546,7 +641,43 @@ python3 tools/media-encode.py still \
     capture-islands/island-02-sponza-0830/island-02-sponza-0830.png \
     docs/media/islands/02-sponza.webp
 python3 tools/media-encode.py tour capture-tour/tour/frames docs/media/tour.webp
+python3 tools/media-encode.py av1  capture-tour/tour/frames pages/media/tour-av1.mp4 --crf 10
+python3 tools/media-encode.py pages pages/media/*.mp4      # publish + verify headers
 ```
+
+**Each animated shot ships twice, and the split is not redundancy.** The
+committed WebP auto-loops, so the page moves the moment you open it and keeps
+working offline, on a fork, and without AV1 decode; **30 fps is a floor** for
+anything shipped (`cinematic::MIN_PRODUCTION_FPS` — the tour used to be 20 and
+read as stuttery). The AV1 is the quality asset at 60 fps and 10-bit, and it is
+delivered as a **link to GitHub Pages** — for two independent reasons, both
+measured, and the second one cost a wrong commit to learn:
+
+1. **A README cannot embed a player at all.** GitHub's README renderer strips
+   `<video>` outright: fetching the live page through
+   `repos/…/readme` with `Accept: application/vnd.github.html` finds zero
+   `<video>` elements while the `<img>` beside it survives. Note the trap — the
+   standalone `/markdown` API is *more permissive* and happily returns the
+   element with its `src`, so testing there says the opposite of what shipping
+   does. A plain link is what works, which is also how
+   [quinlight-audio](https://github.com/Kind-Computers/quinlight-audio) serves
+   its clips.
+2. **The file still has to be hosted where the bytes are playable.**
+   `raw.githubusercontent.com` serves a committed file as
+   `application/octet-stream` *with* `X-Content-Type-Options: nosniff`, which
+   forbids the browser from decoding it, and a release asset is an `attachment`
+   behind a signed URL that expires in an hour. Pages sends a real `video/mp4`
+   with `Accept-Ranges: bytes` on a permanent URL, so the link opens in the
+   browser's own player and seeks.
+
+**Rendering a new video asset: supersample rather than reach for `--cinematic-gi`.**
+Measured on the foliage clip at 240 frames: the hemisphere-GI accumulation path
+took **2026 s**, DLSS-RR at native res took **30.5 s** but visibly softened the
+leaf detail (canopy high-frequency energy −19%), and RR at **3× resolution then
+downscaled** took **212 s** and came back visually comparable to GI (−11%, and
+sharp where native RR was mush). RR's blur is a fixed kernel in *pixels*, so
+supersampling defeats it. Reserve `--cinematic-gi` for stills, where the samples
+are cheap and enclosure light is nearly all bounce.
 
 `--cinematic` renders stills and camera-spline sequences (closed-loop
 Catmull-Rom, so a lap loops seamlessly), writes a numbered PNG sequence, and
@@ -635,21 +766,35 @@ Real flags, all of them measured rather than guessed.
 
 ### `--check` is the test suite
 
-Four narrow Rust tests pin load-bearing shader-source invariants, and CI runs
-them. The main suite is still executable: `--check` renders a frame, re-traces **every pixel**
-with a `tmin = 0` reference ray, and exits nonzero unless the false-sky and
-tmin-overshoot counters are exactly zero — then does it again through the
-depth-capped driver, the temporal cache, the replay path, the bounce
-integrators, and about twenty pure-math module self-tests. It needs no GPU and
-no DLLs. `--check-gpu` and `--check-dxr` carry the same contracts onto the two
-GPU pipelines.
+Twenty-six narrow Rust tests pin load-bearing shader-source invariants — mostly
+ordering and monotonicity statements inside the HLSL that no CPU-only gate can
+reach — and CI runs them. The main suite is still executable: `--check` renders
+a frame, re-traces **every pixel** with a `tmin = 0` reference ray, and exits
+nonzero unless the false-sky and tmin-overshoot counters are exactly zero — then
+does it again through the depth-capped driver, the temporal cache, the replay
+path, the bounce integrators, and about twenty pure-math module self-tests. It
+needs no GPU and no DLLs. `--check-gpu` and `--check-dxr` carry the same
+contracts onto the two D3D12 pipelines; `--check-vk` carries them onto Vulkan,
+where the wavefront-vs-reference image comparison comes back at exactly zero.
 
 ---
 
 ## TROUBLESHOOTING
 
+**`cargo build` panics before compiling anything.** It is NRD, the one required
+component, and the message names the fix. Either `SDKs/NRD-src` is empty (`git
+submodule update --init SDKs/NRD-src`) or the library has not been built
+(`install-prerequisites.bat nrd` / `./install-prerequisites.sh nrd`). This is a
+hard failure on purpose: NRD is the default denoiser, so a tree that cannot
+produce it is a tree whose default session renders undenoised without saying so.
+
 **It says "dxr: falling back to CPU tracing".** DXC is missing — run
 `install-prerequisites.bat dxc`. Everything still works, just on the CPU.
+
+**`--check-vk` says SKIP.** No Vulkan loader, no device meeting the floor
+(Vulkan 1.3 + `scalarBlockLayout` + descriptor indexing), or DXC is missing —
+each says which. Being *told* is different from being *absent*: a mistyped
+`FR_VK_DEVICE` exits 2 rather than skipping quietly.
 
 **The scenes are 1 KB text files.** That is git-lfs. `git lfs install`, then
 `git lfs pull`.

@@ -1035,6 +1035,36 @@ pub const HDR_MASTER_NITS: f32 = 1000.0;
 /// upward is free and a silent slide back toward artifacts is not.
 pub const INLINE_WEBP_Q: u32 = 95;
 
+/// The lowest frame rate a SHIPPED animation may have. A floor, not a target.
+///
+/// The inline tour clip used to be 20 fps (every 3rd frame of a 60 fps render)
+/// and read as visibly stuttery. Measured cost of the alternatives, per-frame
+/// on the real assets: the tour is 41.7 KB/frame and foliage 151.7 KB/frame
+/// (dense moving leaves defeat frame differencing; a smooth aerial does not),
+/// so 20 -> 30 fps costs the tour ~4-8 MB while 60 fps everywhere would put the
+/// two clips at ~67-85 MB against 34 MB — for motion the AV1 video already
+/// delivers at a fraction of the bytes. 30 is the honest middle.
+///
+/// This governs SHIPPED assets, not what the tool may be asked to render:
+/// `--cinematic-fps` stays a free lever for experiments and only warns.
+pub const MIN_PRODUCTION_FPS: u32 = 30;
+
+/// Constant-quality level for the inline AV1 video, on libsvtav1's CRF scale.
+///
+/// Chosen by measurement, not taste: VMAF against a lossless 10-bit reference
+/// built from the same frames put crf 10/14/18/22 at 98.42 / 98.04 / 97.64 /
+/// 97.20, all clearing the VMAF >= 97 "visually lossless" bar, at 1585 / 1081 /
+/// 789 / 597 KB per 120 frames. 18 is two steps inside the bar rather than on
+/// it, and still lands the full 20 s lap around 8 MB.
+///
+/// The encode is 10-BIT, and that is the point rather than a flourish: the
+/// reported sky banding is an 8-bit quantization of a gradient the renderer
+/// produces smoothly (the source carries 786 distinct 16-bit levels over 972
+/// rows; the 8-bit WebP keeps ~50 over 207). At 10 bits the video carries about
+/// twice the WebP's gradient precision. It also costs nothing — smooth
+/// gradients compress BETTER at 10 bits.
+pub const INLINE_AV1_CRF: u32 = 18;
+
 /// Encode a linear-RGB image (post-glare, the same signal the SDR PNG is made
 /// from) to 16-bit PQ / Rec.2020 — the wire format for an HDR10 still or an
 /// HDR10 video frame.
@@ -1059,9 +1089,21 @@ pub fn pq_rgb16(hdr: &[f32], paper_white: f32, peak_nits: f32) -> Vec<u16> {
 
 /// The encode commands for a rendered sequence, as (label, argv) pairs.
 ///
-/// WebP leads because an animated WebP is what actually plays inline in a
-/// GitHub README; a committed mp4 does not (only assets uploaded to GitHub's
-/// own CDN do), so the mp4 is for the Release page.
+/// Order is HEVC, then the inline assets — [0] and [1] are pinned by
+/// `self_test` in both arms, so anything new is APPENDED.
+///
+/// Two delivery routes, and the difference is measured rather than folklore.
+/// The animated **WebP** is committed and auto-loops, so it works for every
+/// reader, offline and on a fork. The **AV1** carries real 60 fps quality and is
+/// LINKED, not embedded, from **GitHub Pages** -- two measured reasons: GitHub's
+/// README renderer STRIPS `<video>` outright (verified against the live page via
+/// `repos/.../readme` with `Accept: application/vnd.github.html`; the standalone
+/// `/markdown` API is more permissive and misleadingly keeps it), and the bytes
+/// must be served playably -- `raw.githubusercontent.com` sends
+/// `application/octet-stream` with `X-Content-Type-Options: nosniff` and a
+/// release asset is an `attachment` behind a URL that expires in an hour, while
+/// Pages sends a real `video/mp4` with byte ranges. The HEVC stays the download
+/// master, where a local player handles the codec happily.
 pub fn ffmpeg_cmds(
     dir: &str,
     name: &str,
@@ -1162,6 +1204,78 @@ pub fn ffmpeg_cmds(
             ],
         ));
     }
+
+    // APPENDED, never inserted: `self_test` indexes [0] and [1] in both arms and
+    // pins the HEVC/webp contracts there, so everything below is additive.
+    //
+    // The AV1 is the quality asset, LINKED from GitHub Pages rather than
+    // embedded: a README cannot embed a player (the renderer strips <video>),
+    // and a committed .mp4 could not be played from a raw URL anyway --
+    // raw.githubusercontent.com sends `application/octet-stream` WITH
+    // `X-Content-Type-Options: nosniff`, so the browser is forbidden to decode
+    // it, and a release asset is an `attachment` behind a signed URL that
+    // expires in an hour. Pages sends a real `video/mp4` with byte ranges.
+    // It is 10-BIT deliberately -- see INLINE_AV1_CRF.
+    let av1 = |src_tags: Vec<String>, vf: String, out_name: String| {
+        let mut a = vec![s("-y")];
+        a.extend(src_tags);
+        a.extend([
+            s("-framerate"), fps.to_string(), s("-start_number"), s("0"),
+            s("-i"), format!("{dir}/frames/f_%05d.png"),
+            s("-vf"), vf,
+            s("-c:v"), s("libsvtav1"), s("-preset"), s("3"),
+            s("-crf"), INLINE_AV1_CRF.to_string(),
+            s("-svtav1-params"), s("tune=0"),
+            s("-pix_fmt"), s("yuv420p10le"),
+            s("-movflags"), s("+faststart"),
+            out_name,
+        ]);
+        a
+    };
+
+    if hdr {
+        // The HDR arm used to emit NO inline-able asset at all, which is why the
+        // committed tour clip was made by a hand-run command that lived nowhere
+        // in the repo. Both inline encodes now come from the PQ frames through
+        // the same tone map the SDR sibling uses.
+        let tone = format!(
+            "zscale=t=linear:npl={},format=gbrpf32le,zscale=p=bt709,\
+             tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=limited",
+            HDR_MASTER_NITS as u32 / 5
+        );
+        out.push((
+            "AV1 10-bit (linked from GitHub Pages -- the 60 fps asset)".to_string(),
+            av1(
+                vec![
+                    s("-color_primaries"), s("bt2020"), s("-color_trc"), s("smpte2084"),
+                    s("-colorspace"), s("bt2020nc"),
+                ],
+                format!("{tone},scale={inline_w}:-2:flags=lanczos"),
+                format!("{dir}/{name}-av1.mp4"),
+            ),
+        ));
+        out.push((
+            "webp (inline-able in a GitHub README, loops forever)".to_string(),
+            vec![
+                s("-y"),
+                s("-color_primaries"), s("bt2020"), s("-color_trc"), s("smpte2084"),
+                s("-colorspace"), s("bt2020nc"),
+                s("-framerate"), fps.to_string(), s("-start_number"), s("0"),
+                s("-i"), format!("{dir}/frames/f_%05d.png"),
+                s("-vf"), format!("{tone},scale={inline_w}:-2:flags=lanczos"),
+                s("-c:v"), s("libwebp"), s("-lossless"), s("0"),
+                s("-q:v"), INLINE_WEBP_Q.to_string(),
+                s("-compression_level"), s("6"), s("-loop"), s("0"), s("-an"),
+                format!("{dir}/{name}.webp"),
+            ],
+        ));
+    } else {
+        out.push((
+            "AV1 10-bit (linked from GitHub Pages -- the 60 fps asset)".to_string(),
+            av1(vec![], format!("scale={inline_w}:-2:flags=lanczos"),
+                format!("{dir}/{name}-av1.mp4")),
+        ));
+    }
     out
 }
 
@@ -1228,11 +1342,98 @@ pub fn composite_premul(present: &mut [u32], hud: &[[u8; 4]], w: usize, h: usize
 }
 
 // ---------------------------------------------------------------------------
+// Which tracer renders the capture
+// ---------------------------------------------------------------------------
+
+/// The capture's render arm — the CPU frustum tracer, or THIS PLATFORM's
+/// GPU-resident one (D3D12's wavefront/DXR on Windows, Vulkan's wavefront on
+/// Linux).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArmPick {
+    Cpu,
+    Gpu,
+}
+
+/// Pick the arm from the mode flags, and NOTHING else.
+///
+/// THIS EXISTS BECAUSE THE LABEL AND THE DISPATCH HAD DRIFTED APART. The header
+/// line derived its arm from `opts.gpu`/`opts.dxr` on every platform while the
+/// dispatch sat behind `#[cfg(windows)]`, and `opts.dxr` DEFAULTS TO TRUE — so
+/// a bare `--cinematic` on Linux announced `[dxr]`, fell past the Windows-only
+/// block, and rendered every frame on the CPU while labelling it `"CPU"`. Three
+/// bools in, an enum out, one call site: that is what makes the two agree by
+/// construction rather than by care, and it is why this is pure data in
+/// `cinematic.rs` rather than an `if` in `main`.
+///
+/// `--dxr` is NOT a refusal on a backend that has no DispatchRays pipeline —
+/// there is exactly one GPU arm there, so picking it is a substitution, and the
+/// caller says so. That matches the mode's own policy (take the best available
+/// arm and degrade loudly) and the precedent already in `run_cinematic_gpu`,
+/// which switches a GI or overlay shot off DXR with one line rather than
+/// failing. It also matters that `--dxr` is a DEFAULT value: making the default
+/// fatal would be the opposite of the `--fsr4` doctrine, which is about being
+/// TOLD something impossible.
+pub fn pick_arm(gpu: bool, dxr: bool, _mode_explicit: bool) -> ArmPick {
+    if gpu || dxr {
+        ArmPick::Gpu
+    } else {
+        ArmPick::Cpu
+    }
+}
+
+/// True when the user TYPED `--dxr` rather than inheriting its default — which
+/// is what a backend with no DXR pipeline reports on, and nothing else.
+/// `--cpu` clears both flags and `--gpu` clears `dxr`, so this is exactly "the
+/// request was for the DispatchRays pipeline".
+pub fn asked_for_dxr(gpu: bool, dxr: bool, mode_explicit: bool) -> bool {
+    dxr && mode_explicit && !gpu
+}
+
+// ---------------------------------------------------------------------------
 // Gates
 // ---------------------------------------------------------------------------
 
 /// Closed-form gates, run by `--check`. Pure — no rng, no GPU, no DLLs.
 pub fn self_test() -> Result<(), String> {
+    // The arm pick. Three bools in, an enum out — and the reason it is gated at
+    // all is that the header LABEL and the DISPATCH must not be able to
+    // disagree again: `opts.dxr` defaults to true, so before this existed a
+    // bare `--cinematic` on a backend with no DXR pipeline announced `[dxr]`
+    // and rendered on the CPU. The table is the same on every platform, which
+    // is the property that makes one command line mean one thing everywhere.
+    {
+        let cases: [(bool, bool, bool, ArmPick); 6] = [
+            // gpu,   dxr,   explicit, expected
+            (false, false, true, ArmPick::Cpu),  // --cpu
+            (true, false, true, ArmPick::Gpu),   // --gpu
+            (false, true, false, ArmPick::Gpu),  // bare: dxr's default
+            (false, true, true, ArmPick::Gpu),   // --dxr, typed
+            (true, true, true, ArmPick::Gpu),    // belt and braces
+            (false, false, false, ArmPick::Cpu), // no mode at all
+        ];
+        for (g, d, e, want) in cases {
+            let got = pick_arm(g, d, e);
+            if got != want {
+                return Err(format!(
+                    "pick_arm(gpu {g}, dxr {d}, explicit {e}) = {got:?}, expected {want:?}"
+                ));
+            }
+        }
+        // `asked_for_dxr` must separate a TYPED --dxr from its own default,
+        // because that is the only thing a backend without the pipeline should
+        // report on. A predicate that fired on the default would put a degrade
+        // line on every bare run.
+        if asked_for_dxr(false, true, false) {
+            return Err("asked_for_dxr fired on --dxr's DEFAULT, which every bare run has".into());
+        }
+        if !asked_for_dxr(false, true, true) {
+            return Err("asked_for_dxr missed a typed --dxr".into());
+        }
+        if asked_for_dxr(true, true, true) {
+            return Err("asked_for_dxr fired when --gpu also named an arm".into());
+        }
+    }
+
     // ISLAND_FRAMING is keyed by island NAME, and a key that matches nothing
     // fails SILENTLY into the bounding-sphere rule — which is the exact bug the
     // table exists to fix, so a rename would quietly restore roof photos of
@@ -1701,6 +1902,54 @@ pub fn self_test() -> Result<(), String> {
             .ok_or("inline webp must set an explicit -q:v")?;
         if q < 90 {
             return Err(format!("inline webp quality {q} is below the visually-transparent floor"));
+        }
+
+        // The frame-rate FLOOR for shipped animation. Pin the constant itself,
+        // not just its use, so lowering it fails the gate instead of quietly
+        // shipping a stuttery clip.
+        if MIN_PRODUCTION_FPS < 30 {
+            return Err(format!(
+                "MIN_PRODUCTION_FPS is {MIN_PRODUCTION_FPS}; 30 is the floor a shipped \
+                 animation may not go below"
+            ));
+        }
+        // ...and that the emitted inline command actually carries the rate it
+        // was given, so a future refactor cannot drop it on the floor.
+        let at_floor = ffmpeg_cmds("capture/x", "x", MIN_PRODUCTION_FPS, 1920, false);
+        let wq = &at_floor[1].1;
+        let got = wq
+            .windows(2)
+            .find(|w| w[0] == "-framerate")
+            .and_then(|w| w[1].parse::<u32>().ok())
+            .ok_or("inline webp must set an explicit -framerate")?;
+        if got < MIN_PRODUCTION_FPS {
+            return Err(format!("inline webp frame rate {got} is below MIN_PRODUCTION_FPS"));
+        }
+
+        // The AV1 — the 60 fps asset the README links to. 10-bit is the
+        // banding fix, not a flourish, so pin the pixel format too.
+        let hdr_arm = ffmpeg_cmds("capture/tour", "tour", 60, 3840, true);
+        for (arm, cmds) in [("sdr", &sdr), ("hdr", &hdr_arm)] {
+            let a = cmds
+                .iter()
+                .find(|(l, _)| l.starts_with("AV1"))
+                .ok_or(format!("{arm} arm emits no AV1 command"))?;
+            if !a.1.windows(2).any(|w| w[0] == "-c:v" && w[1] == "libsvtav1") {
+                return Err(format!("{arm} AV1 must be encoded with libsvtav1"));
+            }
+            if !a.1.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "yuv420p10le") {
+                return Err(format!(
+                    "{arm} AV1 must be 10-bit — 8-bit is what bands the sky"
+                ));
+            }
+            if !a.1.iter().any(|x| x.contains("-av1.mp4")) {
+                return Err(format!("{arm} AV1 output must be named distinctly"));
+            }
+        }
+        // The HDR arm used to emit no inline-able asset at all, which is how the
+        // tour clip came to be built by an unrecorded hand-run command.
+        if !hdr_arm.iter().any(|(l, _)| l.starts_with("webp")) {
+            return Err("hdr arm must emit an inline webp too".into());
         }
 
         // HDR10: the transfer/primaries tags are what stop a player treating

@@ -368,6 +368,15 @@ pub struct InstanceDesc {
 }
 
 #[repr(C)]
+// Clone/Copy so the SNAPSHOT both recorders must take is one call. The slice
+// `compute_dispatches` returns is owned by the instance and is overwritten by
+// the next call, while a recording loop needs `&mut self` — so it has to be
+// copied out, and hand-writing the ten fields to do it (which is what shipped
+// first) is a field list to keep in step for no benefit. Copy is sound for the
+// same reason `DescriptorPoolDesc` derives it: this is a `repr(C)` POD whose
+// pointers are borrowed views into library-owned memory, and copying a raw
+// pointer copies exactly that borrow.
+#[derive(Clone, Copy)]
 pub struct DispatchDesc {
     pub name: *const i8,
     pub identifier: Identifier,

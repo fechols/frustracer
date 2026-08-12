@@ -43,6 +43,7 @@
 //! provisional, and the file is already a default-off env lever (`FR_WORKGRAPH`)
 //! measured as a wash — so it stays D3D12-only by choice, not by obstacle.
 
+pub mod denoise;
 pub mod frame;
 pub mod guides;
 pub mod scene;

@@ -1290,7 +1290,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7);
+            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7, &opts.nrd_path);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -14234,6 +14234,7 @@ fn run_check_vk(
     cam0: Camera,
     structural: bool,
     bc7_mode: bc7::Bc7Mode,
+    nrd_path: &str,
 ) -> i32 {
     let mut ok = true;
 
@@ -14347,7 +14348,7 @@ fn run_check_vk(
     }
 
     // ---- V6: the reference kernel rendering, scored against the CPU. ----
-    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode) {
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode, nrd_path) {
         ok = false;
     }
 
@@ -15200,6 +15201,7 @@ fn run_check_vk_layout(
 /// Small on purpose (`VK_RENDER_W` x `VK_RENDER_H`): the cost here is the CPU
 /// reference, not the GPU, and this stage exists to be run on every commit.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_check_vk_render(
     hg: &vk::headless::VkHeadless,
     sp: &vk::spirv::Spirv,
@@ -15208,6 +15210,7 @@ fn run_check_vk_render(
     cam0: Camera,
     structural: bool,
     bc7_mode: bc7::Bc7Mode,
+    nrd_path: &str,
 ) -> bool {
     // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
     // frame its D3D12 twin does, so the two suites' quadtree structures are
@@ -15817,7 +15820,7 @@ fn run_check_vk_render(
     }
 
     // ---- V13: the GPU-fed feed, and FSR3 consuming it ----
-    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural) {
+    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural, nrd_path) {
         ok = false;
     }
 
@@ -16073,6 +16076,7 @@ fn run_check_vk_gbuf(
 /// and with B2's now-portable `unpack_gbuf_bytes` supplying the oracle.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_check_vk_feed(
     hg: &vk::headless::VkHeadless,
     sp: &vk::spirv::Spirv,
@@ -16082,6 +16086,7 @@ fn run_check_vk_feed(
     vt: &vk::textures::VkTextures,
     cam0: Camera,
     structural: bool,
+    nrd_path: &str,
 ) -> bool {
     if !vk::fsr3::built() {
         println!(
@@ -16347,9 +16352,881 @@ fn run_check_vk_feed(
             run_check_vk_bridge(hg, &tg, &fed, scene, &basis, q, rw, rh, near, far, structural);
     }
 
+    // ---- V15: a REAL NRD engine between the bridge's two halves. ----
+    // Runs last and on the same tracer, because it is the only stage that
+    // leaves the planes carrying denoised history rather than the frame the
+    // gates above scored.
+    if ok && !run_check_vk_nrd(hg, &tg, &fed, scene, &basis, cam0, q, rw, rh, near, far, nrd_path, structural) {
+        ok = false;
+    }
+
+    // ---- V16: the COMPOSED frame — the denoiser and the upscaler in one. ----
+    // After V15 because it needs everything V15 proved, and on its own FFX
+    // contexts because the ones above carry history from a different route.
+    if ok
+        && !run_check_vk_compose(
+            hg, &tg, scene, &basis, cam0, q, rw, rh, ow, oh, near, far, nrd_path, structural,
+        )
+    {
+        ok = false;
+    }
+    // Leave the tracer's feed registers where V13 pointed them, so nothing
+    // above depends on V16 having run — the "left as found" rule V14 follows
+    // for the sig bit.
+    tg.wire_feed(hg, fed.feed_views());
+
     fed.destroy(hg);
     cpu.destroy(hg);
     tg.destroy(hg);
+    ok
+}
+
+/// V16 — THE COMPOSED FRAME: trace -> pack -> ReBLUR -> recompose -> FSR3.
+///
+/// EVERY STAGE BEFORE THIS ONE STOPS ONE STEP SHORT OF IT, and the shape of the
+/// gap is worth stating because it bounds what a green suite has ever meant.
+/// V13 upscales, but there is no denoiser in its frame at all — its FFX history
+/// is built entirely from raw 1-spp colour. V14 and V15 denoise, but they stop
+/// at `read_input`: a readback of the plane. `frame_fed` — the only thing in
+/// this tree that dispatches FFX — appears exactly once in `main.rs`, inside
+/// V13. So the sharpest way to put it is this: **until now, if `cs_nrd_out`
+/// had written into a plane FFX never reads, every V13, V14 and V15 assertion
+/// would still have passed.**
+///
+/// That is also the D3D12 arrangement this closes: `present_trace_fsr3` runs
+/// `trace -> nrd_pack -> engine -> nrd_out -> upscale` on ONE list and runs NO
+/// feed dispatch when the denoiser is armed, because the folded `cs_nrd_pack`
+/// owns the mvec/depth guides and `cs_nrd_out` owns the colour. This stage is
+/// that ordering, and the fold end to end is a thing only it can score.
+///
+/// TWO ARMS, ONE RENDERER — V13's shape one stage up. The same tracer, the same
+/// pose, the same jitter sequence, the same FFX settings; the arms differ in
+/// exactly what writes the three input planes, so anything that moves is the
+/// composition and not taste. Two FFX contexts rather than one run twice, for
+/// V13's own reason: FSR3 is TEMPORAL, and one context would carry the first
+/// route's history into the second.
+///
+/// THE STRONG ARM IS THE DEPENDENCY PROBE, not the picture. "How much should a
+/// denoise change an upscale" has no principled answer and any bar for it would
+/// be a new tolerance; "did FFX read the plane our recompose wrote" does, and
+/// V15 already established its arithmetic — zero the plane between the two and
+/// require the output to move by more than the run-to-run floor, with the floor
+/// MEASURED by a second identical run rather than assumed away.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_compose(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    ow: usize,
+    oh: usize,
+    near: f32,
+    far: f32,
+    nrd_path: &str,
+    structural: bool,
+) -> bool {
+    let lib = std::path::Path::new(nrd_path).join(nrd::LIB_FILE);
+    if !lib.exists() {
+        println!(
+            "check-vk: SKIP V16 ({} not found); run `{}`",
+            lib.display(),
+            nrd::INSTALLER
+        );
+        return true;
+    }
+    let Some(planes) = tg.nrd_plane_handles() else {
+        eprintln!("check-vk: FAIL V16 the tracer carries no bridge planes");
+        return false;
+    };
+    let mut eng = match vk::nrd::VkNrd::new(hg, nrd_path, rw as u32, rh as u32, &planes) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V16 {e}");
+            return false;
+        }
+    };
+
+    // The validation delta, attributed. `validation_errors()` is a monotonic
+    // global read ONCE at the end of the suite, so a layout regression here
+    // would surface as an unattributed total; this stage is the one whose
+    // defect class is layer-only, so it names itself.
+    let ve0 = vk::device::validation_errors();
+
+    let mk = || {
+        vk::fsr3::Fsr3::new(
+            hg,
+            (rw as u32, rh as u32),
+            (ow as u32, oh as u32),
+            vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+        )
+    };
+    let (den, pln) = match (mk(), mk()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            let e = a.err().or(b.err()).unwrap_or_default();
+            if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+                println!("check-vk: SKIP V16 on a software device ({e})");
+            } else {
+                eprintln!("check-vk: FAIL V16 fsr3 context: {e}");
+                eng.destroy(hg);
+                return false;
+            }
+            eng.destroy(hg);
+            return true;
+        }
+    };
+
+    const FRAMES: u32 = 8;
+    const POISON: u8 = 0xee;
+    let rs = gfx::denoise::reblur_settings();
+    let mut ok = true;
+
+    let run = (|| -> Result<(), String> {
+        // Both arms poisoned, so a plane that is never written is provable
+        // rather than merely suspicious. A composed frame that silently ran the
+        // FEED path produces a completely plausible picture — the sentinel is
+        // what separates "denoised" from "plausible".
+        den.poison_inputs(hg, POISON)?;
+        pln.poison_inputs(hg, POISON)?;
+
+        let mut sent_color = 0usize;
+        let mut sent_depth = 0usize;
+
+        for f in 0..FRAMES {
+            let jit = dlss::jitter_for(f);
+            let p = gfx::frame::FrameParams {
+                cam: *basis,
+                frame: f,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                prev_cam: Some(*basis),
+                q,
+                verify: false,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: cam0.fov_y,
+                dt_ms: gfx::denoise::NOMINAL_DT_MS,
+                reset: f == 0,
+            };
+            let reset = f == 0;
+            let (pw, phh) = eng.prev_size();
+            let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+            let cs = gfx::denoise::common_settings(
+                &mats,
+                &mats,
+                dlss::jitter_for(f),
+                dlss::jitter_for(f.saturating_sub(1)),
+                rw as u32,
+                rh as u32,
+                pw,
+                phh,
+                far,
+                gfx::denoise::NOMINAL_DT_MS,
+                f,
+                reset,
+                false,
+            );
+
+            // ONE trace, consumed by BOTH arms — which is what makes the
+            // comparison about the composition rather than about two renders.
+            tg.render_wavefront(hg, &p, true)?;
+
+            // THE COMPOSED ARM. No `record_feed` anywhere in it: the folded
+            // pack wrote the depth and mvec guides, the recompose wrote the
+            // colour. That absence is the D3D12 rule, and scoring it end to end
+            // is a thing no earlier stage can do.
+            tg.wire_feed(hg, den.feed_views());
+            let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+            den.frame_fed(
+                hg,
+                |d, cmd| {
+                    unsafe {
+                        r1 = tg.record_nrd_pack(d, cmd);
+                        r2 = eng.record(d, cmd, &cs, &rs);
+                        r3 = tg.record_nrd_out(d, cmd);
+                    }
+                    // A failure inside must not be swallowed: `record` can fail
+                    // before recording anything, and the frame would then be
+                    // pack -> out, i.e. the passthrough, which upscales
+                    // perfectly well and is not what this stage claims to test.
+                    r2.clone()
+                },
+                dp,
+            )?;
+            r1?;
+            r2?;
+            r3?;
+
+            // THE PLAIN ARM: the same trace through the ordinary feed.
+            tg.wire_feed(hg, pln.feed_views());
+            let mut rf = Ok(());
+            pln.frame_fed(
+                hg,
+                |d, cmd| {
+                    rf = unsafe { tg.record_feed(d, cmd) };
+                    rf.clone()
+                },
+                dp,
+            )?;
+            rf?;
+
+            if f == 0 {
+                // Frame 0 is where a sentinel means something: after it, an
+                // unwritten plane holds the previous frame rather than 0xEE.
+                let c = den.read_input(hg, 0)?;
+                let d = den.read_input(hg, 1)?;
+                sent_color = c.chunks_exact(8).filter(|w| w.iter().all(|&b| b == POISON)).count();
+                sent_depth = d
+                    .chunks_exact(4)
+                    .filter(|w| u32::from_le_bytes((*w).try_into().unwrap()) == 0xeeee_eeee)
+                    .count();
+            }
+        }
+
+        let a = den.read_output(hg)?;
+        let b = pln.read_output(hg)?;
+        // `read_output` hands back linear f32 RGB — three per pixel, not four.
+        let lum = |v: &[f32], i: usize| {
+            0.2126 * v[i * 3] + 0.7152 * v[i * 3 + 1] + 0.0722 * v[i * 3 + 2]
+        };
+        let nch = a.len().min(b.len());
+
+        let mut finite = true;
+        let mut nonzero = 0usize;
+        let mut differs = 0usize;
+        let (mut sum_d, mut sum_a) = (0f64, 0f64);
+        for i in 0..nch {
+            if !a[i].is_finite() {
+                finite = false;
+            }
+            if a[i] != 0.0 {
+                nonzero += 1;
+            }
+            if a[i].to_bits() != b[i].to_bits() {
+                differs += 1;
+            }
+            sum_d += (a[i] - b[i]).abs() as f64;
+            sum_a += a[i].abs() as f64;
+        }
+        let rel = if sum_a > 0.0 { sum_d / sum_a } else { 0.0 };
+
+        // The Laplacian at OUTPUT res — "the denoise survived the upscale",
+        // which is a different claim from V15's "the denoise happened".
+        let lap = |v: &[f32]| -> f64 {
+            let mut s = 0f64;
+            for y in 1..oh - 1 {
+                for x in 1..ow - 1 {
+                    let c = lum(v, y * ow + x);
+                    let n = lum(v, (y - 1) * ow + x)
+                        + lum(v, (y + 1) * ow + x)
+                        + lum(v, y * ow + x - 1)
+                        + lum(v, y * ow + x + 1);
+                    s += (4.0 * c - n).abs() as f64;
+                }
+            }
+            s / ((ow - 2) * (oh - 2)) as f64
+        };
+        let (lap_d, lap_p) = (lap(&a), lap(&b));
+
+        eprintln!(
+            "check-vk: V16 composed frame {rw}x{rh} -> {ow}x{oh} over {FRAMES} frames: \
+             denoised-vs-fed rel {rel:.5} | differs {differs}/{nch} | lap {lap_d:.4} vs fed \
+             {lap_p:.4} | finite {finite} | non-zero ch {nonzero}"
+        );
+
+        if !finite {
+            return Err("the composed output carries non-finite channels".into());
+        }
+        // THE SENTINEL BEFORE THE HISTOGRAM, deliberately: an unwritten plane
+        // usually presents as a black frame, and "0 of 1440000 channels are
+        // non-zero" is the symptom while this is the cause. Checked in the
+        // order that names the bug.
+        if sent_color > 0 || sent_depth > 0 {
+            return Err(format!(
+                "sentinel SURVIVED the composed frame — colour {sent_color} 8-byte runs, depth \
+                 {sent_depth} words. Colour means `cs_nrd_out` never wrote; depth means the \
+                 folded `cs_nrd_pack` never wrote its guide, which no feed dispatch was there \
+                 to cover"
+            ));
+        }
+        if nonzero * 2 < nch {
+            return Err(format!("only {nonzero} of {nch} channels are non-zero"));
+        }
+        if differs == 0 {
+            return Err(
+                "the composed and fed routes produced a BIT-IDENTICAL image — the denoiser is \
+                 not in the composed frame"
+                    .into(),
+            );
+        }
+        if structural && !(lap_d < lap_p) {
+            return Err(format!(
+                "the composed output is not smoother than the fed one ({lap_d:.4} vs {lap_p:.4}) \
+                 — the denoise did not survive the upscale"
+            ));
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V16 {e}");
+        ok = false;
+    }
+
+    // ---- the dependency probe ----
+    if ok {
+        match compose_probe(hg, tg, &mut eng, scene, basis, cam0, q, rw, rh, ow, oh, near, far, &rs)
+        {
+            Ok((ctl, moved, len)) => {
+                let floor = (ctl.max(1)) * 20;
+                eprintln!(
+                    "check-vk: V16   ffx dependency: control drift {ctl} ch | clearing our \
+                     recompose moved {moved}/{len} ch of the upscaled output"
+                );
+                if moved < floor || moved * 100 < len {
+                    eprintln!(
+                        "check-vk: FAIL V16 zeroing the plane our recompose wrote barely moved \
+                         the upscale ({moved} vs a floor of {floor}) — FFX is not reading it"
+                    );
+                    ok = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V16 dependency probe: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!(
+            "check-vk: FAIL V16 {ve} validation error(s) inside this stage — the composed \
+             recording is the one whose defect class only the layer can see"
+        );
+        ok = false;
+    }
+
+    den.destroy(hg);
+    pln.destroy(hg);
+    eng.destroy(hg);
+    ok
+}
+
+/// V16's dependency probe: does FFX consume the plane our recompose wrote?
+///
+/// ONE context, WARMED, then three reset frames on one re-traced pose: two
+/// identical (which MEASURE the floor — assuming a floor is how a probe ends up
+/// asserting its own noise) and a third that zeroes the colour plane between
+/// `cs_nrd_out` and the FFX dispatch.
+///
+/// THE WARM-UP AND THE SHARED CONTEXT ARE BOTH LOAD-BEARING, and the first
+/// draft had neither. Three FRESH contexts read a control drift of **994206 of
+/// 1440000 channels** — two identical runs disagreeing on 69% of the image,
+/// which makes any floor built from it unsatisfiable. That is not
+/// non-determinism: FFX declares essentially every internal resource
+/// `FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED` and `ffx_vk` skips the init copy
+/// for exactly that type, so texels a reset frame never writes hold
+/// PER-ALLOCATION residue by contract (the Metal backend records the same
+/// thing, from the other side). One context makes the allocations identical;
+/// one discarded warm-up run makes the residue identical too, because after it
+/// the internal resources hold this pose's own output rather than whatever the
+/// allocator handed over.
+///
+/// Returns (control drift, moved, channels).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn compose_probe(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    eng: &mut vk::nrd::VkNrd,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    ow: usize,
+    oh: usize,
+    near: f32,
+    far: f32,
+    rs: &nrd::ReblurSettings,
+) -> Result<(usize, usize, usize), String> {
+    let jit = dlss::jitter_for(0);
+    let p = gfx::frame::FrameParams {
+        cam: *basis,
+        frame: 0,
+        accumulate: false,
+        jitter: false,
+        frame_jitter: Some(jit),
+        prev_cam: Some(*basis),
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+    let dp = vk::fsr3::Dispatch {
+        jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+        mv_scale: fsr::UPSCALE_MV_SIGN,
+        near_far: (near, far),
+        fov_y: cam0.fov_y,
+        dt_ms: gfx::denoise::NOMINAL_DT_MS,
+        reset: true,
+    };
+    let (pw, phh) = eng.prev_size();
+    let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+    let cs = gfx::denoise::common_settings(
+        &mats,
+        &mats,
+        jit,
+        jit,
+        rw as u32,
+        rh as u32,
+        pw,
+        phh,
+        far,
+        gfx::denoise::NOMINAL_DT_MS,
+        0,
+        true,
+        false,
+    );
+
+    let f = vk::fsr3::Fsr3::new(
+        hg,
+        (rw as u32, rh as u32),
+        (ow as u32, oh as u32),
+        vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+    )?;
+
+    let mut once = |clear: bool| -> Result<Vec<f32>, String> {
+        tg.render_wavefront(hg, &p, true)?;
+        tg.wire_feed(hg, f.feed_views());
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        let rec = f.frame_fed(
+            hg,
+            |d, cmd| {
+                unsafe {
+                    r1 = tg.record_nrd_pack(d, cmd);
+                    r2 = eng.record(d, cmd, &cs, rs);
+                    r3 = tg.record_nrd_out(d, cmd);
+                }
+                if clear {
+                    // BETWEEN the recompose and the dispatch. Moving it after
+                    // the dispatch is the tooth that proves this measures a
+                    // dependency and not a coincidence.
+                    f.clear_color_in_place(d, cmd);
+                }
+                r2.clone()
+            },
+            dp,
+        );
+        rec.and(r1).and(r2).and(r3)?;
+        f.read_output(hg)
+    };
+
+    let out = (|| -> Result<(usize, usize, usize), String> {
+        let _warm = once(false)?;
+        let ctl_a = once(false)?;
+        let ctl_b = once(false)?;
+        let zeroed = once(true)?;
+        let n = ctl_a.len().min(ctl_b.len()).min(zeroed.len());
+        let ctl = (0..n).filter(|&i| ctl_a[i].to_bits() != ctl_b[i].to_bits()).count();
+        let moved = (0..n).filter(|&i| ctl_a[i].to_bits() != zeroed[i].to_bits()).count();
+        Ok((ctl, moved, n))
+    })();
+    f.destroy(hg);
+    out
+}
+
+/// V15 — A REAL NRD ENGINE, running ReBLUR between the bridge's two halves.
+///
+/// V14 proved the seam with a passthrough; this is the thing the seam exists
+/// for. It is `--check-gpu`'s N4 transplanted with ZERO new tolerances: the
+/// same nine-frame protocol, the same six assertions, the same thresholds — so
+/// what the two backends report is directly comparable rather than merely
+/// similar, which is the property every stage in this suite has been built for.
+///
+/// THE SIX, and each is a strict inequality rather than a bar to tune:
+///   * FINITE — a denoiser that divides by an accumulated zero says so here.
+///   * DIFFERS — against the undenoised recompose. A denoiser that never ran
+///     leaves the passthrough answer, which is a perfectly plausible image.
+///   * LAPLACIAN DROPS — the definition of denoising, as a number.
+///   * MEAN within 25% — it may smooth the frame and may not re-expose it.
+///   * TEMPORAL DELTAS SHRINK — frame-to-frame |d| late < early, i.e. the
+///     history is ACCUMULATING and not merely spatially filtering.
+///   * RESTART DEPARTS — a reset frame must differ from its predecessor by
+///     MORE than the converged pair does, which is the only thing that proves
+///     `AccumulationMode` reached the library at all.
+///
+/// The undenoised reference is the bridge's own passthrough, re-run here: same
+/// tracer, same pose, same pack, one substitution in the middle. So `differs`
+/// and `lap` compare two images that agree in everything except the engine —
+/// the V13 shape (two routes, one renderer) applied one stage up.
+///
+/// SKIPS on an absent library, exit 0, naming the installer — the absent/told
+/// split, and the same rule `--check-nrd`'s N1 follows. A library that is
+/// PRESENT and refuses is a FAIL there and a FAIL here.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_nrd(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    fed: &vk::fsr3::Fsr3,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    near: f32,
+    far: f32,
+    nrd_path: &str,
+    structural: bool,
+) -> bool {
+    let lib = std::path::Path::new(nrd_path).join(nrd::LIB_FILE);
+    if !lib.exists() {
+        println!(
+            "check-vk: SKIP V15 ({} not found); run `{}`",
+            lib.display(),
+            nrd::INSTALLER
+        );
+        return true;
+    }
+    let Some(planes) = tg.nrd_plane_handles() else {
+        eprintln!("check-vk: FAIL V15 the tracer carries no bridge planes");
+        return false;
+    };
+    let mut eng = match vk::nrd::VkNrd::new(hg, nrd_path, rw as u32, rh as u32, &planes) {
+        Ok(e) => e,
+        Err(e) => {
+            // PRESENT and refused. Never a skip — that is the hole B4b-i closed
+            // in N1, and it would be a wider one here, where the library is
+            // built locally by a script anyone can mis-flag.
+            eprintln!("check-vk: FAIL V15 {e}");
+            return false;
+        }
+    };
+
+    let npx = rw * rh;
+    let mut ok = true;
+    // One frame of the pipeline, with `mid` recording whatever sits between the
+    // bridge's halves. Everything else — the pose, the jitter sequence, the
+    // quality, the pack — is identical across the two arms by construction,
+    // which is what makes `differs` attributable to the engine alone.
+    let frame = |f: u32,
+                 mid: &mut dyn FnMut(&ash::Device, ash::vk::CommandBuffer) -> Result<(), String>|
+     -> Result<Vec<u8>, String> {
+        let jit = dlss::jitter_for(f);
+        let p = gfx::frame::FrameParams {
+            cam: *basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(jit),
+            prev_cam: Some(*basis),
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        tg.render_wavefront(hg, &p, true)?;
+        // `write_inputs` for V14's reason — `cs_nrd_out` stores to the ENGINE's
+        // colour image, which only this bracket puts in `GENERAL`.
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        fed.write_inputs(hg, |d, cmd| {
+            unsafe {
+                r1 = tg.record_nrd_pack(d, cmd);
+                r2 = mid(d, cmd);
+                r3 = tg.record_nrd_out(d, cmd);
+            }
+            Ok(())
+        })?;
+        r1?;
+        r2?;
+        r3?;
+        fed.read_input(hg, 0)
+    };
+
+    // Luma off the RGBA16F colour plane — N4's own weights, so the two suites'
+    // Laplacian and mean figures are on one scale.
+    let lum = |b: &[u8], i: usize| -> f32 {
+        let h = |k: usize| {
+            vk::tracer::half_from_bits(u16::from_le_bytes(
+                b[i * 8 + k * 2..][..2].try_into().unwrap(),
+            ))
+        };
+        0.2126 * h(0) + 0.7152 * h(1) + 0.0722 * h(2)
+    };
+
+    let run = (|| -> Result<(), String> {
+        // The UNDENOISED arm first: the bridge's passthrough, which V14 proved
+        // reproduces the feed's colour byte for byte. Taken at frame 0 so it is
+        // the same content the engine's own frame 0 sees.
+        let base = frame(0, &mut |d, cmd| unsafe { tg.record_nrd_passthrough(d, cmd) })?;
+
+        // Nine engine frames: 0..7 accumulate, 8 RESTARTS. `prev_size` is read
+        // back from the engine rather than assumed, which is the field's only
+        // consumer and therefore the only thing that would notice it going
+        // stale.
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(9);
+        let rs = gfx::denoise::reblur_settings();
+        for f in 0u32..9 {
+            let reset = f == 0 || f == 8;
+            let (pw, phh) = eng.prev_size();
+            let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+            let cs = gfx::denoise::common_settings(
+                &mats,
+                &mats,
+                dlss::jitter_for(f),
+                dlss::jitter_for(f.saturating_sub(1)),
+                rw as u32,
+                rh as u32,
+                pw,
+                phh,
+                far,
+                gfx::denoise::NOMINAL_DT_MS,
+                f,
+                reset,
+                false,
+            );
+            let mut err = Ok(());
+            let img = frame(f, &mut |d, cmd| {
+                err = eng.record(d, cmd, &cs, &rs);
+                // A failure here must not be swallowed by the closure's own
+                // Ok: `record` can fail before recording anything, and the
+                // command buffer would then run pack -> out with no engine,
+                // i.e. the passthrough, which passes `differs` against a
+                // DIFFERENT reference and looks like a working denoiser.
+                err.clone()
+            })?;
+            err?;
+            frames.push(img);
+        }
+
+        let mut finite = true;
+        let mut differs = 0usize;
+        let (mut mean_out, mut mean_in) = (0f64, 0f64);
+        let (mut lap_out, mut lap_in) = (0f64, 0f64);
+        for i in 0..npx {
+            let lo = lum(&frames[7], i);
+            let li = lum(&base, i);
+            if !lo.is_finite() {
+                finite = false;
+            }
+            if (lo - li).abs() > 1e-4 {
+                differs += 1;
+            }
+            mean_out += lo as f64;
+            mean_in += li as f64;
+            let (x, y) = (i % rw, i / rw);
+            if x > 0 && x + 1 < rw && y > 0 && y + 1 < rh {
+                let l4 = |f: &dyn Fn(usize) -> f32| {
+                    (4.0 * f(i) - f(i - 1) - f(i + 1) - f(i - rw) - f(i + rw)).abs() as f64
+                };
+                let fo = |j: usize| lum(&frames[7], j);
+                let fi = |j: usize| lum(&base, j);
+                lap_out += l4(&fo);
+                lap_in += l4(&fi);
+            }
+        }
+        let delta = |a: &[u8], b: &[u8]| -> f64 {
+            (0..npx).map(|i| (lum(a, i) - lum(b, i)).abs() as f64).sum::<f64>() / npx as f64
+        };
+        let d_early = delta(&frames[1], &frames[0]);
+        let d_late = delta(&frames[7], &frames[6]);
+        let d_restart = delta(&frames[8], &frames[7]);
+        println!(
+            "check-vk: V15 nrd ReBLUR ({rw}x{rh}, {} pipelines, {} dispatches (max {}), {} pool sets) — \
+             differs {differs}/{npx} | lap {:.4} -> {:.4} | mean {:.4} -> {:.4} | \
+             temporal {:.5} -> {:.5} | restart {:.5}",
+            eng.pipeline_count(),
+            eng.dispatch_count,
+            eng.dispatch_max,
+            eng.pool_sets,
+            lap_in / npx as f64,
+            lap_out / npx as f64,
+            mean_in / npx as f64,
+            mean_out / npx as f64,
+            d_early,
+            d_late,
+            d_restart,
+        );
+
+        let mut bad = Vec::new();
+        if !finite {
+            bad.push("non-finite");
+        }
+        if differs == 0 {
+            bad.push("output == the undenoised recompose (vacuous)");
+        }
+        if lap_out >= lap_in {
+            bad.push("Laplacian did not drop");
+        }
+        if (mean_out - mean_in).abs() > 0.25 * mean_in.max(1e-6) {
+            bad.push("mean drifted > 25%");
+        }
+        // TEMPORAL SHRINK IS THE ONE SCENE-DEPENDENT ARM, and it is gated on
+        // `structural` for the reason every other must-fire in this suite is:
+        // it asserts that ACCUMULATION is reducing frame-to-frame variance,
+        // which needs variance to reduce. MEASURED — san-miguel-low-poly at
+        // this pose reads 0.00195 -> 0.00199, i.e. FLAT, with `d_early` already
+        // BELOW the procedural scene's converged `d_late` of 0.00434: the input
+        // is at the floor by frame 1 and the residual is sampling noise that
+        // can go either way. The Laplacian still drops 72% there and RESTART
+        // still departs by 1.7x, so the denoiser is plainly working; the metric
+        // has simply run out of signal.
+        //
+        // What carries the accumulation claim on those scenes is RESTART: a
+        // reset frame departing from a converged one BY MORE than the converged
+        // pair differ is only possible if there was a history to throw away.
+        if structural && d_late >= d_early {
+            bad.push("temporal deltas not shrinking");
+        }
+        if d_restart <= d_late {
+            bad.push("RESTART did not depart (reset latch dead?)");
+        }
+        if !bad.is_empty() {
+            return Err(format!("nrd: {}", bad.join(", ")));
+        }
+
+        // ---- THE PLANE-ROUTING ARM, and it exists because a planted tooth
+        // proved the six above cannot see a plane swap. Routing IN_SPEC to the
+        // IN_DIFF image — same format, same descriptor type, so validation is
+        // silent — still leaves NRD a plausible radiance signal, so it still
+        // denoises, still accumulates and still restarts: measured, the whole
+        // six passed with the mean moved 6.6%, well inside the 25% band.
+        //
+        // What a swap CANNOT survive is a dependency test. If IN_SPEC is routed
+        // anywhere else then nothing reads the real IN_SPEC image, so ZEROING it
+        // between the pack and the engine changes the output by exactly nothing.
+        // This is M3d's texture probe once more — GPU-vs-GPU, one clear apart —
+        // and it is what makes V15 a statement about wiring as well as about
+        // behaviour.
+        //
+        // Both arms are RESET frames so the comparison is a function of the
+        // inputs rather than of whatever history the nine above accumulated, and
+        // the control is run TWICE first: two identical reset frames must agree
+        // BIT for bit, which both licenses the comparison and is a determinism
+        // assertion in its own right.
+        let spec_img = planes[gfx::denoise::Plane::InSpecRadianceHitDist.index()].0;
+        let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+        let cs_probe = gfx::denoise::common_settings(
+            &mats,
+            &mats,
+            dlss::jitter_for(9),
+            dlss::jitter_for(8),
+            rw as u32,
+            rh as u32,
+            rw as u32,
+            rh as u32,
+            far,
+            gfx::denoise::NOMINAL_DT_MS,
+            9,
+            true,
+            false,
+        );
+        // IT SCORES OUT_SPEC, NOT THE RECOMPOSED COLOUR, and that correction is
+        // the whole reason this arm works. The colour was the obvious readback
+        // and it is CONFOUNDED: `cs_nrd_out` reconstructs the residual as
+        // `R = base − D_in·kd·m_d − S_in·f0`, so it reads IN_SPEC itself and
+        // zeroing that plane moves the colour by ~276 kB whatever the engine
+        // did — measured, with the swap planted and the gate still green. The
+        // engine's OWN output plane has exactly one upstream path.
+        let mut engine = |zero_spec: bool| -> Result<Vec<u8>, String> {
+            let mut err = Ok(());
+            let _ = frame(9, &mut |d, cmd| {
+                if zero_spec {
+                    unsafe {
+                        d.cmd_clear_color_image(
+                            cmd,
+                            spec_img,
+                            ash::vk::ImageLayout::GENERAL,
+                            &ash::vk::ClearColorValue { float32: [0.0; 4] },
+                            &[ash::vk::ImageSubresourceRange::default()
+                                .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1)],
+                        );
+                        // The clear is a TRANSFER write and the engine reads it
+                        // as a shader resource — without this the two are
+                        // unordered and the probe would be a race, not a test.
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                            ash::vk::DependencyFlags::empty(),
+                            &[ash::vk::MemoryBarrier::default()
+                                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)],
+                            &[],
+                            &[],
+                        );
+                    }
+                }
+                err = eng.record(d, cmd, &cs_probe, &rs);
+                err.clone()
+            })?;
+            err?;
+            tg.read_nrd_plane(hg, gfx::denoise::Plane::OutSpecRadianceHitDist.index())
+        };
+        let ctl_a = engine(false)?;
+        let ctl_b = engine(false)?;
+        let zeroed = engine(true)?;
+        let ctl_drift = ctl_a.iter().zip(ctl_b.iter()).filter(|(x, y)| x != y).count();
+        let moved = ctl_b.iter().zip(zeroed.iter()).filter(|(x, y)| x != y).count();
+        println!(
+            "check-vk: V15   in_spec dependency: control drift {ctl_drift} B | \
+             zeroing moved {moved}/{} B of OUT_SPEC",
+            ctl_b.len()
+        );
+        // The control BOUNDS the noise rather than assuming it away, and that
+        // is a measurement rather than a hedge: two identical RESET frames come
+        // back bit-identical in the recomposed COLOUR and NOT in OUT_SPEC —
+        // 90 B of 960000 here — because `ACCUM_RESTART` resets accumulation
+        // while NRD's permanent pool survives it, and the recompose quantises
+        // that residue away at f16. So the claim is that the effect DOMINATES
+        // the floor, which it does by ~6000x, not that the floor is zero.
+        let floor = ctl_drift.max(1) * 20;
+        if moved < floor || moved * 100 < ctl_b.len() {
+            return Err(format!(
+                "nrd: zeroing IN_SPEC moved {moved} B of OUT_SPEC — under the {floor} B \
+                 attributability floor or under 1% of the plane, i.e. the engine is not \
+                 reading that plane and its descriptor points somewhere else"
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V15 {e}");
+        ok = false;
+    }
+    eng.destroy(hg);
     ok
 }
 
@@ -16421,11 +17298,21 @@ fn run_check_vk_bridge(
 
         // The sequence, on ONE command buffer — `nrd_frame_step`'s ordering:
         // pack -> engine -> recompose.
+        //
+        // Through `write_inputs` rather than a bare `hg.run`, because
+        // `cs_nrd_out` stores to `u16` and that is the ENGINE's colour image,
+        // not one of the tracer's own bridge planes: without the bracket it is
+        // written while resting in `SHADER_READ_ONLY_OPTIMAL` through a
+        // descriptor declaring `GENERAL`. See `Fsr3::write_inputs` for why no
+        // gate on this box could see that.
         let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
-        hg.run(|d, cmd| unsafe {
-            r1 = tg.record_nrd_pack(d, cmd);
-            r2 = tg.record_nrd_passthrough(d, cmd);
-            r3 = tg.record_nrd_out(d, cmd);
+        fed.write_inputs(hg, |d, cmd| {
+            unsafe {
+                r1 = tg.record_nrd_pack(d, cmd);
+                r2 = tg.record_nrd_passthrough(d, cmd);
+                r3 = tg.record_nrd_out(d, cmd);
+            }
+            Ok(())
         })?;
         r1?;
         r2?;
@@ -16468,9 +17355,16 @@ fn run_check_vk_bridge(
         // The three IN planes are read back off the tracer's OWN images, which
         // exist whether or not a descriptor points at them — which is exactly
         // what makes an unwired bridge show up here as an untouched plane.
-        for (idx, name) in
-            [(3usize, "in_diff"), (4, "in_spec"), (2, "in_viewz")]
-        {
+        // Named and indexed off the SHARED vocabulary rather than a literal
+        // pair, so a reordering of `Plane::ALL` cannot leave this report
+        // labelling one plane with another's name — which would be a wrong
+        // DIAGNOSIS, the failure mode this suite's own history keeps producing.
+        for p in [
+            gfx::denoise::Plane::InDiffRadianceHitDist,
+            gfx::denoise::Plane::InSpecRadianceHitDist,
+            gfx::denoise::Plane::InViewZ,
+        ] {
+            let (idx, name) = (p.index(), p.name());
             let px = tg.read_nrd_plane(hg, idx)?;
             let nz = px.iter().filter(|b| **b != 0).count();
             eprintln!(
@@ -22562,13 +23456,41 @@ fn run_cinematic(
         _ => Vec::new(),
     };
 
-    let arm = if opts.gpu {
-        "gpu"
-    } else if opts.dxr {
-        "dxr"
-    } else {
-        "cpu"
+    // ONE predicate for the label and the dispatch below. They used to be
+    // derived separately and had drifted: `opts.dxr` defaults to true, so a
+    // bare `--cinematic` off Windows announced `[dxr]` and then rendered every
+    // frame on the CPU.
+    let pick = cinematic::pick_arm(opts.gpu, opts.dxr, opts.mode_explicit);
+    let arm = match pick {
+        cinematic::ArmPick::Cpu => "cpu",
+        #[cfg(windows)]
+        cinematic::ArmPick::Gpu => {
+            if opts.gpu {
+                "gpu"
+            } else {
+                "dxr"
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        cinematic::ArmPick::Gpu => "vk",
+        #[cfg(target_os = "macos")]
+        cinematic::ArmPick::Gpu => "cpu",
     };
+    // Beside the label rather than at the dispatch, so `--cinematic-dry-run`
+    // — whose whole job is to make the decision observable without rendering —
+    // explains the one case where the label is not what was asked for. A
+    // SUBSTITUTION, not a refusal: this backend has exactly one GPU arm, so
+    // there is nothing to be told about, and the `--fsr4` exit-2 doctrine is
+    // about being told something impossible rather than about a default.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if pick == cinematic::ArmPick::Gpu
+        && cinematic::asked_for_dxr(opts.gpu, opts.dxr, opts.mode_explicit)
+    {
+        eprintln!(
+            "cinematic: --dxr names a DispatchRays pipeline, which the Vulkan backend does not \
+             have — using the Vulkan wavefront tracer"
+        );
+    }
     eprintln!(
         "cinematic: {} shot(s) [{arm}] | out {} | fps {} | tod {} | pid {}",
         shots.len(),
@@ -22643,10 +23565,23 @@ fn run_cinematic(
     }
 
     #[cfg(windows)]
-    if opts.gpu || opts.dxr {
+    if pick == cinematic::ArmPick::Gpu {
         match run_cinematic_gpu(scene, bvh, world, &shots, &attractors, cine, opts) {
             Ok(code) => return code,
             Err(e) => eprintln!("cinematic: GPU arm unavailable ({e}) — falling back to the CPU tracer"),
+        }
+    }
+    // The Vulkan arm, in the SAME shape as the Windows one: unreachable-if-not
+    // picked, and an `Err` falls through to the CPU tracer with one line. So
+    // the degrade chain reads identically on both platforms and the CPU arm is
+    // still the floor everywhere.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if pick == cinematic::ArmPick::Gpu {
+        match run_cinematic_vk(scene, bvh, &shots, &attractors, cine, opts) {
+            Ok(code) => return code,
+            Err(e) => {
+                eprintln!("cinematic: Vulkan arm unavailable ({e}) — falling back to the CPU tracer")
+            }
         }
     }
     run_cinematic_cpu(scene, bvh, &shots, &attractors, cine, opts)
@@ -22920,6 +23855,436 @@ fn run_cinematic_cpu(
         cine_encode(&dir, shot, cine);
     }
     0
+}
+
+/// THE VULKAN ARM — the first thing on this backend that produces a picture.
+///
+/// Sixteen `--check-vk` stages have scored the Vulkan tracer and every one of
+/// them ends in a number; nobody has ever looked at its output. This is the
+/// mode that makes that possible without a window, and it needs no swapchain,
+/// no surface, no graphics pipeline and no new dependency, because the whole
+/// presentation path below `cine_write_frame` is already portable and already
+/// runs here for the CPU arm.
+///
+/// It carries the D3D12 arm's shape with the parts that have no peer here
+/// dropped rather than emulated: ONE upscaler (FSR3 — see the vendor survey;
+/// XeSS ships no Linux library and DLSS has no Vulkan NGX at all), ONE denoiser
+/// (NRD, which is the compiled default), no dual-GPU, no HUD.
+///
+/// TWO ARMS PER SHOT, exactly as on D3D12:
+///   * RECONSTRUCTION — every sub-frame is a fresh jittered frame the temporal
+///     model integrates, and the frame written is FFX's reconstructed output.
+///   * ACCUMULATION — the fallback, and the arm a GI shot always takes, because
+///     the hemisphere integrator is a still-frame accumulation contract.
+///
+/// THE TRACER IS CACHED BY RESOLUTION and not rebuilt per shot: constructing
+/// one compiles the whole kernel corpus through DXC, which is ~20 s, and the
+/// `islands` preset is seven shots at one resolution.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_cinematic_vk(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    shots: &[cinematic::Shot],
+    attractors: &[world::TodAttractor],
+    cine: &cinematic::CineOpts,
+    opts: &Opts,
+) -> Result<i32, String> {
+    let hg = vk::headless::VkHeadless::new(false).map_err(|e| e.to_string())?;
+    if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+        // A software ICD renders this correctly and uselessly slowly, and FFX
+        // declines to create a context on one at all. Say so and let the CPU
+        // tracer — which is genuinely faster here — take it.
+        return Err(format!("{} is a software device", hg.vk.info.name));
+    }
+    let sp = vk::spirv::Spirv::load(&vk::spirv::default_dir())?;
+    let vs = vk::scene::VkScene::new(&hg, scene, bvh)?;
+    let vt = vk::textures::VkTextures::new(&hg, &sp, scene, opts.bc7)?;
+
+    // WHAT THIS BACKEND CANNOT DO, each said once and loudly rather than
+    // discovered in the output. `--fsr4` is the exception that stays fatal:
+    // it is a REQUIREMENT rather than a preference, which is the whole point
+    // of the flag.
+    if opts.fsr4_required {
+        return Err(
+            "--fsr4 requires the FSR4 Ray Regeneration provider, which is a D3D12 DLL — this \
+             backend upscales with FSR 3.1 only. Drop the flag, or use --fsr3"
+                .into(),
+        );
+    }
+    if opts.chain.dlss || opts.chain.fsr4 || opts.chain.xess {
+        eprintln!(
+            "cinematic: DLSS / FSR4-RR / XeSS have no Linux artifact — falling through the chain \
+             to FSR 3.1"
+        );
+    }
+    if opts.dual_gpu.is_some() {
+        eprintln!("cinematic: --dual-gpu is D3D12-only — capturing on one device");
+    }
+    if opts.frd {
+        eprintln!("cinematic: --frd is D3D12-only — the capture denoises with NRD, or --no-nrd");
+    }
+    if scene.sway.is_some() {
+        // The animated TLAS ring has no Vulkan peer, so the rest pose is what
+        // traces. A leaf that never moves is a picture of nothing with no
+        // error, which is worse than a missing feature — so name it.
+        eprintln!(
+            "cinematic: foliage sway has no Vulkan arm — leaves render at their REST POSE (the \
+             `foliage` preset has nothing to show on this backend; use --cpu for it)"
+        );
+    }
+
+    // The upscaler, if the chain wants one AND it is compiled in. The
+    // accumulation arm is the fallback and is never an error.
+    let want_up = opts.chain != upchain::UpChain::NONE && vk::fsr3::built();
+    if opts.chain != upchain::UpChain::NONE && !vk::fsr3::built() {
+        eprintln!(
+            "cinematic: FidelityFX was not compiled in (./install-prerequisites.sh fsr3src) — \
+             accumulation fallback"
+        );
+    }
+    let want_dn = want_up && opts.nrd;
+
+    let mut built: Option<((usize, usize), CineVk)> = None;
+    let mut code = 0;
+
+    for shot in shots {
+        let (rw, rh) = shot.res;
+        let dir = cine_prepare_dir(cine, shot)?;
+        let q = cine_quality(shot);
+        // A GI shot integrates the hemisphere, which is a still-frame
+        // accumulation contract — so it takes the accumulation arm whatever the
+        // chain says. D3D12 does the same, for the same reason.
+        let recon = want_up && !shot.gi;
+
+        if built.as_ref().map(|(r, _)| *r) != Some((rw, rh)) {
+            if let Some((_, old)) = built.take() {
+                old.destroy(&hg);
+            }
+            built = Some((
+                (rw, rh),
+                CineVk::build(&hg, &sp, scene, &vs, &vt, bvh, rw, rh, recon, want_dn, opts)?,
+            ));
+        }
+        let cv = &mut built.as_mut().unwrap().1;
+
+        let frames = shot.kind.frames();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let mut present = vec![0u32; rw * rh];
+        let mut prev_hour: Option<f32> = None;
+        let t_shot = Instant::now();
+
+        for f in 0..frames {
+            let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
+            cv.tg.refresh_sky(scene);
+            let hdr = cv.output_frame(&hg, scene, shot, &fs, f, rw, rh, q, opts)?;
+
+            if shot.overlay {
+                let ib = hg.read_buffer(&cv.tg.info, rw * rh * 4)?;
+                for (dst, c) in info.iter().zip(ib.chunks_exact(4)) {
+                    dst.store(u32::from_le_bytes(c.try_into().unwrap()), Relaxed);
+                }
+            }
+            cine_write_frame(
+                &dir, shot, cine, f, &hdr, &info, &mut present, &fs, rw, rh, "VK",
+            );
+            cine_progress(shot, f, frames, t_shot, fs.hour);
+        }
+        cine_finish(&dir, shot, t_shot);
+        cine_encode(&dir, shot, cine);
+        code = 0;
+    }
+
+    if let Some((_, b)) = built.take() {
+        b.destroy(&hg);
+    }
+    vs.destroy(&hg);
+    vt.destroy(&hg);
+    Ok(code)
+}
+
+/// One resolution's worth of Vulkan capture state.
+///
+/// A struct rather than D3D12's positional tuple for a reason this backend has
+/// and that one does not: `VkTracer`, `Fsr3` and `VkNrd` have `destroy(&hg)`
+/// and NO `Drop`, so a forgotten teardown leaks device memory across a
+/// seven-shot preset. One `destroy` in reverse construction order makes that
+/// structural instead of remembered.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct CineVk {
+    tg: vk::tracer::VkTracer,
+    up: Option<vk::fsr3::Fsr3>,
+    dn: Option<vk::nrd::VkNrd>,
+    /// Free-running across the WHOLE shot, so the Halton phase never restarts.
+    seq: u32,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl CineVk {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        hg: &vk::headless::VkHeadless,
+        sp: &vk::spirv::Spirv,
+        scene: &scene::Scene,
+        vs: &vk::scene::VkScene,
+        vt: &vk::textures::VkTextures,
+        bvh: &bvh::Bvh,
+        rw: usize,
+        rh: usize,
+        recon: bool,
+        want_dn: bool,
+        opts: &Opts,
+    ) -> Result<CineVk, String> {
+        let tg = vk::tracer::VkTracer::new(
+            hg,
+            sp,
+            scene,
+            vs,
+            vt,
+            bvh,
+            rw as u32,
+            rh as u32,
+            vk::tracer::TracerOpts {
+                gbuf_full: recon,
+                feed: recon,
+                nrd: recon && want_dn,
+            },
+        )?;
+        // The upscaler runs at 1:1 — `--cinematic` is DLAA-shaped by design
+        // (`run_cinematic_gpu` captures at 100% render scale), so the temporal
+        // model is an antialiaser and integrator rather than a magnifier.
+        let up = if recon {
+            match vk::fsr3::Fsr3::new(
+                hg,
+                (rw as u32, rh as u32),
+                (rw as u32, rh as u32),
+                vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("cinematic: FSR3 unavailable ({e}) — accumulation fallback");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let dn = match (&up, want_dn) {
+            (Some(_), true) => match tg.nrd_plane_handles() {
+                Some(planes) => {
+                    match vk::nrd::VkNrd::new(hg, &opts.nrd_path, rw as u32, rh as u32, &planes) {
+                        Ok(e) => {
+                            eprintln!(
+                                "nrd: armed — cinematic pre-upscale denoising at {rw}x{rh} ({})",
+                                opts.nrd_path
+                            );
+                            Some(e)
+                        }
+                        Err(e) => {
+                            eprintln!("nrd: unavailable ({e}) — the capture upscales undenoised");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(f) = &up {
+            tg.wire_feed(hg, f.feed_views());
+        }
+        if dn.is_some() {
+            tg.wire_nrd(hg);
+        }
+        Ok(CineVk { tg, up, dn, seq: 0 })
+    }
+
+    /// Render ONE output frame and return it as a linear f32 RGB image.
+    #[allow(clippy::too_many_arguments)]
+    fn output_frame(
+        &mut self,
+        hg: &vk::headless::VkHeadless,
+        scene: &scene::Scene,
+        shot: &cinematic::Shot,
+        fs: &CineFrame,
+        f: u32,
+        rw: usize,
+        rh: usize,
+        q: Quality,
+        opts: &Opts,
+    ) -> Result<Vec<f32>, String> {
+        let basis = fs.cam.basis(rw, rh);
+        let (near, far) = dlss::near_far(scene.diag);
+        let samples = shot.samples.max(1);
+
+        let Some(up) = self.up.as_ref() else {
+            return self.accumulate(hg, scene, fs, &basis, samples, q, opts);
+        };
+
+        // OUTPUT FRAME 0 GETS A WARM-UP, and it is not optional: `seq`
+        // free-runs while `reset` fires once per shot, so frame 0 would be
+        // reconstructed from under half a jitter phase AND sampled on a biased
+        // lattice — a discontinuity that, in a looping clip, shows once per lap.
+        // Self-limiting: a 256-sample still is already several phases, so the
+        // extra count is 0 there. Deliberately NOT applied to the accumulation
+        // arm, whose frame 0 is statistically identical to any other.
+        let warm = if f == 0 { dlss::JITTER_PHASE.saturating_sub(samples) } else { 0 };
+
+        let mut out = Vec::new();
+        for k in 0..warm + samples {
+            let emit = k >= warm;
+            let jit = dlss::jitter_for(self.seq);
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: self.seq,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                prev_cam: Some(basis),
+                q,
+                verify: false,
+                spp: opts.spp,
+                probe_sample: 0,
+                clouds: fs.clouds,
+                fireflies: fs.fireflies,
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: fs.cam.fov_y,
+                dt_ms: gfx::denoise::NOMINAL_DT_MS,
+                reset: self.seq == 0,
+            };
+            self.tg.render_wavefront(hg, &p, true)?;
+
+            match self.dn.as_mut() {
+                // THE COMPOSED FRAME (B5a): pack -> ReBLUR -> recompose -> FFX,
+                // and NO feed dispatch — the folded pack wrote the guides and
+                // the recompose wrote the colour.
+                Some(eng) => {
+                    let mats = dlss::cam_matrices(&fs.cam, rw, rh, near, far);
+                    let (pw, ph) = eng.prev_size();
+                    let cs = gfx::denoise::common_settings(
+                        &mats,
+                        &mats,
+                        jit,
+                        dlss::jitter_for(self.seq.saturating_sub(1)),
+                        rw as u32,
+                        rh as u32,
+                        pw,
+                        ph,
+                        far,
+                        gfx::denoise::NOMINAL_DT_MS,
+                        self.seq,
+                        self.seq == 0,
+                        false,
+                    );
+                    let rs = gfx::denoise::reblur_settings();
+                    let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+                    up.frame_fed(
+                        hg,
+                        |d, cmd| {
+                            unsafe {
+                                r1 = self.tg.record_nrd_pack(d, cmd);
+                                r2 = eng.record(d, cmd, &cs, &rs);
+                                r3 = self.tg.record_nrd_out(d, cmd);
+                            }
+                            r2.clone()
+                        },
+                        dp,
+                    )?;
+                    r1?;
+                    r2?;
+                    r3?;
+                }
+                None => {
+                    let mut rf = Ok(());
+                    up.frame_fed(
+                        hg,
+                        |d, cmd| {
+                            rf = unsafe { self.tg.record_feed(d, cmd) };
+                            rf.clone()
+                        },
+                        dp,
+                    )?;
+                    rf?;
+                }
+            }
+            self.seq += 1;
+            if emit && k + 1 == warm + samples {
+                out = up.read_output(hg)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The accumulation arm: N sub-frames at ONE pose into `accum`, averaged.
+    ///
+    /// Structure REPLAY across sub-frames 1..N-1 is a pure win and is why high
+    /// sample counts are affordable — the terminal quadtree is a function of
+    /// (scene, BVH, basis, rw, rh) only, and the pose is bit-equal across a
+    /// shot's sub-frames BY CONSTRUCTION (one `basis`, computed once). This
+    /// backend asks the CALLER to prove that bit-equality rather than keeping a
+    /// `last_struct` cache, and "the same variable, reused" is the narrowest
+    /// possible proof of it.
+    fn accumulate(
+        &self,
+        hg: &vk::headless::VkHeadless,
+        scene: &scene::Scene,
+        fs: &CineFrame,
+        basis: &camera::CamBasis,
+        samples: u32,
+        q: Quality,
+        opts: &Opts,
+    ) -> Result<Vec<f32>, String> {
+        let _ = scene;
+        for k in 0..samples {
+            let p = gfx::frame::FrameParams {
+                cam: *basis,
+                frame: k,
+                accumulate: true,
+                // Sub-frame 0 is the pixel CENTRE, 1.. are jittered — the
+                // codebase's accumulation convention.
+                jitter: k > 0,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp: opts.spp,
+                probe_sample: 0,
+                clouds: fs.clouds,
+                fireflies: fs.fireflies,
+                sway_time: None,
+                sway_prev_time: None,
+                replay: k > 0 && opts.replay,
+            };
+            if k > 0 && opts.replay {
+                self.tg.render_wavefront_replay(hg, &p, k == 0)?;
+            } else {
+                self.tg.render_wavefront(hg, &p, k == 0)?;
+            }
+        }
+        let px = self.tg.rw as usize * self.tg.rh as usize;
+        let bytes = hg.read_buffer(&self.tg.accum, px * 3 * 4)?;
+        let inv = 1.0 / samples as f32;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()) * inv)
+            .collect())
+    }
+
+    fn destroy(self, hg: &vk::headless::VkHeadless) {
+        if let Some(d) = self.dn {
+            d.destroy(hg);
+        }
+        if let Some(u) = self.up {
+            u.destroy(hg);
+        }
+        self.tg.destroy(hg);
+    }
 }
 
 /// Write one output frame's files from the averaged LINEAR image.
@@ -26509,6 +27874,22 @@ fn run_check(
         }
     };
 
+    // The NRD host's SHARED vocabulary — the plane enum both recorders index
+    // by, and the CommonSettings builder they both call. Pure, DLL-free and
+    // adapter-free, which is the point: it runs on every platform, so a Linux
+    // box gates the matrix convention, the UV motion-vector scale and the
+    // denoising-range lockstep that the WINDOWS recorder depends on. The
+    // injectivity arm is the sharpest of them — a duplicated ResourceType
+    // aliases two images inside `reg_for` and produces a wrong picture, never
+    // an error.
+    let dnv_ok = match gfx::denoise::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("denoise vocabulary self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
     // slip), cone sampling inside-and-covering the disc, the disc test agreeing
     // with the cone the sampler draws from, the DOME carrying no disc (the
@@ -29469,6 +30850,7 @@ fn run_check(
         ("bloom", bloom_ok),
         ("frd", frd_ok),
         ("remod", remod_ok),
+        ("denoise-vocab", dnv_ok),
         ("autoexp", autoexp_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),

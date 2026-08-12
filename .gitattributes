@@ -41,9 +41,20 @@ tools/hooks/* text eol=lf
 # and NOT covered by the scenes/ LFS rules above: github.com renders these on
 # the front page, so they must survive a GIT_LFS_SKIP_SMUDGE clone, a fork, and
 # an exhausted LFS bandwidth quota — and the LFS budget belongs to scenes/.
-# Kept small on purpose (~6 MB total, downscaled WebP). Video is NEVER
-# committed: the 4K60 HDR10 master is a GitHub Release asset, and a repo-hosted
-# .mp4 does not play inline in a README anyway.
+# Video is NEVER committed HERE, for two independent measured reasons. (1) A
+# README cannot embed a player: GitHub's README renderer STRIPS <video> --
+# fetching the live page via repos/.../readme with Accept:
+# application/vnd.github.html finds zero <video> elements while the <img> beside
+# it survives. Beware the standalone /markdown API, which is more permissive and
+# returns the element intact, so testing there says the opposite of what ships.
+# (2) The bytes must be served playably: raw.githubusercontent.com sends
+# application/octet-stream WITH X-Content-Type-Options: nosniff, and a release
+# asset is an `attachment` behind a signed URL that expires in an hour. So the
+# videos live on the orphan `gh-pages` branch, which Pages serves as a real
+# video/mp4 with byte ranges, and the README LINKS to them. A separate branch
+# rather than /docs on master because Pages publishes its whole source tree and
+# docs/ holds third-party academic PDFs. The 4K60 HDR10 master stays a Release
+# asset.
 docs/media/** binary
 # Reference papers the design is measured against (docs/papers/). PLAIN GIT for
 # the same reason as docs/media/ above: the README links them, so a reader

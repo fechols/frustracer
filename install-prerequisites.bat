@@ -2,10 +2,14 @@
 rem ===========================================================================
 rem  frustracer — runtime SDK installer
 rem
-rem  Building NEVER needs any of this: the MIT headers the shims compile
-rem  against (FidelityFX) are committed, and every SDK below is
+rem  Building needs EXACTLY ONE of these, `nrd`: the MIT headers the shims
+rem  compile against (FidelityFX) are committed, and every other SDK below is
 rem  LoadLibrary'd at runtime, so `cargo build --release` and every DLL-free
-rem  `--check*` gate work on a bare checkout. This script fetches the runtime
+rem  `--check*` gate work on a checkout carrying nothing else. NRD is the
+rem  exception because it is the DEFAULT denoiser and NVIDIA ships no
+rem  binaries -- build.rs's require_nrd() makes NRD.dll a hard requirement
+rem  for a native build rather than let a session render undenoised in
+rem  silence (see :do_nrd). This script fetches the runtime
 rem  DLLs the *interactive* features need, into the directories the defaults in
 rem  src/main.rs already point at (each is also overridable with the matching
 rem  --*-path flag / FRUSTRACER_*_PATH env var).
