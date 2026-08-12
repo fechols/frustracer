@@ -8913,6 +8913,214 @@ cargo run --release -- --check-metalfx# MetalFX TEMPORAL UPSCALING, gated (macOS
                                       # energy/history/vs-bilinear must not move), --check-fsr, --check,
                                       # and cargo test. FR_MFX_JITTER=neg must FAIL the cross-check;
                                       # if it stops failing, the tooth has gone blunt.
+                                      # X4-X6 EXTEND THE SAME GATE (B4, 2026-08-12) — one SDK,
+                                      # one flag, three more subjects, each SKIPping on its own
+                                      # terms because MTLFXTemporalDenoisedScaler and
+                                      # MTLFXFrameInterpolator are API_AVAILABLE(macos(26.0))
+                                      # where the plain scaler is 13.0. THE FLOOR DOES NOT RISE:
+                                      # rustc's deployment target is 11.0, so those classes
+                                      # weak-import and the binary still launches on older macOS
+                                      # — but objc2's extern_class! PANICS on a missing class, so
+                                      # every typed entry point goes through an
+                                      # AnyClass::get(c"...") probe first (mtl::mfxdn::available).
+                                      # A cargo feature or a build.rs cfg was rejected: build.rs
+                                      # keys on the BUILD host, the cfg(windows)-describes-the-HOST
+                                      # defect class this file already records.
+                                      # X4 = the denoised scaler creates, its nine required
+                                      # usages are a subset of what Mtl::texture hands out, and it
+                                      # destroys. X5 = a real denoise, scored. X6 = frame
+                                      # interpolation, REPORTED (below).
+                                      # THE DENOISER IS THE FIRST THING ON THIS PLATFORM THAT CAN
+                                      # BE SCORED FOR QUALITY, and that is structural rather than
+                                      # lucky: an upscaler has no directional claim (--check-fsr3
+                                      # says plainly that its own quality comparison is
+                                      # report-only, because mean-|d| against a converged
+                                      # reference rewards blur and INVERTS between scenes), while
+                                      # a denoiser's claim is "noise must go DOWN". THE CONTROL IS
+                                      # THE PLAIN SCALER, not a resampler — both arms consume
+                                      # byte-identical planes at identical extents through
+                                      # planes::Trio, both upscale 2x, and only one denoises, so
+                                      # the mean-|Laplacian| comparison has no scene-dependent
+                                      # bias to argue about and doubles as the anti-vacuity (two
+                                      # arms that agreed would mean the denoise did nothing). A
+                                      # bilinear reference would have confounded the denoise with
+                                      # the upscale, since a 2x upscale reduces per-pixel
+                                      # Laplacian by itself. MEASURED 33.8% less high-frequency
+                                      # content; MFXDN_LAPLACIAN_DROP_MIN sits six times under
+                                      # that, because the failure it rejects (guides unbound, no
+                                      # denoise at all) lands at or BELOW zero.
+                                      # THAT METRIC SETTLED THE ONE CONVENTION APPLE DOES NOT
+                                      # DOCUMENT. normalTexture's doc is "The normal texture this
+                                      # scaler evaluates" and nothing else — no space, no
+                                      # encoding, no range. World space was the ARGUMENT (our
+                                      # plane, DLSS-RR's own input, and a denoiser wanting
+                                      # view-space normals would not need a worldToViewMatrix to
+                                      # be told how to get there), and B3's jitter sign is the
+                                      # standing warning that a good argument about an
+                                      # undocumented convention is still a coin flip. MEASURED:
+                                      # world 33.8% vs view 28.8%, so world is the answer.
+                                      # FR_MFXDN_NORMALS=world|view keeps the lever, because that
+                                      # is a per-scene measurement rather than a proof; its view
+                                      # arm is a SECOND pure function (fsr::stage_normal_view),
+                                      # never a parameter on stage_normal — planes.rs's ratchet
+                                      # rule, applied to a diagnostic. THAT ARM IS GATED LIKE THE
+                                      # REST and shipped for one review cycle without being: it
+                                      # is the only stager here that does arithmetic rather than
+                                      # a bit copy, so the world-vs-view measurement above rested
+                                      # on untested code — and, because `mod fsr` carries
+                                      # #[cfg_attr(not(windows), allow(dead_code))], its one
+                                      # macOS-only caller also made it a dead_code WARNING on the
+                                      # Windows target, invisible from this box. One fix closed
+                                      # both. The probe rotation is an exact axis PERMUTATION
+                                      # (columns (0,0,-1)/(0,1,0)/(1,0,0) = a 90 degree yaw, so
+                                      # (x,y,z) -> (z,y,-x)) precisely so the assertion can be
+                                      # BITWISE: every coefficient is 0 or +-1, so the products
+                                      # and sums are exact in f32 and each output lane is a
+                                      # source lane re-encoded from a value that came out of f16
+                                      # — deliberately NOT from_rotation_y(FRAC_PI_2), whose
+                                      # cosine is -4.4e-8 and would turn the whole thing into an
+                                      # uncalibratable threshold. Two teeth, both fired: a LARGE
+                                      # translation column (100,-50,25) catches the obvious wrong
+                                      # spelling (Mat4 * Vec4(n, 1.0) instead of the rotation
+                                      # alone — a normal is a direction), measured 0x5648 vs
+                                      # 0x3800 on the first pixel; and an IDENTITY arm requires
+                                      # byte-for-byte agreement with stage_normal, which pins the
+                                      # f16 round trip AND stops FR_MFXDN_NORMALS from A/Bing two
+                                      # differences at once (an un-zeroed alpha fails it by
+                                      # name).
+                                      # THE FOUR NEW STAGERS INTRODUCE NO ENCODING CONVENTION, and
+                                      # that is the design: fsr::stage_normal / stage_roughness /
+                                      # stage_albedo / stage_hit_dist are bit copies or lane
+                                      # extracts (GBufs::normal_rough is ALREADY an RGBA16Float
+                                      # layout, and its w lane IS roughness), so the f16 narrowing
+                                      # that already happened at GBufs::write is the only one.
+                                      # They ride fsr::stage_self_test, which --check-fsr runs on
+                                      # Windows and Linux too. Teeth exercised BOTH ways: a
+                                      # stage_roughness reading lane 0 fails by name, and a
+                                      # stage_normal SMUGGLING roughness into alpha fails by name
+                                      # — the probe is built so the w lane is always positive and
+                                      # the x lane always negative, since either check is vacuous
+                                      # on a probe whose lanes agree.
+                                      # TWO FINDINGS ABOUT APPLE'S IMPLEMENTATION, both measured
+                                      # and both left as REPORTS rather than softened assertions.
+                                      # (1) THE TWO CAMERA MATRICES ARE NOT SET AT ALL.
+                                      # worldToViewMatrix/viewToClipMatrix are absent from
+                                      # objc2-metal-fx (its header-translator drops
+                                      # simd_float4x4), so reaching them means objc_msgSend
+                                      # transmuted to a hand-written AArch64 HVA signature. Built,
+                                      # then removed, on two measurements: the round trip does not
+                                      # work (viewToClip read back EXACTLY while worldToView read
+                                      # back as pointer-shaped garbage — and setting ONLY
+                                      # worldToView then reading viewToClip returned the WORLD
+                                      # matrix, i.e. the "successful" reads were register residue
+                                      # from the preceding setter), and setting them changes
+                                      # NOTHING (every X5 number byte-identical with both setters
+                                      # removed; a 90-degree rotation of world_to_view moves the
+                                      # output by exactly 0). So: no measurable benefit and an
+                                      # unverifiable 64-byte write. AN UNVERIFIABLE WRITE IS WORSE
+                                      # THAN AN OMISSION — "unset" is a defined default a future
+                                      # driver would read sanely, "written through an ABI we have
+                                      # evidence against" is not. The way in if they ever matter
+                                      # is an ObjC++ shim taking const float*, where the compiler
+                                      # generates the ABI. (2) THE SPECULAR-HIT PLANE IS ACCEPTED,
+                                      # ADVERTISED AND UNUSED: the descriptor takes
+                                      # setSpecularHitDistanceTextureEnabled(true) and reads it
+                                      # back true (mfxdn::new FAILS if it does not), the scaler
+                                      # reports wanting ShaderRead on it, we bind it — and zeroing
+                                      # it leaves the output BIT-IDENTICAL at a pose where 12.7%
+                                      # of the plane is non-zero. Wiring stays (correct, one
+                                      # texture, free the day a driver reads it); the assertion
+                                      # does not. The other four guides ARE asserted, and the
+                                      # probe carries its own anti-vacuity: a plane that is
+                                      # already all-zero SKIPs, because zeroing it would score the
+                                      # scene rather than the wiring.
+                                      # X6 IS A REPORT, NOT AN ASSERTION, and the plan's intended
+                                      # claim is retired by measurement. Frame generation's
+                                      # product is presented CADENCE and this harness has no
+                                      # presentation, so the design was to use the ground truth an
+                                      # in-between frame does have — render the midpoint pose,
+                                      # require the interpolation of A->B to land closer to M than
+                                      # a 50/50 blend of A and B. IT DOES NOT WORK: the
+                                      # interpolator returns the CURRENT frame (5.3e-5 from B
+                                      # against an A-to-B distance of 8.0e-2). THREE
+                                      # configurations give byte-identical results — a single
+                                      # reset dispatch, a primed pair, and a driven
+                                      # MTLFXTemporalScaler attached through the descriptor's
+                                      # `scaler` property — and the plant that settles it is
+                                      # handing it frame B as the PREVIOUS frame, which changes
+                                      # nothing: prevColorTexture is not read. So X6 asserts the
+                                      # wiring (creates, accepts our formats and usages,
+                                      # dispatches, writes a finite non-empty frame) and prints
+                                      # the quality numbers with the reason they are not
+                                      # assertions. A green X6 means ready for a presentation
+                                      # stage, not that generation works.
+                                      # AND X6 SKIPS UNDER MTL_SHADER_VALIDATION=1, for a reason
+                                      # that is not ours: one of MetalFX's own interpolation
+                                      # kernels dispatches a 32x32 threadgroup while the validated
+                                      # device limit drops to 832 threads, and Metal ABORTS THE
+                                      # PROCESS on the assertion rather than failing the encode
+                                      # (_validateThreadsPerThreadgroup:1310, "1024 must be <=
+                                      # 832"). We author no compute kernels on this path. Skipping
+                                      # is what keeps the VALIDATED run — the stricter one, the
+                                      # one this gate's own NOTE tells people to prefer —
+                                      # runnable at all.
+                                      # --cinematic RECONSTRUCTS THROUGH IT on macOS (B4 phase 4),
+                                      # which is the first thing on this platform that produces a
+                                      # PICTURE rather than a number. A STAGE ON THE CPU ARM, NOT
+                                      # A NEW ARM: cinematic::pick_arm is pure and gated in
+                                      # --check, and the tracer really is still the CPU one, so
+                                      # the label gains a suffix (cpu+mfx-dn) and pick_arm gains
+                                      # no case. Ladder: denoised -> plain -> accumulation, each
+                                      # degrading loudly. THE MID-SHOT SHED FALLS THROUGH RATHER
+                                      # THAN SKIPPING, and that is the one place the obvious
+                                      # spelling is wrong: a reconstruction failure at frame f
+                                      # clears the reconstructor AND lets frame f render by
+                                      # accumulation, because an Err arm that `continue`d to the
+                                      # next f would leave a HOLE in the numbered sequence — and
+                                      # cine_encode feeds ffmpeg an image2 pattern, whose input
+                                      # stops at the first missing index, so one failed frame
+                                      # would truncate the whole clip rather than roughen one
+                                      # frame of it. Demonstrated with a planted failure: pre-fix
+                                      # a 3-frame shot wrote f_00001/f_00002 and lost f_00000
+                                      # (the plant fires during frame 0's own 64-pass warm-up),
+                                      # post-fix all three are present.
+                                      # --no-upscale selects accumulation, and
+                                      # GI shots always take it (the hemisphere integrator is a
+                                      # still-frame accumulation contract, so a reconstructor fed
+                                      # one bounce sample per sub-frame would be reconstructing
+                                      # from an estimator that never converged — the GPU arm makes
+                                      # the same exclusion). 1:1, DLAA-shaped, matching
+                                      # gpu::CineUp's own "100% render scale": a capture has no
+                                      # frame budget to buy back. The sub-frame contract is
+                                      # run_cinematic_gpu's verbatim — free-running seq, reset
+                                      # only at seq 0, and the output-frame-0 warm-up of
+                                      # JITTER_PHASE - samples emitting passes, without which
+                                      # frame 0 is reconstructed from under half a jitter phase on
+                                      # a biased lattice (a discontinuity that shows once per lap
+                                      # in a looping clip). MEASURED at 640x360x16: Laplacian 2.03
+                                      # vs accumulation's 6.16 — 3.0x less high-frequency content
+                                      # — with the mean level unmoved (138.73 vs 139.00), which is
+                                      # the shared tone curve holding (cine_write_frame owns it,
+                                      # so all arms tonemap identically). KNOWN COST: structure
+                                      # replay is NOT used on this path, because each sub-frame
+                                      # needs its own G-buffer and its own jitter while
+                                      # render_frame_replay re-shades from a fresh ctx without
+                                      # re-deriving the G-buffer writes the reconstructor depends
+                                      # on — a documented follow-on worth roughly the
+                                      # frustum-query share of a sub-frame.
+                                      # Touch src/mtl/mfxdn.rs / mfxfi.rs / planes.rs's Guides /
+                                      # the four fsr::stage_* guides / CineRecon /
+                                      # cine_reconstruct -> run --check-fsr (the pure half, and it
+                                      # runs on Windows and Linux), --check-metalfx plain AND
+                                      # under MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1,
+                                      # FR_MFXDN_NORMALS=view and FR_MFXDN_JITTER=neg (both must
+                                      # still PASS — they are measurement levers, not teeth),
+                                      # --check-fsr3 (planes::Trio is shared, so its U4 numbers
+                                      # are the before/after fingerprint), --check, --check-dlss,
+                                      # --check-xess, --check-spirv, cargo test, and
+                                      # `--cinematic hero --no-world --cinematic-res 640x360` with
+                                      # and without --no-upscale. Restore check.png/check_gi.png:
+                                      # they are tracked WINDOWS goldens.
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)
 cargo run --release -- --prefer-intel # pick that vendor's adapter for the D3D12 device (also
                                       # --prefer-nvidia / --prefer-amd; default NVIDIA, or AMD under
