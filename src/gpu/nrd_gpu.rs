@@ -153,7 +153,7 @@ pub struct NrdGpu {
     trans_base: usize,
     /// App-plane indices into `regs` (IN_MV, IN_NR, IN_VIEWZ, IN_DIFF,
     /// IN_SPEC, OUT_DIFF, OUT_SPEC, OUT_VALIDATION).
-    plane_idx: [usize; 8],
+    plane_idx: [usize; Plane::COUNT],
     /// Non-shader-visible staging heap: per reg, slot 2i = SRV, 2i+1 = UAV.
     staging: ID3D12DescriptorHeap,
     /// Shader-visible ring: RING_FRAMES * MAX_DISPATCHES * set_stride.
@@ -187,51 +187,18 @@ pub struct NrdGpu {
     vpending: std::cell::Cell<Option<u64>>,
 }
 
-/// The `timeDeltaBetweenFrames` (ms) every DETERMINISTIC caller reports — the
-/// gates and cinematic capture. Those paths have no meaningful frame clock
-/// (a gate frame is a submit-and-wait around readbacks and oracle loops), and
-/// letting NRD fall back to its own wall-clock timer would make the settings
-/// it derives — the antilag scale, the accumulation-speed curve, the specular
-/// tap stride — a function of machine load. A fixed 60 Hz nominal makes two
-/// runs of the same gate hand NRD identical settings.
-pub const NOMINAL_DT_MS: f32 = 1000.0 / 60.0;
+// The settings builders and the plane vocabulary MOVED to `gfx::denoise` when
+// the Vulkan recorder arrived (B4b-ii) — they name no API type, and the
+// transpose argument alone is fifty lines that must not exist twice. Re-exported
+// here so every existing call site is unchanged; there is still one definition.
+pub use crate::gfx::denoise::{common_settings as shared_common_settings, reblur_settings, Plane};
+pub use crate::gfx::denoise::NOMINAL_DT_MS;
 
-/// The frame's CommonSettings from the tree's own camera facts.
-/// `dlss::CamMatrices` is glam — COLUMN-major with COLUMN vectors, which is
-/// NRD's stated convention (NRDSettings.h), so `to_cols_array()` IS the wire
-/// format: no transpose anywhere (the deliberate contrast with
-/// `gpu::row_major`'s SL boundary — verify with FR_NRD_DEBUG's validation
-/// overlay if reprojection ever looks dead). MV scale: the pack stores
-/// pixel-space prev−cur (+ the 2.5D view-Z delta), NRD wants
-/// `pixelUvPrev = pixelUv + mv.xy` in UV units — {1/rw, 1/rh, 1}.
-/// denoisingRange: sky stores view_z == far, so anything at/past far*0.999
-/// is out of range and NRD leaves those texels alone. cs_nrd_out's
-/// pass-accum-through predicate is `view_z >= 0.999 * CAM_FAR` — the SAME
-/// bound, LOCKSTEP (a shader predicate of plain CAM_FAR shipped once and
-/// recomposed the [0.999·far, far) hit band from OUT texels NRD never wrote).
-///
-/// `dt_ms` is `timeDeltaBetweenFrames`, and it is passed EXPLICITLY rather
-/// than left at the header's "0 = tracked internally" default because NRD's
-/// internal timer measures WALL CLOCK BETWEEN `SetCommonSettings` CALLS
-/// (InstanceImpl.cpp's `m_Timer`), which for a headless gate is the gate's own
-/// CPU work — readbacks, oracle loops, PNG writes — not a frame. It is not
-/// cosmetic: `m_FrameRateScale = max(33.333/dt, 1)` reaches ReBLUR's antilag
-/// scale, its accumulation-speed curve, and the specular virtual-motion tap
-/// stride, so an internally-timed gate is a gate whose denoiser settings drift
-/// with machine load. Every caller therefore hands over a value it controls:
-/// the real per-frame wall time interactively, a fixed nominal in the gates
-/// and in cinematic capture (which is deterministic by contract).
-///
-/// `cameraJitter`, by contrast, is deliberately NOT sign-corrected the way
-/// every sibling SDK site is (`xess::JITTER_SIGN`, `fsr::JITTER_SIGN`), and
-/// that asymmetry is settled rather than assumed: in the v4.17.3 source the
-/// value reaches exactly two places — `REBLUR_Validation.cs.hlsl`'s overlay UV,
-/// and `m_JitterDelta = max(|dx|, |dy|)` over the cur/prev pair, which feeds
-/// only the CHECKERBOARD resolve speed. Both are sign-symmetric or
-/// debug-only, and we never run checkerboard mode, so polarity is
-/// STRUCTURALLY inert here. What is NOT inert is the range: NRD asserts
-/// [-0.5, 0.5], which is exactly `FrameCtx::frame_jitter`'s own interval, so
-/// the raw offset is passed through.
+/// `gfx::denoise::common_settings` with this backend's validation arming
+/// supplied. The shared builder takes `enable_validation` as a PARAMETER
+/// rather than reading `FR_NRD_DEBUG` itself (a deterministic gate must not
+/// have a hidden input), and D3D12 is the backend that can honour it — see
+/// `validation_step`, which is what turns the plane into a PNG.
 #[allow(clippy::too_many_arguments)]
 pub fn common_settings(
     mats: &crate::dlss::CamMatrices,
@@ -247,46 +214,21 @@ pub fn common_settings(
     frame_index: u32,
     reset: bool,
 ) -> nrd::CommonSettings {
-    let mut cs = nrd::CommonSettings::default();
-    cs.view_to_clip_matrix = mats.view_to_clip.to_cols_array();
-    cs.view_to_clip_matrix_prev = prev_mats.view_to_clip.to_cols_array();
-    cs.world_to_view_matrix = mats.world_to_view.to_cols_array();
-    cs.world_to_view_matrix_prev = prev_mats.world_to_view.to_cols_array();
-    cs.motion_vector_scale = [1.0 / rw as f32, 1.0 / rh as f32, 1.0];
-    cs.camera_jitter = [jitter.0, jitter.1];
-    cs.camera_jitter_prev = [prev_jitter.0, prev_jitter.1];
-    cs.resource_size = [rw as u16, rh as u16];
-    cs.resource_size_prev = [prev_rw as u16, prev_rh as u16];
-    cs.rect_size = [rw as u16, rh as u16];
-    cs.rect_size_prev = [prev_rw as u16, prev_rh as u16];
-    cs.denoising_range = far * 0.999;
-    // (ms) — clamped into a sane band rather than trusted: a hitch, a
-    // debugger break, or a first frame can hand us 0 or seconds, and 0 is the
-    // sentinel that silently re-enables the internal timer this exists to
-    // replace. 1 ms .. 200 ms spans 1000 fps down to 5.
-    cs.time_delta_between_frames = if dt_ms.is_finite() { dt_ms.clamp(1.0, 200.0) } else { 16.667 };
-    cs.frame_index = frame_index;
-    cs.accumulation_mode = if reset { nrd::ACCUM_RESTART } else { nrd::ACCUM_CONTINUE };
-    if let Some(x) = nrd::common_tuning().split_screen {
-        cs.split_screen = x;
-    }
-    if nrd_debug_frame().is_some() {
-        cs.enable_validation = 1;
-    }
-    cs
-}
-
-/// The session's ReblurSettings: defaults + the ONE departure the 1-spp path
-/// demands (the hit-dist params stay at their {3, 0.1, 20} defaults, which is
-/// what keeps them in LOCKSTEP with nrd_bridge.hlsl's literals), then the
-/// `--nrd-*` tuning overrides (all-None flagless — bit-identical settings).
-pub fn reblur_settings() -> nrd::ReblurSettings {
-    let mut rs = nrd::ReblurSettings::default();
-    // Pixels whose reflection gate never fired carry hit-dist 0 ("no data")
-    // — reconstruction fills them from neighbors (required below ~1 rpp).
-    rs.hit_distance_reconstruction_mode = nrd::HITDIST_RECONSTRUCTION_AREA_3X3;
-    nrd::tuning().apply(&mut rs);
-    rs
+    shared_common_settings(
+        mats,
+        prev_mats,
+        jitter,
+        prev_jitter,
+        rw,
+        rh,
+        prev_rw,
+        prev_rh,
+        far,
+        dt_ms,
+        frame_index,
+        reset,
+        nrd_debug_frame().is_some(),
+    )
 }
 
 impl NrdGpu {
@@ -445,19 +387,15 @@ impl NrdGpu {
         // App planes: IN_MV, IN_NR, IN_VIEWZ, IN_DIFF, IN_SPEC, OUT_DIFF,
         // OUT_SPEC, OUT_VALIDATION (RGBA8 debug — cheap, always present so
         // FR_NRD_DEBUG needs no realloc).
-        let plane_fmts = [
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            DXGI_FORMAT_R10G10B10A2_UNORM,
-            DXGI_FORMAT_R32_FLOAT,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-        ];
-        let mut plane_idx = [0usize; 8];
-        for (k, &f) in plane_fmts.iter().enumerate() {
-            plane_idx[k] = push_tex(device, &mut regs, f, rw, rh)?;
+        // Formats and ORDER from `gfx::denoise::Plane`, so the one statement
+        // "IN_VIEWZ is single-channel f32" is made once, in NRD's own Format
+        // vocabulary, and each backend maps it through the table it already
+        // has. A hand-written array here was a second opinion about a contract
+        // `nrd_bridge.hlsl` shares with the Vulkan recorder.
+        let mut plane_idx = [0usize; Plane::COUNT];
+        for p in Plane::ALL {
+            plane_idx[p.index()] =
+                push_tex(device, &mut regs, dxgi_format(p.nrd_format())?, rw, rh)?;
         }
 
         // --- Staging heap (CPU-only): SRV + UAV per reg.
@@ -689,19 +627,20 @@ impl NrdGpu {
     }
 
     fn reg_for(&self, r: &nrd::ResourceDesc) -> Result<usize> {
-        Ok(match r.ty {
-            nrd::RES_PERMANENT_POOL => self.perm_base + r.index_in_pool as usize,
-            nrd::RES_TRANSIENT_POOL => self.trans_base + r.index_in_pool as usize,
-            nrd::RES_IN_MV => self.plane_idx[0],
-            nrd::RES_IN_NORMAL_ROUGHNESS => self.plane_idx[1],
-            nrd::RES_IN_VIEWZ => self.plane_idx[2],
-            nrd::RES_IN_DIFF_RADIANCE_HITDIST => self.plane_idx[3],
-            nrd::RES_IN_SPEC_RADIANCE_HITDIST => self.plane_idx[4],
-            nrd::RES_OUT_DIFF_RADIANCE_HITDIST => self.plane_idx[5],
-            nrd::RES_OUT_SPEC_RADIANCE_HITDIST => self.plane_idx[6],
-            nrd::RES_OUT_VALIDATION => self.plane_idx[7],
-            other => return Err(format!("nrd: unmapped ResourceType {other}")),
-        })
+        if r.ty == nrd::RES_PERMANENT_POOL {
+            return Ok(self.perm_base + r.index_in_pool as usize);
+        }
+        if r.ty == nrd::RES_TRANSIENT_POOL {
+            return Ok(self.trans_base + r.index_in_pool as usize);
+        }
+        // The app-plane half is the SHARED map (`gfx::denoise`), which is what
+        // makes the two recorders route by one table. Its injectivity is gated
+        // in `--check` and matters more than it looks: a duplicated
+        // ResourceType aliases two images HERE and produces a wrong picture,
+        // never an error.
+        Plane::from_resource_type(r.ty)
+            .map(|p| self.plane_idx[p.index()])
+            .ok_or_else(|| format!("nrd: unmapped ResourceType {}", r.ty))
     }
 
     /// Record one frame's NRD passes. `slot` picks the descriptor/CB ring
@@ -721,24 +660,7 @@ impl NrdGpu {
         self.nrd.set_reblur_settings(0, rs)?;
         // Snapshot: the returned slice borrows the instance and is overwritten
         // by the next call — and the loop below needs &self.
-        let dispatches: Vec<nrd::DispatchDesc> = {
-            let ds = self.nrd.compute_dispatches(&[0])?;
-            ds.iter()
-                .map(|d| nrd::DispatchDesc {
-                    name: d.name,
-                    identifier: d.identifier,
-                    resources: d.resources,
-                    resources_num: d.resources_num,
-                    constant_buffer_data: d.constant_buffer_data,
-                    constant_buffer_data_size: d.constant_buffer_data_size,
-                    constant_buffer_data_matches_previous_dispatch: d
-                        .constant_buffer_data_matches_previous_dispatch,
-                    pipeline_index: d.pipeline_index,
-                    grid_width: d.grid_width,
-                    grid_height: d.grid_height,
-                })
-                .collect()
-        };
+        let dispatches: Vec<nrd::DispatchDesc> = self.nrd.compute_dispatches(&[0])?.to_vec();
         if dispatches.len() > MAX_DISPATCHES {
             return Err(format!(
                 "nrd: {} dispatches > ring capacity {MAX_DISPATCHES}",

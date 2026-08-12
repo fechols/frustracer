@@ -12,10 +12,21 @@
 /// ShaderMake and MathLib as URL zips, and putting the network inside every
 /// `cargo build` is not a trade worth making.
 ///
-/// The artifact half is Windows-only today because the artifact itself is —
-/// a Linux build emits libNRD.so carrying SPIR-V, which is right for a Vulkan
-/// backend and unloadable by the D3D12 sessions this tree currently renders
-/// with. When the Vulkan backend lands, add its arm here beside the DLL.
+/// The artifact is per TARGET: `NRD.dll` carrying DXIL for D3D12, `libNRD.so`
+/// carrying SPIR-V for the Vulkan backend. Both arms are hard requirements —
+/// the Linux one since the installer learned to build it — and both are keyed
+/// on `CARGO_CFG_TARGET_OS`, never `cfg!(windows)`, which describes the HOST
+/// (the defect `build_ffx_fsr3` documents below; `require_nrd` had it too, and
+/// only accidentally: it made cross-compiling to Windows skip the DLL check).
+///
+/// BUT THE ARTIFACT HALF FIRES ONLY ON A NATIVE BUILD, and that is a statement
+/// rather than an escape. The panic exists to stop a SESSION rendering
+/// undenoised without saying so; `cargo check --target x86_64-pc-windows-msvc`
+/// — what `tools/win-cross-check.sh` runs on a Linux box to type-check the
+/// `#[cfg(windows)]` half of this tree — produces no session and cannot
+/// produce an `NRD.dll` either. Keying the artifact on the target WITHOUT this
+/// guard would turn today's accidental pass into a hard panic and take the one
+/// tool that covers the Windows half every commit. Cross-builds get a warning.
 fn require_nrd() {
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=SDKs/NRD-src/CMakeLists.txt");
@@ -26,18 +37,46 @@ fn require_nrd() {
              default denoiser and is required to build.\n"
         );
     }
-    #[cfg(windows)]
-    {
-        println!("cargo:rerun-if-changed=SDKs/NRD/bin/NRD.dll");
-        if !manifest.join("SDKs/NRD/bin/NRD.dll").exists() {
-            panic!(
-                "\n\nNRD.dll is missing: SDKs\\NRD\\bin\\NRD.dll has not been built.\n    \
-                 install-prerequisites.bat nrd\n\nNeeds CMake (3.22...3.30) + VS 2022 C++ \
-                 tools; NVIDIA ships no prebuilt binaries, so it compiles locally from the \
-                 submodule.\n"
-            );
-        }
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // `HOST`/`TARGET` are triples cargo always sets for a build script.
+    let native = std::env::var("HOST").ok() == std::env::var("TARGET").ok();
+    let (rel, installer, deps) = match target_os.as_str() {
+        "windows" => (
+            "SDKs/NRD/bin/NRD.dll",
+            "install-prerequisites.bat nrd",
+            "CMake (3.22...3.30) + VS 2022 C++ tools",
+        ),
+        "linux" => (
+            "SDKs/NRD/bin/libNRD.so",
+            "./install-prerequisites.sh nrd",
+            "CMake + a C++17 compiler",
+        ),
+        // macOS and anything else: no NRD consumer exists there (NRD emits
+        // DXBC/DXIL/SPIR-V and has no Metal output at all), so requiring an
+        // artifact nothing loads would be a gate with no subject.
+        _ => return,
+    };
+    println!("cargo:rerun-if-changed={rel}");
+    if manifest.join(rel).exists() {
+        return;
     }
+    if !native {
+        println!(
+            "cargo:warning={rel} is missing, and this is a cross-build ({} -> {}) — the \
+             artifact check stands down, so this checks types only and produces nothing \
+             runnable. Build it with `{installer}` on the target platform.",
+            std::env::var("HOST").unwrap_or_default(),
+            std::env::var("TARGET").unwrap_or_default(),
+        );
+        return;
+    }
+    panic!(
+        "\n\nThe NRD library is missing: {rel} has not been built.\n    {installer}\n\n\
+         Needs {deps}; NVIDIA ships no prebuilt binaries, so it compiles locally from the \
+         submodule. NRD is the default denoiser, so a tree that cannot produce it is a tree \
+         whose default session silently runs undenoised.\n"
+    );
 }
 
 /// The FidelityFX SDK 1.1.4 core — the backend-neutral half of FSR3 for the
@@ -171,6 +210,25 @@ fn build_ffx_fsr3() {
     }
     b.file(manifest.join("shim/ffx_fsr3.cpp"));
 
+    // THE METAL HALF IS DECIDED BEFORE THE COMPILE, because the shaders and the
+    // backend are two artifacts that are only useful TOGETHER. The transpile is
+    // independent of `cc` and could run anywhere, but a `ffx_metal` backend with
+    // no metallib table can do exactly one thing — fail at the first
+    // fpCreatePipeline — so compiling it without one would ship a linked,
+    // reachable, guaranteed-to-fail arm. Deciding both off one boolean is what
+    // makes `cfg(ffx_fsr3_metal)` mean "the Metal FSR3 arm is fully built"
+    // rather than "half of it is", which is the distinction the `ffx_fsr3_vk`
+    // repair was about.
+    //
+    // Gated on the TARGET, not the host — `cfg(not(windows))` above is a HOST
+    // test (the M0 link-flag fix records that trap). A Linux host
+    // cross-compiling to macOS still gets the metallibs; it will NOT get the
+    // .mm, since neither Metal.framework nor an ObjC++ runtime is there to
+    // build it against, and `generate_fsr3_metallibs` needs Xcode anyway — so
+    // that configuration lands on the same warn-and-skip degrade as a Mac
+    // without spirv-cross.
+    let want_metal = target_os == "macos" && generate_fsr3_metallibs(&shaders) > 0;
+
     if want_vk {
         // `ffx_vk.cpp`'s own sources include each other by bare name from this
         // directory, exactly as the neutral units do from theirs.
@@ -189,6 +247,16 @@ fn build_ffx_fsr3() {
         // Do not remove either flag without reproducing the segfault first.
         b.flag_if_supported("-fno-tree-slp-vectorize");
         b.flag_if_supported("-fno-tree-vectorize");
+    }
+
+    if want_metal {
+        // clang derives Objective-C++ from the `.mm` extension, and `cc` is
+        // already driving the C++ compiler here, so no `-x` and no extra
+        // standard flag are needed. ARC is OPT-IN (`-fobjc-arc`), which is why
+        // not passing it is what gives the manual reference counting the file's
+        // header depends on — every `alloc`/`new*` in there is a +1 some line
+        // must release.
+        b.file(manifest.join("shim/ffx_fsr3_metal.mm"));
     }
 
     b.compile("ffx_fsr3");
@@ -234,14 +302,25 @@ fn build_ffx_fsr3() {
 
     println!("cargo:rustc-cfg=ffx_fsr3_src");
 
-    // The Metal half. Gated on the TARGET, not the host — `cfg(not(windows))`
-    // above is a HOST test (the M0 link-flag fix records that trap), and a
-    // Linux host cross-compiling to macOS must still get the metallibs.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        let n = generate_fsr3_metallibs(&shaders);
-        if n > 0 {
-            println!("cargo:rustc-cfg=ffx_fsr3_metal");
-        }
+    if want_metal {
+        // The `ffx_metal` backend calls Metal DIRECTLY — unlike `ffx_vk`, which
+        // resolves most of its API through a caller-supplied
+        // vkGetDeviceProcAddr — so the frameworks are a link-time dependency
+        // with no dlopen equivalent. `src/mtl/` reaches Metal through `objc2`,
+        // which links the same frameworks, so this adds no NEW dependency to a
+        // macOS build; it is what the shim's own objects need.
+        //
+        // Scoped to `want_metal`, so a bare checkout (no SDK, no metallibs)
+        // still links nothing — the same policy `cargo:rustc-link-lib=vulkan`
+        // is scoped by above.
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rerun-if-changed=shim/ffx_fsr3_metal.mm");
+        println!("cargo:rerun-if-changed=shim/ffx_fsr3_metal.h");
+
+        // ONE CFG PER ARTIFACT — see `want_metal`'s declaration for why the
+        // metallib table and the backend are ONE artifact and not two.
+        println!("cargo:rustc-cfg=ffx_fsr3_metal");
     }
 }
 
@@ -387,7 +466,7 @@ fn generate_fsr3_metallibs(prebuilt: &std::path::Path) -> usize {
     let mut rs = String::with_capacity(256 + emitted.len() * 96);
     rs.push_str("// @generated by build.rs::generate_fsr3_metallibs — do not edit.\n");
     rs.push_str("// FidelityFX FSR3 SPIR-V permutations transpiled to Metal, keyed by\n");
-    rs.push_str("// FNV-1a-64 of the SPIR-V bytes. shim/ffx_metal.mm hashes\n");
+    rs.push_str("// FNV-1a-64 of the SPIR-V bytes. shim/ffx_fsr3_metal.mm hashes\n");
     rs.push_str("// FfxShaderBlob.data with the byte-identical hash to find its metallib.\n");
     rs.push_str("pub static FFX_FSR3_METALLIBS: &[(u64, &[u8])] = &[\n");
     for hash in &emitted {
@@ -460,7 +539,7 @@ fn extract_spirv_from_header(path: &std::path::Path) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 64-bit FNV-1a. `shim/ffx_metal.mm` implements the byte-identical hash — it is
+/// 64-bit FNV-1a. `shim/ffx_fsr3_metal.mm` implements the byte-identical hash — it is
 /// the ONLY thing the two sides agree on to find a permutation's metallib, so
 /// neither may be "cleaned up" without the other.
 #[cfg(not(windows))]
@@ -534,7 +613,7 @@ const SPIRV_CROSS_ARGS: &[&str] = &["--msl", "--msl-version", "30000", "--msl-de
 /// The half of the recipe that is not a flag list, and therefore has to be
 /// bumped BY HAND when either of the two rules it names changes:
 ///   - the 12-byte little-endian threadgroup prefix on each metallib, whose
-///     format `shim/ffx_metal.mm` strips back off;
+///     format `shim/ffx_fsr3_metal.mm` strips back off;
 ///   - the `binding - 1000` sampler remap in `remap_ffx_samplers`.
 /// Both change the emitted bytes while leaving every cache key identical, so
 /// without this the cache would serve pre-change output indefinitely.

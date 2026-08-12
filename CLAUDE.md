@@ -892,6 +892,12 @@ cargo run --release -- --check-fsr    # headless: FSR signal-split/encoding/MV/p
                                       # implementation is not merely unwritten but unexpressible.
                                       # v1.1.4 is the last MIT-source generation with a stock
                                       # first-party ffx_vk AND a seam. Windows keeps v2.3.0.
+                                      # THAT SEAM IS NOT THEORETICAL — it is what
+                                      # shim/ffx_fsr3_metal.mm fills with a hand-written
+                                      # `FfxInterface` against Metal, so macOS upscales through
+                                      # the same SDK with no Vulkan and no vendor backend at all
+                                      # (--check-fsr3). Keeping a generation that HAS the seam is
+                                      # what bought a third platform.
                                       # UNLIKE EVERY OTHER SDK HERE IT IS COMPILED FROM SOURCE and
                                       # statically linked — no DLL, no fn-pointer table, no
                                       # runtime shed; the degrade is at BUILD time
@@ -1663,12 +1669,46 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # the object-code-only grant is never engaged). build.rs's
                                       # require_nrd() hard-FAILS — not the DLSS block's
                                       # cargo:warning degrade — on a missing submodule (all
-                                      # platforms) or a missing SDKs\NRD\bin\NRD.dll (Windows;
-                                      # add the libNRD.so arm when the Vulkan backend lands, the
-                                      # SPIR-V artifact being right for it and unloadable by
-                                      # D3D12). Rationale: NRD is the DEFAULT denoiser, so a tree
-                                      # that cannot produce it is a tree whose default session
-                                      # silently runs undenoised. Consequences, all deliberate:
+                                      # platforms) or a missing ARTIFACT. Rationale: NRD is the
+                                      # DEFAULT denoiser, so a tree that cannot produce it is a
+                                      # tree whose default session silently runs undenoised.
+                                      # TWO ARTIFACTS SINCE 2026-08-11 (the Vulkan port's B4b-i),
+                                      # and the owed arm this comment used to promise is PAID:
+                                      # SDKs\NRD\bin\NRD.dll carrying DXIL for D3D12, and
+                                      # SDKs/NRD/bin/libNRD.so carrying SPIR-V for the Vulkan
+                                      # backend, both from the same submodule at the same tag with
+                                      # the same encoding pins — only the shader arm differs, and
+                                      # off WIN32 that is not even a choice (NRD's own
+                                      # cmake_dependent_option forces DXIL/DXBC OFF, and
+                                      # NRD_EMBEDS_SPIRV_SHADERS already defaults ON everywhere).
+                                      # `install-prerequisites.sh nrd` builds BOTH Linux arms
+                                      # (standard + perf) in ~18 s; the DLL half still is not
+                                      # producible off Windows and the blocker is dxil.dll, the
+                                      # Windows-only DXIL SIGNER, not CMake or MSVC.
+                                      # THE CHECK IS KEYED ON THE TARGET, NOT THE HOST — the
+                                      # `cfg!(windows)`-describes-the-HOST defect build_ffx_fsr3
+                                      # documents, which require_nrd had too and only
+                                      # accidentally: it made cross-compiling to Windows skip the
+                                      # DLL check. BUT THE ARTIFACT HALF FIRES ONLY ON A NATIVE
+                                      # BUILD (`HOST == TARGET`), and that is a statement rather
+                                      # than an escape: the panic exists to stop a SESSION
+                                      # rendering undenoised, and `cargo check --target
+                                      # x86_64-pc-windows-msvc` — what tools/win-cross-check.sh
+                                      # runs on a Linux box to type-check the cfg(windows) half of
+                                      # this tree — produces no session and cannot produce an
+                                      # NRD.dll either. Target-keying WITHOUT that guard turns
+                                      # today's accidental pass into a hard panic and takes the one
+                                      # tool covering the Windows half every commit; cross-builds
+                                      # get a cargo:warning naming the target's artifact and its
+                                      # installer (verified: the Linux->Windows cross-check prints
+                                      # the NRD.dll line and still exits 0). Consequence of the
+                                      # hard fail, accepted rather than discovered: a bare Linux
+                                      # clone must run the installer — network plus a CMake build —
+                                      # before `cargo build` works at all, CPU-tracer-only users
+                                      # included, so do_nrd's missing-cmake degrade is an
+                                      # UNCONDITIONAL fail (a named-only skip would leave a tree
+                                      # that no longer compiles; the two move together).
+                                      # Consequences, all deliberate:
                                       # .gitignore needs the `!/SDKs/NRD-src` negation (the
                                       # blanket /SDKs/* otherwise makes `git submodule add`
                                       # refuse — and NO trailing slash, which only matches an
@@ -2528,8 +2568,68 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # in FRD first, behind its own bit, with
                                       # NRD carrying it clear.
                                       # Gates: --check-nrd (N0
-                                      # DLL-free math twins + N1 instance/dispatch contract,
-                                      # absent-DLL = loud skip exit 0); --check-gpu N2
+                                      # DLL-free math twins + N1 instance/dispatch contract).
+                                      # N1 RUNS ON EVERY PLATFORM since 2026-08-11 (B4b-i) — it
+                                      # was Windows-only, printing a SKIP line here — and its
+                                      # absent/told split changed WITH that, on BOTH platforms:
+                                      # a MISSING artifact still SKIPs at exit 0 (an environment
+                                      # fact), but a PRESENT one the version/encoding gate REFUSES
+                                      # is now a FAIL. Until then any Nrd::new error SKIPped, so a
+                                      # library built without the cmake encoding pins — the exact
+                                      # drift that gate exists to catch — exited 0 having gated
+                                      # nothing, and the hole is far wider on Linux where the
+                                      # artifact is built locally by a script anyone can mis-flag
+                                      # (TOOTH FIRED: a -DNRD_NORMAL_ENCODING=0 build reads
+                                      # "encodings (normal 0, roughness 1) != pinned (2, 1)" and
+                                      # exits 1). MEASURED on Linux, and these are the numbers
+                                      # B4b-ii's recorder is designed against: 14 pipelines / 31
+                                      # dispatches / pool perm 13 trans 8 / cb-max 864 B /
+                                      # samplers 2 / entry point "main" / spaces resources 0,
+                                      # cb+samplers 1.
+                                      # N1'S NEW ASSERTIONS, all read from the library, no
+                                      # literals but the pins: (a) spirv_binding_offsets, PRINTED
+                                      # FIELD BY NAME and pinned at {sampler 0, texture 20,
+                                      # cbuffer 2, storage 3} — a field NOTHING in this tree had
+                                      # ever read, and a prerequisite INPUT to the Vulkan
+                                      # recorder's descriptor layout. UN-cfg'd deliberately:
+                                      # g_NrdLibraryDesc is constexpr and the offsets reach it as
+                                      # compile definitions regardless of which shader arm was
+                                      # embedded, so a Windows DLL reports the same four and the
+                                      # Windows gate thereby protects a value only Vulkan
+                                      # consumes. THE TRAP it pins: NRD's CMakeLists sets them as
+                                      # (S=0, B=2, U=3, T=20) plain set()s no -D can move, and
+                                      # Source/Wrapper.cpp REORDERS them into the struct as
+                                      # {sampler, texture, constantBuffer, storageTextureAndBuffer}
+                                      # — so a recorder reading the CMake order binds every
+                                      # resource at the wrong register (TOOTH FIRED: pinning
+                                      # 0/2/3/20 fails). Naming each field in the line is what
+                                      # makes that visible instead of four bare integers.
+                                      # (b) every pipeline carries THIS platform's blob, through
+                                      # ONE selector (PipelineDesc::shader) the recorder shares,
+                                      # plus its container MAGIC — non-null-and-nonzero passes on
+                                      # garbage. (c) THE DESCRIPTOR LAYOUT IS REALISABLE: the
+                                      # binding windows a recorder would build, computed from read
+                                      # values and required DISJOINT — measured samplers [0,2),
+                                      # cbuffer [2,3), uav [3,10), srv [20,38), which is what makes
+                                      # TREG=20 a hand-packed binding map rather than a magic
+                                      # number, and it is non-vacuous (it fires the moment a
+                                      # denoiser wants >17 storage images or >2 samplers; TOOTH
+                                      # FIRED by swapping one offset). (d) pool coherence against
+                                      # each pipeline's own resource_ranges. (e) the summed blob
+                                      # bytes — the FIRST thing that can tell the perf artifact
+                                      # from the standard one at gate time (LibraryDesc carries no
+                                      # perf bit, which is why the --nrd-perf pick must be loud):
+                                      # measured 523132 B standard vs 452988 B perf.
+                                      # THE FINDING, and the reason this gate precedes the recorder
+                                      # rather than shipping with it: 9 of 14 SPIR-V blobs sit at a
+                                      # NON-4-BYTE-ALIGNED address. That is legal — NRD packs them
+                                      # back to back and promises nothing — but vkCreateShaderModule
+                                      # takes *const u32, so B4b-ii must COPY each blob into a
+                                      # Vec<u32> and must never cast the pointer in place. Reported
+                                      # as a NOTE, not a failure; the half that IS a defect (a size
+                                      # that is not a whole number of words — SPIR-V is a word
+                                      # stream) fails, and reads 0.
+                                      # --check-gpu N2
                                       # (pack-vs-oracle, 0 bad px), N3 (passthrough byte-equal),
                                       # N4 (real ReBLUR: Laplacian −70%, energy +0.6%, temporal
                                       # 8× shrink, RESTART departs — N4 RESTORES frame B's
@@ -5856,8 +5956,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 47/78. Measured 7747408 B procedural
-                                      # vs 7748552 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 47/78. Measured 7797887 B procedural
+                                      # vs 7799031 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
                                       # keying reaches. (Refreshed 2026-08-11, TWICE in one day, and
                                       # the second time is the evidence for the caveat: the ABSOLUTE
@@ -7439,6 +7539,140 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # --sw-rays, llvmpipe, the glassware close-up above (for the
                                       # m_d arm, reading the log), --check-spirv, --check-fsr and
                                       # tools/win-cross-check.sh
+                                      # V15 — A REAL NRD ENGINE (B4b-ii, 2026-08-12): ReBLUR
+                                      # running between the bridge's two halves, i.e. the thing
+                                      # the seam exists for. `src/vk/nrd.rs` is `NrdGpu`'s twin
+                                      # and V15 is `--check-gpu`'s N4 transplanted with ZERO new
+                                      # tolerances — same nine-frame protocol, same six
+                                      # assertions, same thresholds — so the two backends'
+                                      # numbers are directly comparable rather than merely
+                                      # similar. MEASURED (RADV, 400x300 procedural): 14
+                                      # pipelines, 8 dispatches on the RESTART frame and 32 at
+                                      # peak (N1's 31 + one, and BOTH are reported because the
+                                      # gap is the reset latch visible in the dispatch list), 37
+                                      # pool sets, `differs 119241/120000`, **Laplacian 0.1089 ->
+                                      # 0.0236 (a 78% drop)**, mean 0.3378 -> 0.3356 (0.7%),
+                                      # temporal 0.00928 -> 0.00434, restart 0.00893.
+                                      # THE SHARED HALF MOVED FIRST: `gfx::denoise` now owns the
+                                      # plane vocabulary, `common_settings`, `reblur_settings` and
+                                      # `NOMINAL_DT_MS`, and BOTH recorders route through it —
+                                      # `nrd_gpu.rs`'s `reg_for` and its plane-format array are
+                                      # that map now, not a second opinion. The vocabulary existed
+                                      # because it was MISSING: `vk/tracer.rs` cited `P_*`
+                                      # constants in `nrd_gpu.rs` that never existed, so B4a had
+                                      # to re-invent the names and B4b-ii would have been the
+                                      # third naming of one thing. `denoise-vocab` in `--check`
+                                      # gates it on every platform (ALL in index order, the
+                                      # ResourceType map INJECTIVE and round-tripping, pool types
+                                      # resolving to no plane, unique names, the formats, the dt
+                                      # clamp band incl. NaN, the denoising-range lockstep with
+                                      # cs_nrd_out, and a 4x2 MV-scale test — square dimensions
+                                      # cannot tell {1/rw, 1/rh} from its transpose). So a LINUX
+                                      # box now gates the matrix convention and the UV motion-
+                                      # vector scale the WINDOWS recorder depends on.
+                                      # `DispatchDesc` gained Clone/Copy, which makes the snapshot
+                                      # both recorders must take ONE call and deletes D3D12's
+                                      # 14-line hand copy.
+                                      # FOUR DIFFERENCES FROM THE D3D12 TWIN, each API and not
+                                      # design: PER-PIPELINE set layouts from
+                                      # `PipelineDesc::resource_ranges` (D3D12 sizes one table to
+                                      # the per-set maxima and leaves the surplus slots stale —
+                                      # legal, and legal here only via
+                                      # `descriptorBindingPartiallyBound`; the exact counts make
+                                      # nothing stale by construction, at the price of set-1
+                                      # compatibility breaking per pipeline, so both sets bind per
+                                      # dispatch — one call); NO layout transitions and no state
+                                      # tracker (everything rests in GENERAL, so D3D12's
+                                      # NPSR<->UA bracketing has no counterpart and must not be
+                                      # invented, and one global memory barrier per dispatch
+                                      # replaces it — the narrowing A/B measured a WASH on D3D12);
+                                      # the CB is a DYNAMIC uniform buffer at a per-dispatch
+                                      # offset, persistently mapped (a plain host write is legal
+                                      # here where the ladder needed `vkCmdUpdateBuffer` and its
+                                      # easy-to-omit write-after-read edge, because NRD's whole
+                                      # dispatch list is known BEFORE any of it is recorded);
+                                      # and RING_FRAMES collapses to 1, so the descriptor pool is
+                                      # simply RESET per record() — A CONTRACT, not an
+                                      # observation, licensed by `VkHeadless::run` fencing every
+                                      # submit, and a future presenter with real frames in flight
+                                      # must ring the pool or keep the fence.
+                                      # THE MISSING FEATURE, found the way M3a found ray query —
+                                      # by the validation layer, not by reading anything: four of
+                                      # ReBLUR's fourteen kernels declare
+                                      # `ComputeDerivativeGroupQuadsKHR` +
+                                      # `SPV_KHR_compute_shader_derivatives`, and RADV accepted
+                                      # every module on a device created without them while the
+                                      # layer named it exactly. `VK_KHR_compute_shader_derivatives`
+                                      # joins the enabled-when-present list; V15 SKIPs on a device
+                                      # that lacks it rather than dispatching modules whose
+                                      # declared capability is unavailable. ITS NAME IS THE ONE
+                                      # HAND-DECLARED STRING in `vk/device.rs`, and that is a
+                                      # version gap rather than a choice: the KHR extension
+                                      # promoted the NV one in header 1.3.291 and `ash 0.38.0` —
+                                      # the latest release — is generated against 1.3.281. The
+                                      # FEATURE STRUCT still comes from ash, the spec making
+                                      # `...FeaturesNV` a literal alias (same fields, same sType
+                                      # 1000201000), which is why the layer names both as
+                                      # acceptable. Drop the literal when ash regenerates.
+                                      # TEETH, and the second one is why this stage has a seventh
+                                      # assertion: (1) the CMake-order binding trap — pinning
+                                      # `{0, 2, 3, 20}` instead of the struct's `{0, 20, 2, 3}` —
+                                      # fails with the layer naming the exact variables
+                                      # (`gIn_ViewZ` at binding 20, `REBLUR_ClassifyTilesConstants`
+                                      # at Set 1 Binding 2). (2) A PLANE SWAP — IN_SPEC routed to
+                                      # the IN_DIFF image, same format and same descriptor type,
+                                      # so validation is silent — PASSED ALL SIX: NRD still gets a
+                                      # plausible radiance signal, so it still denoises, still
+                                      # accumulates and still restarts, with the mean moved 6.6%
+                                      # and everything inside its band. N4's six are about whether
+                                      # the denoiser RAN, not about whether each plane is routed
+                                      # to the right image, and that gap is real on both backends.
+                                      # THE PLANE-ROUTING ARM closes it: zeroing IN_SPEC between
+                                      # the pack and the engine must move OUT_SPEC, because if the
+                                      # descriptor points elsewhere then nothing reads that image
+                                      # and the clear changes nothing (M3d's texture probe once
+                                      # more, GPU-vs-GPU one clear apart). Measured 544096/960000
+                                      # B moved clean and **0 B with the swap planted**.
+                                      # IT SCORES OUT_SPEC, NOT THE RECOMPOSED COLOUR, and that
+                                      # correction is the whole reason it works: the colour was
+                                      # the obvious readback and is CONFOUNDED, since
+                                      # `cs_nrd_out` reconstructs the residual as
+                                      # `R = base - D_in*kd*m_d - S_in*f0` and therefore reads
+                                      # IN_SPEC itself — measured, the swap moved 276 kB of colour
+                                      # and the gate stayed green. The control is TWO identical
+                                      # RESET frames, which must agree: they do bit-for-bit in the
+                                      # colour and NOT in OUT_SPEC (90 B of 960000), because
+                                      # ACCUM_RESTART resets accumulation while the permanent pool
+                                      # survives it and the recompose quantises the residue away
+                                      # at f16 — so the bar is that the effect DOMINATES the floor
+                                      # (~6000x), not that the floor is zero.
+                                      # ONE SCENE-DEPENDENT ARM, gated on `structural` like every
+                                      # other must-fire here: TEMPORAL SHRINK asserts accumulation
+                                      # is reducing frame-to-frame variance, which needs variance
+                                      # to reduce. MEASURED — san-miguel-low-poly reads 0.00195 ->
+                                      # 0.00199, FLAT, with `d_early` already BELOW the procedural
+                                      # scene's converged `d_late` of 0.00434: the input is at the
+                                      # floor by frame 1 and the residual is sampling noise. The
+                                      # Laplacian still drops 72% there and RESTART still departs
+                                      # by 1.7x, so what carries the accumulation claim on those
+                                      # scenes is RESTART — a reset frame departing from a
+                                      # converged one by MORE than the converged pair differ is
+                                      # only possible if there was a history to discard.
+                                      # NOT PORTED, both deliberate: `FR_NRD_DEBUG`'s
+                                      # OUT_VALIDATION dump (72 lines under a lever, and the
+                                      # readback ring it wants does not exist here — the PLANE is
+                                      # still allocated, since NRD names it in `reg_for` whether
+                                      # or not it writes it) and `FR_NRD_BARRIER=narrow` (an arm
+                                      # for a barrier scheme this file does not have).
+                                      # Touch `src/vk/nrd.rs` / `gfx::denoise` / `nrd_plane_handles`
+                                      # / `vk_format` / the compute-derivatives enable -> run
+                                      # --check (the `denoise-vocab` gate + goldens byte-identical
+                                      # — B4b-ii touches no shading path), cargo test, --check-vk
+                                      # on procedural + san-miguel-low-poly + rungholt, both
+                                      # FR_VK_RES parities, --sw-rays, llvmpipe (V15 SKIPs there
+                                      # if the device lacks the derivatives extension),
+                                      # --check-nrd, --check-spirv, --check-fsr and
+                                      # tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
@@ -7653,6 +7887,257 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # unaffected. unix-only today for the same reason vk/spirv.rs is —
                                       # nothing here forbids Vulkan on Windows, the Windows build simply
                                       # must not gain a dependency it does not yet use
+cargo run --release -- --check-fsr3   # FSR3 UPSCALING ON METAL, gated (macOS; src/mtl/ +
+                                      # shim/ffx_fsr3_metal.mm + build.rs's generate_fsr3_metallibs
+                                      # — the Metal port's B2, 2026-08-12). Headless and CPU-FED:
+                                      # the CPU tracer makes the G-buffer (dlss::GBufs, which runs
+                                      # on every platform), FSR 3.1 upscales it, and the result is
+                                      # SCORED. There is no Metal tracer, no presentation stage and
+                                      # no UpChain integration — an interactive macOS session is
+                                      # explicitly not what this gates. Wrong OS = exit 2 (an
+                                      # explicitly requested gate on a platform that cannot host it
+                                      # is an ENVIRONMENT error, the --check-vk-on-Windows
+                                      # convention); a missing toolchain on the RIGHT OS SKIPs.
+                                      # THE ASYMMETRY WITH --check-vk's V11 IS THE WHOLE COST, and
+                                      # it is why there is one gate per BACKEND rather than one
+                                      # flag with two arms: FidelityFX ships `ffx_vk` and
+                                      # `ffx_dx12` and NOTHING ELSE, so the Vulkan arm is a thin C
+                                      # ABI over a STOCK backend on a device that suite already
+                                      # opens, while this one must ALSO CARRY THE BACKEND — a
+                                      # complete `FfxInterface` (23 callbacks) against Metal,
+                                      # ~1300 lines of non-ARC Objective-C++ this tree owns with no
+                                      # upstream. That file is the single largest maintenance
+                                      # surface the Metal arm has and the one piece with no
+                                      # fallback.
+                                      # THE SHADER ROUTE, measured before any of it was written
+                                      # (M1, Apple M1 / macOS 26.5 / Xcode 26.6): all 160 committed
+                                      # SPIR-V blobs transpile with `spirv-cross --msl --msl-version
+                                      # 30000 --msl-decoration-binding`, and then **112 of 160
+                                      # FAILED `xcrun metal -c` with ONE error** — `'sampler'
+                                      # attribute parameter is out of bounds: must be between 0 and
+                                      # 15` — because the corpus's only sampler is FFX's
+                                      # `s_LinearClamp` at VK binding 1001. After the `binding -
+                                      # 1000` remap: 160/160 compile and package. The shader half
+                                      # was solved by that one substitution; everything else here
+                                      # is a port with a proven reference.
+                                      # EXACTLY 80 OF THE 200 COMMITTED FILES ARE TRANSPILED, and
+                                      # a plain subtraction gets it wrong because the two skipped
+                                      # sets OVERLAP: 40 are permutation INDEX headers (consumed by
+                                      # C++, not shader blobs) of which 20 are themselves wave64,
+                                      # leaving 160 blobs of which 80 are wave64. 200 - 40 - 80 =
+                                      # 80. Both fp32 and fp16 are kept — a pass picks at runtime.
+                                      # The per-PASS breakdown is a MEASURED table, not a product
+                                      # (accumulate alone is 24 of the 40 per precision): it lives
+                                      # at `mtl::fsr3::EXPECTED_PERMUTATIONS`, and if that number
+                                      # moves, RE-COUNT rather than multiply.
+                                      # FOUR CONTRACTS BIND build.rs AND THE SHIM, none of which
+                                      # either side can change alone — there is no other handshake
+                                      # between the transpiled table and the loader:
+                                      # (1) THE KEY IS FNV-1a-64 OF THE SPIR-V BYTES. build.rs
+                                      # hashes the blob it transpiles; `CreatePipelineMetal` hashes
+                                      # `FfxShaderBlob.data` — the same bytes, from the same
+                                      # `ffxGetPermutationBlobByIndex` accessor the Vulkan backend
+                                      # uses — and linear-scans for the match. SPIR-V is the
+                                      # interchange format and no Metal artifact is committed.
+                                      # (2) A 12-BYTE LE THREADGROUP HEADER precedes each metallib.
+                                      # Metal needs the workgroup size HOST-side at dispatch, where
+                                      # Vulkan and DXIL both reflect it out of the bytecode, so
+                                      # build.rs parses `OpExecutionMode LocalSize` and prepends
+                                      # (x,y,z); the shim strips the same 12 bytes back off.
+                                      # (3) THE SAMPLER REMAP IS `binding - 1000` ON BOTH SIDES —
+                                      # build.rs::remap_ffx_samplers rewrites `[[sampler(N)]]` for
+                                      # N >= 1000, and CreatePipelineMetal binds static sampler j
+                                      # at index j on the same assumption. Disagree and every
+                                      # sampler lands on the wrong slot.
+                                      # (4) `--msl-decoration-binding` MAKES THE METAL ARGUMENT
+                                      # INDEX EQUAL THE FFX/VK BINDING NUMBER, which is what lets
+                                      # the backend bind discretely (setTexture/setBuffer/setBytes
+                                      # at slotIndex) instead of building descriptor sets. Drop the
+                                      # flag and every binding silently renumbers.
+                                      # A FIFTH IS A PAIR RATHER THAN A CONTRACT: the caps hardcode
+                                      # in `GetDeviceCapabilitiesMetal` (SM 6.6, waveLaneCountMin =
+                                      # Max = 32, fp16Supported = true) and build.rs's WAVE64 SKIP.
+                                      # Apple GPUs are SIMD-32, so reporting a 32-lane wave is what
+                                      # makes FFX request exactly the set that was transpiled;
+                                      # widen the caps and FFX asks for a hash that was never
+                                      # emitted (and the wave64 blobs would mis-execute at width 32
+                                      # anyway), narrow the transpile and the same happens from the
+                                      # other side.
+                                      # THE FOUR VALIDATION-ONLY BUGS, carried verbatim from the
+                                      # reference rather than re-derived, and marked GOTCHA 1-4 in
+                                      # the .mm. EVERY ONE was found only under `MTL_DEBUG_LAYER=1
+                                      # MTL_SHADER_VALIDATION=1`, and each MASKS THE NEXT (the
+                                      # layer aborts on the first error per command buffer), so a
+                                      # green run without them proves considerably less than it
+                                      # looks: (1) constant buffers must be copied into a 16-BYTE-
+                                      # PADDED temp — spirv-cross rounds an MSL cbuffer struct up
+                                      # (cbFSR3Upscaler is 148 B, the MSL struct 160), and FFX's
+                                      # `data` pointer backs only the 148, so binding the larger
+                                      # length over-reads it (UB) while binding the smaller is
+                                      # REJECTED as too small; (2) R32_UINT textures must be
+                                      # BUFFER-BACKED — spirv-cross emulates image atomics with an
+                                      # aliased MTLBuffer bound at the SAME slot number in buffer
+                                      # space, addressed `alignedWidth*y + x`, so function constant
+                                      # 65535 (`spvLinearTextureAlignmentOverride`) must be set
+                                      # from `minimumLinearTextureAlignmentForPixelFormat:` on
+                                      # EVERY pipeline or the atomic argument is left unbound;
+                                      # (3) `FFX_GPU_JOB_CLEAR_FLOAT` is ILLEGAL on a buffer-backed
+                                      # texture (Metal forbids RenderTarget usage there), so those
+                                      # clear by blit-filling the backing buffer — exact, since FFX
+                                      # only ever zero-clears them and every byte of a 0.0f fill is
+                                      # zero (a nonzero request is now LOUD rather than silently
+                                      # serviced as zero); (4) shim-owned temporals must be created
+                                      # WITH RenderTarget usage, or the render-pass load-clear path
+                                      # aborts. TWO MORE that are not optional:
+                                      # `newFunctionWithName:constantValues:` ALWAYS (some
+                                      # permutations declare the optional spirv-cross function
+                                      # constant and Metal then REFUSES the plain variant), and the
+                                      # wide-char binding `name` is REQUIRED — FSR3's
+                                      # `patchResourceBindings()` resolves each slot by `wcscmp`
+                                      # and returns FFX_ERROR_INVALID_ARGUMENT without it, which
+                                      # nothing in the public headers says.
+                                      # THE STAGES. U0 the input trio's staging math (fsr::
+                                      # stage_self_test — the same pure functions --check-fsr runs
+                                      # on every platform and the D3D12 arm's record_upload uses,
+                                      # repeated here so the gate is self-contained); U1 the
+                                      # metallib table (count vs build.rs's ENUMERATED denominator,
+                                      # strictly-ascending unique hashes, the 12-byte header
+                                      # parsed back, `MTLB` magic — pure, no device, no SDK); U2 a
+                                      # real device plus a texture round-trip through the SHIPPING
+                                      # staging encoder, which is what keeps "the upscaler produced
+                                      # nothing" and "our texture plumbing never carried the bytes"
+                                      # separable; U3 the FSR3 CONTEXT, which is the stage carrying
+                                      # the whole risk — creation drives fpCreatePipeline across
+                                      # every pass, so a mis-keyed hash, a spirv-cross output Metal
+                                      # will not accept, or a caps/wave64 divergence fails THERE
+                                      # rather than at whichever later dispatch needed the missing
+                                      # permutation; U4 a real upscale of two real rendered frames,
+                                      # scored.
+                                      # THE COVERAGE LIMIT IS MEASURED AND IS NOT WHAT U1 PROVES.
+                                      # One context creation builds ELEVEN pipelines of the 80
+                                      # metallibs offered — one per FSR3 pass at the option word
+                                      # its flags select — and a sweep of all EIGHT context-flag
+                                      # combinations reaches only FOURTEEN distinct blobs, because
+                                      # most passes ignore most option bits and the 40 fp32
+                                      # variants are never requested at all (the caps report fp16).
+                                      # So U1 proves all 80 are well-formed metallibs and U3 proves
+                                      # eleven of them become pipeline states; NOTHING here proves
+                                      # the other 69 ever run. The count is returned through
+                                      # `out_pipelines` and floored at 10 rather than left implicit
+                                      # because "context created OK" and "the metallibs work" are
+                                      # different claims that no return code separates — a backend
+                                      # answering every fpCreatePipeline with an empty success
+                                      # would create a context and build nothing.
+                                      # U4 IS WRITTEN AROUND THE FACT THAT AN UPSCALER IS EASY TO
+                                      # GATE VACUOUSLY: a pass-through copy, a bilinear stretch and
+                                      # a working temporal reconstruction all produce a plausible,
+                                      # finite, correctly-sized image, so every assertion is paired
+                                      # with something it must be DIFFERENT from. Two real frames
+                                      # at 321x181 -> 642x362 with REAL Halton jitter (unlike
+                                      # `mv_check_at`/`fsr_frame_check`, which pin it to (0,0)
+                                      # because they reconstruct world positions — here jitter is a
+                                      # genuine FSR3 INPUT and pinning it would leave the one input
+                                      # this renderer feeds and the reference never did untested)
+                                      # and the same 0.02*diag dolly `fsr_frame_check` uses, so the
+                                      # motion vectors are the ones that gate already proves.
+                                      # Asserts: finite and non-negative; energy within [0.5, 2]x
+                                      # of the input (an upscaler RESAMPLES, it does not expose —
+                                      # a colour-space or exposure mistake moves this by orders of
+                                      # magnitude); a warmed history must DIFFER from a reset one
+                                      # (else FFX is not accumulating and every temporal claim is
+                                      # false); and THE ASSERTION THAT CARRIES THE STAGE — the
+                                      # output must differ measurably from a bilinear stretch of
+                                      # its own input, or nothing proves a reconstruction ran.
+                                      # MEASURED energy 1.000x, history 2.197e-2, vs-bilinear
+                                      # 2.962e-2 — and that last BOUND is deliberately SIX TIMES
+                                      # under its measurement (5e-3) rather than snug: the failure
+                                      # it rejects lands at ~0, so a low bound loses no
+                                      # discrimination while a snug one fails on any scene or pose
+                                      # that reconstructs less. Plus three PLUMBING probes, each
+                                      # re-running the sequence with exactly ONE input of frame B
+                                      # changed so a null result attributes to that input alone:
+                                      # jitter 2.592e-2, depth 1.218e-2, motion 3.503e-2.
+                                      # THE PROBES MUST BASELINE ON THE ACCUMULATING FRAME, and the
+                                      # first draft used the RESET one — which reported depth at
+                                      # EXACTLY 0.00e0 and read like a plumbing bug in the backend.
+                                      # It is not: a reset frame has no history, so the
+                                      # depth-derived disocclusion mask has nothing to reject and
+                                      # depth genuinely cannot change the output. A probe that
+                                      # cannot move its target fails whatever the code does — the
+                                      # mirror of one that cannot fail — and depth and motion
+                                      # vectors are BOTH in that class.
+                                      # DETERMINISM SPLITS IN TWO, AND THE OBVIOUS SINGLE BITWISE
+                                      # CLAIM IS WRONG in a way that took the measurement to see.
+                                      # Two fresh contexts, identical inputs: a RESET-ONLY frame is
+                                      # EXACTLY bit-identical every time (4/4, and with the output
+                                      # plane deliberately left uncleared, which also proves FSR3
+                                      # writes every output texel), while an ACCUMULATING frame
+                                      # differs in 100-2800 of 929616 channels, each by EXACTLY ONE
+                                      # f16 ULP, the count varying run to run. THAT IS NOT A DEFECT
+                                      # AND NOT GPU NON-DETERMINISM: FFX declares essentially every
+                                      # internal resource — the three shared temporals included —
+                                      # as FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED, and
+                                      # ffx_vk.cpp skips its init copy for exactly that type, so
+                                      # texels a reset frame never wrote hold per-allocation
+                                      # residue BY CONTRACT; a following frame reads them at an
+                                      # accumulation weight near zero, which is why the effect can
+                                      # only ever tip a rounding boundary. ZEROING THE TEMPORALS
+                                      # ANYWAY WAS TRIED AND MEASURED WORSE (median 388 -> 1050
+                                      # differing channels, 8 samples each) — no benefit, inside
+                                      # the same wide band, for three blocking blits per context
+                                      # creation — so the residue is not the whole story either; it
+                                      # is simply not ours to control. CORROBORATED FROM THE OTHER
+                                      # SIDE, which is what settles it: under
+                                      # MTL_SHADER_VALIDATION=1 the accumulating count drops to
+                                      # EXACTLY ZERO, because that layer zero-fills allocations —
+                                      # execution-order non-determinism would be untouched by it,
+                                      # per-allocation residue is removed by it entirely. So the
+                                      # VALIDATED run is also the STRICTEST run, a reason to prefer
+                                      # it beyond the four gotchas. The gate therefore makes the
+                                      # exact claim where it holds and bounds the other (<= 1%
+                                      # relative, <= 2% of channels), and both halves have teeth:
+                                      # garbage propagating at full magnitude fails the ULP bound,
+                                      # a genuine backend race (the image-atomic aliasing class)
+                                      # fails the exact one.
+                                      # THE BUILD IS CACHED AND THE CACHE IS KEYED ON THE RECIPE AS
+                                      # WELL AS THE INPUT. A metallib's file name is FNV-1a of its
+                                      # SPIR-V, so an existing one is current with respect to its
+                                      # INPUT by construction — but not to spirv-cross's version
+                                      # (whose MSL emission a Homebrew bump changes while every key
+                                      # stays identical) nor to our own recipe, so both ride a
+                                      # `.toolstamp` and a change wipes the directory. SPIRV_CROSS_
+                                      # ARGS is on it verbatim; `RECIPE` is the hand-bumped half
+                                      # covering the two rules that alter the bytes without
+                                      # altering a key (the 12-byte header format, the -1000
+                                      # sampler remap). Without the cache every build re-runs 240
+                                      # subprocesses (~55 s). `SPIRV_CROSS` overrides the binary.
+                                      # ONE CFG PER ARTIFACT: `ffx_fsr3_metal` means the metallib
+                                      # table AND the backend built, decided off ONE boolean in
+                                      # build.rs, because a `ffx_metal` backend with no table can
+                                      # do exactly one thing — fail at the first fpCreatePipeline —
+                                      # so compiling it without one would ship a linked, reachable,
+                                      # guaranteed-to-fail arm (the distinction the `ffx_fsr3_vk`
+                                      # repair was about). Gated on the TARGET, not the host.
+                                      # Missing SDK source, missing committed SPIR-V, or absent
+                                      # spirv-cross/Xcode each degrade to a warn-and-skip with the
+                                      # build printing which half was absent, and U1 then SKIPs by
+                                      # name — "it did not build" is the expected state on a fresh
+                                      # clone and must not read as a defect.
+                                      # Deps: objc2 / objc2-metal / objc2-foundation (macOS only);
+                                      # Metal and Foundation are LINKED (unlike `src/vk/`'s dlopen
+                                      # policy — the backend calls Metal directly, and there is no
+                                      # dlopen equivalent), scoped to want_metal so a bare checkout
+                                      # still links nothing.
+                                      # Touch shim/ffx_fsr3_metal.{mm,h} / src/mtl/ / build.rs's
+                                      # generate_fsr3_metallibs or transpile_ffx_metallib -> run
+                                      # --check-fsr3, then AGAIN under `MTL_DEBUG_LAYER=1
+                                      # MTL_SHADER_VALIDATION=1` (the four gotchas are invisible
+                                      # otherwise, and the gate says so on an unvalidated run),
+                                      # then --check-fsr (the shared staging math), --check,
+                                      # cargo test, and FR_FSR3_DUMP=1 for the half no magnitude
+                                      # can score — a mirrored jitter or MV sign reads as doubled
+                                      # wobble or a directional smear, and both move the numbers
+                                      # by about as much as being right does
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)
 cargo run --release -- --prefer-intel # pick that vendor's adapter for the D3D12 device (also
                                       # --prefer-nvidia / --prefer-amd; default NVIDIA, or AMD under

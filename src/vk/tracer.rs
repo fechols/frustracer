@@ -1408,6 +1408,23 @@ impl VkTracer {
         out
     }
 
+    /// The bridge's planes as `(image, view)` in `Plane::ALL` order, MINUS
+    /// `OutValidation` — which the bridge has no use for and does not allocate.
+    ///
+    /// This is how a real engine gets registered against the SAME images the
+    /// bridge writes and reads, rather than a second set that would then need
+    /// copying at both ends. `vk::nrd::VkNrd::new` is the one caller and it
+    /// checks the length, so a plane appended to `N_*` without being handed
+    /// over is an error at construction rather than a silently short list.
+    ///
+    /// `None` when the tracer was built without `TracerOpts::nrd` — the same
+    /// shape `wire_nrd` and `record_nrd_*` take, so an unarmed tracer cannot be
+    /// handed to an engine by accident.
+    pub fn nrd_plane_handles(&self) -> Option<Vec<(vk::Image, vk::ImageView)>> {
+        let n = self.nrd.as_ref()?;
+        Some(n.planes.iter().map(|p| (p.img, p.view)).collect())
+    }
+
     /// Bring the bridge's planes into `GENERAL`, once. See `Nrd::laid_out` for
     /// why exactly once and not per dispatch.
     unsafe fn nrd_lay_out(&self, d: &ash::Device, cmd: vk::CommandBuffer, n: &Nrd) {
@@ -2390,8 +2407,15 @@ fn create_image_fmt(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
+        // SAMPLED rides along with STORAGE for the NRD planes: a real engine
+        // between `cs_nrd_pack` and `cs_nrd_out` binds the SAME image as a UAV
+        // in the pass that writes it and an SRV in the pass that reads it, so
+        // both usages are genuinely used. Unconditional rather than per-plane
+        // for the reason TRANSFER_SRC already is — a usage bit added only under
+        // one caller makes that caller's resource set a special one.
         .usage(
             vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST,
         )

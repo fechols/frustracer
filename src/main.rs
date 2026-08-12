@@ -574,14 +574,22 @@ fn main() {
     // LibraryDesc carries no perf bit, which is why the pick must be loud —
     // the version gate cannot tell the two DLLs apart after the fact.
     if opts.nrd_perf {
-        let perf_dir = format!("{}\\perf", opts.nrd_path);
-        if std::path::Path::new(&format!("{perf_dir}\\NRD.dll")).exists() {
-            eprintln!("nrd: performance-mode DLL selected ({perf_dir})");
-            opts.nrd_path = perf_dir;
+        // Ungated by platform, and correct on both since the Linux installer
+        // arm landed: `nrd::LIB_FILE` names the artifact and `Path::join` the
+        // separator, so this resolves a real `perf/libNRD.so` here exactly as
+        // it resolves `perf\NRD.dll` there. Gating it off on Linux would be
+        // the silent degrade the conventions forbid — the lever is real the
+        // moment the installer stages the second arm.
+        let perf_dir = std::path::Path::new(&opts.nrd_path).join("perf");
+        if perf_dir.join(nrd::LIB_FILE).exists() {
+            eprintln!("nrd: performance-mode library selected ({})", perf_dir.display());
+            opts.nrd_path = perf_dir.to_string_lossy().into_owned();
         } else {
             eprintln!(
-                "nrd: --nrd-perf requested but {perf_dir}\\NRD.dll not found — using the \
-                 standard DLL (run install-prerequisites.bat nrd to build both)"
+                "nrd: --nrd-perf requested but {} not found — using the standard library \
+                 (run `{}` to build both)",
+                perf_dir.join(nrd::LIB_FILE).display(),
+                nrd::INSTALLER
             );
         }
     }
@@ -1258,7 +1266,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7);
+            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7, &opts.nrd_path);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -14202,6 +14210,7 @@ fn run_check_vk(
     cam0: Camera,
     structural: bool,
     bc7_mode: bc7::Bc7Mode,
+    nrd_path: &str,
 ) -> i32 {
     let mut ok = true;
 
@@ -14315,7 +14324,7 @@ fn run_check_vk(
     }
 
     // ---- V6: the reference kernel rendering, scored against the CPU. ----
-    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode) {
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode, nrd_path) {
         ok = false;
     }
 
@@ -15168,6 +15177,7 @@ fn run_check_vk_layout(
 /// Small on purpose (`VK_RENDER_W` x `VK_RENDER_H`): the cost here is the CPU
 /// reference, not the GPU, and this stage exists to be run on every commit.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_check_vk_render(
     hg: &vk::headless::VkHeadless,
     sp: &vk::spirv::Spirv,
@@ -15176,6 +15186,7 @@ fn run_check_vk_render(
     cam0: Camera,
     structural: bool,
     bc7_mode: bc7::Bc7Mode,
+    nrd_path: &str,
 ) -> bool {
     // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
     // frame its D3D12 twin does, so the two suites' quadtree structures are
@@ -15785,7 +15796,7 @@ fn run_check_vk_render(
     }
 
     // ---- V13: the GPU-fed feed, and FSR3 consuming it ----
-    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural) {
+    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural, nrd_path) {
         ok = false;
     }
 
@@ -16041,6 +16052,7 @@ fn run_check_vk_gbuf(
 /// and with B2's now-portable `unpack_gbuf_bytes` supplying the oracle.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_check_vk_feed(
     hg: &vk::headless::VkHeadless,
     sp: &vk::spirv::Spirv,
@@ -16050,6 +16062,7 @@ fn run_check_vk_feed(
     vt: &vk::textures::VkTextures,
     cam0: Camera,
     structural: bool,
+    nrd_path: &str,
 ) -> bool {
     if !vk::fsr3::built() {
         println!(
@@ -16315,9 +16328,383 @@ fn run_check_vk_feed(
             run_check_vk_bridge(hg, &tg, &fed, scene, &basis, q, rw, rh, near, far, structural);
     }
 
+    // ---- V15: a REAL NRD engine between the bridge's two halves. ----
+    // Runs last and on the same tracer, because it is the only stage that
+    // leaves the planes carrying denoised history rather than the frame the
+    // gates above scored.
+    if ok && !run_check_vk_nrd(hg, &tg, &fed, scene, &basis, cam0, q, rw, rh, near, far, nrd_path, structural) {
+        ok = false;
+    }
+
     fed.destroy(hg);
     cpu.destroy(hg);
     tg.destroy(hg);
+    ok
+}
+
+/// V15 — A REAL NRD ENGINE, running ReBLUR between the bridge's two halves.
+///
+/// V14 proved the seam with a passthrough; this is the thing the seam exists
+/// for. It is `--check-gpu`'s N4 transplanted with ZERO new tolerances: the
+/// same nine-frame protocol, the same six assertions, the same thresholds — so
+/// what the two backends report is directly comparable rather than merely
+/// similar, which is the property every stage in this suite has been built for.
+///
+/// THE SIX, and each is a strict inequality rather than a bar to tune:
+///   * FINITE — a denoiser that divides by an accumulated zero says so here.
+///   * DIFFERS — against the undenoised recompose. A denoiser that never ran
+///     leaves the passthrough answer, which is a perfectly plausible image.
+///   * LAPLACIAN DROPS — the definition of denoising, as a number.
+///   * MEAN within 25% — it may smooth the frame and may not re-expose it.
+///   * TEMPORAL DELTAS SHRINK — frame-to-frame |d| late < early, i.e. the
+///     history is ACCUMULATING and not merely spatially filtering.
+///   * RESTART DEPARTS — a reset frame must differ from its predecessor by
+///     MORE than the converged pair does, which is the only thing that proves
+///     `AccumulationMode` reached the library at all.
+///
+/// The undenoised reference is the bridge's own passthrough, re-run here: same
+/// tracer, same pose, same pack, one substitution in the middle. So `differs`
+/// and `lap` compare two images that agree in everything except the engine —
+/// the V13 shape (two routes, one renderer) applied one stage up.
+///
+/// SKIPS on an absent library, exit 0, naming the installer — the absent/told
+/// split, and the same rule `--check-nrd`'s N1 follows. A library that is
+/// PRESENT and refuses is a FAIL there and a FAIL here.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_nrd(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    fed: &vk::fsr3::Fsr3,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    near: f32,
+    far: f32,
+    nrd_path: &str,
+    structural: bool,
+) -> bool {
+    let lib = std::path::Path::new(nrd_path).join(nrd::LIB_FILE);
+    if !lib.exists() {
+        println!(
+            "check-vk: SKIP V15 ({} not found); run `{}`",
+            lib.display(),
+            nrd::INSTALLER
+        );
+        return true;
+    }
+    let Some(planes) = tg.nrd_plane_handles() else {
+        eprintln!("check-vk: FAIL V15 the tracer carries no bridge planes");
+        return false;
+    };
+    let mut eng = match vk::nrd::VkNrd::new(hg, nrd_path, rw as u32, rh as u32, &planes) {
+        Ok(e) => e,
+        Err(e) => {
+            // PRESENT and refused. Never a skip — that is the hole B4b-i closed
+            // in N1, and it would be a wider one here, where the library is
+            // built locally by a script anyone can mis-flag.
+            eprintln!("check-vk: FAIL V15 {e}");
+            return false;
+        }
+    };
+
+    let npx = rw * rh;
+    let mut ok = true;
+    // One frame of the pipeline, with `mid` recording whatever sits between the
+    // bridge's halves. Everything else — the pose, the jitter sequence, the
+    // quality, the pack — is identical across the two arms by construction,
+    // which is what makes `differs` attributable to the engine alone.
+    let frame = |f: u32,
+                 mid: &mut dyn FnMut(&ash::Device, ash::vk::CommandBuffer) -> Result<(), String>|
+     -> Result<Vec<u8>, String> {
+        let jit = dlss::jitter_for(f);
+        let p = gfx::frame::FrameParams {
+            cam: *basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(jit),
+            prev_cam: Some(*basis),
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        tg.render_wavefront(hg, &p, true)?;
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        hg.run(|d, cmd| unsafe {
+            r1 = tg.record_nrd_pack(d, cmd);
+            r2 = mid(d, cmd);
+            r3 = tg.record_nrd_out(d, cmd);
+        })?;
+        r1?;
+        r2?;
+        r3?;
+        fed.read_input(hg, 0)
+    };
+
+    // Luma off the RGBA16F colour plane — N4's own weights, so the two suites'
+    // Laplacian and mean figures are on one scale.
+    let lum = |b: &[u8], i: usize| -> f32 {
+        let h = |k: usize| {
+            vk::tracer::half_from_bits(u16::from_le_bytes(
+                b[i * 8 + k * 2..][..2].try_into().unwrap(),
+            ))
+        };
+        0.2126 * h(0) + 0.7152 * h(1) + 0.0722 * h(2)
+    };
+
+    let run = (|| -> Result<(), String> {
+        // The UNDENOISED arm first: the bridge's passthrough, which V14 proved
+        // reproduces the feed's colour byte for byte. Taken at frame 0 so it is
+        // the same content the engine's own frame 0 sees.
+        let base = frame(0, &mut |d, cmd| unsafe { tg.record_nrd_passthrough(d, cmd) })?;
+
+        // Nine engine frames: 0..7 accumulate, 8 RESTARTS. `prev_size` is read
+        // back from the engine rather than assumed, which is the field's only
+        // consumer and therefore the only thing that would notice it going
+        // stale.
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(9);
+        let rs = gfx::denoise::reblur_settings();
+        for f in 0u32..9 {
+            let reset = f == 0 || f == 8;
+            let (pw, phh) = eng.prev_size();
+            let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+            let cs = gfx::denoise::common_settings(
+                &mats,
+                &mats,
+                dlss::jitter_for(f),
+                dlss::jitter_for(f.saturating_sub(1)),
+                rw as u32,
+                rh as u32,
+                pw,
+                phh,
+                far,
+                gfx::denoise::NOMINAL_DT_MS,
+                f,
+                reset,
+                false,
+            );
+            let mut err = Ok(());
+            let img = frame(f, &mut |d, cmd| {
+                err = eng.record(d, cmd, &cs, &rs);
+                // A failure here must not be swallowed by the closure's own
+                // Ok: `record` can fail before recording anything, and the
+                // command buffer would then run pack -> out with no engine,
+                // i.e. the passthrough, which passes `differs` against a
+                // DIFFERENT reference and looks like a working denoiser.
+                err.clone()
+            })?;
+            err?;
+            frames.push(img);
+        }
+
+        let mut finite = true;
+        let mut differs = 0usize;
+        let (mut mean_out, mut mean_in) = (0f64, 0f64);
+        let (mut lap_out, mut lap_in) = (0f64, 0f64);
+        for i in 0..npx {
+            let lo = lum(&frames[7], i);
+            let li = lum(&base, i);
+            if !lo.is_finite() {
+                finite = false;
+            }
+            if (lo - li).abs() > 1e-4 {
+                differs += 1;
+            }
+            mean_out += lo as f64;
+            mean_in += li as f64;
+            let (x, y) = (i % rw, i / rw);
+            if x > 0 && x + 1 < rw && y > 0 && y + 1 < rh {
+                let l4 = |f: &dyn Fn(usize) -> f32| {
+                    (4.0 * f(i) - f(i - 1) - f(i + 1) - f(i - rw) - f(i + rw)).abs() as f64
+                };
+                let fo = |j: usize| lum(&frames[7], j);
+                let fi = |j: usize| lum(&base, j);
+                lap_out += l4(&fo);
+                lap_in += l4(&fi);
+            }
+        }
+        let delta = |a: &[u8], b: &[u8]| -> f64 {
+            (0..npx).map(|i| (lum(a, i) - lum(b, i)).abs() as f64).sum::<f64>() / npx as f64
+        };
+        let d_early = delta(&frames[1], &frames[0]);
+        let d_late = delta(&frames[7], &frames[6]);
+        let d_restart = delta(&frames[8], &frames[7]);
+        println!(
+            "check-vk: V15 nrd ReBLUR ({rw}x{rh}, {} pipelines, {} dispatches (max {}), {} pool sets) — \
+             differs {differs}/{npx} | lap {:.4} -> {:.4} | mean {:.4} -> {:.4} | \
+             temporal {:.5} -> {:.5} | restart {:.5}",
+            eng.pipeline_count(),
+            eng.dispatch_count,
+            eng.dispatch_max,
+            eng.pool_sets,
+            lap_in / npx as f64,
+            lap_out / npx as f64,
+            mean_in / npx as f64,
+            mean_out / npx as f64,
+            d_early,
+            d_late,
+            d_restart,
+        );
+
+        let mut bad = Vec::new();
+        if !finite {
+            bad.push("non-finite");
+        }
+        if differs == 0 {
+            bad.push("output == the undenoised recompose (vacuous)");
+        }
+        if lap_out >= lap_in {
+            bad.push("Laplacian did not drop");
+        }
+        if (mean_out - mean_in).abs() > 0.25 * mean_in.max(1e-6) {
+            bad.push("mean drifted > 25%");
+        }
+        // TEMPORAL SHRINK IS THE ONE SCENE-DEPENDENT ARM, and it is gated on
+        // `structural` for the reason every other must-fire in this suite is:
+        // it asserts that ACCUMULATION is reducing frame-to-frame variance,
+        // which needs variance to reduce. MEASURED — san-miguel-low-poly at
+        // this pose reads 0.00195 -> 0.00199, i.e. FLAT, with `d_early` already
+        // BELOW the procedural scene's converged `d_late` of 0.00434: the input
+        // is at the floor by frame 1 and the residual is sampling noise that
+        // can go either way. The Laplacian still drops 72% there and RESTART
+        // still departs by 1.7x, so the denoiser is plainly working; the metric
+        // has simply run out of signal.
+        //
+        // What carries the accumulation claim on those scenes is RESTART: a
+        // reset frame departing from a converged one BY MORE than the converged
+        // pair differ is only possible if there was a history to throw away.
+        if structural && d_late >= d_early {
+            bad.push("temporal deltas not shrinking");
+        }
+        if d_restart <= d_late {
+            bad.push("RESTART did not depart (reset latch dead?)");
+        }
+        if !bad.is_empty() {
+            return Err(format!("nrd: {}", bad.join(", ")));
+        }
+
+        // ---- THE PLANE-ROUTING ARM, and it exists because a planted tooth
+        // proved the six above cannot see a plane swap. Routing IN_SPEC to the
+        // IN_DIFF image — same format, same descriptor type, so validation is
+        // silent — still leaves NRD a plausible radiance signal, so it still
+        // denoises, still accumulates and still restarts: measured, the whole
+        // six passed with the mean moved 6.6%, well inside the 25% band.
+        //
+        // What a swap CANNOT survive is a dependency test. If IN_SPEC is routed
+        // anywhere else then nothing reads the real IN_SPEC image, so ZEROING it
+        // between the pack and the engine changes the output by exactly nothing.
+        // This is M3d's texture probe once more — GPU-vs-GPU, one clear apart —
+        // and it is what makes V15 a statement about wiring as well as about
+        // behaviour.
+        //
+        // Both arms are RESET frames so the comparison is a function of the
+        // inputs rather than of whatever history the nine above accumulated, and
+        // the control is run TWICE first: two identical reset frames must agree
+        // BIT for bit, which both licenses the comparison and is a determinism
+        // assertion in its own right.
+        let spec_img = planes[gfx::denoise::Plane::InSpecRadianceHitDist.index()].0;
+        let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+        let cs_probe = gfx::denoise::common_settings(
+            &mats,
+            &mats,
+            dlss::jitter_for(9),
+            dlss::jitter_for(8),
+            rw as u32,
+            rh as u32,
+            rw as u32,
+            rh as u32,
+            far,
+            gfx::denoise::NOMINAL_DT_MS,
+            9,
+            true,
+            false,
+        );
+        // IT SCORES OUT_SPEC, NOT THE RECOMPOSED COLOUR, and that correction is
+        // the whole reason this arm works. The colour was the obvious readback
+        // and it is CONFOUNDED: `cs_nrd_out` reconstructs the residual as
+        // `R = base − D_in·kd·m_d − S_in·f0`, so it reads IN_SPEC itself and
+        // zeroing that plane moves the colour by ~276 kB whatever the engine
+        // did — measured, with the swap planted and the gate still green. The
+        // engine's OWN output plane has exactly one upstream path.
+        let mut engine = |zero_spec: bool| -> Result<Vec<u8>, String> {
+            let mut err = Ok(());
+            let _ = frame(9, &mut |d, cmd| {
+                if zero_spec {
+                    unsafe {
+                        d.cmd_clear_color_image(
+                            cmd,
+                            spec_img,
+                            ash::vk::ImageLayout::GENERAL,
+                            &ash::vk::ClearColorValue { float32: [0.0; 4] },
+                            &[ash::vk::ImageSubresourceRange::default()
+                                .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1)],
+                        );
+                        // The clear is a TRANSFER write and the engine reads it
+                        // as a shader resource — without this the two are
+                        // unordered and the probe would be a race, not a test.
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                            ash::vk::DependencyFlags::empty(),
+                            &[ash::vk::MemoryBarrier::default()
+                                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)],
+                            &[],
+                            &[],
+                        );
+                    }
+                }
+                err = eng.record(d, cmd, &cs_probe, &rs);
+                err.clone()
+            })?;
+            err?;
+            tg.read_nrd_plane(hg, gfx::denoise::Plane::OutSpecRadianceHitDist.index())
+        };
+        let ctl_a = engine(false)?;
+        let ctl_b = engine(false)?;
+        let zeroed = engine(true)?;
+        let ctl_drift = ctl_a.iter().zip(ctl_b.iter()).filter(|(x, y)| x != y).count();
+        let moved = ctl_b.iter().zip(zeroed.iter()).filter(|(x, y)| x != y).count();
+        println!(
+            "check-vk: V15   in_spec dependency: control drift {ctl_drift} B | \
+             zeroing moved {moved}/{} B of OUT_SPEC",
+            ctl_b.len()
+        );
+        // The control BOUNDS the noise rather than assuming it away, and that
+        // is a measurement rather than a hedge: two identical RESET frames come
+        // back bit-identical in the recomposed COLOUR and NOT in OUT_SPEC —
+        // 90 B of 960000 here — because `ACCUM_RESTART` resets accumulation
+        // while NRD's permanent pool survives it, and the recompose quantises
+        // that residue away at f16. So the claim is that the effect DOMINATES
+        // the floor, which it does by ~6000x, not that the floor is zero.
+        let floor = ctl_drift.max(1) * 20;
+        if moved < floor || moved * 100 < ctl_b.len() {
+            return Err(format!(
+                "nrd: zeroing IN_SPEC moved {moved} B of OUT_SPEC — under the {floor} B \
+                 attributability floor or under 1% of the plane, i.e. the engine is not \
+                 reading that plane and its descriptor points somewhere else"
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V15 {e}");
+        ok = false;
+    }
+    eng.destroy(hg);
     ok
 }
 
@@ -16436,9 +16823,16 @@ fn run_check_vk_bridge(
         // The three IN planes are read back off the tracer's OWN images, which
         // exist whether or not a descriptor points at them — which is exactly
         // what makes an unwired bridge show up here as an untouched plane.
-        for (idx, name) in
-            [(3usize, "in_diff"), (4, "in_spec"), (2, "in_viewz")]
-        {
+        // Named and indexed off the SHARED vocabulary rather than a literal
+        // pair, so a reordering of `Plane::ALL` cannot leave this report
+        // labelling one plane with another's name — which would be a wrong
+        // DIAGNOSIS, the failure mode this suite's own history keeps producing.
+        for p in [
+            gfx::denoise::Plane::InDiffRadianceHitDist,
+            gfx::denoise::Plane::InSpecRadianceHitDist,
+            gfx::denoise::Plane::InViewZ,
+        ] {
+            let (idx, name) = (p.index(), p.name());
             let px = tg.read_nrd_plane(hg, idx)?;
             let nz = px.iter().filter(|b| **b != 0).count();
             eprintln!(
@@ -17810,9 +18204,6 @@ fn run_check_vk_replay(
 }
 
 fn run_check_nrd(opts: &Opts) -> i32 {
-    // Only N1 reads it (the DLL path); N0 below is pure.
-    #[cfg(not(windows))]
-    let _ = opts;
     let mut ok = true;
 
     // N0 — DLL-free math twins.
@@ -17832,20 +18223,29 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         println!("check-nrd: N9-CPU remodulation identity OK");
     }
 
-    // N1 — the DLL contract. Windows-only for now, and SAID rather than
-    // silently skipped: NRD's D3D12 artifact is `NRD.dll` with DXIL
-    // embedded, which has no Linux equivalent (the portable NRD build
-    // carries SPIRV — see `SpirvBindingOffsets` in nrd.rs — and is a
-    // Vulkan-backend concern). N0 above is the DLL-free half and runs on
-    // every platform, so the packing math is still gated here.
-    #[cfg(not(windows))]
-    println!(
-        "check-nrd: SKIP N1 (the NRD.dll instance/dispatch contract is \
-         D3D12-only; N0's math twins ran)"
-    );
-
-    #[cfg(windows)]
+    // N1 — the library contract, on every platform since the Linux installer
+    // arm landed. Windows loads `NRD.dll` with DXIL embedded, Linux
+    // `libNRD.so` with SPIR-V; the seven entry points, the structs and the
+    // version gate are identical, so this block is platform-free and the two
+    // places that are not (`nrd::LIB_FILE`, `PipelineDesc::shader`) carry the
+    // difference.
     {
+        // THE ABSENT/TOLD SPLIT, and it is a behaviour change on Windows too.
+        // Until now ANY `Nrd::new` error SKIPped, so a library built without
+        // the encoding pins — the exact drift the gate inside `Nrd::new`
+        // exists to catch — exited 0 having gated nothing. Absent is an
+        // environment fact and still SKIPs; present-but-REFUSED is a FAIL.
+        // One rule, both platforms — and the hole would be much wider here,
+        // where the artifact is built locally by a script anyone can mis-flag.
+        let lib_path = std::path::Path::new(&opts.nrd_path).join(nrd::LIB_FILE);
+        if !lib_path.exists() {
+            println!(
+                "check-nrd: SKIP N1 ({} not found); run `{}`",
+                lib_path.display(),
+                nrd::INSTALLER
+            );
+            return if ok { 0 } else { 1 };
+        }
         let denoisers = [nrd::DenoiserDesc {
             identifier: 0,
             denoiser: nrd::DENOISER_REBLUR_DIFFUSE_SPECULAR,
@@ -17853,18 +18253,57 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         let mut inst = match nrd::Nrd::new(&opts.nrd_path, &denoisers) {
             Ok(i) => i,
             Err(e) => {
-                // A missing/drifted DLL must not fail a bare-checkout gate run —
-                // but say exactly how to get one.
-                println!(
-                    "check-nrd: SKIP N1 (NRD.dll unavailable: {e}); run install-prerequisites.bat nrd"
-                );
-                return if ok { 0 } else { 1 };
+                eprintln!("check-nrd: FAIL N1 {e}");
+                return 1;
             }
         };
         println!(
-            "check-nrd: N1 NRD v{}.{}.{} loaded (encodings pinned 2/1)",
-            inst.version.0, inst.version.1, inst.version.2
+            "check-nrd: N1 {} v{}.{}.{} loaded from {} (encodings pinned 2/1)",
+            nrd::LIB_FILE,
+            inst.version.0,
+            inst.version.1,
+            inst.version.2,
+            opts.nrd_path
         );
+
+        // The SPIR-V register shifts. Read, printed FIELD BY NAME, and pinned
+        // — on BOTH platforms, because `g_NrdLibraryDesc` is a constexpr whose
+        // offsets reach it as compile definitions regardless of which shader
+        // arm was embedded, so a Windows DLL reports the same four. That makes
+        // the Windows gate protect a value only the Vulkan backend consumes.
+        //
+        // Naming each field in the line is the point: NRD's CMakeLists sets
+        // them in the order (S=0, B=2, U=3, T=20) and `Wrapper.cpp` REORDERS
+        // them into the struct, so bare integers here would read as agreeing
+        // with the build system while meaning something else entirely.
+        {
+            let o = inst.spirv_offsets;
+            let p = nrd::PIN_SPIRV_BINDING_OFFSETS;
+            println!(
+                "check-nrd: N1 spirv binding offsets sampler {} texture {} cbuffer {} storage {} \
+                 (pinned {}/{}/{}/{})",
+                o.sampler_offset,
+                o.texture_offset,
+                o.constant_buffer_offset,
+                o.storage_texture_and_buffer_offset,
+                p.sampler_offset,
+                p.texture_offset,
+                p.constant_buffer_offset,
+                p.storage_texture_and_buffer_offset,
+            );
+            if o.sampler_offset != p.sampler_offset
+                || o.texture_offset != p.texture_offset
+                || o.constant_buffer_offset != p.constant_buffer_offset
+                || o.storage_texture_and_buffer_offset != p.storage_texture_and_buffer_offset
+            {
+                eprintln!(
+                    "check-nrd: FAIL N1 spirv binding offsets != pinned — a descriptor layout \
+                     built from these would bind every resource at the wrong register"
+                );
+                ok = false;
+            }
+        }
+
         {
             let d = inst.instance_desc();
             let mut n1_ok = d.pipelines_num > 0
@@ -17872,27 +18311,191 @@ fn run_check_nrd(opts: &Opts) -> i32 {
                 && d.transient_pool_size > 0
                 && d.constant_buffer_max_data_size > 0
                 && d.samplers_num == 2;
-            // The install script builds DXIL-only — every pipeline must carry a
-            // DXIL blob or the GPU host has nothing to create PSOs from.
+            // Every pipeline must carry THIS platform's blob, or its host has
+            // nothing to create pipelines from. `shader()` is the one
+            // selector; the recorder uses the same one, so a green count here
+            // is a count of what would actually be loaded.
             let pipes = unsafe { std::slice::from_raw_parts(d.pipelines, d.pipelines_num as usize) };
-            let dxil_missing = pipes
+            let missing = pipes.iter().filter(|p| !p.shader().is_present()).count();
+            // Non-null-and-nonzero passes on garbage: assert the container
+            // magic so the bytes are the FORMAT they are claimed to be.
+            let bad_magic = pipes
                 .iter()
-                .filter(|p| p.compute_shader_dxil.bytecode.is_null() || p.compute_shader_dxil.size == 0)
+                .filter(|p| p.shader().is_present() && p.shader().magic() != Some(nrd::SHADER_MAGIC))
                 .count();
-            if dxil_missing > 0 {
+            // SPIR-V consumability, and the two halves are NOT the same claim.
+            // `vkCreateShaderModule` takes `*const u32` with `codeSize` a
+            // multiple of 4, so:
+            //   * a size that is not a whole number of words is MALFORMED —
+            //     SPIR-V is defined as a word stream, so this is a real defect
+            //     and fails;
+            //   * an ADDRESS that is not 4-byte aligned is perfectly legal —
+            //     NRD packs its blobs back to back in a data section and
+            //     promises nothing about their placement. It is a FINDING, not
+            //     a fault, and the finding is precisely what the Vulkan
+            //     recorder needs to know: it must copy into a `Vec<u32>`
+            //     rather than casting the pointer, which is what
+            //     `Spirv::compile` already returns everywhere else in src/vk/.
+            // Measuring it here is the whole reason this gate precedes the
+            // recorder instead of shipping with it.
+            let short_words =
+                pipes.iter().filter(|p| p.shader().is_present() && p.shader().size % 4 != 0).count();
+            let unaligned = pipes
+                .iter()
+                .filter(|p| {
+                    p.shader().is_present() && !(p.shader().bytecode as usize).is_multiple_of(4)
+                })
+                .count();
+            let blob_bytes: u64 = pipes.iter().map(|p| p.shader().size).sum();
+            if missing > 0 || bad_magic > 0 || short_words > 0 {
                 n1_ok = false;
             }
             println!(
-                "check-nrd: N1 pipelines {} (dxil-missing {dxil_missing}) | pool perm {} trans {} | \
+                "check-nrd: N1 pipelines {} ({}-missing {missing}, bad-magic {bad_magic}, \
+                 non-word-size {short_words}, {blob_bytes} B total) | pool perm {} trans {} | \
                  cb-max {} B | samplers {}",
                 d.pipelines_num,
+                nrd::SHADER_KIND,
                 d.permanent_pool_size,
                 d.transient_pool_size,
                 d.constant_buffer_max_data_size,
                 d.samplers_num
             );
+            if unaligned > 0 {
+                println!(
+                    "check-nrd: N1 NOTE — {unaligned} of {} blobs sit at a non-4-byte-aligned \
+                     address. Legal (NRD packs them back to back and promises no alignment) but \
+                     load-bearing for the Vulkan recorder: vkCreateShaderModule takes *const u32, \
+                     so the blobs must be COPIED into a Vec<u32>, never cast in place",
+                    d.pipelines_num
+                );
+            }
+
+            // The entry point every VkPipelineShaderStageCreateInfo needs, and
+            // that nothing reads today. Assert what is READ, print it, never
+            // hardcode the string.
+            let entry = if d.shader_entry_point.is_null() {
+                None
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(d.shader_entry_point) }.to_str().ok()
+            };
+            match entry {
+                Some(e) if !e.is_empty() => {
+                    println!(
+                        "check-nrd: N1 entry point {e:?} | spaces: resources {} cb+samplers {}",
+                        d.resources_space_index, d.constant_buffer_and_samplers_space_index
+                    );
+                }
+                _ => {
+                    eprintln!("check-nrd: FAIL N1 shader_entry_point is null/empty/non-UTF8");
+                    n1_ok = false;
+                }
+            }
+
+            // THE DESCRIPTOR LAYOUT IS REALISABLE — the assertion that only
+            // exists because a Vulkan recorder is coming, and the direct
+            // answer to "prove the foreign contract before a foreign-DECLARED
+            // layout is in flight". Build the binding windows that recorder
+            // will use, entirely from read values, and require them disjoint.
+            // With v4.17.3's numbers this reads samplers {0,1}, cbuffer {2},
+            // UAVs from 3, SRVs from 20 — which is what makes TREG=20 a
+            // hand-packed binding map rather than a magic number. Non-vacuous:
+            // it fires the moment a denoiser wants more than 17 storage
+            // images, or more than two samplers.
+            {
+                let o = inst.spirv_offsets;
+                let pool = d.descriptor_pool_desc;
+                let srv = (
+                    d.resources_base_register_index + o.texture_offset,
+                    pool.per_set_textures_max_num,
+                );
+                let uav = (
+                    d.resources_base_register_index + o.storage_texture_and_buffer_offset,
+                    pool.per_set_storage_textures_max_num,
+                );
+                let smp = (d.samplers_base_register_index + o.sampler_offset, d.samplers_num);
+                let cbv = (d.constant_buffer_register_index + o.constant_buffer_offset, 1);
+                let overlaps = |a: (u32, u32), b: (u32, u32)| {
+                    a.0 < b.0.saturating_add(b.1) && b.0 < a.0.saturating_add(a.1)
+                };
+                let same_space =
+                    d.resources_space_index == d.constant_buffer_and_samplers_space_index;
+                let mut clash = Vec::new();
+                if overlaps(srv, uav) {
+                    clash.push("SRV/UAV");
+                }
+                if overlaps(smp, cbv) {
+                    clash.push("sampler/cbuffer");
+                }
+                if same_space
+                    && (overlaps(srv, smp)
+                        || overlaps(srv, cbv)
+                        || overlaps(uav, smp)
+                        || overlaps(uav, cbv))
+                {
+                    clash.push("resources/cb+samplers (one space)");
+                }
+                println!(
+                    "check-nrd: N1 binding windows — samplers [{}, {}) cbuffer [{}, {}) \
+                     uav [{}, {}) srv [{}, {})",
+                    smp.0,
+                    smp.0 + smp.1,
+                    cbv.0,
+                    cbv.0 + cbv.1,
+                    uav.0,
+                    uav.0 + uav.1,
+                    srv.0,
+                    srv.0 + srv.1
+                );
+                if !clash.is_empty() {
+                    eprintln!(
+                        "check-nrd: FAIL N1 binding windows overlap ({}) — the descriptor \
+                         layout a recorder builds from these cannot be realised",
+                        clash.join(", ")
+                    );
+                    n1_ok = false;
+                }
+
+                // Pool coherence: a pipeline needing more than the per-set
+                // maximum means the one layout sized to those maxima is wrong
+                // for it.
+                let (mut max_tex, mut max_uav) = (0u32, 0u32);
+                for p in pipes {
+                    let (mut t, mut u) = (0u32, 0u32);
+                    let rr = unsafe {
+                        std::slice::from_raw_parts(p.resource_ranges, p.resource_ranges_num as usize)
+                    };
+                    for r in rr {
+                        if r.descriptor_type == nrd::DESC_TEXTURE {
+                            t += r.descriptors_num;
+                        } else {
+                            u += r.descriptors_num;
+                        }
+                    }
+                    max_tex = max_tex.max(t);
+                    max_uav = max_uav.max(u);
+                }
+                println!(
+                    "check-nrd: N1 pool — per-set tex {} (max over pipelines {max_tex}) storage {} \
+                     (max {max_uav}) | totals {}/{} | sets {}",
+                    pool.per_set_textures_max_num,
+                    pool.per_set_storage_textures_max_num,
+                    pool.total_textures_num,
+                    pool.total_storage_textures_num,
+                    pool.sets_max_num
+                );
+                if max_tex > pool.per_set_textures_max_num
+                    || max_uav > pool.per_set_storage_textures_max_num
+                    || pool.sets_max_num == 0
+                    || pool.total_textures_num < pool.per_set_textures_max_num
+                {
+                    eprintln!("check-nrd: FAIL N1 descriptor pool cannot cover its own pipelines");
+                    n1_ok = false;
+                }
+            }
+
             if !n1_ok {
-                eprintln!("check-nrd: FAIL N1 instance contract (see the counter line)");
+                eprintln!("check-nrd: FAIL N1 instance contract (see the counter lines)");
                 ok = false;
             }
         }
@@ -18383,9 +18986,9 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
 /// that cannot host it is not.
 #[cfg(target_os = "macos")]
 fn run_check_fsr3(
-    _scene: &scene::Scene,
-    _bvh: &bvh::Bvh,
-    _cam0: Camera,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
     _structural: bool,
 ) -> i32 {
     let mut ok = true;
@@ -18457,6 +19060,76 @@ fn run_check_fsr3(
         }
     };
 
+    // ---- U3: the FSR3 context, i.e. every metallib becoming a pipeline ------
+    //
+    // The stage that carries this gate's whole risk. Context creation drives
+    // `fpCreatePipeline` across every FSR3 pass, so it is where all 80
+    // transpiled permutations are loaded, specialized against the device's
+    // linear-texture alignment, and built into compute pipeline states — a
+    // spirv-cross output Metal will not accept, a mis-keyed hash, or a
+    // caps/wave64 divergence all fail HERE, loudly, instead of at whichever
+    // later dispatch happens to need the one missing permutation.
+    #[cfg(ffx_fsr3_metal)]
+    if let Some(m) = mtl.as_ref() {
+        // A non-square, non-power-of-two, odd render extent against a 2x
+        // upscale: FSR3's own passes round their dispatch grids up, and a
+        // tidy extent would let an off-by-one in that rounding pass unnoticed.
+        let (rw, rh) = (401usize, 227usize);
+        let (uw, uh) = (802usize, 454usize);
+        let flags = mtl::fsr3::FLAG_HDR
+            | mtl::fsr3::FLAG_DEPTH_INVERTED
+            | mtl::fsr3::FLAG_AUTO_EXPOSURE;
+        let t0 = std::time::Instant::now();
+        match mtl::fsr3::Fsr3::new(m, (rw, rh), (uw, uh), flags) {
+            Ok(fsr) => {
+                eprintln!(
+                    "check-fsr3: U3 context created — {rw}x{rh} -> {uw}x{uh}, {} pipelines \
+                     built of {} metallibs offered, {:.0} ms",
+                    fsr.pipelines(),
+                    mtl::fsr3::metallibs().len(),
+                    t0.elapsed().as_secs_f32() * 1e3
+                );
+                // ANTI-VACUITY, and it is not redundant with the Ok above: a
+                // backend that answered every fpCreatePipeline with an empty
+                // success would create a context and build nothing, which no
+                // return code distinguishes. FSR3 has eleven passes; the floor
+                // sits just under so a pass count that legitimately moves with
+                // an SDK bump does not fail, while zero or a handful does.
+                //
+                // NOT a coverage claim: MEASURED, one creation requests ELEVEN
+                // of the 80 permutations (one per pass at the option word its
+                // flags select) and all eight flag combinations together reach
+                // only 14, because most passes ignore most option bits and the
+                // 40 fp32 variants are never requested at all — the caps report
+                // fp16. U1 proves all 80 are well-formed; this proves eleven of
+                // them become pipeline states.
+                if fsr.pipelines() < 10 {
+                    fail(format!(
+                        "U3 built only {} pipelines — FSR3 has eleven passes, so the backend \
+                         answered fpCreatePipeline without building anything",
+                        fsr.pipelines()
+                    ));
+                }
+                // Destroying it here rather than at scope end is the point of
+                // the drop(): it runs fpDestroyPipeline and fpDestroyResource
+                // back through our own backend callbacks, which nothing else
+                // in this gate exercises, and a double release or a missing
+                // one is a crash we want attributed to U3.
+                drop(fsr);
+                eprintln!("check-fsr3: U3 context destroyed OK");
+            }
+            Err(e) => fail(format!("U3 {e}")),
+        }
+    }
+
+    // ---- U4: a real upscale, scored -----------------------------------------
+    #[cfg(ffx_fsr3_metal)]
+    if let Some(m) = mtl.as_ref() {
+        if let Err(e) = fsr3_upscale_check(m, scene, bvh, cam0) {
+            fail(format!("U4 {e}"));
+        }
+    }
+
     // The four FFX-on-Metal bugs that shipped in the reference implementation
     // were ALL invisible without the validation layers, and each masked the one
     // after it (the layer aborts on the first error per command buffer). The
@@ -18479,6 +19152,433 @@ fn run_check_fsr3(
         eprintln!("check-fsr3: PASSED");
     }
     i32::from(!ok)
+}
+
+/// U4: two real rendered frames through the real FSR3 pipelines, scored.
+///
+/// Everything above it in `--check-fsr3` proves a piece in isolation — the
+/// staging math, the metallib table, a texture round-trip, that the pipelines
+/// build. This is the only stage where the whole chain runs and the RESULT is
+/// examined, and it is written around the fact that an upscaler is very easy to
+/// gate vacuously: a pass-through copy, a bilinear stretch and a working
+/// temporal reconstruction all produce a plausible, finite, correctly-sized
+/// image. So every assertion here is paired with something it must be DIFFERENT
+/// from.
+#[cfg(ffx_fsr3_metal)]
+fn fsr3_upscale_check(
+    m: &mtl::device::Mtl,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> Result<(), String> {
+    use std::sync::atomic::AtomicU32;
+
+    // Small on purpose: the CPU tracer renders every frame here, and U4 needs
+    // five of them. Odd-ish and non-square so a stride assumption cannot hide.
+    let (rw, rh) = (321usize, 181usize);
+    let (uw, uh) = (rw * 2, rh * 2);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+
+    // The G-buffer is the SLIM variant — mvec + depth and nothing else — which
+    // is exactly the FSR 3.1 upscale-only session's plane set. Using the full
+    // one would allocate and fill four guide planes no part of this path reads.
+    let render = |g: &dlss::GBufs,
+                  accum: &[AtomicU32],
+                  basis: camera::CamBasis,
+                  prev: Option<camera::CamBasis>,
+                  frame: u32,
+                  jitter: (f32, f32)| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: false,
+            rw,
+            rh,
+            accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(g),
+            fsr_buf: None,
+            prev_cam: prev,
+            frame_jitter: Some(jitter),
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+    };
+
+    // REAL jitter, unlike every other frame gate in this file. The two
+    // reconstruction gates (`mv_check_at`, `fsr_frame_check`) pin it to
+    // (0,0) because they reconstruct world positions and assume pixel centres;
+    // here jitter is a genuine FSR3 INPUT — it is what the temporal
+    // accumulation resolves sub-pixel detail from — so pinning it would leave
+    // the one input this renderer feeds and the reference never did untested.
+    let jit = |f: u32| {
+        let (jx, jy) = dlss::jitter_for(f);
+        (jx * fsr::JITTER_SIGN, jy * fsr::JITTER_SIGN)
+    };
+
+    let accum_a = alloc32(rw * rh * 3);
+    let accum_b = alloc32(rw * rh * 3);
+    let ga = dlss::GBufs::new_slim(rw, rh);
+    let gb = dlss::GBufs::new_slim(rw, rh);
+    let basis_a = cam0.basis(rw, rh);
+    // The same 0.02·diag forward dolly `fsr_frame_check` uses, so the motion
+    // vectors this exercises are the ones that gate already proves correct.
+    let cam_b = Camera {
+        pos: cam0.pos + cam0.forward() * (0.02 * scene.diag),
+        ..cam0
+    };
+    let basis_b = cam_b.basis(rw, rh);
+    render(&ga, &accum_a, basis_a, None, 0, jit(0));
+    render(&gb, &accum_b, basis_b, Some(basis_a), 1, jit(1));
+
+    let flags =
+        mtl::fsr3::FLAG_HDR | mtl::fsr3::FLAG_DEPTH_INVERTED | mtl::fsr3::FLAG_AUTO_EXPOSURE;
+    let params = |frame: u32, reset: bool| mtl::fsr3::DispatchParams {
+        render: (rw, rh),
+        jitter: jit(frame),
+        near,
+        far,
+        fov_y: cam0.fov_y,
+        frame_time_ms: 1000.0 / 60.0,
+        reset,
+    };
+
+    // `warm`: A with reset, then B against A's history — the ordinary
+    // steady-state frame. `cold`: B alone into a fresh context — the same
+    // inputs with NO history. Two contexts, because FFX's temporal state is
+    // per-context and there is no other way to have both.
+    // `gb_over` replaces frame B's G-buffer, which is how the plumbing probes
+    // below change exactly one input and nothing else.
+    let run_with = |seq: &[(u32, bool)],
+                    gb_over: Option<&dlss::GBufs>,
+                    jit_over: Option<(f32, f32)>|
+     -> Result<Vec<f32>, String> {
+        let f = mtl::fsr3::Fsr3::new(m, (rw, rh), (uw, uh), flags)?;
+        for &(frame, reset) in seq {
+            let (acc, g) = if frame == 0 {
+                (&accum_a, &ga)
+            } else {
+                (&accum_b, gb_over.unwrap_or(&gb))
+            };
+            f.upload(m, acc, g, (rw, rh), near, far);
+            let mut p = params(frame, reset);
+            if frame == 1 {
+                if let Some(j) = jit_over {
+                    p.jitter = j;
+                }
+            }
+            f.dispatch(m, &p)?;
+        }
+        Ok(f.read_output(m))
+    };
+    let run = |seq: &[(u32, bool)]| run_with(seq, None, None);
+
+    let warm = run(&[(0, true), (1, false)])?;
+    let cold = run(&[(1, true)])?;
+    let warm2 = run(&[(0, true), (1, false)])?;
+    let cold2 = run(&[(1, true)])?;
+
+    // ---- finite, non-negative, and actually written ------------------------
+    // `Fsr3::dispatch` clears the output plane before every dispatch, so "all
+    // zeros" is what a no-op leaves; a NaN is what an unbound argument or a
+    // mis-strided atomic leaves.
+    let bad = warm.iter().filter(|v| !v.is_finite() || **v < 0.0).count();
+    if bad != 0 {
+        return Err(format!("{bad} of {} output channels are non-finite or negative", warm.len()));
+    }
+    let mean = |v: &[f32]| v.chunks(4).map(|p| (p[0] + p[1] + p[2]) / 3.0).sum::<f32>() / (v.len() / 4) as f32;
+    let in_mean = {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh * 3 {
+            s += f64::from(f32::from_bits(accum_b[i].load(Relaxed)));
+        }
+        (s / (rw * rh * 3) as f64) as f32
+    };
+    let out_mean = mean(&warm);
+    if out_mean <= 0.0 {
+        return Err("the output is uniformly zero — the dispatch wrote nothing".into());
+    }
+    // An UPSCALER preserves energy: it resamples, it does not expose. A factor
+    // of two either way is loose enough for a jittered temporal reconstruction
+    // of two frames and tight enough to catch an exposure or colour-space
+    // mistake, which move it by orders of magnitude.
+    let ratio = out_mean / in_mean;
+    if !(0.5..=2.0).contains(&ratio) {
+        return Err(format!(
+            "output mean {out_mean:.4} is {ratio:.3}x the input's {in_mean:.4} — an upscaler \
+             resamples, it does not expose"
+        ));
+    }
+
+    // ---- determinism, in the two regimes it genuinely has ------------------
+    //
+    // THE SPLIT IS MEASURED, and the obvious single bitwise claim is WRONG in a
+    // way that took the measurement to see. Two fresh contexts given identical
+    // inputs:
+    //
+    //   * a RESET-only frame -> EXACTLY bit-identical, every time (4/4, and
+    //     with the output plane deliberately left uncleared, which also proves
+    //     FSR3 writes every output texel);
+    //   * an ACCUMULATING frame -> 100-2800 of 929616 channels differ, each by
+    //     EXACTLY ONE f16 ULP, with the count varying run to run.
+    //
+    // The second is not a defect and not GPU non-determinism. FSR3 declares
+    // essentially every internal resource — the three shared temporals included
+    // — as FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED, and ffx_vk.cpp skips its
+    // init copy for exactly that type, so texels a reset frame never wrote hold
+    // per-allocation residue BY CONTRACT. A following frame reads them at an
+    // accumulation weight near zero, which is why the effect is a tipped f16
+    // rounding boundary and never more. Zeroing the temporals anyway was tried
+    // and made it WORSE (median 388 -> 1050 differing channels), so the residue
+    // is not the whole story either — it is simply not ours to control.
+    //
+    // CORROBORATED FROM THE OTHER SIDE, which is what settles it: under
+    // MTL_SHADER_VALIDATION=1 the accumulating count drops to EXACTLY ZERO,
+    // because that layer zero-fills allocations. Execution-order
+    // non-determinism would be untouched by it; per-allocation residue is
+    // removed by it entirely. So the validated run is also the STRICTEST run —
+    // a reason to prefer it beyond the four gotchas.
+    //
+    // So the exact claim is made where it holds, and the accumulating path gets
+    // a bound instead. Both have teeth: garbage propagating at full magnitude
+    // fails the ULP test, and a genuine backend race (the image-atomic aliasing
+    // class) fails the exact one.
+    let ndiff = cold.iter().zip(&cold2).filter(|(a, b)| a != b).count();
+    if ndiff != 0 {
+        return Err(format!(
+            "two reset-only dispatches into fresh contexts differ in {ndiff} of {} channels — \
+             the one path with no history to read must be exactly reproducible, so this is a \
+             race or an uninitialised read in the backend itself",
+            cold.len()
+        ));
+    }
+    let (mut n_acc, mut worst_rel) = (0usize, 0.0f32);
+    for (a, b) in warm.iter().zip(&warm2) {
+        if a != b {
+            n_acc += 1;
+            let rel = (a - b).abs() / a.abs().max(b.abs()).max(1e-6);
+            worst_rel = worst_rel.max(rel);
+        }
+    }
+    // 1% separates a tipped f16 ULP (2^-11 relative at worst) from anything
+    // carrying real garbage, by two orders of magnitude in each direction.
+    if worst_rel > 0.01 {
+        return Err(format!(
+            "an accumulating frame differs across contexts by {worst_rel:.2e} relative — the \
+             uninitialised-residue path bounds this at one f16 ULP, so something larger is \
+             reaching the output"
+        ));
+    }
+    // A hard ceiling on HOW MANY, so a backend that started diverging broadly
+    // cannot hide behind each difference being individually small.
+    let frac = n_acc as f32 / warm.len() as f32;
+    if frac > 0.02 {
+        return Err(format!(
+            "an accumulating frame differs across contexts in {n_acc} of {} channels ({:.2}%) \
+             — far past the contract-permitted residue band",
+            warm.len(),
+            frac * 100.0
+        ));
+    }
+
+    // ---- the history is REAL ------------------------------------------------
+    // Same frame, same inputs, one with a warmed history and one without. If
+    // these agree, FFX is not accumulating and every temporal claim this arm
+    // makes is false — which a finite, correctly-sized, energy-preserving
+    // image would otherwise sail past.
+    let hist: f64 = warm
+        .iter()
+        .zip(&cold)
+        .map(|(a, b)| f64::from((a - b).abs()))
+        .sum::<f64>()
+        / warm.len() as f64;
+    let rel_hist = hist / f64::from(out_mean.max(1e-6));
+    if rel_hist < 1e-3 {
+        return Err(format!(
+            "a warmed history and a reset one differ by {rel_hist:.2e} of the mean — FFX is \
+             not accumulating anything"
+        ));
+    }
+
+    // ---- NOT A BILINEAR STRETCH --------------------------------------------
+    // THE assertion that carries this stage. Everything above is satisfied by a
+    // competent resampler; only this says a temporal reconstruction happened.
+    // The reference is built here rather than taken from a library so it is
+    // unambiguously the same pixels: a plain 2x box-centre bilinear lift of
+    // frame B's own colour.
+    let bilinear = |x: usize, y: usize, c: usize| -> f32 {
+        let (fx, fy) = ((x as f32 + 0.5) / 2.0 - 0.5, (y as f32 + 0.5) / 2.0 - 0.5);
+        let (x0, y0) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+        let (x1, y1) = ((x0 + 1).min(rw - 1), (y0 + 1).min(rh - 1));
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let s = |xx: usize, yy: usize| f32::from_bits(accum_b[(yy * rw + xx) * 3 + c].load(Relaxed));
+        let a = s(x0, y0) * (1.0 - tx) + s(x1, y0) * tx;
+        let b = s(x0, y1) * (1.0 - tx) + s(x1, y1) * tx;
+        a * (1.0 - ty) + b * ty
+    };
+    let mut d_bil = 0.0f64;
+    for y in 0..uh {
+        for x in 0..uw {
+            for c in 0..3 {
+                d_bil += f64::from((warm[(y * uw + x) * 4 + c] - bilinear(x, y, c)).abs());
+            }
+        }
+    }
+    let rel_bil = d_bil / (uw * uh * 3) as f64 / f64::from(out_mean.max(1e-6));
+    // MEASURED 2.96e-2 here, and the bound is deliberately SIX TIMES under it
+    // rather than just below. The failure this rejects — someone swapping the
+    // reconstruction for a resampler — lands at ~0, so a low bound loses no
+    // discrimination, while a bound set snugly under the measurement would fail
+    // on any scene or pose that happens to reconstruct less.
+    if rel_bil < 5e-3 {
+        return Err(format!(
+            "the output is within {rel_bil:.2e} of a bilinear stretch of its own input — \
+             nothing here proves a temporal reconstruction ran"
+        ));
+    }
+
+    eprintln!(
+        "check-fsr3: U4 upscale {rw}x{rh} -> {uw}x{uh} OK — energy {ratio:.3}x, history \
+         {rel_hist:.3e}, vs-bilinear {rel_bil:.3e}; reset frame bit-exact across contexts, \
+         accumulating {n_acc} ch ({:.3}%) at <= {worst_rel:.1e} rel",
+        frac * 100.0
+    );
+
+    // ---- the inputs are PLUMBED --------------------------------------------
+    //
+    // Three confidently-wrong failures none of the scoring above can see: a
+    // jitter that never reaches the evaluate, a depth plane bound to the wrong
+    // argument, motion vectors read as zero. Each probe re-runs the ACCUMULATING
+    // sequence with exactly one input of frame B changed, so a null result
+    // attributes to that input and to nothing else.
+    //
+    // THE BASELINE MUST BE THE ACCUMULATING FRAME, and the first draft of this
+    // used the reset one — which reported depth at EXACTLY 0.00e0 and looked
+    // like a plumbing bug in the backend. It is not: on a reset frame there is
+    // no history, so the depth-derived disocclusion mask has nothing to reject
+    // and depth genuinely cannot change the output. A probe that cannot move
+    // its target fails whatever the code does, which is the mirror of a probe
+    // that cannot fail — and depth and motion vectors are BOTH in that class.
+    let differs = |label: &str, other: &[f32]| -> Result<f64, String> {
+        let d: f64 = warm.iter().zip(other).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
+            / warm.len() as f64
+            / f64::from(out_mean.max(1e-6));
+        // Two orders of magnitude above the contract-permitted residue band
+        // measured above (~1e-5 of the mean), so this cannot pass on noise.
+        if d < 1e-3 {
+            return Err(format!(
+                "changing {label} moved the output by {d:.2e} of the mean — that input is not \
+                 reaching the shaders"
+            ));
+        }
+        Ok(d)
+    };
+
+    // Half a pixel the other way, still inside the legal [-0.5, 0.5): a valid
+    // frame, not a torture test.
+    let d_jit = differs(
+        "the jitter offset",
+        &run_with(&[(0, true), (1, false)], None, Some((-jit(1).0, -jit(1).1)))?,
+    )?;
+
+    // Everything at the near plane — the opposite end of the reversed-Z
+    // encoding from sky, so every pixel reads as disoccluded against a history
+    // built from real depth. MVs stay real, which is what isolates depth.
+    let d_depth = {
+        let flat = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            flat.depth[i].store(near.to_bits(), Relaxed);
+            flat.mvec[i * 2].store(gb.mvec[i * 2].load(Relaxed), Relaxed);
+            flat.mvec[i * 2 + 1].store(gb.mvec[i * 2 + 1].load(Relaxed), Relaxed);
+        }
+        differs("the depth plane", &run_with(&[(0, true), (1, false)], Some(&flat), None)?)?
+    };
+
+    // Zero motion against a camera that really moved: the history reprojects to
+    // the wrong place everywhere. Depth stays real, isolating the MV plane —
+    // and this is the one probe that would catch a plane bound but never read,
+    // which is exactly what the D3D12 arm's `mv_scale` sign guards against on
+    // the other side.
+    let d_mv = {
+        let still = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            still.depth[i].store(gb.depth[i].load(Relaxed), Relaxed);
+        }
+        differs("the motion vectors", &run_with(&[(0, true), (1, false)], Some(&still), None)?)?
+    };
+
+    eprintln!(
+        "check-fsr3: U4 inputs plumbed — jitter {d_jit:.3e}, depth {d_depth:.3e}, motion \
+         {d_mv:.3e} (each one input away from the accumulating frame above)"
+    );
+
+    // ---- the images, for the half no gate can score ------------------------
+    //
+    // Every number above is a magnitude, and a magnitude cannot tell a
+    // CORRECTLY signed jitter from a mirrored one — both move the output by
+    // about as much. The plan names that explicitly: the reset-differs and
+    // not-a-bilinear teeth catch gross wiring, and polarity needs eyes. So
+    // rather than pretend, this writes the frames out and says what to look
+    // for. Both go through the SAME tonemap the renderer presents with, so the
+    // input and the output are comparable by eye rather than by exposure.
+    if std::env::var("FR_FSR3_DUMP").is_ok() {
+        let px = |c: Vec3A| {
+            let t = tone::map(c, tone::ToneParams::SDR);
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+            (b(t.x) << 16) | (b(t.y) << 8) | b(t.z)
+        };
+        let mut inp = Vec::with_capacity(rw * rh);
+        for i in 0..rw * rh {
+            let g = |c: usize| f32::from_bits(accum_b[i * 3 + c].load(Relaxed));
+            inp.push(px(Vec3A::new(g(0), g(1), g(2))));
+        }
+        save_png("fsr3-input.png", &inp, rw, rh);
+        let (ow, oh) = (uw, uh);
+        let mut out = Vec::with_capacity(ow * oh);
+        for i in 0..ow * oh {
+            out.push(px(Vec3A::new(warm[i * 4], warm[i * 4 + 1], warm[i * 4 + 2])));
+        }
+        save_png("fsr3-output.png", &out, ow, oh);
+        eprintln!(
+            "check-fsr3: wrote fsr3-input.png ({rw}x{rh}) and fsr3-output.png ({ow}x{oh}) — \
+             look for edges SHARPER than the input at 2x, and for a static view that does not \
+             wobble; a mirrored jitter or motion-vector sign reads as doubled wobble or as a \
+             directional smear, neither of which any magnitude above can distinguish"
+        );
+    }
+    Ok(())
 }
 
 /// The rendered-frame half of --check-fsr at one resolution: frame A at
@@ -25066,6 +26166,22 @@ fn run_check(
         }
     };
 
+    // The NRD host's SHARED vocabulary — the plane enum both recorders index
+    // by, and the CommonSettings builder they both call. Pure, DLL-free and
+    // adapter-free, which is the point: it runs on every platform, so a Linux
+    // box gates the matrix convention, the UV motion-vector scale and the
+    // denoising-range lockstep that the WINDOWS recorder depends on. The
+    // injectivity arm is the sharpest of them — a duplicated ResourceType
+    // aliases two images inside `reg_for` and produces a wrong picture, never
+    // an error.
+    let dnv_ok = match gfx::denoise::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("denoise vocabulary self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
     // slip), cone sampling inside-and-covering the disc, the disc test agreeing
     // with the cone the sampler draws from, the DOME carrying no disc (the
@@ -28026,6 +29142,7 @@ fn run_check(
         ("bloom", bloom_ok),
         ("frd", frd_ok),
         ("remod", remod_ok),
+        ("denoise-vocab", dnv_ok),
         ("autoexp", autoexp_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),

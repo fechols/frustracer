@@ -50,17 +50,18 @@
 #  YOUR machine. Nothing here redistributes them.
 #
 #  DIFFERENCES FROM THE .bat, each forced by the platform:
-#    * nrd is skipped. NRD ITSELF IS NOT WINDOWS-ONLY — it is an API-agnostic
-#      library that builds fine on Linux — but the artifact this renderer loads
-#      is NRD.dll: a PE with DXIL shaders EMBEDDED in it (the .bat configures
-#      NRD_EMBEDS_DXIL_SHADERS=ON, DXBC/SPIRV OFF). A Linux build emits
-#      libNRD.so carrying SPIRV, which a D3D12 session cannot load, and a
-#      mingw cross-build would still hand D3D12 UNSIGNED DXIL, because the
-#      signer is dxil.dll — Windows-only, and the `(validator)` row in the
-#      checklist below. So this degrades exactly as the .bat does when it finds
-#      no Visual Studio: a note by default, [x] and a failure exit only when nrd
-#      was asked for BY NAME. Build it from Windows: `install-prerequisites.bat
-#      nrd`.
+#    * nrd builds the HOST-NATIVE half. NRD is an API-agnostic library and
+#      both halves come from the same submodule at the same pinned tag; only
+#      the embedded shader arm differs, and off WIN32 that is not even a choice
+#      (NRD's own cmake_dependent_option forces DXIL/DXBC OFF). So this script
+#      builds libNRD.so with SPIRV, for the Vulkan backend, and the .bat builds
+#      NRD.dll with DXIL, for D3D12. THE DLL HALF STILL IS NOT PRODUCIBLE HERE,
+#      and the blocker is dxil.dll — the Windows-only DXIL signer, the
+#      `(validator)` row in the checklist below — not CMake or MSVC: a mingw
+#      cross-build would hand D3D12 UNSIGNED DXIL, which it refuses to load.
+#      NOTE this component is the one place `Building NEVER needs any of this`
+#      does not hold on Linux: build.rs's require_nrd() makes libNRD.so a hard
+#      requirement for a native build, because NRD is the default denoiser.
 #    * flags are --force / --clean (the .bat's /force and /clean also work).
 #    * unzip (or bsdtar) does the extracting — GNU tar cannot read a zip, which
 #      is the mirror image of the .bat's reason for calling System32's bsdtar by
@@ -185,8 +186,11 @@ FFX_SRC_TAG=v1.1.4
 #  it — the 8 translation units we compile plus their headers — which is ~19 MB.
 FFX_SRC_SUBSET=(sdk/include sdk/src sdk/libs sdk/CMakeLists.txt)
 #  NRD is pinned BOTH here and in src/nrd.rs (the transcribed structs + runtime
-#  GetLibraryDesc gate) — move them together or --nrd sheds loudly. Unused on
-#  this platform (see the header), kept so the two installers stay comparable.
+#  GetLibraryDesc gate) — move them together or --nrd sheds loudly. This is the
+#  human-readable label only: the SOURCE is the SDKs/NRD-src submodule, whose
+#  SHA is the thing that actually moves, and it can drift from this string
+#  silently (a `git submodule update --remote` changes no pinned constant). The
+#  runtime version gate is what catches that.
 NRD_TAG=v4.17.3
 
 # --- tools ---------------------------------------------------------------
@@ -436,9 +440,13 @@ do_dxc() {
     # rests on; if a future pin ever drops it, the fallbacks are the Vulkan
     # SDK's DXC or a source build with -DENABLE_SPIRV_CODEGEN=ON.
     #
-    # NOTE the runtime needs its own lib/ on the loader path:
-    #     LD_LIBRARY_PATH=SDKs/dxc-linux/lib SDKs/dxc-linux/bin/dxc ...
-    # since bin/dxc resolves libdxcompiler.so by soname, not by sibling.
+    # NOTE bin/dxc needs NO LD_LIBRARY_PATH, and this comment used to say the
+    # opposite. It carries DT_RPATH=$ORIGIN/../lib, which the loader resolves
+    # from the binary's own realpath — verified by running it from / under
+    # `env -i`, and DT_RPATH additionally outranks LD_LIBRARY_PATH. That holds
+    # when another process spawns it too, which is what lets NRD's ShaderMake
+    # drive it as its SPIRV compiler with nothing added to the environment
+    # (do_nrd below). The wrong claim was never acted on until then.
     #
     # ONLY LINUX HAS AN UPSTREAM DROP, and that is a fact about the release
     # rather than about this script: DXC_TAG publishes the Windows zip, this
@@ -622,32 +630,140 @@ do_pix() {
     extract pix.zip "$SDKS/pix" || return 0
 }
 
+# nrd — the one component this script BUILDS rather than downloads, because
+# NVIDIA ships no prebuilt binaries at all.
+#
+# TWO ARTIFACTS, ONE SOURCE. The .bat builds NRD.dll with DXIL embedded, for
+# D3D12; this builds libNRD.so with SPIRV embedded, for the Vulkan backend.
+# Both are the same submodule at the same pinned tag with the same encoding
+# flags, and the runtime version gate (src/nrd.rs) refuses either if the pins
+# drift. Only the shader arm differs, and off WIN32 that is not even a choice:
+# NRD's own cmake_dependent_option forces DXIL and DXBC OFF.
+#
+# THE DLL HALF IS STILL NOT PRODUCIBLE HERE, and the reason is dxil.dll — the
+# Windows-only DXIL signer — not CMake or MSVC. A mingw cross-build would hand
+# D3D12 unsigned DXIL, which it refuses to load.
 do_nrd() {
-    # The .bat COMPILES this component (NVIDIA ships no prebuilt NRD binaries),
-    # and the artifact is a PE whose DXIL shaders are embedded by dxc at build
-    # time — an MSVC + Windows-SDK job with no Linux equivalent. A Linux CMake
-    # run would happily produce libNRD.so with SPIRV shaders, which a D3D12
-    # session cannot load; producing that and calling the component done would
-    # be worse than skipping it, so this degrades exactly like the .bat does on
-    # a machine with no Visual Studio: a note by default, a failure when named.
-    if [[ -e $SDKS/NRD/bin/NRD.dll && -e $SDKS/NRD/bin/perf/NRD.dll ]]; then
+    if [[ $OS != linux ]]; then
+        local where="Windows"
+        [[ -n ${WSL_DISTRO_NAME:-} ]] && where="the Windows side of this WSL install"
+        if [[ -n $NRD_EXPLICIT ]]; then
+            echo "    [x] nrd: no backend on this platform consumes an NRD artifact"
+            echo "        (NRD emits DXBC/DXIL/SPIRV and has no Metal output at all)."
+            echo "        For the D3D12 DLL, build from $where:"
+            echo "            install-prerequisites.bat nrd"
+            fail
+        else
+            echo "    [i] nrd skipped — no backend here consumes it (NRD emits no Metal"
+            echo "        shaders). Run \`install-prerequisites.bat nrd\` from $where for"
+            echo "        the D3D12 DLL; every other feature works without it."
+        fi
+        return 0
+    fi
+
+    if [[ -z $FORCE && -e $SDKS/NRD/bin/libNRD.so && -e $SDKS/NRD/bin/perf/libNRD.so ]]; then
         echo "[=] nrd already installed"
         return 0
     fi
-    local where="Windows"
-    [[ -n ${WSL_DISTRO_NAME:-} ]] && where="the Windows side of this WSL install"
-    if [[ -n $NRD_EXPLICIT ]]; then
-        echo "    [x] nrd: NRD is portable, but the artifact --nrd loads is not —"
-        echo "        NRD.dll is a PE with dxc-built DXIL embedded, and NVIDIA ships"
-        echo "        no prebuilt binaries. Build it from $where:"
-        echo "            install-prerequisites.bat nrd"
+
+    local src="$ROOT/SDKs/NRD-src"
+    if [[ ! -e $src/CMakeLists.txt ]]; then
+        echo "    [x] nrd: SDKs/NRD-src is empty (the submodule was not checked out)"
+        echo "            git submodule update --init SDKs/NRD-src"
         fail
-    else
-        echo "    [i] nrd skipped — the artifact is a Windows DLL with embedded DXIL"
-        echo "        (MSVC + CMake + dxc), not producible here. Run"
-        echo "        \`install-prerequisites.bat nrd\` from $where; every other"
-        echo "        feature works without it."
+        return 0
     fi
+    # THE TOOLCHAIN PROBE IS AN UNCONDITIONAL FAILURE, not the usual
+    # named-only one, and it is COUPLED to build.rs: require_nrd() panics on a
+    # missing libNRD.so for a native Linux build, so a skip here would leave a
+    # tree that no longer compiles. If that policy is ever relaxed to a
+    # warning, relax this to the `[[ -n $NRD_EXPLICIT ]]` shape in the same
+    # commit.
+    if ! command -v cmake >/dev/null; then
+        echo "    [x] nrd: cmake not found, and NRD is a hard build requirement"
+        echo "        (build.rs require_nrd). Install cmake (3.22+) and a C++17 compiler."
+        fail
+        return 0
+    fi
+
+    # DXC for the SPIRV arm. SHADERMAKE_DXC_VK_PATH is the *_VK_* variable —
+    # the .bat's SHADERMAKE_DXC_PATH drives the DXIL arm and is the wrong lever
+    # here. No LD_LIBRARY_PATH is needed and adding one would be cargo-cult:
+    # bin/dxc carries DT_RPATH=$ORIGIN/../lib, verified by running it from /
+    # with a scrubbed environment, and DT_RPATH is resolved from the binary's
+    # own realpath so it holds when ShaderMake spawns it as a subprocess.
+    local dxcarg=()
+    [[ -x $SDKS/dxc-linux/bin/dxc ]] && dxcarg=(-DSHADERMAKE_DXC_VK_PATH="$SDKS/dxc-linux/bin/dxc")
+
+    # One arm = configure -> build -> copy, UNBROKEN, and never a build without
+    # its own configure immediately before it. Three outputs are shared across
+    # the two build trees — the generated Shaders/NRDConfig.hlsli, _Shaders/
+    # (where ShaderMake's blobs land) and _Bin/ — all inside the SOURCE tree,
+    # so a build run against a stale configure silently embeds the other arm's
+    # shaders into a library the runtime version gate cannot tell apart.
+    _nrd_arm() {
+        local tag="$1" build="$2" dest="$3"
+        shift 3
+        local clog="$CACHE/nrd-cmake-$tag.log" blog="$CACHE/nrd-build-$tag.log"
+        echo "    [>] nrd: cmake configure ($tag)"
+        cmake -S "$src" -B "$build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNRD_STATIC_LIBRARY=OFF -DNRD_NRI=OFF \
+            -DNRD_EMBEDS_SPIRV_SHADERS=ON \
+            -DNRD_EMBEDS_DXIL_SHADERS=OFF -DNRD_EMBEDS_DXBC_SHADERS=OFF \
+            -DNRD_NORMAL_ENCODING=2 -DNRD_ROUGHNESS_ENCODING=1 \
+            "${dxcarg[@]}" "$@" >"$clog" 2>&1 || {
+            echo "    [x] nrd: cmake configure failed — see $clog"
+            echo "        (configure fetches ShaderMake + MathLib, so it needs network)"
+            fail
+            return 1
+        }
+        # A -D that reached nothing is a SILENT no-op: if ShaderMake renames its
+        # cache variable, the build quietly falls back to whatever find_program
+        # turned up — a compiler off the pin, which nothing downstream can see.
+        if grep -q "Manually-specified variables were not used" "$clog"; then
+            echo "    [!] nrd: cmake ignored a -D we passed (see $clog) — a lever that"
+            echo "        reached nothing, not a warning to skim"
+        fi
+        echo "    [>] nrd: building ($tag)"
+        # --config is a no-op for single-config generators and CMAKE_BUILD_TYPE
+        # a no-op for multi-config ones; passing both covers a developer whose
+        # environment carries CMAKE_GENERATOR=Ninja Multi-Config, which also
+        # lands the artifact under _Bin/Release/.
+        cmake --build "$build" --config Release --parallel >"$blog" 2>&1 || {
+            echo "    [x] nrd: build failed — see $blog"
+            fail
+            return 1
+        }
+        local out="$src/_Bin/libNRD.so"
+        [[ -e $out ]] || out="$src/_Bin/Release/libNRD.so"
+        if [[ ! -e $out ]]; then
+            echo "    [x] nrd: build reported success but no libNRD.so in $src/_Bin"
+            fail
+            return 1
+        fi
+        mkdir -p "$(dirname "$dest")"
+        cp -f "$out" "$dest" || { fail; return 1; }
+    }
+
+    mkdir -p "$SDKS/NRD/bin/perf"
+    _nrd_arm standard "$CACHE/nrd-build" "$SDKS/NRD/bin/libNRD.so" || return 0
+    _nrd_arm perf "$CACHE/nrd-build-perf" "$SDKS/NRD/bin/perf/libNRD.so" \
+        -DREBLUR_PERFORMANCE_MODE=ON || return 0
+
+    # The sequencing contract, made CHECKABLE rather than merely documented.
+    # REBLUR_PERFORMANCE_MODE changes a compile definition AND every embedded
+    # shader blob, so byte-identical output is DEFINITELY a stale-shared-state
+    # failure. One-sided and therefore sound: differing output is merely
+    # consistent, which is all this can honestly claim.
+    if cmp -s "$SDKS/NRD/bin/libNRD.so" "$SDKS/NRD/bin/perf/libNRD.so"; then
+        echo "    [x] nrd: the perf artifact is BYTE-IDENTICAL to the standard one —"
+        echo "        the perf configure did not take (a stale NRDConfig.hlsli or"
+        echo "        _Shaders/ from the other arm). Re-run with --force."
+        fail
+        return 0
+    fi
+    echo "[+] nrd built (standard + perf, SPIRV embedded)"
 }
 
 # run <component> — the one place CUR is set, so `fail` can name what broke
@@ -686,7 +802,9 @@ check "  (perf variant, --nrd-perf)" "$SDKS/NRD/bin/perf/NRD.dll"
 echo "---- host-native ($OS; vulkan backend port) ----"
 if [[ $OS == linux ]]; then
     check "DXC -> SPIR-V" "$SDKS/dxc-linux/bin/dxc"
-    check "  (runtime; needs LD_LIBRARY_PATH)" "$SDKS/dxc-linux/lib/libdxcompiler.so"
+    check "  (runtime, found via DT_RPATH)" "$SDKS/dxc-linux/lib/libdxcompiler.so"
+    check "NRD denoiser (Vulkan, --nrd)" "$SDKS/NRD/bin/libNRD.so"
+    check "  (perf variant, --nrd-perf)" "$SDKS/NRD/bin/perf/libNRD.so"
 else
     # Report the ABSENCE with its reason rather than a bare MISSING row: this
     # one is not retryable, so a row that looks like a failed download would
@@ -732,8 +850,10 @@ fi
 echo
 if [[ -n $FAILED ]]; then
     echo "failed: ${FAILED_LIST[*]}"
-    if [[ ${FAILED_LIST[*]} == nrd ]]; then
+    if [[ ${FAILED_LIST[*]} == nrd && $OS != linux ]]; then
         echo "nrd is a Windows BUILD, not a download — there is nothing here to retry."
+    elif [[ ${FAILED_LIST[*]} == nrd ]]; then
+        echo "nrd is a local CMAKE BUILD, not a download — read the log it named above."
     else
         echo "rerun, or install those by hand (see README)."
     fi

@@ -20,6 +20,7 @@ pub mod device;
 pub mod fsr3;
 pub mod headless;
 pub mod layout;
+pub mod nrd;
 pub mod reflect;
 pub mod scene;
 pub mod spirv;
