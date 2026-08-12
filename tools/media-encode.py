@@ -23,9 +23,9 @@ already 1280x536, so the `scale=1280` is a no-op) — reproduce it with
 
 EACH SHOT SHIPS TWICE, and the split is the point. The committed **WebP**
 auto-loops, so it works for every reader — offline, on a fork, without AV1
-decode. The **AV1** is the 60 fps quality asset, and it has to be served from
-GitHub Pages (see `do_av1` for why a committed or release-hosted mp4 cannot
-play). The README puts a click-to-play <video> beside each loop.
+decode. The **AV1** is the 60 fps quality asset, LINKED from GitHub Pages (see `do_av1`
+for why a README cannot embed a player and why raw/release hosting cannot serve
+one). The README puts that link beside each loop.
 
 THE EXACT INVOCATIONS FOR THE COMMITTED SET
 -------------------------------------------
@@ -41,7 +41,7 @@ THE EXACT INVOCATIONS FOR THE COMMITTED SET
     # the lap loop: 60 fps render -> every 2nd frame at 30 fps, letterboxed
     python3 tools/media-encode.py tour capture-tour/tour/frames docs/media/tour.webp
 
-    # the 60 fps AV1s the README's <video> tags point at
+    # the 60 fps AV1s the README links to
     python3 tools/media-encode.py av1 capture-tour/tour/frames      pages/media/tour-av1.mp4
     python3 tools/media-encode.py av1 capture-foliage60/foliage/frames \\
         pages/media/foliage-av1.mp4 --width 1280 --height 0
@@ -246,19 +246,23 @@ def do_tour(args):
 
 
 def do_av1(args):
-    """The inline <video> asset: 10-bit AV1, served from GitHub Pages.
+    """The 60 fps quality asset: 10-bit AV1, LINKED from GitHub Pages.
 
-    Pages is the only route that plays. GitHub's markdown renderer does NOT
-    strip <video> (all five src domains survive its /markdown API), but
-    raw.githubusercontent.com serves a committed file as application/octet-stream
-    WITH X-Content-Type-Options: nosniff, which forbids the browser decoding it,
-    and a release asset is an `attachment` behind a signed URL that expires in an
-    hour. Pages serves a real video/mp4 with byte ranges.
+    Two measured reasons it is a link and not an embedded player:
 
-    Note what the sanitizer strips, since it constrains the markup: `src` off
-    <source> (so no multi-codec fallback -- one codec only), plus `loop`,
-    `poster` and `playsinline`. `controls`, `muted`, `width` and a child <img>
-    survive. Hence: single AV1, click-to-play, with the looping WebP beside it.
+    1. A README cannot embed one. GitHub's README renderer STRIPS <video>;
+       verified against the live page through repos/.../readme with
+       Accept: application/vnd.github.html, which finds zero <video> elements
+       while the <img> beside it survives. THE TRAP: the standalone /markdown
+       API is more permissive and returns the element with its src intact, so
+       testing there says the opposite of what shipping does. A plain link is
+       what works -- the same thing quinlight-audio does for its .m4a clips.
+    2. The bytes still have to be playable. raw.githubusercontent.com serves a
+       committed file as application/octet-stream WITH
+       X-Content-Type-Options: nosniff, which forbids the browser decoding it,
+       and a release asset is an `attachment` behind a signed URL that expires
+       in an hour. Pages serves a real video/mp4 with Accept-Ranges: bytes on a
+       permanent URL, so the link opens in the browser's player and seeks.
     """
     require_fps(args.fps)
     pat = os.path.join(args.frames, "f_%05d.png")
@@ -305,7 +309,7 @@ def do_pages(args):
     for f in files:
         print(f"  git add -f {f}")
     print("  echo > .nojekyll && git add .nojekyll")
-    print("  git commit -m 'pages: media for the README <video> tags'")
+    print("  git commit -m 'pages: media for the README video links'")
     print("  git push -u origin gh-pages")
     print("  git switch master")
     print("\nThen verify the serving headers -- this is the whole reason Pages was")
@@ -349,7 +353,7 @@ def main():
                    help="dither amplitude; 0 disables (see BAND_NOISE)")
     p.set_defaults(fn=do_tour)
 
-    p = sub.add_parser("av1", help="10-bit AV1 for the inline <video> (GitHub Pages)")
+    p = sub.add_parser("av1", help="10-bit AV1 for the Pages-hosted 60 fps link")
     p.add_argument("frames")
     p.add_argument("dst")
     p.add_argument("--src-fps", type=int, default=60)

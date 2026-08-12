@@ -1094,15 +1094,16 @@ pub fn pq_rgb16(hdr: &[f32], paper_white: f32, peak_nits: f32) -> Vec<u16> {
 ///
 /// Two delivery routes, and the difference is measured rather than folklore.
 /// The animated **WebP** is committed and auto-loops, so it works for every
-/// reader, offline and on a fork. The **AV1** is what carries real 60 fps
-/// quality, and it has to be served from **GitHub Pages**: GitHub's renderer
-/// does NOT strip a `<video>` tag (all five src domains survive its markdown
-/// API), but `raw.githubusercontent.com` serves a committed file as
-/// `application/octet-stream` with `X-Content-Type-Options: nosniff`, which
-/// forbids the browser decoding it, and a release asset is an `attachment`
-/// behind a signed URL that expires in an hour. Pages serves a real
-/// `video/mp4` with byte ranges, so that is where the AV1 goes. The HEVC stays
-/// the download master, where a local player handles the codec happily.
+/// reader, offline and on a fork. The **AV1** carries real 60 fps quality and is
+/// LINKED, not embedded, from **GitHub Pages** -- two measured reasons: GitHub's
+/// README renderer STRIPS `<video>` outright (verified against the live page via
+/// `repos/.../readme` with `Accept: application/vnd.github.html`; the standalone
+/// `/markdown` API is more permissive and misleadingly keeps it), and the bytes
+/// must be served playably -- `raw.githubusercontent.com` sends
+/// `application/octet-stream` with `X-Content-Type-Options: nosniff` and a
+/// release asset is an `attachment` behind a URL that expires in an hour, while
+/// Pages sends a real `video/mp4` with byte ranges. The HEVC stays the download
+/// master, where a local player handles the codec happily.
 pub fn ffmpeg_cmds(
     dir: &str,
     name: &str,
@@ -1207,14 +1208,14 @@ pub fn ffmpeg_cmds(
     // APPENDED, never inserted: `self_test` indexes [0] and [1] in both arms and
     // pins the HEVC/webp contracts there, so everything below is additive.
     //
-    // The AV1 is what a README can actually PLAY, and it is the reason a video
-    // finally works here at all: a committed .mp4 cannot be played from a raw
-    // URL (raw.githubusercontent.com serves `application/octet-stream` WITH
+    // The AV1 is the quality asset, LINKED from GitHub Pages rather than
+    // embedded: a README cannot embed a player (the renderer strips <video>),
+    // and a committed .mp4 could not be played from a raw URL anyway --
+    // raw.githubusercontent.com sends `application/octet-stream` WITH
     // `X-Content-Type-Options: nosniff`, so the browser is forbidden to decode
-    // it) and a release asset is worse (an `attachment` disposition behind a
-    // signed URL that expires in an hour). GitHub Pages serves a real
-    // `video/mp4` with byte ranges, so the AV1 goes there and the README points
-    // a <video> at it. It is 10-BIT deliberately -- see INLINE_AV1_CRF.
+    // it, and a release asset is an `attachment` behind a signed URL that
+    // expires in an hour. Pages sends a real `video/mp4` with byte ranges.
+    // It is 10-BIT deliberately -- see INLINE_AV1_CRF.
     let av1 = |src_tags: Vec<String>, vf: String, out_name: String| {
         let mut a = vec![s("-y")];
         a.extend(src_tags);
@@ -1243,7 +1244,7 @@ pub fn ffmpeg_cmds(
             HDR_MASTER_NITS as u32 / 5
         );
         out.push((
-            "AV1 10-bit (the inline <video>, served from GitHub Pages)".to_string(),
+            "AV1 10-bit (linked from GitHub Pages -- the 60 fps asset)".to_string(),
             av1(
                 vec![
                     s("-color_primaries"), s("bt2020"), s("-color_trc"), s("smpte2084"),
@@ -1270,7 +1271,7 @@ pub fn ffmpeg_cmds(
         ));
     } else {
         out.push((
-            "AV1 10-bit (the inline <video>, served from GitHub Pages)".to_string(),
+            "AV1 10-bit (linked from GitHub Pages -- the 60 fps asset)".to_string(),
             av1(vec![], format!("scale={inline_w}:-2:flags=lanczos"),
                 format!("{dir}/{name}-av1.mp4")),
         ));
@@ -1838,7 +1839,7 @@ pub fn self_test() -> Result<(), String> {
             return Err(format!("inline webp frame rate {got} is below MIN_PRODUCTION_FPS"));
         }
 
-        // The AV1 — the asset the README's <video> points at. 10-bit is the
+        // The AV1 — the 60 fps asset the README links to. 10-bit is the
         // banding fix, not a flourish, so pin the pixel format too.
         let hdr_arm = ffmpeg_cmds("capture/tour", "tour", 60, 3840, true);
         for (arm, cmds) in [("sdr", &sdr), ("hdr", &hdr_arm)] {
