@@ -518,11 +518,24 @@ jobs:
       # summary is unreachable after a SKIP, these gates skip a stage and still
       # print PASSED — so PASSED alone would go green on an image that lost the
       # Metal toolchain or the GPU. --check-fsr3 is guarded HARD on its U4 line,
-      # because U1-U4 are PROVEN to run here. --check-metalfx is guarded only on
-      # PASSED for now: MTLFXTemporalScalerDescriptor.supportsDevice on a
-      # PARAVIRTUAL device is not something any run has reported yet, so a hard
-      # X3 guard could fail for an environment fact rather than a defect. Read
-      # the first runs, then tighten it to `check-metalfx: X3 upscale`.
+      # because U1-U4 are PROVEN to run here.
+      #
+      # --check-metalfx IS GUARDED ONLY ON PASSED, AND IT IS NEAR-VACUOUS HERE.
+      # Say it plainly, because a green job printing `check-metalfx: PASSED` may
+      # not otherwise read that way: run 31630969341 reports
+      #
+      #   check-metalfx: SKIP X1 — MTLFXTemporalScalerDescriptor.supportsDevice
+      #                            is false for this device
+      #
+      # Apple's own temporal scaler does not support the paravirtual GPU, so
+      # X2/X3 CANNOT run on this runner and no guard can make them. What is
+      # actually covered here is X0 (staging math, which --check-fsr already
+      # runs on all three platforms) and X1's device + texture round-trip
+      # (which --check-fsr3's U2 also covers) — i.e. approximately nothing that
+      # is not covered elsewhere. It stays because it costs seconds and lights
+      # up by itself the day a runner image gains a device MetalFX supports;
+      # it must NOT be read as MetalFX having CI coverage. Do not "tighten" the
+      # guard to its X3 line: that would fail on an environment fact.
       #
       # BOTH GATES RUN BEFORE ANY GUARD IS EVALUATED. The first draft asserted
       # after each, so the fsr3 failure above exited the step and --check-metalfx
