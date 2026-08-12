@@ -408,31 +408,28 @@ jobs:
             vk.log
           if-no-files-found: warn
 
-  # THE METAL PROBE — manual only, and the `if` is the whole point: it is skipped
-  # on push and pull_request, so it can never touch the badge.
+  # THE METAL JOB — the only REAL GPU coverage this workflow has, because
+  # macos-latest is macos-26-arm64 and the Linux/Windows runners have no GPU at
+  # all. --check-fsr3 is staged like --check-vk (U0 pure staging math | U1 the
+  # transpiled metallib table | U2 a real Metal device | U3 an FSR3 context |
+  # U4 one scored upscale); --check-metalfx is its Apple-scaler twin.
   #
-  # It exists because macos-latest is macos-26-arm64 — Apple silicon, and the
-  # ONLY runner in this workflow with a GPU. --check-fsr3 is staged like
-  # --check-vk (U0 pure staging math | U1 the transpiled metallib table | U2 a
-  # real Metal device | U3 an FSR3 context | U4 one scored upscale), so U2-U4
-  # would be the first real-GPU coverage this project has ever had in CI.
-  #
-  # THREE UNKNOWNS, and one run's log answers all three at once:
-  #   1. Is `xcrun metal` on the image? Xcode 16.3 split the Metal toolchain
-  #      into a separately downloadable component and the image manifest does
-  #      not list it. generate_fsr3_metallibs needs it, plus spirv-cross.
-  #   2. Does a Metal device enumerate inside the runner VM? (U2.)
-  #   3. Do U3/U4 hold there, given the SDK fetch below?
-  #
-  # DELIBERATELY UNGUARDED, unlike check-vulkan: this run's job is to REPORT.
-  # --check-fsr3 skips loudly and exits 0 when the toolchain is absent and fails
-  # only on a real defect, and build.rs prints enumerated-vs-emitted metallib
-  # counts as a cargo:warning — so a skipped stage here is the finding, not a
-  # failure to hide. Promoting this to a push-triggered, guarded job once the
-  # three answers are in is a one-line change.
+  # It landed as a `workflow_dispatch`-only probe because three things had to be
+  # true and none was answerable without running. Run 31626195554 answered all
+  # three, which is why the `if` is gone:
+  #   1. `xcrun metal` IS on the image — an already-installed MobileAsset
+  #      cryptex (MetalToolchain-v17.6.109.0, metal 32023.883), despite Xcode
+  #      16.3 having split the toolchain out and the manifest not listing it. So
+  #      build.rs transpiles 80/80 non-wave64 permutations, 0 failed.
+  #   2. A Metal device DOES enumerate in the runner VM: "Apple Paravirtual
+  #      device | unified true". Note `system_profiler SPDisplaysDataType`
+  #      prints NOTHING for it — U2 is the authoritative probe, not the system
+  #      tool.
+  #   3. U3/U4 hold: 11 pipelines built of 80 metallibs offered, and a scored
+  #      321x181 -> 642x362 upscale at energy 1.000x. 6m21s all in, which is
+  #      less than this workflow's other macOS job costs.
   check-metal:
     runs-on: macos-latest
-    if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -449,26 +446,84 @@ jobs:
       - name: spirv-cross
         run: brew install spirv-cross
 
-      # The FSR3 SDK source — a 189 MB tarball, ~19 MB kept. U3/U4 need it; U0/U1
-      # do not, so an absent SDK still answers unknowns 1 and 2.
+      # The FSR3 SDK source — a 189 MB tarball of which ~19 MB is kept (four
+      # paths). Cached on FFX_SRC_TAG now that this runs per push rather than by
+      # hand; the installer's own `skip` sentinel makes a hit a no-op, so the
+      # cache and the script agree on what "installed" means by construction.
+      - name: FFX source version
+        id: ffxver
+        run: echo "tag=$(sed -n 's/^FFX_SRC_TAG=//p' install-prerequisites.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: SDKs/FidelityFX-SDK
+          key: ffx-src-${{ runner.os }}-${{ steps.ffxver.outputs.tag }}
+
       - name: FidelityFX SDK 1.1.4 source
         run: ./install-prerequisites.sh fsr3src
 
-      # The three unknowns, asked directly and before anything can obscure them.
-      # `|| true` throughout: a missing tool is an ANSWER here, not an error.
+      # Kept from the probe, because it is what makes a FUTURE image change
+      # readable: if the Metal toolchain ever leaves the image, the guard below
+      # fails on a metallib table of zero and this step is where you see WHY in
+      # one line instead of inferring it. `|| true` throughout — a missing tool
+      # is an answer, and the guard is what turns it into a failure.
       - name: Probe the toolchain and the GPU
         run: |
           echo "--- xcode ---";       xcodebuild -version || true
           echo "--- xcrun metal ---"; xcrun -f metal || true
           xcrun metal --version || true
           echo "--- spirv-cross ---"; brew list --versions spirv-cross || true
-          echo "--- GPU ---";         system_profiler SPDisplaysDataType || true
 
       # build.rs reports the metallib table as cargo:warning lines (enumerated vs
       # emitted, and the first failure if any) — expect 80 of the 200 committed
-      # permutation files. Zero emitted means unknown 1 is answered "no".
+      # permutation files, which is what a working `xcrun metal` + spirv-cross
+      # produce. Zero emitted is the toolchain being gone.
       - name: Build
         run: cargo build --profile quick
 
-      - name: Gate (Metal FSR3)
-        run: cargo run --profile quick -- --check-fsr3
+      # BOTH VALIDATION LAYERS ARE ON, at the gates' own request: each prints a
+      # NOTE naming the failure class that is INVISIBLE without them (padded
+      # constant buffers, image-atomic buffer aliasing, clear-on-buffer-backed
+      # and RenderTarget usage for FSR3; texture storage modes, usage flags and
+      # unbound arguments for MetalFX) and says "Re-run with both =1".
+      #
+      # It is also the STRICTER run, not merely the noisier one, and the reason
+      # is recorded at main.rs's cold-dispatch comment: the layer ZERO-FILLS
+      # allocations, so FFX's UNINITIALIZED-tagged temporals stop carrying
+      # per-allocation residue and --check-fsr3's accumulating-channel count
+      # drops to exactly zero. That path is asserted as a BOUND, so zero passes
+      # it — turning validation on cannot make an anti-vacuity check vacuous.
+      #
+      # THE GUARDS ARE ASYMMETRIC, deliberately. Unlike --check-vk, whose
+      # summary is unreachable after a SKIP, these gates skip a stage and still
+      # print PASSED — so PASSED alone would go green on an image that lost the
+      # Metal toolchain or the GPU. --check-fsr3 is guarded HARD on its U4 line,
+      # because U1-U4 are PROVEN to run here. --check-metalfx is guarded only on
+      # PASSED for now: MTLFXTemporalScalerDescriptor.supportsDevice on a
+      # PARAVIRTUAL device is not something any run has reported yet, so a hard
+      # X3 guard could fail for an environment fact rather than a defect. Read
+      # the first runs, then tighten it to `check-metalfx: X3 upscale`.
+      - name: Gates (Metal)
+        env:
+          MTL_DEBUG_LAYER: 1
+          MTL_SHADER_VALIDATION: 1
+        shell: bash
+        run: |
+          set -eo pipefail
+          cargo run --profile quick -- --check-fsr3 2>&1 | tee fsr3.log
+          grep -q "check-fsr3: PASSED" fsr3.log \
+            || { echo "::error::--check-fsr3 did not pass"; exit 1; }
+          grep -q "check-fsr3: U4 upscale" fsr3.log \
+            || { echo "::error::--check-fsr3 passed WITHOUT running a real upscale — the GPU half skipped:"; grep -E "SKIP U[0-9]" fsr3.log; exit 1; }
+          cargo run --profile quick -- --check-metalfx 2>&1 | tee metalfx.log
+          grep -q "check-metalfx: PASSED" metalfx.log \
+            || { echo "::error::--check-metalfx did not pass"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: check-metal-logs
+          path: |
+            fsr3.log
+            metalfx.log
+          if-no-files-found: warn
