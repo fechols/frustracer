@@ -363,11 +363,20 @@ camera.
 
 ![A lap of the archipelago](docs/media/tour.webp)
 
+### ▶ [Watch the lap at 60 fps — 1920×804, 10-bit AV1](https://fechols.github.io/frustracer/media/tour-av1.mp4)
+
 *A lap of the world, sunrise to moonlit night. Every frame is lit by the
 always-on real-time bounce — this is the one clip on the page that is **not**
 a hemisphere-GI capture, so the light filling the arcades and streets is the
-same single cosine bounce per pixel a live session gets. Rendered with
-`--cinematic`; the full 4K60 version is on the
+same single cosine bounce per pixel a live session gets.*
+
+*Two copies, because a README can only auto-play an image: GitHub strips
+`<video>` from a rendered README, so the loop above is a 30 fps animated WebP
+and the link is the real thing — the same lap at **60 fps, three times the
+pixels, and a sky never quantized to 8 bits**, in fewer bytes than the loop.
+(The loop's own gradients are dithered, which halves its widest visible band;
+10 bits is how the video avoids the problem rather than masking it.) Rendered
+with `--cinematic`; the 4K60 HDR10 master is on the
 [releases page](../../releases).*
 
 ---
@@ -527,6 +536,11 @@ each one's A/B is how its cost was measured in the first place.
 
 ![Wind through San Miguel's ficus](docs/media/foliage.webp)
 
+### ▶ [Watch the wind at 60 fps — 10-bit AV1](https://fechols.github.io/frustracer/media/foliage-av1.mp4)
+
+*The loop above plays everywhere at 30 fps; the link is the 60 fps version, which
+is where the individual leaves actually resolve.*
+
 *Wind in the leaves — and the leaves are **geometry**, not a shader trick. Leaf and
 bark triangles are welded and grouped into **plants** at load — 2,048 of them across
 the world's seven islands — then bucketed by locality into 3,086 cells, 7.3 M
@@ -589,9 +603,12 @@ cargo run --release -- --cinematic hero --cinematic-island san-miguel \
                         --cinematic-gi --cinematic-res 2560x1072 \
                         --cinematic-samples 320 --cinematic-hdr
 
-# the wind in the leaves: a locked-off clip, because a still cannot show it
+# the wind in the leaves: a locked-off clip, because a still cannot show it.
+# 240 frames at 60 fps, so one render feeds both the 60 fps AV1 and, at every
+# 2nd frame, the 30 fps loop
 cargo run --release -- --cinematic foliage --cinematic-gi \
-                        --cinematic-res 1280x536 --cinematic-samples 32
+                        --cinematic-res 1280x536 --cinematic-samples 32 \
+                        --cinematic-frames 240 --cinematic-fps 60
 
 # the lap, as released: 4K, 60 fps, HDR10. No --cinematic-gi, so this one
 # reconstructs through the upscaler chain at 100% scale — see below
@@ -624,7 +641,43 @@ python3 tools/media-encode.py still \
     capture-islands/island-02-sponza-0830/island-02-sponza-0830.png \
     docs/media/islands/02-sponza.webp
 python3 tools/media-encode.py tour capture-tour/tour/frames docs/media/tour.webp
+python3 tools/media-encode.py av1  capture-tour/tour/frames pages/media/tour-av1.mp4 --crf 10
+python3 tools/media-encode.py pages pages/media/*.mp4      # publish + verify headers
 ```
+
+**Each animated shot ships twice, and the split is not redundancy.** The
+committed WebP auto-loops, so the page moves the moment you open it and keeps
+working offline, on a fork, and without AV1 decode; **30 fps is a floor** for
+anything shipped (`cinematic::MIN_PRODUCTION_FPS` — the tour used to be 20 and
+read as stuttery). The AV1 is the quality asset at 60 fps and 10-bit, and it is
+delivered as a **link to GitHub Pages** — for two independent reasons, both
+measured, and the second one cost a wrong commit to learn:
+
+1. **A README cannot embed a player at all.** GitHub's README renderer strips
+   `<video>` outright: fetching the live page through
+   `repos/…/readme` with `Accept: application/vnd.github.html` finds zero
+   `<video>` elements while the `<img>` beside it survives. Note the trap — the
+   standalone `/markdown` API is *more permissive* and happily returns the
+   element with its `src`, so testing there says the opposite of what shipping
+   does. A plain link is what works, which is also how
+   [quinlight-audio](https://github.com/Kind-Computers/quinlight-audio) serves
+   its clips.
+2. **The file still has to be hosted where the bytes are playable.**
+   `raw.githubusercontent.com` serves a committed file as
+   `application/octet-stream` *with* `X-Content-Type-Options: nosniff`, which
+   forbids the browser from decoding it, and a release asset is an `attachment`
+   behind a signed URL that expires in an hour. Pages sends a real `video/mp4`
+   with `Accept-Ranges: bytes` on a permanent URL, so the link opens in the
+   browser's own player and seeks.
+
+**Rendering a new video asset: supersample rather than reach for `--cinematic-gi`.**
+Measured on the foliage clip at 240 frames: the hemisphere-GI accumulation path
+took **2026 s**, DLSS-RR at native res took **30.5 s** but visibly softened the
+leaf detail (canopy high-frequency energy −19%), and RR at **3× resolution then
+downscaled** took **212 s** and came back visually comparable to GI (−11%, and
+sharp where native RR was mush). RR's blur is a fixed kernel in *pixels*, so
+supersampling defeats it. Reserve `--cinematic-gi` for stills, where the samples
+are cheap and enclosure light is nearly all bounce.
 
 `--cinematic` renders stills and camera-spline sequences (closed-loop
 Catmull-Rom, so a lap loops seamlessly), writes a numbered PNG sequence, and

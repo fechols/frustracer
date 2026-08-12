@@ -112,8 +112,43 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # No "Build NRD" step: build.rs gates the ARTIFACT half behind
-      # `#[cfg(windows)]`, and a build script compiles for the HOST.
+      # THE ARTIFACT HALF APPLIES HERE TOO, and this step exists because it did
+      # not always: require_nrd() used to gate the artifact behind
+      # `#[cfg(windows)]` — the HOST, not the target — and now keys it on
+      # `CARGO_CFG_TARGET_OS` with a real Linux arm, because the Vulkan backend
+      # consumes libNRD.so (SPIR-V) exactly as D3D12 consumes NRD.dll (DXIL).
+      # Same source, same tag, same encoding pins; only the shader arm differs,
+      # and off WIN32 that is not even a choice. So a bare Linux clone must run
+      # the installer before `cargo build` works at all, and CI is a bare clone.
+      #
+      # NO DXC DROP IS NEEDED, unlike `--check-spirv`: the installer passes
+      # SHADERMAKE_DXC_VK_PATH only when SDKs/dxc-linux exists, and ShaderMake's
+      # own CMake otherwise downloads DXC from the DirectXShaderCompiler
+      # releases and falls back to it for the SPIR-V arm. The blobs are then
+      # compiled by ShaderMake's DXC pin rather than this repository's — which
+      # costs this job nothing, because the four gates below are the DLL-FREE
+      # half and never load the library. If that ever stops being true, add
+      # `./install-prerequisites.sh dxc` above and the drop takes over.
+      - name: NRD version
+        id: nrdver
+        run: echo "sha=$(git -C SDKs/NRD-src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Same shape as the Windows job: cache the ~3 MB of built artifacts on the
+      # submodule SHA, not the CMake tree, and let the installer's early-out
+      # ("[=] nrd already installed") make a hit a no-op. `runner.os` is in the
+      # key, so the .so and the .dll cannot collide.
+      - uses: actions/cache@v4
+        with:
+          path: SDKs/NRD/bin
+          key: nrd-dll-${{ runner.os }}-${{ steps.nrdver.outputs.sha }}
+
+      # The real installer component, for the Windows job's reason: CI and a
+      # developer machine build the library exactly one way, including the
+      # configure->build->copy sequencing that keeps the perf arm's shaders out
+      # of the standard library (do_nrd checks that with a cmp of the two).
+      - name: Build NRD
+        run: ./install-prerequisites.sh nrd
+
       - name: Build
         run: cargo build --profile quick
 
@@ -162,10 +197,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Deliberately NO "Build NRD" step, unlike the Windows job. build.rs gates
-      # the ARTIFACT half (SDKs\NRD\bin\NRD.dll) behind `#[cfg(windows)]`, and a
-      # build script compiles for the HOST — so that block is dead here and no
-      # DLL is needed. The source-submodule half above is what still applies.
+      # Deliberately NO "Build NRD" step, unlike the Windows and Linux jobs —
+      # and the reason is the TARGET, not the host. require_nrd() selects the
+      # artifact off `CARGO_CFG_TARGET_OS` (NRD.dll for windows, libNRD.so for
+      # linux) and returns for everything else, because NRD emits DXBC/DXIL/
+      # SPIR-V and has no Metal output at all: requiring an artifact no backend
+      # here could load would be a gate with no subject. The source-submodule
+      # half above is platform-neutral and is what still applies.
       - name: Build
         run: cargo build --profile quick
 
