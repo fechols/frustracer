@@ -737,11 +737,14 @@ fn main() {
              the naive coin flip, delivering only p of the correction)"
         );
     }
-    // DEFAULT 1.0 — only a DEPARTURE prints, the lever-line convention, so a
-    // flagless session's stderr is exactly what it was before the ladder.
+    // Only a DEPARTURE prints, the lever-line convention — so a flagless
+    // session's stderr says nothing about GI. Compared against the ONE const
+    // rather than a literal of its own: a lever line that announces the
+    // default (or goes quiet on a departure) is the exact silent half-landing
+    // `shade::DEFAULT_BOUNCES` exists to prevent.
     if opts.rtgi_bounces <= 0.0 {
         eprintln!("rtgi: OFF — flat SH×AO ambient (the pre-RTGI renderer)");
-    } else if opts.rtgi_bounces != 1.0 {
+    } else if opts.rtgi_bounces != shade::DEFAULT_BOUNCES {
         let det = opts.rtgi_bounces.floor();
         let pr = opts.rtgi_bounces - det;
         if pr > 0.0 {
@@ -753,7 +756,11 @@ fn main() {
                 det + 1.0
             );
         } else {
-            eprintln!("rtgi: {} deterministic bounces", opts.rtgi_bounces);
+            eprintln!(
+                "rtgi: {} deterministic bounce{}",
+                opts.rtgi_bounces,
+                if opts.rtgi_bounces == 1.0 { "" } else { "s" }
+            );
         }
     }
     autoexp::set_enabled(opts.autoexp);

@@ -1474,7 +1474,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("detail_ao_strength", "detail AO strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.125, default: 0.125 }, acc_f32!(effects.detail_ao_strength)),
             item!("detail_untex_scale", "detail on untextured (scale)", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 1.0 }, acc_f32!(effects.detail_untex_scale)),
             item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
-            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, Cycle { options: &["0", "0.5", "1", "1.5", "2"], default_ix: 2 }, acc_str!(effects.rtgi_bounces)),
+            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, Cycle { options: &["0", "0.5", "1", "1.5", "2"], default_ix: 4 }, acc_str!(effects.rtgi_bounces)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
             item!("foliage_sway", "foliage sway", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.foliage_sway)),
             item!("foliage_amp", "foliage sway amplitude", "Effects", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 1.0 }, acc_f32!(effects.foliage_amp)),

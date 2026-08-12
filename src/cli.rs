@@ -557,10 +557,12 @@ pub struct Opts {
     /// no-op on flat-shaded geometry (n_s == n_g).
     pub amb_bump: bool,
     /// `--rtgi-bounces N` (`shade::set_rtgi_bounces`): the GI ladder, as a
-    /// BOUNCE BUDGET. DEFAULT 1.0 — one cosine-sampled gather per pixel per
-    /// frame replaces the ambient term, shaded at the hemi BOUNCE_Q policy and
-    /// integrated by the temporal denoisers / accumulation, which is the
-    /// renderer this field used to spell as a bool.
+    /// BOUNCE BUDGET. DEFAULT `shade::DEFAULT_BOUNCES` = 2.0 — TWO real
+    /// bounces, the user's feel-test call, at a measured cost that const
+    /// records. `1` is one cosine-sampled gather per pixel per frame replacing
+    /// the ambient term, shaded at the hemi BOUNCE_Q policy and integrated by
+    /// the temporal denoisers / accumulation — the renderer this field used to
+    /// spell as a bool, and the lever for a session that wants the time back.
     ///
     /// The five canonical rungs are 0 | 0.5 | 1 | 1.5 | 2. `0` is the flat
     /// `SH sky irradiance × AO` ambient, bit-identical to the pre-RTGI
@@ -1006,7 +1008,7 @@ pub fn defaults() -> Opts {
         detail_ao_strength: 0.125,
         detail_untex_scale: 1.0,
         amb_bump: true,
-        rtgi_bounces: 1.0,
+        rtgi_bounces: crate::shade::DEFAULT_BOUNCES,
         autoexp: true,
         exposure_bias: 0.0,
         autoexp_guard: true,
@@ -2847,9 +2849,10 @@ pub fn usage() {
                 eprintln!("                maps + detail bump read flat under sky light again; a no-op on");
                 eprintln!("                flat-shaded geometry)");
                 eprintln!("  --rtgi-bounces N  the GI ladder, as a BOUNCE BUDGET. Rungs 0 | 0.5 | 1 | 1.5 | 2");
-                eprintln!("                (any N in 0..=2 parses; DEFAULT 1 = one cosine gather per pixel per");
-                eprintln!("                frame as the ambient term, the renderer this flag used to be a bool");
-                eprintln!("                for). A HALF rung buys the rung above at a fraction of its rays:");
+                eprintln!("                (any N in 0..=2 parses; DEFAULT 2 = two real bounces. It costs: 1 -> 2");
+                eprintln!("                is +11% CPU frame and +28-37% of the GPU leaf region, so --rtgi-bounces 1");
+                eprintln!("                — one gather as the ambient term — is the lever for the time back).");
+                eprintln!("                A HALF rung buys the rung above at a fraction of its rays:");
                 eprintln!("                the SH-sky x AO tail is kept as a control variate and a real gather");
                 eprintln!("                is rouletted over it at that probability, which is UNBIASED for the");
                 eprintln!("                rung above rather than an average of the two — so the temporal");
@@ -3295,11 +3298,18 @@ pub fn self_test() -> Result<(), String> {
     // The default is the rung this renderer shipped with, and it is what makes
     // a flagless session byte-identical to the pre-ladder build. A drift here
     // would move every golden without moving a single gate.
-    if defaults().rtgi_bounces != 1.0 {
-        return Err("the default rtgi-bounces must be 1.0 (the pre-ladder renderer)".into());
+    // The shipping rung, from its ONE const — this only checks that `defaults`
+    // reads it rather than carrying a literal of its own, since a second
+    // literal is exactly how the four sites drifted apart before.
+    if defaults().rtgi_bounces != crate::shade::DEFAULT_BOUNCES {
+        return Err(format!(
+            "cli::defaults' rtgi-bounces is {}, shade::DEFAULT_BOUNCES is {}",
+            defaults().rtgi_bounces,
+            crate::shade::DEFAULT_BOUNCES
+        ));
     }
     for (argv, want) in [
-        (vec![], 1.0f32),
+        (vec![], crate::shade::DEFAULT_BOUNCES),
         (vec!["--no-rtgi"], 0.0),
         (vec!["--rtgi"], 1.0),
         (vec!["--rtgi-bounces", "0"], 0.0),

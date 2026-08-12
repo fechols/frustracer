@@ -45,7 +45,9 @@ pub struct Quality {
     /// is kept as a control variate and a real gather is rouletted over it at
     /// that probability — unbiased for the next rung up, at that fraction of
     /// its ray cost (see the ambient tier's roulette arm for the estimator).
-    /// `0.0` is the flat SH×AO ambient, i.e. the pre-RTGI renderer.
+    /// `0.0` is the flat SH×AO ambient, i.e. the pre-RTGI renderer. The
+    /// SHIPPING default is `DEFAULT_BOUNCES` = 2.0 — two real bounces, the
+    /// user's feel-test call; see that const for what it costs.
     ///
     /// ONE field, deliberately not a bool beside a probability:
     /// `Quality { rtgi_bounces: 0.0, .. }` pins the whole tier off in a single
@@ -71,13 +73,36 @@ pub struct Quality {
     pub emissive_display: bool,
 }
 
+/// THE SHIPPING RUNG — the ONE place the GI ladder's default lives.
+///
+/// 2.0 since 2026-08-12 (the user's feel-test: "a pretty big perf hit, but it
+/// looks AMAZING"), i.e. TWO real bounces on every session that does not say
+/// otherwise. It was 1.0 for the ladder's first day, which is the renderer the
+/// bool this replaced used to spell; `--rtgi-bounces 1` is that arm and is
+/// still what the `rtgi-ab` gate scores against hemi's one-bounce fb.gi.
+///
+/// COSTED, and accepted rather than discovered — 1 -> 2 measured CPU 51.61 ->
+/// 57.41 ms (--spin path 120f procedural), GPU leaf 0.292 -> 0.374 on a 4090
+/// and 0.423 -> 0.579 on san-miguel-low-poly (+28%/+37% of the leaf region,
+/// ~4% of GPU frame span on the light scene). `--rtgi-bounces 1` is the lever
+/// for a session that wants the time back, and 1.5 buys most of the look for
+/// 62% of the increment on a heavy scene.
+///
+/// It is a CONST rather than the codebase's usual triplicated literal because
+/// the default was reaching four sites (this static, `cli::defaults`, main's
+/// lever-line comparand and the self-test's expectation) and a half-landed
+/// flip is silent: the lever line would stop announcing a departure, or start
+/// announcing the default. `settings.rs`'s `Cycle` row still carries its own
+/// `default_ix` (it indexes strings, not floats) and `cli::self_test` pins the
+/// two against each other.
+pub const DEFAULT_BOUNCES: f32 = 2.0;
+
 /// Session lever for real-time GI (the `scene::amb_bump` lever shape): the
-/// BOUNCE BUDGET `--rtgi-bounces N`, DEFAULT 1.0 — one deterministic bounce,
-/// the pre-ladder renderer — and 0.0 under `--no-rtgi`. Read by the `Quality`
-/// constructors, never inside `shade()` itself, which takes its budget from
-/// the Quality it was handed.
+/// BOUNCE BUDGET `--rtgi-bounces N`, defaulting to `DEFAULT_BOUNCES` and 0.0
+/// under `--no-rtgi`. Read by the `Quality` constructors, never inside
+/// `shade()` itself, which takes its budget from the Quality it was handed.
 static RTGI_BOUNCES: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
+    std::sync::atomic::AtomicU32::new(DEFAULT_BOUNCES.to_bits());
 
 pub fn set_rtgi_bounces(n: f32) {
     RTGI_BOUNCES.store(n.to_bits(), std::sync::atomic::Ordering::Relaxed);
