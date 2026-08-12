@@ -892,6 +892,12 @@ cargo run --release -- --check-fsr    # headless: FSR signal-split/encoding/MV/p
                                       # implementation is not merely unwritten but unexpressible.
                                       # v1.1.4 is the last MIT-source generation with a stock
                                       # first-party ffx_vk AND a seam. Windows keeps v2.3.0.
+                                      # THAT SEAM IS NOT THEORETICAL — it is what
+                                      # shim/ffx_fsr3_metal.mm fills with a hand-written
+                                      # `FfxInterface` against Metal, so macOS upscales through
+                                      # the same SDK with no Vulkan and no vendor backend at all
+                                      # (--check-fsr3). Keeping a generation that HAS the seam is
+                                      # what bought a third platform.
                                       # UNLIKE EVERY OTHER SDK HERE IT IS COMPILED FROM SOURCE and
                                       # statically linked — no DLL, no fn-pointer table, no
                                       # runtime shed; the degrade is at BUILD time
@@ -7881,6 +7887,257 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # unaffected. unix-only today for the same reason vk/spirv.rs is —
                                       # nothing here forbids Vulkan on Windows, the Windows build simply
                                       # must not gain a dependency it does not yet use
+cargo run --release -- --check-fsr3   # FSR3 UPSCALING ON METAL, gated (macOS; src/mtl/ +
+                                      # shim/ffx_fsr3_metal.mm + build.rs's generate_fsr3_metallibs
+                                      # — the Metal port's B2, 2026-08-12). Headless and CPU-FED:
+                                      # the CPU tracer makes the G-buffer (dlss::GBufs, which runs
+                                      # on every platform), FSR 3.1 upscales it, and the result is
+                                      # SCORED. There is no Metal tracer, no presentation stage and
+                                      # no UpChain integration — an interactive macOS session is
+                                      # explicitly not what this gates. Wrong OS = exit 2 (an
+                                      # explicitly requested gate on a platform that cannot host it
+                                      # is an ENVIRONMENT error, the --check-vk-on-Windows
+                                      # convention); a missing toolchain on the RIGHT OS SKIPs.
+                                      # THE ASYMMETRY WITH --check-vk's V11 IS THE WHOLE COST, and
+                                      # it is why there is one gate per BACKEND rather than one
+                                      # flag with two arms: FidelityFX ships `ffx_vk` and
+                                      # `ffx_dx12` and NOTHING ELSE, so the Vulkan arm is a thin C
+                                      # ABI over a STOCK backend on a device that suite already
+                                      # opens, while this one must ALSO CARRY THE BACKEND — a
+                                      # complete `FfxInterface` (23 callbacks) against Metal,
+                                      # ~1300 lines of non-ARC Objective-C++ this tree owns with no
+                                      # upstream. That file is the single largest maintenance
+                                      # surface the Metal arm has and the one piece with no
+                                      # fallback.
+                                      # THE SHADER ROUTE, measured before any of it was written
+                                      # (M1, Apple M1 / macOS 26.5 / Xcode 26.6): all 160 committed
+                                      # SPIR-V blobs transpile with `spirv-cross --msl --msl-version
+                                      # 30000 --msl-decoration-binding`, and then **112 of 160
+                                      # FAILED `xcrun metal -c` with ONE error** — `'sampler'
+                                      # attribute parameter is out of bounds: must be between 0 and
+                                      # 15` — because the corpus's only sampler is FFX's
+                                      # `s_LinearClamp` at VK binding 1001. After the `binding -
+                                      # 1000` remap: 160/160 compile and package. The shader half
+                                      # was solved by that one substitution; everything else here
+                                      # is a port with a proven reference.
+                                      # EXACTLY 80 OF THE 200 COMMITTED FILES ARE TRANSPILED, and
+                                      # a plain subtraction gets it wrong because the two skipped
+                                      # sets OVERLAP: 40 are permutation INDEX headers (consumed by
+                                      # C++, not shader blobs) of which 20 are themselves wave64,
+                                      # leaving 160 blobs of which 80 are wave64. 200 - 40 - 80 =
+                                      # 80. Both fp32 and fp16 are kept — a pass picks at runtime.
+                                      # The per-PASS breakdown is a MEASURED table, not a product
+                                      # (accumulate alone is 24 of the 40 per precision): it lives
+                                      # at `mtl::fsr3::EXPECTED_PERMUTATIONS`, and if that number
+                                      # moves, RE-COUNT rather than multiply.
+                                      # FOUR CONTRACTS BIND build.rs AND THE SHIM, none of which
+                                      # either side can change alone — there is no other handshake
+                                      # between the transpiled table and the loader:
+                                      # (1) THE KEY IS FNV-1a-64 OF THE SPIR-V BYTES. build.rs
+                                      # hashes the blob it transpiles; `CreatePipelineMetal` hashes
+                                      # `FfxShaderBlob.data` — the same bytes, from the same
+                                      # `ffxGetPermutationBlobByIndex` accessor the Vulkan backend
+                                      # uses — and linear-scans for the match. SPIR-V is the
+                                      # interchange format and no Metal artifact is committed.
+                                      # (2) A 12-BYTE LE THREADGROUP HEADER precedes each metallib.
+                                      # Metal needs the workgroup size HOST-side at dispatch, where
+                                      # Vulkan and DXIL both reflect it out of the bytecode, so
+                                      # build.rs parses `OpExecutionMode LocalSize` and prepends
+                                      # (x,y,z); the shim strips the same 12 bytes back off.
+                                      # (3) THE SAMPLER REMAP IS `binding - 1000` ON BOTH SIDES —
+                                      # build.rs::remap_ffx_samplers rewrites `[[sampler(N)]]` for
+                                      # N >= 1000, and CreatePipelineMetal binds static sampler j
+                                      # at index j on the same assumption. Disagree and every
+                                      # sampler lands on the wrong slot.
+                                      # (4) `--msl-decoration-binding` MAKES THE METAL ARGUMENT
+                                      # INDEX EQUAL THE FFX/VK BINDING NUMBER, which is what lets
+                                      # the backend bind discretely (setTexture/setBuffer/setBytes
+                                      # at slotIndex) instead of building descriptor sets. Drop the
+                                      # flag and every binding silently renumbers.
+                                      # A FIFTH IS A PAIR RATHER THAN A CONTRACT: the caps hardcode
+                                      # in `GetDeviceCapabilitiesMetal` (SM 6.6, waveLaneCountMin =
+                                      # Max = 32, fp16Supported = true) and build.rs's WAVE64 SKIP.
+                                      # Apple GPUs are SIMD-32, so reporting a 32-lane wave is what
+                                      # makes FFX request exactly the set that was transpiled;
+                                      # widen the caps and FFX asks for a hash that was never
+                                      # emitted (and the wave64 blobs would mis-execute at width 32
+                                      # anyway), narrow the transpile and the same happens from the
+                                      # other side.
+                                      # THE FOUR VALIDATION-ONLY BUGS, carried verbatim from the
+                                      # reference rather than re-derived, and marked GOTCHA 1-4 in
+                                      # the .mm. EVERY ONE was found only under `MTL_DEBUG_LAYER=1
+                                      # MTL_SHADER_VALIDATION=1`, and each MASKS THE NEXT (the
+                                      # layer aborts on the first error per command buffer), so a
+                                      # green run without them proves considerably less than it
+                                      # looks: (1) constant buffers must be copied into a 16-BYTE-
+                                      # PADDED temp — spirv-cross rounds an MSL cbuffer struct up
+                                      # (cbFSR3Upscaler is 148 B, the MSL struct 160), and FFX's
+                                      # `data` pointer backs only the 148, so binding the larger
+                                      # length over-reads it (UB) while binding the smaller is
+                                      # REJECTED as too small; (2) R32_UINT textures must be
+                                      # BUFFER-BACKED — spirv-cross emulates image atomics with an
+                                      # aliased MTLBuffer bound at the SAME slot number in buffer
+                                      # space, addressed `alignedWidth*y + x`, so function constant
+                                      # 65535 (`spvLinearTextureAlignmentOverride`) must be set
+                                      # from `minimumLinearTextureAlignmentForPixelFormat:` on
+                                      # EVERY pipeline or the atomic argument is left unbound;
+                                      # (3) `FFX_GPU_JOB_CLEAR_FLOAT` is ILLEGAL on a buffer-backed
+                                      # texture (Metal forbids RenderTarget usage there), so those
+                                      # clear by blit-filling the backing buffer — exact, since FFX
+                                      # only ever zero-clears them and every byte of a 0.0f fill is
+                                      # zero (a nonzero request is now LOUD rather than silently
+                                      # serviced as zero); (4) shim-owned temporals must be created
+                                      # WITH RenderTarget usage, or the render-pass load-clear path
+                                      # aborts. TWO MORE that are not optional:
+                                      # `newFunctionWithName:constantValues:` ALWAYS (some
+                                      # permutations declare the optional spirv-cross function
+                                      # constant and Metal then REFUSES the plain variant), and the
+                                      # wide-char binding `name` is REQUIRED — FSR3's
+                                      # `patchResourceBindings()` resolves each slot by `wcscmp`
+                                      # and returns FFX_ERROR_INVALID_ARGUMENT without it, which
+                                      # nothing in the public headers says.
+                                      # THE STAGES. U0 the input trio's staging math (fsr::
+                                      # stage_self_test — the same pure functions --check-fsr runs
+                                      # on every platform and the D3D12 arm's record_upload uses,
+                                      # repeated here so the gate is self-contained); U1 the
+                                      # metallib table (count vs build.rs's ENUMERATED denominator,
+                                      # strictly-ascending unique hashes, the 12-byte header
+                                      # parsed back, `MTLB` magic — pure, no device, no SDK); U2 a
+                                      # real device plus a texture round-trip through the SHIPPING
+                                      # staging encoder, which is what keeps "the upscaler produced
+                                      # nothing" and "our texture plumbing never carried the bytes"
+                                      # separable; U3 the FSR3 CONTEXT, which is the stage carrying
+                                      # the whole risk — creation drives fpCreatePipeline across
+                                      # every pass, so a mis-keyed hash, a spirv-cross output Metal
+                                      # will not accept, or a caps/wave64 divergence fails THERE
+                                      # rather than at whichever later dispatch needed the missing
+                                      # permutation; U4 a real upscale of two real rendered frames,
+                                      # scored.
+                                      # THE COVERAGE LIMIT IS MEASURED AND IS NOT WHAT U1 PROVES.
+                                      # One context creation builds ELEVEN pipelines of the 80
+                                      # metallibs offered — one per FSR3 pass at the option word
+                                      # its flags select — and a sweep of all EIGHT context-flag
+                                      # combinations reaches only FOURTEEN distinct blobs, because
+                                      # most passes ignore most option bits and the 40 fp32
+                                      # variants are never requested at all (the caps report fp16).
+                                      # So U1 proves all 80 are well-formed metallibs and U3 proves
+                                      # eleven of them become pipeline states; NOTHING here proves
+                                      # the other 69 ever run. The count is returned through
+                                      # `out_pipelines` and floored at 10 rather than left implicit
+                                      # because "context created OK" and "the metallibs work" are
+                                      # different claims that no return code separates — a backend
+                                      # answering every fpCreatePipeline with an empty success
+                                      # would create a context and build nothing.
+                                      # U4 IS WRITTEN AROUND THE FACT THAT AN UPSCALER IS EASY TO
+                                      # GATE VACUOUSLY: a pass-through copy, a bilinear stretch and
+                                      # a working temporal reconstruction all produce a plausible,
+                                      # finite, correctly-sized image, so every assertion is paired
+                                      # with something it must be DIFFERENT from. Two real frames
+                                      # at 321x181 -> 642x362 with REAL Halton jitter (unlike
+                                      # `mv_check_at`/`fsr_frame_check`, which pin it to (0,0)
+                                      # because they reconstruct world positions — here jitter is a
+                                      # genuine FSR3 INPUT and pinning it would leave the one input
+                                      # this renderer feeds and the reference never did untested)
+                                      # and the same 0.02*diag dolly `fsr_frame_check` uses, so the
+                                      # motion vectors are the ones that gate already proves.
+                                      # Asserts: finite and non-negative; energy within [0.5, 2]x
+                                      # of the input (an upscaler RESAMPLES, it does not expose —
+                                      # a colour-space or exposure mistake moves this by orders of
+                                      # magnitude); a warmed history must DIFFER from a reset one
+                                      # (else FFX is not accumulating and every temporal claim is
+                                      # false); and THE ASSERTION THAT CARRIES THE STAGE — the
+                                      # output must differ measurably from a bilinear stretch of
+                                      # its own input, or nothing proves a reconstruction ran.
+                                      # MEASURED energy 1.000x, history 2.197e-2, vs-bilinear
+                                      # 2.962e-2 — and that last BOUND is deliberately SIX TIMES
+                                      # under its measurement (5e-3) rather than snug: the failure
+                                      # it rejects lands at ~0, so a low bound loses no
+                                      # discrimination while a snug one fails on any scene or pose
+                                      # that reconstructs less. Plus three PLUMBING probes, each
+                                      # re-running the sequence with exactly ONE input of frame B
+                                      # changed so a null result attributes to that input alone:
+                                      # jitter 2.592e-2, depth 1.218e-2, motion 3.503e-2.
+                                      # THE PROBES MUST BASELINE ON THE ACCUMULATING FRAME, and the
+                                      # first draft used the RESET one — which reported depth at
+                                      # EXACTLY 0.00e0 and read like a plumbing bug in the backend.
+                                      # It is not: a reset frame has no history, so the
+                                      # depth-derived disocclusion mask has nothing to reject and
+                                      # depth genuinely cannot change the output. A probe that
+                                      # cannot move its target fails whatever the code does — the
+                                      # mirror of one that cannot fail — and depth and motion
+                                      # vectors are BOTH in that class.
+                                      # DETERMINISM SPLITS IN TWO, AND THE OBVIOUS SINGLE BITWISE
+                                      # CLAIM IS WRONG in a way that took the measurement to see.
+                                      # Two fresh contexts, identical inputs: a RESET-ONLY frame is
+                                      # EXACTLY bit-identical every time (4/4, and with the output
+                                      # plane deliberately left uncleared, which also proves FSR3
+                                      # writes every output texel), while an ACCUMULATING frame
+                                      # differs in 100-2800 of 929616 channels, each by EXACTLY ONE
+                                      # f16 ULP, the count varying run to run. THAT IS NOT A DEFECT
+                                      # AND NOT GPU NON-DETERMINISM: FFX declares essentially every
+                                      # internal resource — the three shared temporals included —
+                                      # as FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED, and
+                                      # ffx_vk.cpp skips its init copy for exactly that type, so
+                                      # texels a reset frame never wrote hold per-allocation
+                                      # residue BY CONTRACT; a following frame reads them at an
+                                      # accumulation weight near zero, which is why the effect can
+                                      # only ever tip a rounding boundary. ZEROING THE TEMPORALS
+                                      # ANYWAY WAS TRIED AND MEASURED WORSE (median 388 -> 1050
+                                      # differing channels, 8 samples each) — no benefit, inside
+                                      # the same wide band, for three blocking blits per context
+                                      # creation — so the residue is not the whole story either; it
+                                      # is simply not ours to control. CORROBORATED FROM THE OTHER
+                                      # SIDE, which is what settles it: under
+                                      # MTL_SHADER_VALIDATION=1 the accumulating count drops to
+                                      # EXACTLY ZERO, because that layer zero-fills allocations —
+                                      # execution-order non-determinism would be untouched by it,
+                                      # per-allocation residue is removed by it entirely. So the
+                                      # VALIDATED run is also the STRICTEST run, a reason to prefer
+                                      # it beyond the four gotchas. The gate therefore makes the
+                                      # exact claim where it holds and bounds the other (<= 1%
+                                      # relative, <= 2% of channels), and both halves have teeth:
+                                      # garbage propagating at full magnitude fails the ULP bound,
+                                      # a genuine backend race (the image-atomic aliasing class)
+                                      # fails the exact one.
+                                      # THE BUILD IS CACHED AND THE CACHE IS KEYED ON THE RECIPE AS
+                                      # WELL AS THE INPUT. A metallib's file name is FNV-1a of its
+                                      # SPIR-V, so an existing one is current with respect to its
+                                      # INPUT by construction — but not to spirv-cross's version
+                                      # (whose MSL emission a Homebrew bump changes while every key
+                                      # stays identical) nor to our own recipe, so both ride a
+                                      # `.toolstamp` and a change wipes the directory. SPIRV_CROSS_
+                                      # ARGS is on it verbatim; `RECIPE` is the hand-bumped half
+                                      # covering the two rules that alter the bytes without
+                                      # altering a key (the 12-byte header format, the -1000
+                                      # sampler remap). Without the cache every build re-runs 240
+                                      # subprocesses (~55 s). `SPIRV_CROSS` overrides the binary.
+                                      # ONE CFG PER ARTIFACT: `ffx_fsr3_metal` means the metallib
+                                      # table AND the backend built, decided off ONE boolean in
+                                      # build.rs, because a `ffx_metal` backend with no table can
+                                      # do exactly one thing — fail at the first fpCreatePipeline —
+                                      # so compiling it without one would ship a linked, reachable,
+                                      # guaranteed-to-fail arm (the distinction the `ffx_fsr3_vk`
+                                      # repair was about). Gated on the TARGET, not the host.
+                                      # Missing SDK source, missing committed SPIR-V, or absent
+                                      # spirv-cross/Xcode each degrade to a warn-and-skip with the
+                                      # build printing which half was absent, and U1 then SKIPs by
+                                      # name — "it did not build" is the expected state on a fresh
+                                      # clone and must not read as a defect.
+                                      # Deps: objc2 / objc2-metal / objc2-foundation (macOS only);
+                                      # Metal and Foundation are LINKED (unlike `src/vk/`'s dlopen
+                                      # policy — the backend calls Metal directly, and there is no
+                                      # dlopen equivalent), scoped to want_metal so a bare checkout
+                                      # still links nothing.
+                                      # Touch shim/ffx_fsr3_metal.{mm,h} / src/mtl/ / build.rs's
+                                      # generate_fsr3_metallibs or transpile_ffx_metallib -> run
+                                      # --check-fsr3, then AGAIN under `MTL_DEBUG_LAYER=1
+                                      # MTL_SHADER_VALIDATION=1` (the four gotchas are invisible
+                                      # otherwise, and the gate says so on an unvalidated run),
+                                      # then --check-fsr (the shared staging math), --check,
+                                      # cargo test, and FR_FSR3_DUMP=1 for the half no magnitude
+                                      # can score — a mirrored jitter or MV sign reads as doubled
+                                      # wobble or a directional smear, and both move the numbers
+                                      # by about as much as being right does
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)
 cargo run --release -- --prefer-intel # pick that vendor's adapter for the D3D12 device (also
                                       # --prefer-nvidia / --prefer-amd; default NVIDIA, or AMD under
