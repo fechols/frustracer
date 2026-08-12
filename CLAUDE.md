@@ -3761,8 +3761,26 @@ cargo run --release -- --move-ease 0.18  # KEYBOARD FLIGHT EASE-IN/EASE-OUT (sec
                                       # the REVERSAL anti-vacuity (a W->S flip must pass through a
                                       # stop and take ~2x the ease — without it the whole gate
                                       # would pass on a no-op).
-                                      # OWED: the user's feel-test — 0.18 is a chosen number, and
-                                      # the look/feel is not gate-visible
+                                      # FEEL-TESTED AND KEPT at 0.18 (2026-08-12, the user's call:
+                                      # "works amazingly well"). The verdict named a payoff the
+                                      # feature was not built for and which is worth stating,
+                                      # because it is the SHAPE and not the smoothing: FINE
+                                      # POSITIONING from a digital key. Under the hard step,
+                                      # displacement from a tap is LINEAR in hold time, so the
+                                      # shortest human tap (~50 ms) always moved 0.05x full speed
+                                      # and there was no way to ask for less. Under the ease a tap
+                                      # shorter than the ramp never reaches full speed at all — the
+                                      # ramp only gets to tau/T and smoothstep is QUADRATIC near
+                                      # zero, so the integral makes displacement CUBIC in tau
+                                      # (~2*tau^3/T^2 counting the symmetric decay). The
+                                      # attenuation vs the hard step is therefore 2*tau^2/T^2:
+                                      # 1.6x at a 100 ms tap, 6.5x at 50 ms, 40x at 20 ms (derived
+                                      # from the shipped functions, not measured). That is the same
+                                      # trick a stick's magnitude^STICK_CURVE response plays, so
+                                      # the keyboard now has an analog-feeling low end — and it is
+                                      # the reason to be suspicious of "just make T smaller if it
+                                      # feels laggy": T shrinks the fine-control range as T^2 while
+                                      # only shrinking the lag as T
 cargo run --release -- --no-move-ease  # the hard-step A/B arm, spelled explicitly (later flags
                                       # win: `--no-move-ease --move-ease 0.3` = 0.3)
 cargo run --release -- --no-autoexp-spike-guard  # A/B lever: let the aperture boost NOISE SPIKES
