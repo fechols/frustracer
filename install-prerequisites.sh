@@ -455,6 +455,10 @@ do_dxc() {
     # DXC_LINUX_TGZ above: the two backends compile the identical concatenated
     # source, so a front-end difference is invisible to every gate), so the
     # macOS answer is a source build at the SAME tag, not a community binary.
+    if [[ $OS == macos ]]; then
+        do_dxc_macos
+        return 0
+    fi
     if [[ $OS != linux ]]; then
         if [[ ! -e $SDKS/dxc-$OS/bin/dxc ]]; then
             echo "[i] dxc (host-native, SPIR-V) skipped — upstream publishes no"
@@ -472,6 +476,84 @@ do_dxc() {
             chmod +x "$SDKS/dxc-linux/bin/"* 2>/dev/null
         fi
     fi
+}
+
+# The macOS arm of do_dxc: a SOURCE build at DXC_TAG, because upstream publishes
+# no macOS and no arm64 binary at that tag and the pin is the whole point (see
+# do_dxc's header). Same shape as do_nrd — the other component that compiles a
+# vendor SDK locally because no usable binary exists.
+#
+# NOT a hard failure when the toolchain is missing, unlike do_nrd's: nothing in
+# a macOS build LINKS this, it is dlopen'd by --check-spirv/--check-vk alone
+# (src/vk/spirv.rs), so its absence costs two gates rather than a tree that no
+# longer compiles.
+do_dxc_macos() {
+    if skip "$SDKS/dxc-macos/lib/libdxcompiler.dylib" "dxc (macos, SPIR-V)"; then
+        return 0
+    fi
+    for t in cmake ninja git; do
+        if ! command -v $t >/dev/null; then
+            echo "    [i] dxc (macos): $t not found — skipping the source build."
+            echo "        Needs cmake + ninja + git and Xcode's clang; ~10 min on an M1."
+            return 0
+        fi
+    done
+
+    local src="$SDKS/dxc-src" build="$SDKS/dxc-src/build"
+    local clog="$CACHE/dxc-cmake.log" blog="$CACHE/dxc-build.log"
+    mkdir -p "$CACHE"
+    if [[ ! -e $src/CMakeLists.txt ]]; then
+        echo "    [>] dxc (macos): cloning $DXC_TAG"
+        git clone --depth 1 --branch "$DXC_TAG" --recurse-submodules --shallow-submodules \
+            https://github.com/microsoft/DirectXShaderCompiler.git "$src" >"$clog" 2>&1 || {
+            echo "    [x] dxc (macos): clone failed — see $clog"
+            fail
+            return 1
+        }
+    fi
+
+    echo "    [>] dxc (macos): cmake configure"
+    # THREE FLAGS, EACH A MEASURED WORKAROUND rather than taste:
+    #
+    #  * CMAKE_POLICY_VERSION_MINIMUM=3.5 — DXC is an old LLVM fork and CMake 4
+    #    removed compatibility with `cmake_minimum_required(VERSION <3.5)`.
+    #    Without it configure fails outright on CMake 4.x.
+    #  * CMAKE_CXX_FLAGS=-Wno-invalid-specialization — llvm/ADT/StringRef.h
+    #    specializes std::is_nothrow_constructible, and Xcode 26's libc++ marks
+    #    that entity __no_specializations__, which clang now diagnoses as an
+    #    ERROR. Three lines in one header; a compiler flag fixes it WITHOUT
+    #    patching the fork, which is the same discipline shim/ffx_msvc_compat.h
+    #    applies to the FidelityFX sources (a patch would silently un-apply on
+    #    the next fetch, and here it would also break the pin's meaning).
+    #  * LLVM_PARALLEL_LINK_JOBS=1 — LLVM link steps are the memory-hungry part
+    #    and 8 GB Apple silicon is a real configuration; the compile steps still
+    #    run at full width.
+    cmake -S "$src" -B "$build" -G Ninja \
+        -C "$src/cmake/caches/PredefinedParams.cmake" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_CXX_FLAGS=-Wno-invalid-specialization \
+        -DLLVM_PARALLEL_LINK_JOBS=1 >"$clog" 2>&1 || {
+        echo "    [x] dxc (macos): cmake failed — see $clog"
+        fail
+        return 1
+    }
+
+    echo "    [>] dxc (macos): building (~10 min on an M1)"
+    cmake --build "$build" --target dxc dxcompiler --parallel >"$blog" 2>&1 || {
+        echo "    [x] dxc (macos): build failed — see $blog"
+        fail
+        return 1
+    }
+
+    mkdir -p "$SDKS/dxc-macos/bin" "$SDKS/dxc-macos/lib"
+    # -L because build/bin/dxc is a symlink into the same tree; the drop must be
+    # self-contained. The binary carries LC_RPATH=@executable_path/../lib, so
+    # this layout makes it find the dylib with nothing added to the environment
+    # — the same property do_dxc documents for the Linux drop's DT_RPATH.
+    cp -L "$build/bin/dxc" "$SDKS/dxc-macos/bin/dxc" || { fail; return 1; }
+    cp -f "$build/lib/libdxcompiler.dylib" "$SDKS/dxc-macos/lib/" || { fail; return 1; }
+    echo "    [ok] dxc (macos, SPIR-V) built and installed"
 }
 
 do_fsr3src() {
@@ -805,6 +887,12 @@ if [[ $OS == linux ]]; then
     check "  (runtime, found via DT_RPATH)" "$SDKS/dxc-linux/lib/libdxcompiler.so"
     check "NRD denoiser (Vulkan, --nrd)" "$SDKS/NRD/bin/libNRD.so"
     check "  (perf variant, --nrd-perf)" "$SDKS/NRD/bin/perf/libNRD.so"
+elif [[ $OS == macos ]]; then
+    # A real row, because there IS a retryable action here now: `dxc` builds it
+    # from source at the pin (do_dxc_macos). Still no upstream binary — that is
+    # a fact about the release — but "missing" is actionable rather than final.
+    check "DXC -> SPIR-V (source build)" "$SDKS/dxc-macos/bin/dxc"
+    check "  (runtime, found via LC_RPATH)" "$SDKS/dxc-macos/lib/libdxcompiler.dylib"
 else
     # Report the ABSENCE with its reason rather than a bare MISSING row: this
     # one is not retryable, so a row that looks like a failed download would

@@ -19,7 +19,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize,
     MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
@@ -112,22 +112,45 @@ impl Mtl {
         Retained::as_ptr(&self.device) as *mut c_void
     }
 
-    /// A texture in `Shared` storage — CPU-writable, CPU-readable, and usable
-    /// by the GPU with no staging copy or blit on Apple silicon. `Private`
-    /// would need both, for nothing: this harness is headless, so no texture
+    /// The device as a typed object, for Rust-side framework calls.
+    ///
+    /// The sibling of `device_ptr`, which exists only because the ObjC++ shim
+    /// takes a `void*`. MetalFX is called from Rust through `objc2`, so it
+    /// wants the real thing.
+    pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.device
+    }
+
+    /// A texture, in the storage mode the CALLER names.
+    ///
+    /// `Shared` is what this harness wants nearly everywhere — CPU-writable,
+    /// CPU-readable, and GPU-usable with no staging copy or blit on Apple
+    /// silicon, so `upload`/`read`/`clear` below are plain memory access.
+    /// `Private` would need all three, for nothing: headless, so no texture
     /// here is bandwidth-critical.
+    ///
+    /// THE MODE IS A PARAMETER BECAUSE ONE CONSUMER HAS NO CHOICE. MetalFX's
+    /// `MTLFXTemporalScalerBase::outputTexture` is documented "You are
+    /// responsible for providing a texture with a private `storageMode`"
+    /// (`MTLFXTemporalScaler.h:222` in the macOS 26.5 SDK) — the one texture in
+    /// this tree the CPU may not touch directly, which is why `read_private`
+    /// and `clear_private` exist beside their plain siblings. Hardcoding
+    /// `Shared` here and hoping the requirement is advisory would put the whole
+    /// question under `MTL_SHADER_VALIDATION=1`, where an assert aborts the
+    /// process rather than failing a gate.
     pub fn texture(
         &self,
         w: usize,
         h: usize,
         format: MTLPixelFormat,
+        storage: MTLStorageMode,
     ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, String> {
         let d = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                 format, w, h, false,
             )
         };
-        d.setStorageMode(MTLStorageMode::Shared);
+        d.setStorageMode(storage);
         // ShaderRead|ShaderWrite|RenderTarget is the superset FFX can ask for:
         // its reset dispatch issues FFX_GPU_JOB_CLEAR_FLOAT on shared
         // temporals, and that path is a render-pass load-clear, which Metal
@@ -137,7 +160,9 @@ impl Mtl {
         );
         self.device
             .newTextureWithDescriptor(&d)
-            .ok_or_else(|| format!("newTextureWithDescriptor {w}x{h} {format:?} returned nil"))
+            .ok_or_else(|| {
+                format!("newTextureWithDescriptor {w}x{h} {format:?} {storage:?} returned nil")
+            })
     }
 
     /// Upload a tightly- or loosely-packed image into a texture's `(0,0,w,h)`
@@ -217,6 +242,91 @@ impl Mtl {
         let zeros = vec![0u8; w * h * bpp];
         self.upload(tex, w, h, w * bpp, &zeros);
     }
+
+    /// Copy `w x h` from one texture's `(0,0)` to another's, on the GPU.
+    ///
+    /// The only way to move bytes in or out of a `Private` texture: `getBytes`
+    /// and `replaceRegion` are both illegal there, which is what `read_private`
+    /// and `clear_private` use this for. Same blocking submit as `run`.
+    ///
+    /// A NIL ENCODER IS AN ERROR, not a skipped copy, and that is the whole
+    /// reason `encoded` exists: `run`'s closure returns nothing, so without it a
+    /// nil encoder would submit an EMPTY command buffer, `cb.error()` would be
+    /// `None`, and this would return `Ok` having moved no bytes. `read_private`
+    /// would then hand back a freshly-created staging texture's UNDEFINED
+    /// contents as if they were data, and `clear_private` would leave its target
+    /// untouched — which is precisely the "silently untestable" shape
+    /// `clear_private`'s own comment argues against. `blitCommandEncoder()`
+    /// realistically never returns nil; the point is that if it did, nothing
+    /// downstream could tell.
+    fn blit(
+        &self,
+        src: &ProtocolObject<dyn MTLTexture>,
+        dst: &ProtocolObject<dyn MTLTexture>,
+        w: usize,
+        h: usize,
+    ) -> Result<(), String> {
+        let mut encoded = false;
+        self.run(|cb| {
+            if let Some(e) = cb.blitCommandEncoder() {
+                unsafe {
+                    e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        src,
+                        0,
+                        0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                        MTLSize { width: w, height: h, depth: 1 },
+                        dst,
+                        0,
+                        0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                    );
+                }
+                e.endEncoding();
+                encoded = true;
+            }
+        })?;
+        if !encoded {
+            return Err(format!("blitCommandEncoder() returned nil for a {w}x{h} copy"));
+        }
+        Ok(())
+    }
+
+    /// `read`, for a `Private` texture: blit into a Shared staging texture and
+    /// read THAT. The staging texture is created per call — this is a headless
+    /// gate reading one frame, not a present path.
+    pub fn read_private(
+        &self,
+        tex: &ProtocolObject<dyn MTLTexture>,
+        w: usize,
+        h: usize,
+        bpp: usize,
+        format: MTLPixelFormat,
+    ) -> Result<Vec<u8>, String> {
+        let staging = self.texture(w, h, format, MTLStorageMode::Shared)?;
+        self.blit(tex, &staging, w, h)?;
+        Ok(self.read(&staging, w, h, bpp))
+    }
+
+    /// `clear`, for a `Private` texture: zero a Shared texture and blit it over.
+    ///
+    /// Preserving the clear across the storage-mode change is the point, not an
+    /// incidental convenience — it is what keeps "the scaler wrote nothing"
+    /// distinguishable from "the scaler wrote a dark image" in the readback,
+    /// and dropping it because `replaceRegion` no longer applies would make a
+    /// gate's non-zero assertion silently untestable.
+    pub fn clear_private(
+        &self,
+        tex: &ProtocolObject<dyn MTLTexture>,
+        w: usize,
+        h: usize,
+        bpp: usize,
+        format: MTLPixelFormat,
+    ) -> Result<(), String> {
+        let staging = self.texture(w, h, format, MTLStorageMode::Shared)?;
+        self.clear(&staging, w, h, bpp);
+        self.blit(&staging, tex, w, h)
+    }
 }
 
 /// The harness's own gate: a real texture round-trip through a real device.
@@ -232,7 +342,7 @@ pub fn self_test(m: &Mtl) -> Result<(), String> {
     use std::sync::atomic::AtomicU32;
 
     let (w, h) = (37usize, 29usize); // odd on purpose — see fsr::stage_self_test
-    let tex = m.texture(w, h, MTLPixelFormat::RGBA16Float)?;
+    let tex = m.texture(w, h, MTLPixelFormat::RGBA16Float, MTLStorageMode::Shared)?;
 
     // Cleared first, so a failed upload reads as zeros rather than as whatever
     // the allocator happened to hand us.

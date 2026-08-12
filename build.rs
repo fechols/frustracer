@@ -310,9 +310,17 @@ fn build_ffx_fsr3() {
         // which links the same frameworks, so this adds no NEW dependency to a
         // macOS build; it is what the shim's own objects need.
         //
-        // Scoped to `want_metal`, so a bare checkout (no SDK, no metallibs)
-        // still links nothing — the same policy `cargo:rustc-link-lib=vulkan`
-        // is scoped by above.
+        // Scoped to `want_metal` because that is when the SHIM's objects need
+        // them — and note what this scoping does NOT buy, since the comment
+        // here used to claim it and was wrong. A bare checkout links Metal and
+        // Foundation anyway: `mod mtl` is unconditional on macOS,
+        // `objc2-metal` carries `#[link(name = "Metal", kind = "framework")]`
+        // in its own generated root and `objc2` does the same for Foundation,
+        // so both are in the binary's load commands with or without these two
+        // lines. (`objc2-metal-fx` adds MetalFX on the same terms — see
+        // Cargo.toml, where the macOS floor that implies is spelled out.)
+        // These lines are load-bearing for `shim/ffx_fsr3_metal.mm`, which
+        // calls Metal directly from C++, and decorative for the Rust side.
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rerun-if-changed=shim/ffx_fsr3_metal.mm");

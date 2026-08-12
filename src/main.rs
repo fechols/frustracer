@@ -356,6 +356,7 @@ fn main() {
         nppd_dump,
         check_nrd,
         check_fsr3,
+        check_metalfx,
         check_spirv,
         check_vk,
         check_gpu,
@@ -996,6 +997,10 @@ fn main() {
         // through the CPU tracer, so the G-buffer it scores is the scene's.
         // Today's stages are scene-independent.
         || check_fsr3
+        // Same reason as the line above: the scored upscale renders a real
+        // frame pair through the CPU tracer, so the G-buffer it scores is the
+        // scene's. Today's stages are otherwise scene-independent.
+        || check_metalfx
         || check_nppd
         || check_nrd
         // Scene-keyed like the rest: the conditional-hit machinery
@@ -1267,6 +1272,25 @@ fn main() {
                  because Metal needs a hand-written FfxInterface, which is a different \
                  subject. The pure half of the shared staging math runs everywhere in \
                  --check-fsr."
+            );
+            std::process::exit(2);
+        }
+    }
+    if check_metalfx {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_metalfx(&scene, &bvh, cam0, structural);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2, not a SKIP, for the reason the sibling above states: an
+            // explicitly requested gate on the wrong OS is an ENVIRONMENT error.
+            eprintln!(
+                "--check-metalfx gates Apple's MetalFX temporal upscaler, which exists only on \
+                 macOS — there is no equivalent to fall back to, unlike FidelityFX, whose \
+                 Vulkan arm is --check-vk's V11 and whose Metal arm is --check-fsr3. The pure \
+                 half of the shared input-plane staging math runs everywhere in --check-fsr."
             );
             std::process::exit(2);
         }
@@ -14001,7 +14025,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
             return i32::from(!ok);
         }
     };
-    println!("check-spirv: S1 libdxcompiler.so loaded from {dir}");
+    println!("check-spirv: S1 {} loaded from {dir}", vk::spirv::LIB_NAME);
 
     // ---- S2: assemble the corpus. ----
     /// A compile unit: how to target it, and how to find its entry points.
@@ -16184,6 +16208,21 @@ fn run_check_vk_feed(
         }
     };
 
+    // Hoisted above the FFX contexts (it is a pure function of `cam0` and the
+    // render size) so V17 below can use it.
+    let basis = cam0.basis(rw, rh);
+
+    // ---- V17: structure replay WITH THE PACK ARMED. ----
+    // BEFORE the FFX contexts, deliberately. This arm needs only the tracer,
+    // and everything after context creation is unreachable on a software ICD,
+    // where V11/V13 SKIP outright — so placing it here is what gives the one
+    // pure-tracer gate in this function the same llvmpipe coverage V6/V7/V8/V9
+    // have, i.e. what keeps it gateable in CI without a GPU.
+    if !run_check_vk_replay_pack(hg, &tg, scene, &basis, q, rw, rh) {
+        tg.destroy(hg);
+        return false;
+    }
+
     // Two FFX contexts, one per route, stepped in lockstep on one frame
     // sequence. Separate rather than one context run twice because FSR3 is
     // TEMPORAL: a single context would carry the first route's history into
@@ -16235,7 +16274,6 @@ fn run_check_vk_feed(
         return false;
     }
 
-    let basis = cam0.basis(rw, rh);
     let mut ok = true;
 
     let run = (|| -> Result<(), String> {
@@ -16410,10 +16448,619 @@ fn run_check_vk_feed(
         ok = false;
     }
 
+    // ---- V16: the COMPOSED frame — the denoiser and the upscaler in one. ----
+    // After V15 because it needs everything V15 proved, and on its own FFX
+    // contexts because the ones above carry history from a different route.
+    if ok
+        && !run_check_vk_compose(
+            hg, &tg, scene, &basis, cam0, q, rw, rh, ow, oh, near, far, nrd_path, structural,
+        )
+    {
+        ok = false;
+    }
+    // Leave the tracer's feed registers where V13 pointed them, so nothing
+    // above depends on V16 having run — the "left as found" rule V14 follows
+    // for the sig bit.
+    tg.wire_feed(hg, fed.feed_views());
+
     fed.destroy(hg);
     cpu.destroy(hg);
     tg.destroy(hg);
     ok
+}
+
+/// V17 — STRUCTURE REPLAY WITH THE PACK ARMED.
+///
+/// V9 proves a replayed frame is bit-identical to a produced one, but its
+/// tracer is built `TracerOpts::default()`, i.e. `gbuf_full: false` — so there
+/// the pack is not merely unchecked, it is not ALLOCATED (`VkTracer::new`
+/// collapses it to a one-element dummy). And V13/V14/V15/V16 all run on a
+/// pack-armed tracer that never replays. So "replay with the pack armed" was
+/// exercised by no gate in either direction.
+///
+/// That stopped being academic when the capture arm started doing exactly it:
+/// `CineVk::output_frame` replays every sub-frame after the first, on a tracer
+/// carrying the pack, the feed planes and NRD's. This is the gate that licenses
+/// it.
+///
+/// The claim is V9's, one configuration further out. The terminal structure is
+/// a pure function of (scene, BVH, basis, rw, rh) while spp/jitter/frame ride
+/// the cbuffer; the PACK is written by the leaf and sky passes, which a replay
+/// re-dispatches. So a replayed frame must reproduce a produced one BYTE for
+/// byte in `accum` and in both halves of the pack — and the ladder must
+/// provably not have run.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_replay_pack(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+) -> bool {
+    use gfx::shaders as gs;
+    let px = rw * rh;
+    // The capture arm's own frame shape: a fresh 1-spp upscaler frame, not
+    // V9's accumulating one — this gate is about the configuration that
+    // actually ships, and `accumulate` changes which store the leaf takes.
+    let mk = |replay: bool| gfx::frame::FrameParams {
+        cam: *basis,
+        frame: 7,
+        accumulate: false,
+        jitter: false,
+        frame_jitter: Some(dlss::jitter_for(7)),
+        prev_cam: Some(*basis),
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay,
+    };
+    let grab = |tag: &str| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u32>), String> {
+        Ok((
+            hg.read_buffer(&tg.accum, px * 3 * 4).map_err(|e| format!("{tag} accum: {e}"))?,
+            hg.read_buffer(&tg.gbuf, px * gfx::frame::GBUF_STRIDE as usize)
+                .map_err(|e| format!("{tag} gbuf: {e}"))?,
+            hg.read_buffer(&tg.gbuf_ext, px * gfx::frame::GBUF_EXT_STRIDE as usize)
+                .map_err(|e| format!("{tag} gbuf_ext: {e}"))?,
+            tg.read_counters(hg).map_err(|e| format!("{tag} counters: {e}"))?,
+        ))
+    };
+
+    let r = (|| -> Result<(), String> {
+        tg.render_wavefront(hg, &mk(false), true).map_err(|e| format!("produce: {e}"))?;
+        let (a0, g0, e0, c0) = grab("produce")?;
+        tg.render_wavefront_replay(hg, &mk(true), true).map_err(|e| format!("replay: {e}"))?;
+        let (a1, g1, e1, c1) = grab("replay")?;
+
+        // ANTI-VACUITY FIRST, because every assertion below is satisfied by two
+        // buffers that were never written: an all-zero pack compares clean.
+        let nz = g0.iter().filter(|b| **b != 0).count();
+        if nz == 0 {
+            return Err("the produced pack is entirely zero — the comparison is vacuous".into());
+        }
+        let c = |v: &[u32], i: u32| v.get(i as usize).copied().unwrap_or(0);
+        if c(&c0, gs::CTR_SPLIT) == 0 {
+            return Err("the producing frame ran no ladder — nothing was replayed".into());
+        }
+        // The ladder must provably NOT have run on the replay: a "replay" that
+        // quietly re-traced everything is bit-identical by construction, which
+        // is V9's own anti-vacuity argument.
+        for (name, i) in [
+            ("split", gs::CTR_SPLIT),
+            ("tile-a", gs::CTR_TILE_A),
+            ("tile-b", gs::CTR_TILE_B),
+        ] {
+            if c(&c1, i) != 0 {
+                return Err(format!("replay ran the ladder ({name} {})", c(&c1, i)));
+            }
+        }
+        for (name, p, r) in
+            [("accum", &a0, &a1), ("gbuf", &g0, &g1), ("gbuf-ext", &e0, &e1)]
+        {
+            let d = p.iter().zip(r.iter()).filter(|(x, y)| x != y).count();
+            if d != 0 || p.len() != r.len() {
+                return Err(format!("{name}: {d} of {} bytes differ under replay", p.len()));
+            }
+        }
+        println!(
+            "check-vk: V17 replay with the pack armed {rw}x{rh}: accum/gbuf/gbuf-ext byte-diff 0 \
+             | pack non-zero {nz} B | ladder produce split {} -> replay 0",
+            c(&c0, gs::CTR_SPLIT)
+        );
+        Ok(())
+    })();
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V17 {e}");
+            false
+        }
+    }
+}
+
+/// V16 — THE COMPOSED FRAME: trace -> pack -> ReBLUR -> recompose -> FSR3.
+///
+/// EVERY STAGE BEFORE THIS ONE STOPS ONE STEP SHORT OF IT, and the shape of the
+/// gap is worth stating because it bounds what a green suite has ever meant.
+/// V13 upscales, but there is no denoiser in its frame at all — its FFX history
+/// is built entirely from raw 1-spp colour. V14 and V15 denoise, but they stop
+/// at `read_input`: a readback of the plane. `frame_fed` — the only thing in
+/// this tree that dispatches FFX — appears exactly once in `main.rs`, inside
+/// V13. So the sharpest way to put it is this: **until now, if `cs_nrd_out`
+/// had written into a plane FFX never reads, every V13, V14 and V15 assertion
+/// would still have passed.**
+///
+/// That is also the D3D12 arrangement this closes: `present_trace_fsr3` runs
+/// `trace -> nrd_pack -> engine -> nrd_out -> upscale` on ONE list and runs NO
+/// feed dispatch when the denoiser is armed, because the folded `cs_nrd_pack`
+/// owns the mvec/depth guides and `cs_nrd_out` owns the colour. This stage is
+/// that ordering, and the fold end to end is a thing only it can score.
+///
+/// TWO ARMS, ONE RENDERER — V13's shape one stage up. The same tracer, the same
+/// pose, the same jitter sequence, the same FFX settings; the arms differ in
+/// exactly what writes the three input planes, so anything that moves is the
+/// composition and not taste. Two FFX contexts rather than one run twice, for
+/// V13's own reason: FSR3 is TEMPORAL, and one context would carry the first
+/// route's history into the second.
+///
+/// THE STRONG ARM IS THE DEPENDENCY PROBE, not the picture. "How much should a
+/// denoise change an upscale" has no principled answer and any bar for it would
+/// be a new tolerance; "did FFX read the plane our recompose wrote" does, and
+/// V15 already established its arithmetic — zero the plane between the two and
+/// require the output to move by more than the run-to-run floor, with the floor
+/// MEASURED by a second identical run rather than assumed away.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_compose(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    ow: usize,
+    oh: usize,
+    near: f32,
+    far: f32,
+    nrd_path: &str,
+    structural: bool,
+) -> bool {
+    let lib = std::path::Path::new(nrd_path).join(nrd::LIB_FILE);
+    if !lib.exists() {
+        println!(
+            "check-vk: SKIP V16 ({} not found); run `{}`",
+            lib.display(),
+            nrd::INSTALLER
+        );
+        return true;
+    }
+    let Some(planes) = tg.nrd_plane_handles() else {
+        eprintln!("check-vk: FAIL V16 the tracer carries no bridge planes");
+        return false;
+    };
+    let mut eng = match vk::nrd::VkNrd::new(hg, nrd_path, rw as u32, rh as u32, &planes) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V16 {e}");
+            return false;
+        }
+    };
+
+    // The validation delta, attributed. `validation_errors()` is a monotonic
+    // global read ONCE at the end of the suite, so a layout regression here
+    // would surface as an unattributed total; this stage is the one whose
+    // defect class is layer-only, so it names itself.
+    let ve0 = vk::device::validation_errors();
+
+    let mk = || {
+        vk::fsr3::Fsr3::new(
+            hg,
+            (rw as u32, rh as u32),
+            (ow as u32, oh as u32),
+            vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+        )
+    };
+    let (den, pln) = match (mk(), mk()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            let e = a.err().or(b.err()).unwrap_or_default();
+            if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+                println!("check-vk: SKIP V16 on a software device ({e})");
+            } else {
+                eprintln!("check-vk: FAIL V16 fsr3 context: {e}");
+                eng.destroy(hg);
+                return false;
+            }
+            eng.destroy(hg);
+            return true;
+        }
+    };
+
+    const FRAMES: u32 = 8;
+    const POISON: u8 = 0xee;
+    let rs = gfx::denoise::reblur_settings();
+    let mut ok = true;
+
+    let run = (|| -> Result<(), String> {
+        // Both arms poisoned, so a plane that is never written is provable
+        // rather than merely suspicious. A composed frame that silently ran the
+        // FEED path produces a completely plausible picture — the sentinel is
+        // what separates "denoised" from "plausible".
+        den.poison_inputs(hg, POISON)?;
+        pln.poison_inputs(hg, POISON)?;
+
+        let mut sent_color = 0usize;
+        let mut sent_depth = 0usize;
+
+        for f in 0..FRAMES {
+            let jit = dlss::jitter_for(f);
+            let p = gfx::frame::FrameParams {
+                cam: *basis,
+                frame: f,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                prev_cam: Some(*basis),
+                q,
+                verify: false,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: cam0.fov_y,
+                dt_ms: gfx::denoise::NOMINAL_DT_MS,
+                reset: f == 0,
+            };
+            let reset = f == 0;
+            let (pw, phh) = eng.prev_size();
+            let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+            let cs = gfx::denoise::common_settings(
+                &mats,
+                &mats,
+                dlss::jitter_for(f),
+                dlss::jitter_for(f.saturating_sub(1)),
+                rw as u32,
+                rh as u32,
+                pw,
+                phh,
+                far,
+                gfx::denoise::NOMINAL_DT_MS,
+                f,
+                reset,
+                false,
+            );
+
+            // ONE trace, consumed by BOTH arms — which is what makes the
+            // comparison about the composition rather than about two renders.
+            tg.render_wavefront(hg, &p, true)?;
+
+            // THE COMPOSED ARM. No `record_feed` anywhere in it: the folded
+            // pack wrote the depth and mvec guides, the recompose wrote the
+            // colour. That absence is the D3D12 rule, and scoring it end to end
+            // is a thing no earlier stage can do.
+            tg.wire_feed(hg, den.feed_views());
+            let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+            den.frame_fed(
+                hg,
+                |d, cmd| {
+                    unsafe {
+                        r1 = tg.record_nrd_pack(d, cmd);
+                        r2 = eng.record(d, cmd, &cs, &rs);
+                        r3 = tg.record_nrd_out(d, cmd);
+                    }
+                    // A failure inside must not be swallowed: `record` can fail
+                    // before recording anything, and the frame would then be
+                    // pack -> out, i.e. the passthrough, which upscales
+                    // perfectly well and is not what this stage claims to test.
+                    r2.clone()
+                },
+                dp,
+            )?;
+            r1?;
+            r2?;
+            r3?;
+
+            // THE PLAIN ARM: the same trace through the ordinary feed.
+            tg.wire_feed(hg, pln.feed_views());
+            let mut rf = Ok(());
+            pln.frame_fed(
+                hg,
+                |d, cmd| {
+                    rf = unsafe { tg.record_feed(d, cmd) };
+                    rf.clone()
+                },
+                dp,
+            )?;
+            rf?;
+
+            if f == 0 {
+                // Frame 0 is where a sentinel means something: after it, an
+                // unwritten plane holds the previous frame rather than 0xEE.
+                let c = den.read_input(hg, 0)?;
+                let d = den.read_input(hg, 1)?;
+                sent_color = c.chunks_exact(8).filter(|w| w.iter().all(|&b| b == POISON)).count();
+                sent_depth = d
+                    .chunks_exact(4)
+                    .filter(|w| u32::from_le_bytes((*w).try_into().unwrap()) == 0xeeee_eeee)
+                    .count();
+            }
+        }
+
+        let a = den.read_output(hg)?;
+        let b = pln.read_output(hg)?;
+        // `read_output` hands back linear f32 RGB — three per pixel, not four.
+        let lum = |v: &[f32], i: usize| {
+            0.2126 * v[i * 3] + 0.7152 * v[i * 3 + 1] + 0.0722 * v[i * 3 + 2]
+        };
+        let nch = a.len().min(b.len());
+
+        let mut finite = true;
+        let mut nonzero = 0usize;
+        let mut differs = 0usize;
+        let (mut sum_d, mut sum_a) = (0f64, 0f64);
+        for i in 0..nch {
+            if !a[i].is_finite() {
+                finite = false;
+            }
+            if a[i] != 0.0 {
+                nonzero += 1;
+            }
+            if a[i].to_bits() != b[i].to_bits() {
+                differs += 1;
+            }
+            sum_d += (a[i] - b[i]).abs() as f64;
+            sum_a += a[i].abs() as f64;
+        }
+        let rel = if sum_a > 0.0 { sum_d / sum_a } else { 0.0 };
+
+        // The Laplacian at OUTPUT res — "the denoise survived the upscale",
+        // which is a different claim from V15's "the denoise happened".
+        let lap = |v: &[f32]| -> f64 {
+            let mut s = 0f64;
+            for y in 1..oh - 1 {
+                for x in 1..ow - 1 {
+                    let c = lum(v, y * ow + x);
+                    let n = lum(v, (y - 1) * ow + x)
+                        + lum(v, (y + 1) * ow + x)
+                        + lum(v, y * ow + x - 1)
+                        + lum(v, y * ow + x + 1);
+                    s += (4.0 * c - n).abs() as f64;
+                }
+            }
+            s / ((ow - 2) * (oh - 2)) as f64
+        };
+        let (lap_d, lap_p) = (lap(&a), lap(&b));
+
+        eprintln!(
+            "check-vk: V16 composed frame {rw}x{rh} -> {ow}x{oh} over {FRAMES} frames: \
+             denoised-vs-fed rel {rel:.5} | differs {differs}/{nch} | lap {lap_d:.4} vs fed \
+             {lap_p:.4} | finite {finite} | non-zero ch {nonzero}"
+        );
+
+        if !finite {
+            return Err("the composed output carries non-finite channels".into());
+        }
+        // THE SENTINEL BEFORE THE HISTOGRAM, deliberately: an unwritten plane
+        // usually presents as a black frame, and "0 of 1440000 channels are
+        // non-zero" is the symptom while this is the cause. Checked in the
+        // order that names the bug.
+        if sent_color > 0 || sent_depth > 0 {
+            return Err(format!(
+                "sentinel SURVIVED the composed frame — colour {sent_color} 8-byte runs, depth \
+                 {sent_depth} words. Colour means `cs_nrd_out` never wrote; depth means the \
+                 folded `cs_nrd_pack` never wrote its guide, which no feed dispatch was there \
+                 to cover"
+            ));
+        }
+        if nonzero * 2 < nch {
+            return Err(format!("only {nonzero} of {nch} channels are non-zero"));
+        }
+        if differs == 0 {
+            return Err(
+                "the composed and fed routes produced a BIT-IDENTICAL image — the denoiser is \
+                 not in the composed frame"
+                    .into(),
+            );
+        }
+        if structural && !(lap_d < lap_p) {
+            return Err(format!(
+                "the composed output is not smoother than the fed one ({lap_d:.4} vs {lap_p:.4}) \
+                 — the denoise did not survive the upscale"
+            ));
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V16 {e}");
+        ok = false;
+    }
+
+    // ---- the dependency probe ----
+    if ok {
+        match compose_probe(hg, tg, &mut eng, scene, basis, cam0, q, rw, rh, ow, oh, near, far, &rs)
+        {
+            Ok((ctl, moved, len)) => {
+                let floor = (ctl.max(1)) * 20;
+                eprintln!(
+                    "check-vk: V16   ffx dependency: control drift {ctl} ch | clearing our \
+                     recompose moved {moved}/{len} ch of the upscaled output"
+                );
+                if moved < floor || moved * 100 < len {
+                    eprintln!(
+                        "check-vk: FAIL V16 zeroing the plane our recompose wrote barely moved \
+                         the upscale ({moved} vs a floor of {floor}) — FFX is not reading it"
+                    );
+                    ok = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V16 dependency probe: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!(
+            "check-vk: FAIL V16 {ve} validation error(s) inside this stage — the composed \
+             recording is the one whose defect class only the layer can see"
+        );
+        ok = false;
+    }
+
+    den.destroy(hg);
+    pln.destroy(hg);
+    eng.destroy(hg);
+    ok
+}
+
+/// V16's dependency probe: does FFX consume the plane our recompose wrote?
+///
+/// ONE context, WARMED, then three reset frames on one re-traced pose: two
+/// identical (which MEASURE the floor — assuming a floor is how a probe ends up
+/// asserting its own noise) and a third that zeroes the colour plane between
+/// `cs_nrd_out` and the FFX dispatch.
+///
+/// THE WARM-UP AND THE SHARED CONTEXT ARE BOTH LOAD-BEARING, and the first
+/// draft had neither. Three FRESH contexts read a control drift of **994206 of
+/// 1440000 channels** — two identical runs disagreeing on 69% of the image,
+/// which makes any floor built from it unsatisfiable. That is not
+/// non-determinism: FFX declares essentially every internal resource
+/// `FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED` and `ffx_vk` skips the init copy
+/// for exactly that type, so texels a reset frame never writes hold
+/// PER-ALLOCATION residue by contract (the Metal backend records the same
+/// thing, from the other side). One context makes the allocations identical;
+/// one discarded warm-up run makes the residue identical too, because after it
+/// the internal resources hold this pose's own output rather than whatever the
+/// allocator handed over.
+///
+/// Returns (control drift, moved, channels).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn compose_probe(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    eng: &mut vk::nrd::VkNrd,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    ow: usize,
+    oh: usize,
+    near: f32,
+    far: f32,
+    rs: &nrd::ReblurSettings,
+) -> Result<(usize, usize, usize), String> {
+    let jit = dlss::jitter_for(0);
+    let p = gfx::frame::FrameParams {
+        cam: *basis,
+        frame: 0,
+        accumulate: false,
+        jitter: false,
+        frame_jitter: Some(jit),
+        prev_cam: Some(*basis),
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+    let dp = vk::fsr3::Dispatch {
+        jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+        mv_scale: fsr::UPSCALE_MV_SIGN,
+        near_far: (near, far),
+        fov_y: cam0.fov_y,
+        dt_ms: gfx::denoise::NOMINAL_DT_MS,
+        reset: true,
+    };
+    let (pw, phh) = eng.prev_size();
+    let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+    let cs = gfx::denoise::common_settings(
+        &mats,
+        &mats,
+        jit,
+        jit,
+        rw as u32,
+        rh as u32,
+        pw,
+        phh,
+        far,
+        gfx::denoise::NOMINAL_DT_MS,
+        0,
+        true,
+        false,
+    );
+
+    let f = vk::fsr3::Fsr3::new(
+        hg,
+        (rw as u32, rh as u32),
+        (ow as u32, oh as u32),
+        vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+    )?;
+
+    let mut once = |clear: bool| -> Result<Vec<f32>, String> {
+        tg.render_wavefront(hg, &p, true)?;
+        tg.wire_feed(hg, f.feed_views());
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        let rec = f.frame_fed(
+            hg,
+            |d, cmd| {
+                unsafe {
+                    r1 = tg.record_nrd_pack(d, cmd);
+                    r2 = eng.record(d, cmd, &cs, rs);
+                    r3 = tg.record_nrd_out(d, cmd);
+                }
+                if clear {
+                    // BETWEEN the recompose and the dispatch. Moving it after
+                    // the dispatch is the tooth that proves this measures a
+                    // dependency and not a coincidence.
+                    f.clear_color_in_place(d, cmd);
+                }
+                r2.clone()
+            },
+            dp,
+        );
+        rec.and(r1).and(r2).and(r3)?;
+        f.read_output(hg)
+    };
+
+    let out = (|| -> Result<(usize, usize, usize), String> {
+        let _warm = once(false)?;
+        let ctl_a = once(false)?;
+        let ctl_b = once(false)?;
+        let zeroed = once(true)?;
+        let n = ctl_a.len().min(ctl_b.len()).min(zeroed.len());
+        let ctl = (0..n).filter(|&i| ctl_a[i].to_bits() != ctl_b[i].to_bits()).count();
+        let moved = (0..n).filter(|&i| ctl_a[i].to_bits() != zeroed[i].to_bits()).count();
+        Ok((ctl, moved, n))
+    })();
+    f.destroy(hg);
+    out
 }
 
 /// V15 — A REAL NRD ENGINE, running ReBLUR between the bridge's two halves.
@@ -16470,6 +17117,23 @@ fn run_check_vk_nrd(
         );
         return true;
     }
+    // THE SKIP THE CODE ALREADY PROMISED AND DID NOT IMPLEMENT. Four of
+    // ReBLUR's fourteen kernels declare `ComputeDerivativeGroupQuadsKHR`, so
+    // `vk/device.rs` enables `VK_KHR_compute_shader_derivatives`
+    // when present — and its own comment there, plus CLAUDE.md, both stated
+    // that V15 skips on a device without it. Nothing did: the only skip was
+    // the missing-library one above, so this gate would have dispatched
+    // modules whose declared capability is unavailable, which the same
+    // comment calls "undefined and — as measured — silent". An environment
+    // fact, so SKIP at exit 0, matching the absent/told split.
+    if !hg.vk.info.compute_derivatives {
+        println!(
+            "check-vk: SKIP V15 (no VK_KHR_compute_shader_derivatives — four ReBLUR kernels \
+             declare ComputeDerivativeGroupQuads and dispatching them with the feature off is \
+             undefined)"
+        );
+        return true;
+    }
     let Some(planes) = tg.nrd_plane_handles() else {
         eprintln!("check-vk: FAIL V15 the tracer carries no bridge planes");
         return false;
@@ -16513,11 +17177,16 @@ fn run_check_vk_nrd(
             replay: false,
         };
         tg.render_wavefront(hg, &p, true)?;
+        // `write_inputs` for V14's reason — `cs_nrd_out` stores to the ENGINE's
+        // colour image, which only this bracket puts in `GENERAL`.
         let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
-        hg.run(|d, cmd| unsafe {
-            r1 = tg.record_nrd_pack(d, cmd);
-            r2 = mid(d, cmd);
-            r3 = tg.record_nrd_out(d, cmd);
+        fed.write_inputs(hg, |d, cmd| {
+            unsafe {
+                r1 = tg.record_nrd_pack(d, cmd);
+                r2 = mid(d, cmd);
+                r3 = tg.record_nrd_out(d, cmd);
+            }
+            Ok(())
         })?;
         r1?;
         r2?;
@@ -16850,11 +17519,21 @@ fn run_check_vk_bridge(
 
         // The sequence, on ONE command buffer — `nrd_frame_step`'s ordering:
         // pack -> engine -> recompose.
+        //
+        // Through `write_inputs` rather than a bare `hg.run`, because
+        // `cs_nrd_out` stores to `u16` and that is the ENGINE's colour image,
+        // not one of the tracer's own bridge planes: without the bracket it is
+        // written while resting in `SHADER_READ_ONLY_OPTIMAL` through a
+        // descriptor declaring `GENERAL`. See `Fsr3::write_inputs` for why no
+        // gate on this box could see that.
         let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
-        hg.run(|d, cmd| unsafe {
-            r1 = tg.record_nrd_pack(d, cmd);
-            r2 = tg.record_nrd_passthrough(d, cmd);
-            r3 = tg.record_nrd_out(d, cmd);
+        fed.write_inputs(hg, |d, cmd| {
+            unsafe {
+                r1 = tg.record_nrd_pack(d, cmd);
+                r2 = tg.record_nrd_passthrough(d, cmd);
+                r3 = tg.record_nrd_out(d, cmd);
+            }
+            Ok(())
         })?;
         r1?;
         r2?;
@@ -19658,6 +20337,711 @@ fn fsr3_upscale_check(
     Ok(())
 }
 
+/// How far MetalFX's output must sit from a bilinear stretch of its own input.
+///
+/// MEASURED on this arm rather than inherited: `--check-fsr3`'s twin records
+/// 2.96e-2 for FidelityFX and sets its bound six times under, and that number
+/// describes FFX's reconstruction on this scene — not Apple's. The same SIX
+/// TIMES rule is applied here to this arm's own measurement, for the same
+/// reason it was there: the failure being rejected (a resampler in place of a
+/// reconstruction) lands at ~0, so a low bound loses no discrimination while a
+/// snug one fails on any pose that reconstructs less.
+#[cfg(target_os = "macos")]
+const MFX_BILINEAR_MIN: f64 = 4.5e-3;
+
+/// How strongly MetalFX's and FSR3's deviations from a common bilinear
+/// reference must agree. See the cross-check block in `metalfx_upscale_check`
+/// for why this is a CORRELATION and not a distance — the tempting distance
+/// form is mathematically unsound and was measured to be.
+///
+/// MEASURED, both arms, on the default scene: **0.655 correct, 0.479 with the
+/// MetalFX jitter sign mirrored one-sidedly** (`FR_MFX_JITTER=neg`). This is the
+/// only assertion in either Metal gate that can score a POLARITY, which
+/// `--check-fsr3`'s own dump-image note says no magnitude can.
+///
+/// THE FLOOR IS NOT MIDWAY, and the asymmetry is the choice rather than an
+/// accident: 0.5 sits 0.024 above the FAILING measurement and 0.155 below the
+/// passing one. That buys margin against false failures at the cost of margin
+/// against a blunt tooth, which is the right direction for a gate — a flaky red
+/// costs every future run, while a tooth that stops biting costs only the case
+/// it was aimed at, and the dump images remain the authority for polarity. The
+/// consequence to know: if a future scene or driver moves the MIRRORED reading
+/// up by 5%, this stops discriminating, and the symptom is a green run rather
+/// than a noisy one. Re-measure both arms before trusting it on new content.
+///
+/// THE SEPARATION IS REAL BUT NARROW, and saying so is the point. A mirrored
+/// jitter displaces detail by about a pixel; that is a subtle error, which is
+/// exactly why single-arm magnitudes cannot see it and why the correlation gap
+/// is 0.18 rather than an order of magnitude. Both numbers are reproducible
+/// here (every other comparison in this gate comes back bit-exact), so the
+/// thin margin is not flakiness on this scene — but on a scene that
+/// reconstructs less coherently it could become so, and the dump images stay
+/// the authority for polarity rather than this number.
+#[cfg(all(target_os = "macos", ffx_fsr3_metal))]
+const MFX_FSR3_CORR_MIN: f64 = 0.5;
+
+/// `--check-metalfx` — Apple's temporal upscaler over the same G-buffer
+/// `--check-fsr3` feeds FidelityFX.
+///
+/// A SEPARATE GATE rather than a stage of `--check-fsr3`, matching this tree's
+/// one-gate-per-SDK convention (`--check-oidn`, `--check-xess`, `--check-nrd`):
+/// the two have unrelated skip stories — this one turns on device support and a
+/// macOS version, that one on whether the FidelityFX SDK source and a
+/// build-time transpile were present — and folding Apple's upscaler into a flag
+/// named after FidelityFX would mislead every later reader. The one place they
+/// touch is X3's cross-check, which is compiled only where both exist.
+#[cfg(target_os = "macos")]
+fn run_check_metalfx(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    _structural: bool,
+) -> i32 {
+    let mut ok = true;
+    // Whether a MetalFX scaler was ever reachable in this run — see the NOTE at
+    // the bottom, which is about a failure class that needs one to hide in.
+    let mut ran = false;
+    let mut fail = |m: String| {
+        eprintln!("check-metalfx: FAIL {m}");
+        ok = false;
+    };
+
+    // ---- X0: the pure half -------------------------------------------------
+    // The staging math, which is `--check-fsr` on every platform and
+    // `--check-fsr3`'s U0 here. Duplicated deliberately so the gate is
+    // self-contained; it adds no MetalFX-specific coverage and is not described
+    // as if it does.
+    match fsr::stage_self_test() {
+        Ok(()) => println!("check-metalfx: X0 input trio staging (colour/mvec/depth) OK"),
+        Err(e) => fail(format!("X0 {e}")),
+    }
+
+    // ---- X1: a device, and MetalFX on it -----------------------------------
+    let m = match mtl::device::Mtl::new() {
+        Ok(m) => {
+            println!("check-metalfx: X1 device — {}", m.line());
+            match mtl::device::self_test(&m) {
+                Ok(()) => println!("check-metalfx: X1 texture round-trip + submit OK"),
+                Err(e) => fail(format!("X1 {e}")),
+            }
+            Some(m)
+        }
+        Err(e) if e.absent => {
+            println!("check-metalfx: SKIP X1 ({e})");
+            None
+        }
+        Err(e) => {
+            eprintln!("check-metalfx: {e}");
+            return if ok { 2 } else { 1 };
+        }
+    };
+
+    if let Some(m) = m.as_ref() {
+        // A LABELLED BLOCK, NOT `return`, so every exit below reaches the
+        // verdict line at the bottom of this function. A bare `return` here
+        // would print no PASSED/FAILED at all, which matters most in the case
+        // that reaches it first: X0 failing on a Mac without MetalFX support
+        // exits 1 with nothing in the log saying the run failed. `ran` is what
+        // keeps the validation NOTE honest on those paths — it advertises an
+        // invisible failure class, and there is no MetalFX run to hide one in
+        // until the scaler is actually reachable.
+        'device: {
+            if !mtl::mfx::Mfx::supported(m) {
+                // An environment fact, like the absent device above: MetalFX needs
+                // macOS 13 and hardware support, and a machine without it is a
+                // different Mac rather than a broken tree.
+                println!(
+                    "check-metalfx: SKIP X1 — MTLFXTemporalScalerDescriptor.supportsDevice is \
+                     false for this device"
+                );
+                break 'device;
+            }
+            let (smin, smax) = mtl::mfx::Mfx::scale_range(m);
+            println!(
+                "check-metalfx: X1 MetalFX supported — input scale range {smin:.2}x..{smax:.2}x"
+            );
+            // Asserted rather than discovered as an opaque nil from the factory: a
+            // ratio outside the range is an environment limit with a number on it.
+            if !(smin..=smax).contains(&2.0f32) {
+                fail(format!(
+                    "X1 this gate upscales exactly 2.0x, which is outside the device's supported \
+                     {smin:.2}x..{smax:.2}x"
+                ));
+                break 'device;
+            }
+            ran = true;
+
+            // ---- X2: the scaler builds, and our textures satisfy it --------
+            //
+            // DELIBERATELY NOT X3's EXTENTS. This stage's subject is creation,
+            // the usage contract and destruction, none of which X3 covers (it
+            // holds one scaler for its whole life), and running it at a second
+            // size is the cheap way to keep the answers from being a property
+            // of one hardcoded pair — the descriptor is where a rejected format
+            // or ratio surfaces, and it takes the extents as input. Still
+            // exactly 2.0x, which is what the range assertion above cleared.
+            let t0 = std::time::Instant::now();
+            match mtl::mfx::Mfx::new(m, (401, 227), (802, 454)) {
+                Ok(s) => {
+                    let u = s.required_usage();
+                    println!(
+                        "check-metalfx: X2 scaler created — 401x227 -> 802x454, {} ms \
+                         (synchronous init)",
+                        t0.elapsed().as_millis()
+                    );
+                    // READ OFF THE OBJECT, not assumed — the discipline
+                    // `--check-nrd`'s N1 applies to spirv_binding_offsets. Note
+                    // the narrowness: this is about USAGE, and the requirement
+                    // that actually bites on this API is the OUTPUT's STORAGE
+                    // MODE (Private), which no usage comparison can reach. That
+                    // one is enforced by construction in `mtl::mfx` and by the
+                    // validation layer, which is why the NOTE below is not
+                    // optional.
+                    let ours = (objc2_metal::MTLTextureUsage::ShaderRead
+                        | objc2_metal::MTLTextureUsage::ShaderWrite
+                        | objc2_metal::MTLTextureUsage::RenderTarget)
+                        .0;
+                    for (what, need) in [
+                        ("color", u.color),
+                        ("depth", u.depth),
+                        ("motion", u.motion),
+                        ("output", u.output),
+                    ] {
+                        if need.0 & !ours != 0 {
+                            fail(format!(
+                                "X2 the scaler needs {what} usage {:#x}, and Mtl::texture hands \
+                                 out {ours:#x} — not a superset",
+                                need.0
+                            ));
+                        }
+                    }
+                    println!(
+                        "check-metalfx: X2 texture usage OK — required color {:#x} depth {:#x} \
+                         motion {:#x} output {:#x}, all within the harness's {ours:#x}",
+                        u.color.0, u.depth.0, u.motion.0, u.output.0
+                    );
+                    drop(s);
+                    println!("check-metalfx: X2 scaler destroyed OK");
+                }
+                Err(e) => fail(format!("X2 {e}")),
+            }
+
+            // ---- X3: a real upscale, scored ----------------------------------
+            if let Err(e) = metalfx_upscale_check(m, scene, bvh, cam0) {
+                fail(format!("X3 {e}"));
+            }
+        }
+    }
+
+    // The FSR3 arm's NOTE, and it matters MORE here: MetalFX documents a
+    // storage-mode requirement for its output texture, and a storage/usage
+    // violation is precisely the class the validation layer catches and an
+    // unvalidated run does not.
+    //
+    // Gated on `ran` rather than on having a device: on a Mac where
+    // `supportsDevice` is false, nothing MetalFX-shaped executed, so advertising
+    // an invisible failure class would be advertising one that had nowhere to
+    // hide.
+    if ran
+        && std::env::var("MTL_DEBUG_LAYER").is_err()
+        && std::env::var("MTL_SHADER_VALIDATION").is_err()
+    {
+        println!(
+            "check-metalfx: NOTE MTL_DEBUG_LAYER / MTL_SHADER_VALIDATION unset — the \
+             validation-only failure class (texture storage modes, usage flags, unbound \
+             arguments) is INVISIBLE in this run. Re-run with both =1."
+        );
+    }
+    println!("check-metalfx: {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
+}
+
+/// X3: two real rendered frames through the real MetalFX scaler, scored.
+///
+/// The twin of `fsr3_upscale_check`, and deliberately the same vocabulary:
+/// finite, energy-preserving, history-differs, not-a-bilinear-stretch, plus the
+/// three plumbing probes baselined on the ACCUMULATING frame. What it does NOT
+/// inherit is any of that gate's NUMBERS — the vs-bilinear bound there records
+/// its own provenance ("MEASURED 2.96e-2 here, and the bound is deliberately
+/// SIX TIMES under it"), which is a fact about FidelityFX's reconstruction on
+/// this scene, not about Apple's. Copying the constant would be the single most
+/// likely way to ship a tooth that does not bite.
+#[cfg(target_os = "macos")]
+fn metalfx_upscale_check(
+    m: &mtl::device::Mtl,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> Result<(), String> {
+    use std::sync::atomic::AtomicU32;
+
+    // The same extents, quality, dolly and jitter as `fsr3_upscale_check`, so
+    // the two arms are read against each other on identical work.
+    let (rw, rh) = (321usize, 181usize);
+    let (uw, uh) = (rw * 2, rh * 2);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+
+    let render = |g: &dlss::GBufs,
+                  accum: &[AtomicU32],
+                  basis: camera::CamBasis,
+                  prev: Option<camera::CamBasis>,
+                  frame: u32,
+                  jitter: (f32, f32)| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: false,
+            rw,
+            rh,
+            accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(g),
+            fsr_buf: None,
+            prev_cam: prev,
+            frame_jitter: Some(jitter),
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+    };
+
+    // THE JITTER SIGN IS THE ONE CONVENTION APPLE DOES NOT DOCUMENT, so it rides
+    // a lever exactly as the Vulkan FSR3 arm's does. `mtl::mfx::JITTER_SIGN` is
+    // seeded at FFX's value; `FR_MFX_JITTER=raw|neg` walks it. No assertion
+    // below scores it — a magnitude cannot tell a correct sign from a mirrored
+    // one — so the dump images are the instrument and this is said, not hidden.
+    let jsign = match std::env::var("FR_MFX_JITTER").as_deref() {
+        Ok("raw") => 1.0f32,
+        Ok("neg") => -1.0f32,
+        Ok(v) => {
+            println!("check-metalfx: FR_MFX_JITTER={v:?} unrecognized — using the default");
+            mtl::mfx::JITTER_SIGN
+        }
+        Err(_) => mtl::mfx::JITTER_SIGN,
+    };
+    // TWO JITTERS, AND CONFLATING THEM MAKES THE LEVER TEST NOTHING. The
+    // renderer OFFSETS its samples by `jitter_for(f)`; the scaler is TOLD
+    // `JITTER_SIGN * jitter_for(f)` — `fsr.rs` states exactly that
+    // ("the jitter reported to BOTH ffx dispatches = JITTER_SIGN * the
+    // renderer's sample offset"). So the sign belongs on the REPORT alone.
+    //
+    // A first draft applied it to both, which made `FR_MFX_JITTER=neg` a
+    // CONSISTENT change of sample positions rather than a mirror — a different
+    // but perfectly valid jitter, correctly reported. Measured: it moved
+    // vs-bilinear 2.752e-2 -> 5.065e-2 and pushed the FSR3 correlation UP,
+    // 0.655 -> 0.931, i.e. the lever made the two arms agree MORE. That is the
+    // "probe that cannot move its target" class inverted — a probe that moved
+    // the wrong one — and it is invisible while `JITTER_SIGN` is 1.0, which is
+    // why `fsr3_upscale_check` carries the same conflation harmlessly today.
+    let jit_render = |f: u32| dlss::jitter_for(f);
+    let jit = |f: u32| {
+        let (jx, jy) = jit_render(f);
+        (jx * jsign, jy * jsign)
+    };
+
+    let accum_a = alloc32(rw * rh * 3);
+    let accum_b = alloc32(rw * rh * 3);
+    let ga = dlss::GBufs::new_slim(rw, rh);
+    let gb = dlss::GBufs::new_slim(rw, rh);
+    let basis_a = cam0.basis(rw, rh);
+    let cam_b = Camera { pos: cam0.pos + cam0.forward() * (0.02 * scene.diag), ..cam0 };
+    let basis_b = cam_b.basis(rw, rh);
+    render(&ga, &accum_a, basis_a, None, 0, jit_render(0));
+    render(&gb, &accum_b, basis_b, Some(basis_a), 1, jit_render(1));
+
+    // A fresh scaler per run: MetalFX's history is internal and per-object, so
+    // there is no other way to have a warmed and an unwarmed one.
+    let run_with = |seq: &[(u32, bool)],
+                    gb_over: Option<&dlss::GBufs>,
+                    jit_over: Option<(f32, f32)>|
+     -> Result<(Vec<f32>, Vec<u16>), String> {
+        let f = mtl::mfx::Mfx::new(m, (rw, rh), (uw, uh))?;
+        for &(frame, reset) in seq {
+            let (acc, g) =
+                if frame == 0 { (&accum_a, &ga) } else { (&accum_b, gb_over.unwrap_or(&gb)) };
+            f.stage(m, acc, g, near, far);
+            let mut jitter = jit(frame);
+            if frame == 1 {
+                if let Some(j) = jit_over {
+                    jitter = j;
+                }
+            }
+            f.dispatch(m, &mtl::mfx::MfxParams { jitter, reset })?;
+        }
+        Ok((f.read_output(m)?, f.read_output_bits(m)?))
+    };
+    let run = |seq: &[(u32, bool)]| run_with(seq, None, None);
+
+    let t0 = std::time::Instant::now();
+    let (warm, warm_bits) = run(&[(0, true), (1, false)])?;
+    let (cold, cold_bits) = run(&[(1, true)])?;
+    // Only the BITS of the repeats are used: the determinism claim below is an
+    // integer ULP distance, not a float comparison.
+    let (_warm2, warm2_bits) = run(&[(0, true), (1, false)])?;
+    let (_cold2, cold2_bits) = run(&[(1, true)])?;
+    let setup_ms = t0.elapsed().as_millis();
+
+    // ---- finite, non-negative, and actually written ------------------------
+    let bad = warm.iter().filter(|v| !v.is_finite() || **v < 0.0).count();
+    if bad != 0 {
+        return Err(format!("{bad} of {} output channels are non-finite or negative", warm.len()));
+    }
+    let mean = |v: &[f32]| {
+        v.chunks(4).map(|p| (p[0] + p[1] + p[2]) / 3.0).sum::<f32>() / (v.len() / 4) as f32
+    };
+    let in_mean = {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh * 3 {
+            s += f64::from(f32::from_bits(accum_b[i].load(Relaxed)));
+        }
+        (s / (rw * rh * 3) as f64) as f32
+    };
+    let out_mean = mean(&warm);
+    if out_mean <= 0.0 {
+        return Err("the output is uniformly zero — the scaler wrote nothing".into());
+    }
+    // THIS ASSERTION IS ONLY MEANINGFUL BECAUSE AUTO-EXPOSURE IS OFF. With it
+    // on, MetalFX computes a per-frame gain that multiplies the input colour and
+    // nothing documents it being un-applied on output, so this would score
+    // Apple's exposure heuristic rather than our wiring — and the temptation on
+    // failure would be to widen the one bound that catches colour-space
+    // mistakes. See `mtl::mfx`'s header.
+    let ratio = out_mean / in_mean;
+    if !(0.5..=2.0).contains(&ratio) {
+        return Err(format!(
+            "output mean {out_mean:.4} is {ratio:.3}x the input's {in_mean:.4} — an upscaler \
+             resamples, it does not expose"
+        ));
+    }
+
+    // ---- determinism, as an INTEGER claim ----------------------------------
+    //
+    // THE ULP DISTANCE IS THE HONEST FORM, and it is why `read_output_bits`
+    // exists. The FSR3 arm's own comment records the measured fact — differing
+    // channels differ "by EXACTLY ONE f16 ULP" — while its code asserts a
+    // relative bound of 1%, which is a tunable number. An ULP distance is not
+    // tunable: it is a statement about adjacent representable values, so a
+    // failure cannot be answered by moving a threshold.
+    //
+    // The claim is written STRICT — both regimes exactly reproducible — and left
+    // that way unless a measurement says otherwise WITH A NAMED CAUSE. FSR3
+    // earned its two-regime split from one (FidelityFX declares its internal
+    // resources FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED, corroborated by the
+    // count dropping to zero under MTL_SHADER_VALIDATION=1, which zero-fills).
+    // MetalFX's history is internal and opaque, so no such cause is available
+    // here in advance, and inheriting FSR3's bound on the assumption that the
+    // same mechanism applies would be describing an unmeasured thing in another
+    // vendor's vocabulary.
+    //
+    // `requiresSynchronousInitialization(true)` is a precondition of this whole
+    // block rather than a performance preference: Apple's default compiles a
+    // faster upscaler in the BACKGROUND, so a compile landing between two of the
+    // four runs above would have this comparing two different implementations
+    // and calling the difference residue.
+    let ulp = |a: &[u16], b: &[u16]| -> (usize, i32) {
+        let (mut n, mut worst) = (0usize, 0i32);
+        for (x, y) in a.iter().zip(b) {
+            if x != y {
+                n += 1;
+                worst = worst.max((i32::from(*x) - i32::from(*y)).abs());
+            }
+        }
+        (n, worst)
+    };
+    let (n_cold, ulp_cold) = ulp(&cold_bits, &cold2_bits);
+    let (n_warm, ulp_warm) = ulp(&warm_bits, &warm2_bits);
+    if n_cold != 0 {
+        return Err(format!(
+            "two reset-only dispatches into fresh scalers differ in {n_cold} of {} channels \
+             (worst {ulp_cold} ULP) — the one path with no history to read must be exactly \
+             reproducible",
+            cold_bits.len()
+        ));
+    }
+    if n_warm != 0 {
+        return Err(format!(
+            "an accumulating frame differs across scalers in {n_warm} of {} channels (worst \
+             {ulp_warm} ULP) — MetalFX's history is internal, so there is no known cause to \
+             attribute this to; investigate rather than widening a bound",
+            warm_bits.len()
+        ));
+    }
+
+    // ---- the history is REAL ------------------------------------------------
+    let hist: f64 = warm.iter().zip(&cold).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
+        / warm.len() as f64;
+    let rel_hist = hist / f64::from(out_mean.max(1e-6));
+    if rel_hist < 1e-3 {
+        return Err(format!(
+            "a warmed history and a reset one differ by {rel_hist:.2e} of the mean — MetalFX is \
+             not accumulating anything"
+        ));
+    }
+
+    // ---- NOT A BILINEAR STRETCH --------------------------------------------
+    let bilinear = |x: usize, y: usize, c: usize| -> f32 {
+        let (fx, fy) = ((x as f32 + 0.5) / 2.0 - 0.5, (y as f32 + 0.5) / 2.0 - 0.5);
+        let (x0, y0) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+        let (x1, y1) = ((x0 + 1).min(rw - 1), (y0 + 1).min(rh - 1));
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let s =
+            |xx: usize, yy: usize| f32::from_bits(accum_b[(yy * rw + xx) * 3 + c].load(Relaxed));
+        let a = s(x0, y0) * (1.0 - tx) + s(x1, y0) * tx;
+        let b = s(x0, y1) * (1.0 - tx) + s(x1, y1) * tx;
+        a * (1.0 - ty) + b * ty
+    };
+    let mut d_bil = 0.0f64;
+    for y in 0..uh {
+        for x in 0..uw {
+            for c in 0..3 {
+                d_bil += f64::from((warm[(y * uw + x) * 4 + c] - bilinear(x, y, c)).abs());
+            }
+        }
+    }
+    let rel_bil = d_bil / (uw * uh * 3) as f64 / f64::from(out_mean.max(1e-6));
+    // MEASURED for MetalFX specifically — see the doc comment. Same six-times
+    // rule as the FSR3 arm, applied to this arm's own number.
+    if rel_bil < MFX_BILINEAR_MIN {
+        return Err(format!(
+            "the output is within {rel_bil:.2e} of a bilinear stretch of its own input — \
+             nothing here proves a temporal reconstruction ran"
+        ));
+    }
+
+    eprintln!(
+        "check-metalfx: X3 upscale {rw}x{rh} -> {uw}x{uh} OK — energy {ratio:.3}x, history \
+         {rel_hist:.3e}, vs-bilinear {rel_bil:.3e}; both regimes bit-exact across scalers \
+         (reset {n_cold} ch, accumulating {n_warm} ch), 4 scalers in {setup_ms} ms"
+    );
+
+    // ---- the two upscalers sharpen the SAME EDGES --------------------------
+    //
+    // THE TOOTH THE SHARED `planes::Trio` EARNS, and the reason that sharing is
+    // justified as more than dedup: given byte-identical inputs, two correct
+    // temporal reconstructions should add detail in the same PLACES and the
+    // same DIRECTIONS, even though their kernels differ. So the claim is a
+    // correlation between the two arms' deviations from one common reference —
+    // scale-free, bounded in [-1, 1], and near ZERO for the failures it exists
+    // to catch (a mirrored convention on one side, a plane reaching one arm and
+    // not the other, a vendor quietly resampling).
+    //
+    // THE OBVIOUS FORMULATION IS MATHEMATICALLY UNSOUND AND WAS MEASURED TO BE —
+    // do not re-derive it. The first draft asserted the tempting
+    // `d(mfx, fsr3) < d(mfx, bilinear)`: "two reconstructions must resemble each
+    // other more than either resembles a resampler." That is not implied by
+    // anything. Bilinear is the SMOOTH image and both arms deviate from it by
+    // adding high-frequency detail; where those deviations are not identical
+    // they ADD rather than cancel, so the mutual distance can legitimately
+    // EXCEED each arm's distance from the smooth reference — approaching sqrt(2)
+    // times it for independent deviations. Measured here: mutual 2.999e-2
+    // against 2.752e-2 vs bilinear, a ratio of 1.09, i.e. the two are strongly
+    // correlated AND the inequality is false. The correlation below is what that
+    // 1.09 actually says, stated as the quantity it is.
+    //
+    // Compiled only where FidelityFX is available, so it SKIPs on a bare clone —
+    // which is the coupling "one gate per SDK" exists to avoid, taken
+    // deliberately and in one direction only (`--check-fsr3` does not know this
+    // gate exists).
+    #[cfg(ffx_fsr3_metal)]
+    {
+        let flags = mtl::fsr3::FLAG_HDR
+            | mtl::fsr3::FLAG_DEPTH_INVERTED
+            | mtl::fsr3::FLAG_AUTO_EXPOSURE;
+        let f = mtl::fsr3::Fsr3::new(m, (rw, rh), (uw, uh), flags)?;
+        for &(frame, reset) in &[(0u32, true), (1u32, false)] {
+            let (acc, g) = if frame == 0 { (&accum_a, &ga) } else { (&accum_b, &gb) };
+            f.upload(m, acc, g, (rw, rh), near, far);
+            f.dispatch(
+                m,
+                &mtl::fsr3::DispatchParams {
+                    render: (rw, rh),
+                    // FFX's OWN settled sign, never MetalFX's lever: that is
+                    // what makes `FR_MFX_JITTER=neg` a genuine ONE-SIDED mirror
+                    // and therefore a calibration point for the correlation
+                    // floor. Driving both arms from one lever would mirror them
+                    // together, which they would agree about.
+                    jitter: {
+                        let (jx, jy) = jit_render(frame);
+                        (jx * fsr::JITTER_SIGN, jy * fsr::JITTER_SIGN)
+                    },
+                    near,
+                    far,
+                    fov_y: cam0.fov_y,
+                    frame_time_ms: 1000.0 / 60.0,
+                    reset,
+                },
+            )?;
+        }
+        let other = f.read_output(m);
+        // Pearson correlation of the two arms' deviations from the SAME
+        // bilinear reference, over every colour channel of the frame.
+        let (mut sa, mut sb, mut n) = (0.0f64, 0.0f64, 0usize);
+        let mut dev = Vec::with_capacity(uw * uh * 3);
+        for y in 0..uh {
+            for x in 0..uw {
+                for c in 0..3 {
+                    let i = (y * uw + x) * 4 + c;
+                    let bil = bilinear(x, y, c);
+                    let (a, b) =
+                        (f64::from(warm[i] - bil), f64::from(other[i] - bil));
+                    sa += a;
+                    sb += b;
+                    n += 1;
+                    dev.push((a, b));
+                }
+            }
+        }
+        let (ma, mb) = (sa / n as f64, sb / n as f64);
+        let (mut caa, mut cbb, mut cab) = (0.0f64, 0.0f64, 0.0f64);
+        for (a, b) in &dev {
+            let (da, db) = (a - ma, b - mb);
+            caa += da * da;
+            cbb += db * db;
+            cab += da * db;
+        }
+        let corr = cab / (caa.sqrt() * cbb.sqrt()).max(1e-30);
+        let mut d_pair = 0.0f64;
+        for y in 0..uh {
+            for x in 0..uw {
+                for c in 0..3 {
+                    let i = (y * uw + x) * 4 + c;
+                    d_pair += f64::from((warm[i] - other[i]).abs());
+                }
+            }
+        }
+        let rel_pair = d_pair / (uw * uh * 3) as f64 / f64::from(out_mean.max(1e-6));
+        // MEASURED 0.655 correct against 0.479 with the MetalFX jitter sign
+        // mirrored — see `MFX_FSR3_CORR_MIN`. This is what SETTLED that sign:
+        // FidelityFX's is already settled, so the arm that agrees more with it
+        // is the one whose convention matches, and `mtl::mfx::JITTER_SIGN`
+        // being +1 (the same as FFX's) is a measurement rather than the
+        // inherited guess it started as.
+        if corr < MFX_FSR3_CORR_MIN {
+            return Err(format!(
+                "MetalFX and FSR3 deviate from a common bilinear reference with correlation \
+                 {corr:.3} on byte-identical inputs — two correct reconstructions add detail in \
+                 the same places, so at this level one of them is mis-wired or is not \
+                 reconstructing"
+            ));
+        }
+        eprintln!(
+            "check-metalfx: X3 cross-check OK — vs FSR3 corr {corr:.3} on identical inputs \
+             (planes::Trio); mutual {rel_pair:.3e}, each vs bilinear {rel_bil:.3e}"
+        );
+    }
+
+    // ---- the inputs are PLUMBED --------------------------------------------
+    //
+    // Each probe re-runs the ACCUMULATING sequence with exactly one input of
+    // frame B changed. The baseline MUST be the accumulating frame: on a reset
+    // frame there is no history, so the depth-derived disocclusion mask has
+    // nothing to reject and depth genuinely cannot change the output — a probe
+    // that cannot move its target fails whatever the code does.
+    //
+    // WHAT THESE CANNOT SEE, said rather than implied: they are magnitudes, so
+    // they fire whether a convention is right or mirrored. The jitter sign has a
+    // lever and the dump images; `setDepthReversed` is in the same class —
+    // pointing it the wrong way inverts disocclusion everywhere, and flattening
+    // the depth plane still moves the output by plenty.
+    let differs = |label: &str, other: &[f32]| -> Result<f64, String> {
+        let d: f64 = warm.iter().zip(other).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
+            / warm.len() as f64
+            / f64::from(out_mean.max(1e-6));
+        if d < 1e-3 {
+            return Err(format!(
+                "changing {label} moved the output by {d:.2e} of the mean — that input is not \
+                 reaching the scaler"
+            ));
+        }
+        Ok(d)
+    };
+
+    let d_jit = differs(
+        "the jitter offset",
+        &run_with(&[(0, true), (1, false)], None, Some((-jit(1).0, -jit(1).1)))?.0,
+    )?;
+
+    let d_depth = {
+        let flat = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            flat.depth[i].store(near.to_bits(), Relaxed);
+            flat.mvec[i * 2].store(gb.mvec[i * 2].load(Relaxed), Relaxed);
+            flat.mvec[i * 2 + 1].store(gb.mvec[i * 2 + 1].load(Relaxed), Relaxed);
+        }
+        differs("the depth plane", &run_with(&[(0, true), (1, false)], Some(&flat), None)?.0)?
+    };
+
+    let d_mv = {
+        let still = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            still.depth[i].store(gb.depth[i].load(Relaxed), Relaxed);
+        }
+        differs("the motion vectors", &run_with(&[(0, true), (1, false)], Some(&still), None)?.0)?
+    };
+
+    eprintln!(
+        "check-metalfx: X3 inputs plumbed — jitter {d_jit:.3e}, depth {d_depth:.3e}, motion \
+         {d_mv:.3e} (each one input away from the accumulating frame above)"
+    );
+
+    if std::env::var("FR_MFX_DUMP").is_ok() {
+        let px = |c: Vec3A| {
+            let t = tone::map(c, tone::ToneParams::SDR);
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+            (b(t.x) << 16) | (b(t.y) << 8) | b(t.z)
+        };
+        let mut inp = Vec::with_capacity(rw * rh);
+        for i in 0..rw * rh {
+            let g = |c: usize| f32::from_bits(accum_b[i * 3 + c].load(Relaxed));
+            inp.push(px(Vec3A::new(g(0), g(1), g(2))));
+        }
+        save_png("metalfx-input.png", &inp, rw, rh);
+        let mut out = Vec::with_capacity(uw * uh);
+        for i in 0..uw * uh {
+            out.push(px(Vec3A::new(warm[i * 4], warm[i * 4 + 1], warm[i * 4 + 2])));
+        }
+        save_png("metalfx-output.png", &out, uw, uh);
+        eprintln!(
+            "check-metalfx: wrote metalfx-input.png ({rw}x{rh}) and metalfx-output.png \
+             ({uw}x{uh}) — look for edges SHARPER than the input at 2x, and for a static view \
+             that does not wobble; a mirrored jitter sign reads as doubled wobble, which no \
+             magnitude above can distinguish (FR_MFX_JITTER=neg is the other arm)"
+        );
+    }
+    Ok(())
+}
+
 /// The rendered-frame half of --check-fsr at one resolution: frame A at
 /// `cam0`, frame B a 0.02·diag dolly later with A as its previous frame, both
 /// with the G-buffer AND signal capture on. Zero jitter (reconstructions
@@ -22296,13 +23680,41 @@ fn run_cinematic(
         _ => Vec::new(),
     };
 
-    let arm = if opts.gpu {
-        "gpu"
-    } else if opts.dxr {
-        "dxr"
-    } else {
-        "cpu"
+    // ONE predicate for the label and the dispatch below. They used to be
+    // derived separately and had drifted: `opts.dxr` defaults to true, so a
+    // bare `--cinematic` off Windows announced `[dxr]` and then rendered every
+    // frame on the CPU.
+    let pick = cinematic::pick_arm(opts.gpu, opts.dxr, opts.mode_explicit);
+    let arm = match pick {
+        cinematic::ArmPick::Cpu => "cpu",
+        #[cfg(windows)]
+        cinematic::ArmPick::Gpu => {
+            if opts.gpu {
+                "gpu"
+            } else {
+                "dxr"
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        cinematic::ArmPick::Gpu => "vk",
+        #[cfg(target_os = "macos")]
+        cinematic::ArmPick::Gpu => "cpu",
     };
+    // Beside the label rather than at the dispatch, so `--cinematic-dry-run`
+    // — whose whole job is to make the decision observable without rendering —
+    // explains the one case where the label is not what was asked for. A
+    // SUBSTITUTION, not a refusal: this backend has exactly one GPU arm, so
+    // there is nothing to be told about, and the `--fsr4` exit-2 doctrine is
+    // about being told something impossible rather than about a default.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if pick == cinematic::ArmPick::Gpu
+        && cinematic::asked_for_dxr(opts.gpu, opts.dxr, opts.mode_explicit)
+    {
+        eprintln!(
+            "cinematic: --dxr names a DispatchRays pipeline, which the Vulkan backend does not \
+             have — using the Vulkan wavefront tracer"
+        );
+    }
     eprintln!(
         "cinematic: {} shot(s) [{arm}] | out {} | fps {} | tod {} | pid {}",
         shots.len(),
@@ -22377,10 +23789,23 @@ fn run_cinematic(
     }
 
     #[cfg(windows)]
-    if opts.gpu || opts.dxr {
+    if pick == cinematic::ArmPick::Gpu {
         match run_cinematic_gpu(scene, bvh, world, &shots, &attractors, cine, opts) {
             Ok(code) => return code,
             Err(e) => eprintln!("cinematic: GPU arm unavailable ({e}) — falling back to the CPU tracer"),
+        }
+    }
+    // The Vulkan arm, in the SAME shape as the Windows one: unreachable-if-not
+    // picked, and an `Err` falls through to the CPU tracer with one line. So
+    // the degrade chain reads identically on both platforms and the CPU arm is
+    // still the floor everywhere.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if pick == cinematic::ArmPick::Gpu {
+        match run_cinematic_vk(scene, bvh, &shots, &attractors, cine, opts) {
+            Ok(code) => return code,
+            Err(e) => {
+                eprintln!("cinematic: Vulkan arm unavailable ({e}) — falling back to the CPU tracer")
+            }
         }
     }
     run_cinematic_cpu(scene, bvh, &shots, &attractors, cine, opts)
@@ -22654,6 +24079,507 @@ fn run_cinematic_cpu(
         cine_encode(&dir, shot, cine);
     }
     0
+}
+
+/// THE VULKAN ARM — the first thing on this backend that produces a picture.
+///
+/// Sixteen `--check-vk` stages have scored the Vulkan tracer and every one of
+/// them ends in a number; nobody has ever looked at its output. This is the
+/// mode that makes that possible without a window, and it needs no swapchain,
+/// no surface, no graphics pipeline and no new dependency, because the whole
+/// presentation path below `cine_write_frame` is already portable and already
+/// runs here for the CPU arm.
+///
+/// It carries the D3D12 arm's shape with the parts that have no peer here
+/// dropped rather than emulated: ONE upscaler (FSR3 — see the vendor survey;
+/// XeSS ships no Linux library and DLSS has no Vulkan NGX at all), ONE denoiser
+/// (NRD, which is the compiled default), no dual-GPU, no HUD.
+///
+/// TWO ARMS PER SHOT, exactly as on D3D12:
+///   * RECONSTRUCTION — every sub-frame is a fresh jittered frame the temporal
+///     model integrates, and the frame written is FFX's reconstructed output.
+///   * ACCUMULATION — the fallback, and the arm a GI shot always takes, because
+///     the hemisphere integrator is a still-frame accumulation contract.
+///
+/// THE TRACER IS CACHED BY RESOLUTION and not rebuilt per shot: constructing
+/// one compiles the whole kernel corpus through DXC, which is ~20 s, and the
+/// `islands` preset is seven shots at one resolution.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_cinematic_vk(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    shots: &[cinematic::Shot],
+    attractors: &[world::TodAttractor],
+    cine: &cinematic::CineOpts,
+    opts: &Opts,
+) -> Result<i32, String> {
+    let hg = vk::headless::VkHeadless::new(false).map_err(|e| e.to_string())?;
+    if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+        // A software ICD renders this correctly and uselessly slowly, and FFX
+        // declines to create a context on one at all. Say so and let the CPU
+        // tracer — which is genuinely faster here — take it.
+        return Err(format!("{} is a software device", hg.vk.info.name));
+    }
+    let sp = vk::spirv::Spirv::load(&vk::spirv::default_dir())?;
+    let vs = vk::scene::VkScene::new(&hg, scene, bvh)?;
+    let vt = vk::textures::VkTextures::new(&hg, &sp, scene, opts.bc7)?;
+
+    // WHAT THIS BACKEND CANNOT DO, each said once and loudly rather than
+    // discovered in the output. `--fsr4` is the exception that stays fatal:
+    // it is a REQUIREMENT rather than a preference, which is the whole point
+    // of the flag.
+    if opts.fsr4_required {
+        return Err(
+            "--fsr4 requires the FSR4 Ray Regeneration provider, which is a D3D12 DLL — this \
+             backend upscales with FSR 3.1 only. Drop the flag, or use --fsr3"
+                .into(),
+        );
+    }
+    if opts.chain.dlss || opts.chain.fsr4 || opts.chain.xess {
+        eprintln!(
+            "cinematic: DLSS / FSR4-RR / XeSS have no Linux artifact — falling through the chain \
+             to FSR 3.1"
+        );
+    }
+    if opts.dual_gpu.is_some() {
+        eprintln!("cinematic: --dual-gpu is D3D12-only — capturing on one device");
+    }
+    if opts.frd {
+        eprintln!("cinematic: --frd is D3D12-only — the capture denoises with NRD, or --no-nrd");
+    }
+    if scene.sway.is_some() {
+        // The animated TLAS ring has no Vulkan peer, so the rest pose is what
+        // traces. A leaf that never moves is a picture of nothing with no
+        // error, which is worse than a missing feature — so name it.
+        eprintln!(
+            "cinematic: foliage sway has no Vulkan arm — leaves render at their REST POSE (the \
+             `foliage` preset has nothing to show on this backend; use --cpu for it)"
+        );
+    }
+
+    // The upscaler, if the chain wants one AND it is compiled in. The
+    // accumulation arm is the fallback and is never an error.
+    let want_up = opts.chain != upchain::UpChain::NONE && vk::fsr3::built();
+    if opts.chain != upchain::UpChain::NONE && !vk::fsr3::built() {
+        eprintln!(
+            "cinematic: FidelityFX was not compiled in (./install-prerequisites.sh fsr3src) — \
+             accumulation fallback"
+        );
+    }
+    let want_dn = want_up && opts.nrd;
+
+    // KEYED ON `recon` AS WELL AS THE RESOLUTION. The pack, the feed and the
+    // NRD planes are BUILD-time `TracerOpts`, so a key of size alone freezes
+    // the first shot's answer for every later shot at that size: a GI shot
+    // following a non-GI one would reuse an upscaler-armed tracer and take the
+    // reconstruction arm, which is exactly what "a GI shot always accumulates"
+    // forbids. D3D12 gets away with a size-only key because it decides per shot
+    // at the frame loop; here the decision is baked into the build, so it
+    // belongs in the key.
+    let mut built: Option<((usize, usize, bool), CineVk)> = None;
+    let mut code = 0;
+
+    for shot in shots {
+        let (rw, rh) = shot.res;
+        let dir = cine_prepare_dir(cine, shot)?;
+        let q = cine_quality(shot);
+        // A GI shot integrates the hemisphere, which is a still-frame
+        // accumulation contract — so it takes the accumulation arm whatever the
+        // chain says. D3D12 does the same, for the same reason.
+        let recon = want_up && !shot.gi;
+
+        let key = (rw, rh, recon);
+        if built.as_ref().map(|(k, _)| *k) != Some(key) {
+            if let Some((_, old)) = built.take() {
+                old.destroy(&hg);
+            }
+            built = Some((
+                key,
+                CineVk::build(&hg, &sp, scene, &vs, &vt, bvh, rw, rh, recon, want_dn, opts)?,
+            ));
+        }
+        let cv = &mut built.as_mut().unwrap().1;
+        // A shot boundary is a HARD CUT, and the expensive half above is cached
+        // across it — so the per-shot temporal state has to be dropped by hand.
+        cv.begin_shot();
+
+        let frames = shot.kind.frames();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let mut present = vec![0u32; rw * rh];
+        let mut prev_hour: Option<f32> = None;
+        let t_shot = Instant::now();
+
+        for f in 0..frames {
+            let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
+            cv.tg.refresh_sky(scene);
+            let hdr = cv.output_frame(&hg, scene, shot, &fs, f, rw, rh, q, opts)?;
+
+            if shot.overlay {
+                let ib = hg.read_buffer(&cv.tg.info, rw * rh * 4)?;
+                for (dst, c) in info.iter().zip(ib.chunks_exact(4)) {
+                    dst.store(u32::from_le_bytes(c.try_into().unwrap()), Relaxed);
+                }
+            }
+            cine_write_frame(
+                &dir, shot, cine, f, &hdr, &info, &mut present, &fs, rw, rh, "VK",
+            );
+            cine_progress(shot, f, frames, t_shot, fs.hour);
+        }
+        cine_finish(&dir, shot, t_shot);
+        cine_encode(&dir, shot, cine);
+        code = 0;
+    }
+
+    if let Some((_, b)) = built.take() {
+        b.destroy(&hg);
+    }
+    vs.destroy(&hg);
+    vt.destroy(&hg);
+    Ok(code)
+}
+
+/// One resolution's worth of Vulkan capture state.
+///
+/// A struct rather than D3D12's positional tuple for a reason this backend has
+/// and that one does not: `VkTracer`, `Fsr3` and `VkNrd` have `destroy(&hg)`
+/// and NO `Drop`, so a forgotten teardown leaks device memory across a
+/// seven-shot preset. One `destroy` in reverse construction order makes that
+/// structural instead of remembered.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct CineVk {
+    tg: vk::tracer::VkTracer,
+    up: Option<vk::fsr3::Fsr3>,
+    dn: Option<vk::nrd::VkNrd>,
+    /// Free-running across ONE shot, so the Halton phase never restarts inside
+    /// it — and reset BY `begin_shot` at every shot boundary, because a new
+    /// shot is a hard cut. This struct is cached by resolution across shots
+    /// (the `islands` preset is seven at one res), so a `seq` that only ever
+    /// incremented gave the whole RUN a single `reset` and carried shot 1's
+    /// history into all six that followed. D3D12 declares its `seq` inside the
+    /// per-shot loop for exactly this reason.
+    seq: u32,
+    /// The previous SUB-frame's pose — what the pack reprojects from, what
+    /// NRD's `prev_mats` is built from, and what decides whether the terminal
+    /// quadtree can be replayed. One per shot; see `cinematic::Temporal`.
+    temporal: cinematic::Temporal,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl CineVk {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        hg: &vk::headless::VkHeadless,
+        sp: &vk::spirv::Spirv,
+        scene: &scene::Scene,
+        vs: &vk::scene::VkScene,
+        vt: &vk::textures::VkTextures,
+        bvh: &bvh::Bvh,
+        rw: usize,
+        rh: usize,
+        recon: bool,
+        want_dn: bool,
+        opts: &Opts,
+    ) -> Result<CineVk, String> {
+        let tg = vk::tracer::VkTracer::new(
+            hg,
+            sp,
+            scene,
+            vs,
+            vt,
+            bvh,
+            rw as u32,
+            rh as u32,
+            vk::tracer::TracerOpts {
+                gbuf_full: recon,
+                feed: recon,
+                nrd: recon && want_dn,
+            },
+        )?;
+        // The upscaler runs at 1:1 — `--cinematic` is DLAA-shaped by design
+        // (`run_cinematic_gpu` captures at 100% render scale), so the temporal
+        // model is an antialiaser and integrator rather than a magnifier.
+        let up = if recon {
+            match vk::fsr3::Fsr3::new(
+                hg,
+                (rw as u32, rh as u32),
+                (rw as u32, rh as u32),
+                vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("cinematic: FSR3 unavailable ({e}) — accumulation fallback");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let dn = match (&up, want_dn) {
+            (Some(_), true) => match tg.nrd_plane_handles() {
+                Some(planes) => {
+                    match vk::nrd::VkNrd::new(hg, &opts.nrd_path, rw as u32, rh as u32, &planes) {
+                        Ok(e) => {
+                            eprintln!(
+                                "nrd: armed — cinematic pre-upscale denoising at {rw}x{rh} ({})",
+                                opts.nrd_path
+                            );
+                            Some(e)
+                        }
+                        Err(e) => {
+                            eprintln!("nrd: unavailable ({e}) — the capture upscales undenoised");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(f) = &up {
+            tg.wire_feed(hg, f.feed_views());
+        }
+        if dn.is_some() {
+            tg.wire_nrd(hg);
+        }
+        Ok(CineVk {
+            tg,
+            up,
+            dn,
+            seq: 0,
+            temporal: cinematic::Temporal::default(),
+        })
+    }
+
+    /// A shot boundary is a HARD CUT: drop every temporal history.
+    ///
+    /// This is a method rather than a fresh `CineVk` because the expensive half
+    /// (the tracer's kernels, the FFX context, the NRD instance) is cached
+    /// across shots at one resolution and must survive — only the per-shot
+    /// state resets. Forgetting it is what let the `islands` preset reconstruct
+    /// shot 2's first frames out of shot 1's island.
+    fn begin_shot(&mut self) {
+        self.seq = 0;
+        self.temporal = cinematic::Temporal::default();
+    }
+
+    /// Render ONE output frame and return it as a linear f32 RGB image.
+    #[allow(clippy::too_many_arguments)]
+    fn output_frame(
+        &mut self,
+        hg: &vk::headless::VkHeadless,
+        scene: &scene::Scene,
+        shot: &cinematic::Shot,
+        fs: &CineFrame,
+        f: u32,
+        rw: usize,
+        rh: usize,
+        q: Quality,
+        opts: &Opts,
+    ) -> Result<Vec<f32>, String> {
+        let basis = fs.cam.basis(rw, rh);
+        let (near, far) = dlss::near_far(scene.diag);
+        let samples = shot.samples.max(1);
+
+        let Some(up) = self.up.as_ref() else {
+            return self.accumulate(hg, scene, fs, &basis, samples, q, opts);
+        };
+
+        // OUTPUT FRAME 0 GETS A WARM-UP, and it is not optional: `seq`
+        // free-runs while `reset` fires once per shot, so frame 0 would be
+        // reconstructed from under half a jitter phase AND sampled on a biased
+        // lattice — a discontinuity that, in a looping clip, shows once per lap.
+        // Self-limiting: a 256-sample still is already several phases, so the
+        // extra count is 0 there. Deliberately NOT applied to the accumulation
+        // arm, whose frame 0 is statistically identical to any other.
+        let warm = if f == 0 { dlss::JITTER_PHASE.saturating_sub(samples) } else { 0 };
+
+        let mut out = Vec::new();
+        for k in 0..warm + samples {
+            let emit = k >= warm;
+            let jit = dlss::jitter_for(self.seq);
+            // What the PREVIOUS sub-frame was, which is a different question
+            // from what this one is — and the question this arm used to answer
+            // with `basis` itself, zeroing every motion vector on a moving shot
+            // and telling NRD the camera had not moved for the whole tour.
+            // Inside an output frame the pose really is unchanged, so `st`
+            // reports prev == cur AND licenses a replay; at an output-frame
+            // boundary it reports the frame before and refuses one.
+            let st = self.temporal.step(&basis, &fs.cam, jit);
+            let replay = st.replay && opts.replay;
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: self.seq,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                prev_cam: Some(st.prev_basis),
+                q,
+                verify: false,
+                spp: opts.spp,
+                probe_sample: 0,
+                clouds: fs.clouds,
+                fireflies: fs.fireflies,
+                sway_time: None,
+                sway_prev_time: None,
+                replay,
+            };
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: fs.cam.fov_y,
+                dt_ms: gfx::denoise::NOMINAL_DT_MS,
+                reset: st.reset,
+            };
+            // Structure replay across a shot's sub-frames is why high sample
+            // counts are affordable — the terminal quadtree is a function of
+            // (scene, BVH, basis, rw, rh) and the pose is bit-equal here, so a
+            // 256-sample still ran the whole ladder 256 times for one answer.
+            // The accumulation arm three functions down has always done this;
+            // the arm that produces the shipped pictures did not.
+            if replay {
+                self.tg.render_wavefront_replay(hg, &p, true)?;
+            } else {
+                self.tg.render_wavefront(hg, &p, true)?;
+            }
+
+            match self.dn.as_mut() {
+                // THE COMPOSED FRAME (B5a): pack -> ReBLUR -> recompose -> FFX,
+                // and NO feed dispatch — the folded pack wrote the guides and
+                // the recompose wrote the colour.
+                Some(eng) => {
+                    let mats = dlss::cam_matrices(&fs.cam, rw, rh, near, far);
+                    // The PREVIOUS sub-frame's matrices, which is the whole
+                    // point: `common_settings` takes two equally-typed
+                    // `&CamMatrices` and `(&mats, &mats)` compiles cleanly, so
+                    // the compiler cannot tell a reprojection from an identity.
+                    // It is only correct where the pose provably did not move
+                    // — which is true of V15/V16 and was not true here.
+                    let prev_mats = dlss::cam_matrices(&st.prev_cam, rw, rh, near, far);
+                    let (pw, ph) = eng.prev_size();
+                    let cs = gfx::denoise::common_settings(
+                        &mats,
+                        &prev_mats,
+                        jit,
+                        st.prev_jitter,
+                        rw as u32,
+                        rh as u32,
+                        pw,
+                        ph,
+                        far,
+                        gfx::denoise::NOMINAL_DT_MS,
+                        self.seq,
+                        st.reset,
+                        false,
+                    );
+                    let rs = gfx::denoise::reblur_settings();
+                    let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+                    up.frame_fed(
+                        hg,
+                        |d, cmd| {
+                            unsafe {
+                                r1 = self.tg.record_nrd_pack(d, cmd);
+                                r2 = eng.record(d, cmd, &cs, &rs);
+                                r3 = self.tg.record_nrd_out(d, cmd);
+                            }
+                            r2.clone()
+                        },
+                        dp,
+                    )?;
+                    r1?;
+                    r2?;
+                    r3?;
+                }
+                None => {
+                    let mut rf = Ok(());
+                    up.frame_fed(
+                        hg,
+                        |d, cmd| {
+                            rf = unsafe { self.tg.record_feed(d, cmd) };
+                            rf.clone()
+                        },
+                        dp,
+                    )?;
+                    rf?;
+                }
+            }
+            // ADVANCE ONLY HERE, past every `?` above: a sub-frame that failed
+            // must not become the pose the next one reprojects from, nor the
+            // structure it replays. `nrd_frame_step`'s rule, and the reason
+            // `Temporal` splits `step` from `advance`.
+            self.seq += 1;
+            self.temporal.advance(basis, fs.cam, jit);
+            if emit && k + 1 == warm + samples {
+                out = up.read_output(hg)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The accumulation arm: N sub-frames at ONE pose into `accum`, averaged.
+    ///
+    /// Structure REPLAY across sub-frames 1..N-1 is a pure win and is why high
+    /// sample counts are affordable — the terminal quadtree is a function of
+    /// (scene, BVH, basis, rw, rh) only, and the pose is bit-equal across a
+    /// shot's sub-frames BY CONSTRUCTION (one `basis`, computed once). This
+    /// backend asks the CALLER to prove that bit-equality rather than keeping a
+    /// `last_struct` cache, and "the same variable, reused" is the narrowest
+    /// possible proof of it.
+    fn accumulate(
+        &self,
+        hg: &vk::headless::VkHeadless,
+        scene: &scene::Scene,
+        fs: &CineFrame,
+        basis: &camera::CamBasis,
+        samples: u32,
+        q: Quality,
+        opts: &Opts,
+    ) -> Result<Vec<f32>, String> {
+        let _ = scene;
+        for k in 0..samples {
+            let p = gfx::frame::FrameParams {
+                cam: *basis,
+                frame: k,
+                accumulate: true,
+                // Sub-frame 0 is the pixel CENTRE, 1.. are jittered — the
+                // codebase's accumulation convention.
+                jitter: k > 0,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp: opts.spp,
+                probe_sample: 0,
+                clouds: fs.clouds,
+                fireflies: fs.fireflies,
+                sway_time: None,
+                sway_prev_time: None,
+                replay: k > 0 && opts.replay,
+            };
+            if k > 0 && opts.replay {
+                self.tg.render_wavefront_replay(hg, &p, k == 0)?;
+            } else {
+                self.tg.render_wavefront(hg, &p, k == 0)?;
+            }
+        }
+        let px = self.tg.rw as usize * self.tg.rh as usize;
+        let bytes = hg.read_buffer(&self.tg.accum, px * 3 * 4)?;
+        let inv = 1.0 / samples as f32;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()) * inv)
+            .collect())
+    }
+
+    fn destroy(self, hg: &vk::headless::VkHeadless) {
+        if let Some(d) = self.dn {
+            d.destroy(hg);
+        }
+        if let Some(u) = self.up {
+            u.destroy(hg);
+        }
+        self.tg.destroy(hg);
+    }
 }
 
 /// Write one output frame's files from the averaged LINEAR image.
@@ -26740,8 +28666,14 @@ fn run_check(
             false
         }
     };
+    // A gate that reports green without running is worse than a missing one,
+    // because a suite reading PASSED is taken to have covered it. `dual_ok`
+    // below prints its SKIP; these two were silently `true`.
     #[cfg(not(windows))]
-    let quin_ok = true;
+    let quin_ok = {
+        eprintln!("quin self-test: SKIP (D3D12-hosted; pending its own move to gfx::)");
+        true
+    };
 
     // Raw-NGX DLSS-G guide self-test — the two conversions the --fg
     // evaluate feeds the FG snippet: clip depth must be the exact z-mapping
@@ -26760,8 +28692,15 @@ fn run_check(
             false
         }
     };
+    // Same shape as `quin_ok` above, and the same reason: ~64% of
+    // ngxfg_guides.rs is D3D12-free `glam` math and a pure self_test, so this
+    // is a `gfx::guides` candidate rather than a permanent skip — but until it
+    // moves, say so instead of reporting a gate that never ran.
     #[cfg(not(windows))]
-    let ngxfg_guides_ok = true;
+    let ngxfg_guides_ok = {
+        eprintln!("ngxfg-guides self-test: SKIP (D3D12-hosted; pending its own move to gfx::)");
+        true
+    };
 
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.

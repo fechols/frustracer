@@ -179,7 +179,7 @@ everything else on that line really is optional.
 
 | | |
 |---|---|
-| **OS** | **Windows 10/11, x64** for the renderer proper — the interactive window, both D3D12 backends (compute-wavefront and DXR), DLSS, XeSS, NRD and frame generation. **Linux** runs a **Vulkan** backend, headless: the wavefront quadtree, the hemisphere bounce tiers, structure replay, BC7, `--blas-split`, FSR 3.1 upscaling and NRD denoising all run and are gated by `--check-vk` — there is no presentation stage yet, so there is no window. On **macOS** the Metal work so far is FSR 3.1 upscaling only, headless and gated by `--check-fsr3` — the CPU tracer renders, FidelityFX upscales it through a hand-written Metal `FfxInterface`, and the frame is scored; there is no Metal tracer and no presentation stage. The DLL-free suite (`--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-spirv`) runs on all three; `--check-nrd`'s instance gate is real on Windows and Linux and skips on macOS, which has no NRD consumer. |
+| **OS** | **Windows 10/11, x64** for the renderer proper — the interactive window, both D3D12 backends (compute-wavefront and DXR), DLSS, XeSS, NRD and frame generation. **Linux** runs a **Vulkan** backend, headless: the wavefront quadtree, the hemisphere bounce tiers, structure replay, BC7, `--blas-split`, FSR 3.1 upscaling and NRD denoising all run and are gated by `--check-vk` — there is no presentation stage yet, so there is no window. On **macOS** (13.0+ — the MetalFX framework is linked unconditionally) the Metal work so far is two upscalers over one CPU-rendered G-buffer, headless and gated: FSR 3.1 through a hand-written Metal `FfxInterface` (`--check-fsr3`, needs the FidelityFX SDK source at build time) and Apple's MetalFX temporal scaler (`--check-metalfx`, needs nothing — it runs on a bare clone). Where both are built they cross-check each other on byte-identical inputs. There is no Metal tracer and no presentation stage. The DLL-free suite (`--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-spirv`) runs on all three; `--check-nrd`'s instance gate is real on Windows and Linux and skips on macOS, which has no NRD consumer. |
 | **Toolchain** | Rust (stable) + a C++ toolchain — `build.rs` compiles a few small C++ shims (MSVC build tools & the Windows SDK on Windows; clang or GCC elsewhere). **CMake**, because SDL3 and NRD both build from source. |
 | **git-lfs** | Only if you want the scenes. `git lfs install` once per clone, or you get pointer files. |
 | **GPU** | D3D12 feature level 12_0. NVIDIA/AMD start in DXR when available; Intel RT 1.1 adapters start in the compute-wavefront tracer. `--cpu` selects the CPU tracer explicitly. |
@@ -258,8 +258,27 @@ except the vendor upscaler):
 ```bash
 ./install-prerequisites.sh dxc spirv
 cargo run --release -- --check-spirv   # the whole shader corpus -> SPIR-V, validated
-cargo run --release -- --check-vk      # device, tracer, hemi tiers, replay, BC7, FSR3
+cargo run --release -- --check-vk      # device, tracer, hemi tiers, replay, BC7, FSR3, NRD
 ```
+
+There is no window on Linux yet, but there is a picture: `--cinematic` has a
+Vulkan arm, so the GPU tracer renders stills and camera-spline sequences
+straight to PNG (and to PQ/EXR under `--cinematic-hdr`, and to video through the
+ffmpeg lines it prints). NRD denoises and FSR 3.1 reconstructs each frame; GI
+shots take the accumulation path, which is the one thing a live session could
+never do anyway.
+
+```bash
+cargo run --release -- --cinematic hero --gpu          # a still, Vulkan-traced
+cargo run --release -- --cinematic orbit --gpu         # a sequence + the ffmpeg commands
+cargo run --release -- --cinematic hero --gpu --cinematic-gi   # moving camera WITH bounce GI
+```
+
+Every arm hands the same linear image to the same tone curve, so the Vulkan and
+CPU captures agree on level to a fraction of a step — but they are not
+bit-identical and cannot be, being different tracers with different
+reconstruction. Foliage sway has no Vulkan arm yet and renders at the rest pose,
+which the run says out loud.
 
 `FR_VK_DEVICE=<index|name>` picks the adapter, `FR_VK_MAP=1` prints the derived
 register map, and `FR_VK_VALIDATION=0` opts out of the validation layer (which

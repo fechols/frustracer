@@ -771,6 +771,22 @@ pub struct Cli {
     /// promised the Vulkan arm would join this flag; it did not, and one gate
     /// per BACKEND is the arrangement that shipped.
     pub check_fsr3: bool,
+    /// `--check-metalfx`: Apple's `MTLFXTemporalScaler` over the same
+    /// CPU-rendered G-buffer `--check-fsr3` feeds FidelityFX — a real device, a
+    /// real scaler, and one scored upscale.
+    ///
+    /// A SEPARATE gate rather than a stage of `--check-fsr3`, on this tree's
+    /// one-gate-per-SDK convention: the skip stories are unrelated (device
+    /// support and a macOS floor here; the FidelityFX SDK source plus a
+    /// build-time transpile there), and a flag named after FidelityFX that also
+    /// ran Apple's upscaler would mislead every later reader. Unlike that gate
+    /// this one needs NO SDK at all — MetalFX is a system framework, so it runs
+    /// on a bare clone.
+    ///
+    /// The two touch in exactly one place: X3 cross-checks the two outputs
+    /// against each other on byte-identical inputs (`mtl::planes::Trio`), which
+    /// is compiled only where FidelityFX is also available.
+    pub check_metalfx: bool,
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
@@ -1066,6 +1082,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut nppd_dump = false;
     let mut check_nrd = false;
     let mut check_fsr3 = false;
+    let mut check_metalfx = false;
     let mut check_spirv = false;
     let mut check_vk = false;
     let mut no_xess_explicit = false;
@@ -1126,6 +1143,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--check-nrd" => check_nrd = true,
             "--check-fsr3" => check_fsr3 = true,
+            "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
             "--check-vk" => check_vk = true,
             "--nrd" => {
@@ -2438,6 +2456,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         nppd_dump,
         check_nrd,
         check_fsr3,
+        check_metalfx,
         check_spirv,
         check_vk,
         check_gpu,
@@ -2661,6 +2680,11 @@ pub fn usage() {
                 eprintln!("                --check-vk's V11.) Needs the SDK source");
                 eprintln!("                (./install-prerequisites.sh fsr3src) plus spirv-cross + Xcode at build");
                 eprintln!("                time; without them the pure half still runs and the rest SKIPs");
+                eprintln!("  --check-metalfx  headless (macOS): Apple's MTLFXTemporalScaler over the SAME");
+                eprintln!("                G-buffer --check-fsr3 feeds FidelityFX — a real scaler and one");
+                eprintln!("                scored upscale. Needs NO SDK (MetalFX is a system framework), so");
+                eprintln!("                it runs on a bare clone; where FSR3 is also built it cross-checks");
+                eprintln!("                the two outputs on byte-identical inputs. macOS 13+");
                 eprintln!("  --fsr         force-start the upscaler chain at FSR4 + Ray Regeneration (K toggles;");
                 eprintln!("                RDNA4 only — elsewhere the chain falls to XeSS then FSR 3.1)");
                 eprintln!("  --fsr4        --fsr, but REQUIRED: exit(2) instead of falling through when FSR4 +");
