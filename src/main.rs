@@ -20585,7 +20585,7 @@ fn metalfx_upscale_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
