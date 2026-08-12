@@ -379,6 +379,13 @@ jobs:
       #   * CHECK-VK PASSED is necessary but NOT sufficient: a device without
       #     ray query skips V6 (and V7/V8/V9 follow) and still passes, i.e. the
       #     tracer gates would silently not run. Forbid those four by name.
+      #   * V18 joins them, and it is the one stage whose CI coverage was
+      #     EARNED rather than assumed: the display stage renders into an image
+      #     it owns and needs no surface, so it runs on llvmpipe — measured,
+      #     including the blit arm's EXACT byte identity, which two independent
+      #     rasterizers agreeing on the pixel mapping is a stronger statement
+      #     than either one passing alone. It skips only on a device that
+      #     cannot draw at all, which this runner is not.
       #   * V11/V13 are PERMITTED to skip: FSR3 on a software device is a
       #     documented environment fact, not a degraded run.
       #
@@ -393,9 +400,9 @@ jobs:
           cargo run --profile quick -- --check-vk 2>&1 | tee vk.log
           grep -q "CHECK-VK PASSED" vk.log \
             || { echo "::error::--check-vk did not run (no summary line — it skipped)"; exit 1; }
-          if grep -qE "SKIP (V6|V7|V8|V9)" vk.log; then
-            echo "::error::--check-vk passed vacuously — the tracer stages skipped:"
-            grep -E "SKIP (V6|V7|V8|V9)" vk.log
+          if grep -qE "SKIP (V6|V7|V8|V9|V18)" vk.log; then
+            echo "::error::--check-vk passed vacuously — the tracer or display stages skipped:"
+            grep -E "SKIP (V6|V7|V8|V9|V18)" vk.log
             exit 1
           fi
 

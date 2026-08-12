@@ -178,3 +178,129 @@ pub fn compute_pipeline(
         Err((_, e)) => Err(format!("vkCreateComputePipelines: {e}")),
     }
 }
+
+/// Create a graphics pipeline for one vertex/fragment pair, drawing into a
+/// single colour attachment of `fmt`.
+///
+/// `compute_pipeline`'s sibling, and its doc's claim — that creation IS the
+/// check — reaches FURTHER here: a graphics pipeline validates two stages
+/// against one layout, so a binding the fragment shader uses and the layout
+/// omits surfaces at creation rather than as a wrong-resource read at draw
+/// time.
+///
+/// DYNAMIC RENDERING, so there is no `VkRenderPass` and no `VkFramebuffer`:
+/// `VkPipelineRenderingCreateInfo` names the attachment format and the caller
+/// brackets its draw with `cmd_begin_rendering`/`cmd_end_rendering`. That is
+/// core in Vulkan 1.3 — this backend's floor (`device::REQ_API`) — but core
+/// means MANDATED, not enabled, and `vkCreateGraphicsPipelines` enforces the
+/// difference by rejecting a null `renderPass` unless the feature was switched
+/// on at device creation. `DeviceInfo::dynamic_rendering` records it and
+/// `open_device` enables it; a caller that reaches here on a device without it
+/// gets a validation error rather than a silent wrong result.
+///
+/// EVERY FIXED-FUNCTION CHOICE BELOW IS FORCED BY THE CORPUS, not preferred:
+///
+/// * **No vertex input.** Both display shaders build a fullscreen triangle out
+///   of `SV_VertexID` (`tonemap.hlsl`'s `vsmain`, `blit.hlsl`'s), so the draw is
+///   three vertices against an empty binding/attribute set.
+/// * **`cullMode = NONE`, and this one is load-bearing rather than lazy.** D3D
+///   and Vulkan disagree about which way NDC y points, so the IDENTICAL
+///   `SV_VertexID` triangle has opposite screen-space winding under the two
+///   APIs. Its coverage is unaffected — it contains the whole [-1,1] square
+///   either way, which is the point of the trick — but a cull mode that is
+///   correct on D3D12 would discard it outright here. `gpu/tonemap.rs` sets
+///   `D3D12_CULL_MODE_NONE` for these same shaders, so this is agreement with
+///   the other backend, not a workaround for this one.
+/// * **No depth, no stencil, no blend.** The display stage overwrites its
+///   target. The one D3D12 pass that blends is the HUD's premultiplied arm,
+///   which is not part of this stage.
+/// * **Viewport and scissor DYNAMIC**, so one pipeline serves every target
+///   size — which is what lets a gate sweep resolutions without recompiling.
+///
+/// TWO ash DEFAULTS ARE INVALID AND ARE SET EXPLICITLY. `Default` here is a
+/// zeroed struct with only `sType` filled, so `line_width` would be 0.0 (the
+/// spec requires exactly 1.0 unless `wideLines` is enabled) and
+/// `rasterization_samples` would be 0 (not a legal `VkSampleCountFlagBits`).
+/// Both are the kind of thing a validation layer catches and a driver without
+/// one may not.
+pub fn graphics_pipeline(
+    vkd: &Vk,
+    layouts: &Layouts,
+    vs: &[u32],
+    vs_entry: &str,
+    ps: &[u32],
+    ps_entry: &str,
+    fmt: vk::Format,
+) -> Result<vk::Pipeline, String> {
+    let d = &vkd.device;
+    let mk = |words: &[u32]| unsafe {
+        d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+    };
+    let vsm = mk(vs).map_err(|e| format!("vkCreateShaderModule(vs): {e}"))?;
+    let psm = match mk(ps) {
+        Ok(m) => m,
+        Err(e) => {
+            // The vertex module is already live; leaking it because the second
+            // create failed would be a leak on the error path nothing cleans.
+            unsafe { d.destroy_shader_module(vsm, None) };
+            return Err(format!("vkCreateShaderModule(ps): {e}"));
+        }
+    };
+
+    let vsn = std::ffi::CString::new(vs_entry).map_err(|_| "vs entry has a NUL".to_string())?;
+    let psn = std::ffi::CString::new(ps_entry).map_err(|_| "ps entry has a NUL".to_string())?;
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vsm)
+            .name(&vsn),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(psm)
+            .name(&psn),
+    ];
+
+    let vin = vk::PipelineVertexInputStateCreateInfo::default();
+    let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    // Counts only — the values are dynamic, so the pointers stay null.
+    let vp = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+    let rs = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let ms = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let atts = [vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(false)
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let cb = vk::PipelineColorBlendStateCreateInfo::default().attachments(&atts);
+    let dynstate = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dy = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynstate);
+
+    let fmts = [fmt];
+    let mut rend = vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&fmts);
+    let ci = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vin)
+        .input_assembly_state(&ia)
+        .viewport_state(&vp)
+        .rasterization_state(&rs)
+        .multisample_state(&ms)
+        .color_blend_state(&cb)
+        .dynamic_state(&dy)
+        .layout(layouts.pipeline)
+        // No render pass, no subpass — the whole point of dynamic rendering.
+        .render_pass(vk::RenderPass::null())
+        .push_next(&mut rend);
+    let r = unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[ci], None) };
+    unsafe {
+        d.destroy_shader_module(vsm, None);
+        d.destroy_shader_module(psm, None);
+    }
+    match r {
+        Ok(p) => Ok(p[0]),
+        Err((_, e)) => Err(format!("vkCreateGraphicsPipelines: {e}")),
+    }
+}

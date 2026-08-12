@@ -7840,6 +7840,130 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # CONSTRUCTION — and shading the replay at a different frame
                                       # index reads `accum: 815314 of 1440000 bytes differ`, which
                                       # is the byte comparison proving it bites.
+                                      # V18 — THE DISPLAY STAGE, RUNG 1 (B6a, 2026-08-12): the
+                                      # first thing this backend ever DREW. Everything before it is
+                                      # compute — eighteen stages each ending in a number, and a
+                                      # `--cinematic` PNG whose tone curve was applied on the CPU —
+                                      # so `src/vk/display.rs` is a graphics pipeline
+                                      # (`layout::graphics_pipeline`, DYNAMIC RENDERING, no
+                                      # VkRenderPass and no VkFramebuffer), a derived layout
+                                      # carrying a sampler and a uniform buffer, a colour
+                                      # attachment with a real layout lifecycle, and a fullscreen
+                                      # triangle. The gate is `--check-gpu`'s M12 transplanted with
+                                      # ZERO new tolerances: the same ramp (TW 64 x TH 32, n 2048,
+                                      # RAMP_LO 1e-3 -> RAMP_HI 6e4 with index 0 exactly 0.0 and
+                                      # index 1 exactly 1.0 = the HDR knee, plus M12's own
+                                      # anti-vacuity assert that the top lands in [4.4e4, 65504]),
+                                      # the same three wires at the same limits, the same
+                                      # f16-ROUNDED oracle (the source is a real RGBA16F texture, so
+                                      # comparing against the exact f32 would charge the port for
+                                      # the wire's rounding), the same |got-want|/max(1,|want|)
+                                      # metric. MEASURED (RADV, 400x300 unrelated — this stage is
+                                      # 64x32): sdr worst 2.37e-3 (limit 3.92e-3), sdr10 9.41e-4
+                                      # (1.08e-3), hdr10 9.68e-4 (2.5e-3) — all slightly above
+                                      # D3D12's own M12 figures (2.2e-3 / 5.4e-4 / 5.5e-4), which is
+                                      # DXC at SM 6.0 against fxc at SM 5.0 for the pow/exp pair and
+                                      # is comfortably inside the shared limits.
+                                      # THE FORMATS CROSS OVER UNCHANGED, which is what lets the
+                                      # oracle transplant at all: Vulkan's
+                                      # `A2B10G10R10_UNORM_PACK32` puts R in the low ten bits
+                                      # exactly as D3D12's `R10G10B10A2_UNORM` does (the names
+                                      # suggest the opposite and the memory layout agrees), and
+                                      # `B8G8R8A8_UNORM` is B,G,R,A in memory in both.
+                                      # TWO ARMS M12 DOES NOT HAVE, and the first is why this is not
+                                      # simply M12 with the formats renamed. **THE BLIT
+                                      # EXACT-IDENTITY ARM**: M12's ramp is geometric and therefore
+                                      # SMOOTH, and the consequence is measured rather than
+                                      # asserted — for a ONE-PIXEL horizontal shift within the
+                                      # geometric span the worst per-channel error is 2.02e-3
+                                      # against an sdr tolerance of 3.92e-3, i.e. INVISIBLE, with
+                                      # ALL 2045 ramp texels individually inside tolerance of their
+                                      # own neighbour; the 10-bit wires catch it at 2.02e-3 vs
+                                      # 1.08e-3, under 2x and only because their quantum is
+                                      # smaller. So the ramp is a CURVE gate that is weak evidence
+                                      # about the pixel MAPPING — exactly the class a wrong
+                                      # SV_Position convention, a half-texel offset or a transposed
+                                      # row length lives in, and exactly the class a backend that
+                                      # has never rasterized anything is most likely to get wrong.
+                                      # `blit.hlsl` is twelve lines of
+                                      # `src.Load(int3(pos.xy,0)).rgb` with alpha forced to 1, so
+                                      # over a per-(pixel, channel) byte pattern it is an EXACT byte
+                                      # identity with no tolerance to hide in. 8-bit only, and that
+                                      # is a precision argument rather than a shortcut: f16 carries
+                                      # 11 significant bits so representing k/255 is worst-case
+                                      # ~0.12 of a UNORM8 step — an eighth of the rounding boundary
+                                      # — while at ten bits the two are the same size and an exact
+                                      # bar would be scoring f16 rather than the rasterizer. Per
+                                      # CHANNEL rather than per pixel so a swizzle is caught too,
+                                      # which the ramp's own per-channel tint cannot do (it is
+                                      # monotone in all three). **ALPHA IS A FREE COVERAGE
+                                      # WITNESS**: both pixel shaders write 1.0 unconditionally and
+                                      # the M12 oracle compares RGB only, so "alpha at maximum
+                                      # everywhere" answers a question no colour comparison can —
+                                      # did the draw cover this pixel — which is what separates "the
+                                      # curve is wrong" from "the triangle missed", a black frame
+                                      # reporting both identically. Plus a per-stage validation
+                                      # delta (V16's pattern), so the first graphics pipeline in
+                                      # this backend names itself instead of surfacing as an
+                                      # unattributed count in the suite-wide sweep.
+                                      # `cullMode = NONE` IS LOAD-BEARING, not lazy: D3D and Vulkan
+                                      # disagree about which way NDC y points, so the IDENTICAL
+                                      # `SV_VertexID` triangle has opposite screen-space winding
+                                      # under the two APIs. Its COVERAGE is unaffected (it contains
+                                      # the whole [-1,1] square either way — the point of the trick)
+                                      # but a cull mode correct on D3D12 would discard it outright;
+                                      # `gpu/tonemap.rs` sets `D3D12_CULL_MODE_NONE` for these same
+                                      # shaders, so this is agreement rather than a workaround. Two
+                                      # ash `Default`s are INVALID and are set explicitly —
+                                      # `line_width` would be 0.0 (the spec requires exactly 1.0
+                                      # without `wideLines`) and `rasterization_samples` 0 (not a
+                                      # legal bit) — the class a validation layer catches and a
+                                      # driver without one may not.
+                                      # THE `Params` BLOCK is the one hand-written thing in a slice
+                                      # whose virtue is that everything else is derived: D3D12
+                                      # pushes ten f32 ROOT CONSTANTS (`gpu/tonemap.rs`'s
+                                      # `Passes::record`), Vulkan has no equivalent for a `b`
+                                      # register, so they ride a UBO — and the bytes are identical
+                                      # because `-fvk-use-dx-layout` puts the members at DX offsets.
+                                      # WHICH WIRE CATCHES A MISORDERING DEPENDS ON WHERE IT LANDS,
+                                      # measured: a slide of the WHOLE block zeroes `inv_samples`
+                                      # so the frame goes black and all three rows fail (worst
+                                      # 1.00e0 on both SDR wires), while an error confined to the
+                                      # TAIL is the quiet one — `ToneParams::SDR` has `scale` and
+                                      # `mode` BOTH at 1.0, so swapping those two is literally
+                                      # undetectable on the SDR wires (they read their exact
+                                      # unplanted 2.37e-3 / 9.41e-4) and hdr10 alone fails, at
+                                      # 5.83e-1, 233x over. **Do not drop the hdr10 row because the
+                                      # SDR rows pass** — on this block it is the only detector for
+                                      # half the failure modes.
+                                      # ON llvmpipe IT PASSES TOO (sdr 1.96e-3, sdr10 9.61e-4,
+                                      # hdr10 8.86e-4, blit EXACT), which is what makes CI coverage
+                                      # a fact rather than a hope: the stage renders into an image
+                                      # it owns and needs no surface, so `ci.yml`'s `check-vulkan`
+                                      # job runs it on every push and V18 joins V6/V7/V8/V9 in the
+                                      # forbidden-skip list. The blit identity being EXACT on BOTH
+                                      # ICDs is the stronger half — two independent rasterizers
+                                      # agreeing bit-for-bit on the pixel mapping.
+                                      # TEETH, four fired: swapped VS/PS modules (validation names
+                                      # it precisely, and RADV then SEGFAULTS on the invalid
+                                      # pipeline — so the layer is the only thing that names it, the
+                                      # armed-instrument argument again); the `Params` UBO never
+                                      # written (worst 1.00e0 on both SDR wires); the block slid by
+                                      # one slot (same); and `scale`/`mode` swapped, the one that
+                                      # proves the paragraph above. ALL FOUR leave the blit arm
+                                      # EXACT, which is the arms SEPARATING: blit scores the
+                                      # mapping, the tonemap rows score the curve and its constants,
+                                      # and neither substitutes for the other.
+                                      # NOT TRANSPLANTED, deliberately: M12b (`main.rs`, 292 lines)
+                                      # — the spike-guard / pre-glare family, which wants a live
+                                      # bloom pyramid and carries its own six arms. Its own commit,
+                                      # not a rider on the first graphics pipeline this backend has.
+                                      # Touch `src/vk/display.rs` / `layout::graphics_pipeline` /
+                                      # `gfx::shaders::GFX_VS`/`GFX_PS` / `run_check_vk_display` ->
+                                      # run --check (goldens byte-identical — B6a touches no shading
+                                      # path), cargo test, --check-vk on procedural +
+                                      # san-miguel-low-poly, both FR_VK_RES parities, --sw-rays,
+                                      # llvmpipe, --check-spirv and tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
