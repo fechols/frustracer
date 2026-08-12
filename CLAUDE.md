@@ -7533,6 +7533,140 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # --sw-rays, llvmpipe, the glassware close-up above (for the
                                       # m_d arm, reading the log), --check-spirv, --check-fsr and
                                       # tools/win-cross-check.sh
+                                      # V15 — A REAL NRD ENGINE (B4b-ii, 2026-08-12): ReBLUR
+                                      # running between the bridge's two halves, i.e. the thing
+                                      # the seam exists for. `src/vk/nrd.rs` is `NrdGpu`'s twin
+                                      # and V15 is `--check-gpu`'s N4 transplanted with ZERO new
+                                      # tolerances — same nine-frame protocol, same six
+                                      # assertions, same thresholds — so the two backends'
+                                      # numbers are directly comparable rather than merely
+                                      # similar. MEASURED (RADV, 400x300 procedural): 14
+                                      # pipelines, 8 dispatches on the RESTART frame and 32 at
+                                      # peak (N1's 31 + one, and BOTH are reported because the
+                                      # gap is the reset latch visible in the dispatch list), 37
+                                      # pool sets, `differs 119241/120000`, **Laplacian 0.1089 ->
+                                      # 0.0236 (a 78% drop)**, mean 0.3378 -> 0.3356 (0.7%),
+                                      # temporal 0.00928 -> 0.00434, restart 0.00893.
+                                      # THE SHARED HALF MOVED FIRST: `gfx::denoise` now owns the
+                                      # plane vocabulary, `common_settings`, `reblur_settings` and
+                                      # `NOMINAL_DT_MS`, and BOTH recorders route through it —
+                                      # `nrd_gpu.rs`'s `reg_for` and its plane-format array are
+                                      # that map now, not a second opinion. The vocabulary existed
+                                      # because it was MISSING: `vk/tracer.rs` cited `P_*`
+                                      # constants in `nrd_gpu.rs` that never existed, so B4a had
+                                      # to re-invent the names and B4b-ii would have been the
+                                      # third naming of one thing. `denoise-vocab` in `--check`
+                                      # gates it on every platform (ALL in index order, the
+                                      # ResourceType map INJECTIVE and round-tripping, pool types
+                                      # resolving to no plane, unique names, the formats, the dt
+                                      # clamp band incl. NaN, the denoising-range lockstep with
+                                      # cs_nrd_out, and a 4x2 MV-scale test — square dimensions
+                                      # cannot tell {1/rw, 1/rh} from its transpose). So a LINUX
+                                      # box now gates the matrix convention and the UV motion-
+                                      # vector scale the WINDOWS recorder depends on.
+                                      # `DispatchDesc` gained Clone/Copy, which makes the snapshot
+                                      # both recorders must take ONE call and deletes D3D12's
+                                      # 14-line hand copy.
+                                      # FOUR DIFFERENCES FROM THE D3D12 TWIN, each API and not
+                                      # design: PER-PIPELINE set layouts from
+                                      # `PipelineDesc::resource_ranges` (D3D12 sizes one table to
+                                      # the per-set maxima and leaves the surplus slots stale —
+                                      # legal, and legal here only via
+                                      # `descriptorBindingPartiallyBound`; the exact counts make
+                                      # nothing stale by construction, at the price of set-1
+                                      # compatibility breaking per pipeline, so both sets bind per
+                                      # dispatch — one call); NO layout transitions and no state
+                                      # tracker (everything rests in GENERAL, so D3D12's
+                                      # NPSR<->UA bracketing has no counterpart and must not be
+                                      # invented, and one global memory barrier per dispatch
+                                      # replaces it — the narrowing A/B measured a WASH on D3D12);
+                                      # the CB is a DYNAMIC uniform buffer at a per-dispatch
+                                      # offset, persistently mapped (a plain host write is legal
+                                      # here where the ladder needed `vkCmdUpdateBuffer` and its
+                                      # easy-to-omit write-after-read edge, because NRD's whole
+                                      # dispatch list is known BEFORE any of it is recorded);
+                                      # and RING_FRAMES collapses to 1, so the descriptor pool is
+                                      # simply RESET per record() — A CONTRACT, not an
+                                      # observation, licensed by `VkHeadless::run` fencing every
+                                      # submit, and a future presenter with real frames in flight
+                                      # must ring the pool or keep the fence.
+                                      # THE MISSING FEATURE, found the way M3a found ray query —
+                                      # by the validation layer, not by reading anything: four of
+                                      # ReBLUR's fourteen kernels declare
+                                      # `ComputeDerivativeGroupQuadsKHR` +
+                                      # `SPV_KHR_compute_shader_derivatives`, and RADV accepted
+                                      # every module on a device created without them while the
+                                      # layer named it exactly. `VK_KHR_compute_shader_derivatives`
+                                      # joins the enabled-when-present list; V15 SKIPs on a device
+                                      # that lacks it rather than dispatching modules whose
+                                      # declared capability is unavailable. ITS NAME IS THE ONE
+                                      # HAND-DECLARED STRING in `vk/device.rs`, and that is a
+                                      # version gap rather than a choice: the KHR extension
+                                      # promoted the NV one in header 1.3.291 and `ash 0.38.0` —
+                                      # the latest release — is generated against 1.3.281. The
+                                      # FEATURE STRUCT still comes from ash, the spec making
+                                      # `...FeaturesNV` a literal alias (same fields, same sType
+                                      # 1000201000), which is why the layer names both as
+                                      # acceptable. Drop the literal when ash regenerates.
+                                      # TEETH, and the second one is why this stage has a seventh
+                                      # assertion: (1) the CMake-order binding trap — pinning
+                                      # `{0, 2, 3, 20}` instead of the struct's `{0, 20, 2, 3}` —
+                                      # fails with the layer naming the exact variables
+                                      # (`gIn_ViewZ` at binding 20, `REBLUR_ClassifyTilesConstants`
+                                      # at Set 1 Binding 2). (2) A PLANE SWAP — IN_SPEC routed to
+                                      # the IN_DIFF image, same format and same descriptor type,
+                                      # so validation is silent — PASSED ALL SIX: NRD still gets a
+                                      # plausible radiance signal, so it still denoises, still
+                                      # accumulates and still restarts, with the mean moved 6.6%
+                                      # and everything inside its band. N4's six are about whether
+                                      # the denoiser RAN, not about whether each plane is routed
+                                      # to the right image, and that gap is real on both backends.
+                                      # THE PLANE-ROUTING ARM closes it: zeroing IN_SPEC between
+                                      # the pack and the engine must move OUT_SPEC, because if the
+                                      # descriptor points elsewhere then nothing reads that image
+                                      # and the clear changes nothing (M3d's texture probe once
+                                      # more, GPU-vs-GPU one clear apart). Measured 544096/960000
+                                      # B moved clean and **0 B with the swap planted**.
+                                      # IT SCORES OUT_SPEC, NOT THE RECOMPOSED COLOUR, and that
+                                      # correction is the whole reason it works: the colour was
+                                      # the obvious readback and is CONFOUNDED, since
+                                      # `cs_nrd_out` reconstructs the residual as
+                                      # `R = base - D_in*kd*m_d - S_in*f0` and therefore reads
+                                      # IN_SPEC itself — measured, the swap moved 276 kB of colour
+                                      # and the gate stayed green. The control is TWO identical
+                                      # RESET frames, which must agree: they do bit-for-bit in the
+                                      # colour and NOT in OUT_SPEC (90 B of 960000), because
+                                      # ACCUM_RESTART resets accumulation while the permanent pool
+                                      # survives it and the recompose quantises the residue away
+                                      # at f16 — so the bar is that the effect DOMINATES the floor
+                                      # (~6000x), not that the floor is zero.
+                                      # ONE SCENE-DEPENDENT ARM, gated on `structural` like every
+                                      # other must-fire here: TEMPORAL SHRINK asserts accumulation
+                                      # is reducing frame-to-frame variance, which needs variance
+                                      # to reduce. MEASURED — san-miguel-low-poly reads 0.00195 ->
+                                      # 0.00199, FLAT, with `d_early` already BELOW the procedural
+                                      # scene's converged `d_late` of 0.00434: the input is at the
+                                      # floor by frame 1 and the residual is sampling noise. The
+                                      # Laplacian still drops 72% there and RESTART still departs
+                                      # by 1.7x, so what carries the accumulation claim on those
+                                      # scenes is RESTART — a reset frame departing from a
+                                      # converged one by MORE than the converged pair differ is
+                                      # only possible if there was a history to discard.
+                                      # NOT PORTED, both deliberate: `FR_NRD_DEBUG`'s
+                                      # OUT_VALIDATION dump (72 lines under a lever, and the
+                                      # readback ring it wants does not exist here — the PLANE is
+                                      # still allocated, since NRD names it in `reg_for` whether
+                                      # or not it writes it) and `FR_NRD_BARRIER=narrow` (an arm
+                                      # for a barrier scheme this file does not have).
+                                      # Touch `src/vk/nrd.rs` / `gfx::denoise` / `nrd_plane_handles`
+                                      # / `vk_format` / the compute-derivatives enable -> run
+                                      # --check (the `denoise-vocab` gate + goldens byte-identical
+                                      # — B4b-ii touches no shading path), cargo test, --check-vk
+                                      # on procedural + san-miguel-low-poly + rungholt, both
+                                      # FR_VK_RES parities, --sw-rays, llvmpipe (V15 SKIPs there
+                                      # if the device lacks the derivatives extension),
+                                      # --check-nrd, --check-spirv, --check-fsr and
+                                      # tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

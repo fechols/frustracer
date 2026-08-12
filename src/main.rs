@@ -1266,7 +1266,7 @@ fn main() {
     if check_vk {
         #[cfg(unix)]
         {
-            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7);
+            let code = run_check_vk(&scene, &bvh, cam0, structural, opts.bc7, &opts.nrd_path);
             std::process::exit(code);
         }
         #[cfg(not(unix))]
@@ -14210,6 +14210,7 @@ fn run_check_vk(
     cam0: Camera,
     structural: bool,
     bc7_mode: bc7::Bc7Mode,
+    nrd_path: &str,
 ) -> i32 {
     let mut ok = true;
 
@@ -14323,7 +14324,7 @@ fn run_check_vk(
     }
 
     // ---- V6: the reference kernel rendering, scored against the CPU. ----
-    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode) {
+    if !run_check_vk_render(&hg, &sp, scene, bvh, cam0, structural, bc7_mode, nrd_path) {
         ok = false;
     }
 
@@ -15176,6 +15177,7 @@ fn run_check_vk_layout(
 /// Small on purpose (`VK_RENDER_W` x `VK_RENDER_H`): the cost here is the CPU
 /// reference, not the GPU, and this stage exists to be run on every commit.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_check_vk_render(
     hg: &vk::headless::VkHeadless,
     sp: &vk::spirv::Spirv,
@@ -15184,6 +15186,7 @@ fn run_check_vk_render(
     cam0: Camera,
     structural: bool,
     bc7_mode: bc7::Bc7Mode,
+    nrd_path: &str,
 ) -> bool {
     // `--check-gpu`'s OWN gate resolution, deliberately: V7 scores the same
     // frame its D3D12 twin does, so the two suites' quadtree structures are
@@ -15793,7 +15796,7 @@ fn run_check_vk_render(
     }
 
     // ---- V13: the GPU-fed feed, and FSR3 consuming it ----
-    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural) {
+    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural, nrd_path) {
         ok = false;
     }
 
@@ -16049,6 +16052,7 @@ fn run_check_vk_gbuf(
 /// and with B2's now-portable `unpack_gbuf_bytes` supplying the oracle.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_check_vk_feed(
     hg: &vk::headless::VkHeadless,
     sp: &vk::spirv::Spirv,
@@ -16058,6 +16062,7 @@ fn run_check_vk_feed(
     vt: &vk::textures::VkTextures,
     cam0: Camera,
     structural: bool,
+    nrd_path: &str,
 ) -> bool {
     if !vk::fsr3::built() {
         println!(
@@ -16323,9 +16328,383 @@ fn run_check_vk_feed(
             run_check_vk_bridge(hg, &tg, &fed, scene, &basis, q, rw, rh, near, far, structural);
     }
 
+    // ---- V15: a REAL NRD engine between the bridge's two halves. ----
+    // Runs last and on the same tracer, because it is the only stage that
+    // leaves the planes carrying denoised history rather than the frame the
+    // gates above scored.
+    if ok && !run_check_vk_nrd(hg, &tg, &fed, scene, &basis, cam0, q, rw, rh, near, far, nrd_path, structural) {
+        ok = false;
+    }
+
     fed.destroy(hg);
     cpu.destroy(hg);
     tg.destroy(hg);
+    ok
+}
+
+/// V15 — A REAL NRD ENGINE, running ReBLUR between the bridge's two halves.
+///
+/// V14 proved the seam with a passthrough; this is the thing the seam exists
+/// for. It is `--check-gpu`'s N4 transplanted with ZERO new tolerances: the
+/// same nine-frame protocol, the same six assertions, the same thresholds — so
+/// what the two backends report is directly comparable rather than merely
+/// similar, which is the property every stage in this suite has been built for.
+///
+/// THE SIX, and each is a strict inequality rather than a bar to tune:
+///   * FINITE — a denoiser that divides by an accumulated zero says so here.
+///   * DIFFERS — against the undenoised recompose. A denoiser that never ran
+///     leaves the passthrough answer, which is a perfectly plausible image.
+///   * LAPLACIAN DROPS — the definition of denoising, as a number.
+///   * MEAN within 25% — it may smooth the frame and may not re-expose it.
+///   * TEMPORAL DELTAS SHRINK — frame-to-frame |d| late < early, i.e. the
+///     history is ACCUMULATING and not merely spatially filtering.
+///   * RESTART DEPARTS — a reset frame must differ from its predecessor by
+///     MORE than the converged pair does, which is the only thing that proves
+///     `AccumulationMode` reached the library at all.
+///
+/// The undenoised reference is the bridge's own passthrough, re-run here: same
+/// tracer, same pose, same pack, one substitution in the middle. So `differs`
+/// and `lap` compare two images that agree in everything except the engine —
+/// the V13 shape (two routes, one renderer) applied one stage up.
+///
+/// SKIPS on an absent library, exit 0, naming the installer — the absent/told
+/// split, and the same rule `--check-nrd`'s N1 follows. A library that is
+/// PRESENT and refuses is a FAIL there and a FAIL here.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_nrd(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    fed: &vk::fsr3::Fsr3,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    cam0: Camera,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    near: f32,
+    far: f32,
+    nrd_path: &str,
+    structural: bool,
+) -> bool {
+    let lib = std::path::Path::new(nrd_path).join(nrd::LIB_FILE);
+    if !lib.exists() {
+        println!(
+            "check-vk: SKIP V15 ({} not found); run `{}`",
+            lib.display(),
+            nrd::INSTALLER
+        );
+        return true;
+    }
+    let Some(planes) = tg.nrd_plane_handles() else {
+        eprintln!("check-vk: FAIL V15 the tracer carries no bridge planes");
+        return false;
+    };
+    let mut eng = match vk::nrd::VkNrd::new(hg, nrd_path, rw as u32, rh as u32, &planes) {
+        Ok(e) => e,
+        Err(e) => {
+            // PRESENT and refused. Never a skip — that is the hole B4b-i closed
+            // in N1, and it would be a wider one here, where the library is
+            // built locally by a script anyone can mis-flag.
+            eprintln!("check-vk: FAIL V15 {e}");
+            return false;
+        }
+    };
+
+    let npx = rw * rh;
+    let mut ok = true;
+    // One frame of the pipeline, with `mid` recording whatever sits between the
+    // bridge's halves. Everything else — the pose, the jitter sequence, the
+    // quality, the pack — is identical across the two arms by construction,
+    // which is what makes `differs` attributable to the engine alone.
+    let frame = |f: u32,
+                 mid: &mut dyn FnMut(&ash::Device, ash::vk::CommandBuffer) -> Result<(), String>|
+     -> Result<Vec<u8>, String> {
+        let jit = dlss::jitter_for(f);
+        let p = gfx::frame::FrameParams {
+            cam: *basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(jit),
+            prev_cam: Some(*basis),
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        tg.render_wavefront(hg, &p, true)?;
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        hg.run(|d, cmd| unsafe {
+            r1 = tg.record_nrd_pack(d, cmd);
+            r2 = mid(d, cmd);
+            r3 = tg.record_nrd_out(d, cmd);
+        })?;
+        r1?;
+        r2?;
+        r3?;
+        fed.read_input(hg, 0)
+    };
+
+    // Luma off the RGBA16F colour plane — N4's own weights, so the two suites'
+    // Laplacian and mean figures are on one scale.
+    let lum = |b: &[u8], i: usize| -> f32 {
+        let h = |k: usize| {
+            vk::tracer::half_from_bits(u16::from_le_bytes(
+                b[i * 8 + k * 2..][..2].try_into().unwrap(),
+            ))
+        };
+        0.2126 * h(0) + 0.7152 * h(1) + 0.0722 * h(2)
+    };
+
+    let run = (|| -> Result<(), String> {
+        // The UNDENOISED arm first: the bridge's passthrough, which V14 proved
+        // reproduces the feed's colour byte for byte. Taken at frame 0 so it is
+        // the same content the engine's own frame 0 sees.
+        let base = frame(0, &mut |d, cmd| unsafe { tg.record_nrd_passthrough(d, cmd) })?;
+
+        // Nine engine frames: 0..7 accumulate, 8 RESTARTS. `prev_size` is read
+        // back from the engine rather than assumed, which is the field's only
+        // consumer and therefore the only thing that would notice it going
+        // stale.
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(9);
+        let rs = gfx::denoise::reblur_settings();
+        for f in 0u32..9 {
+            let reset = f == 0 || f == 8;
+            let (pw, phh) = eng.prev_size();
+            let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+            let cs = gfx::denoise::common_settings(
+                &mats,
+                &mats,
+                dlss::jitter_for(f),
+                dlss::jitter_for(f.saturating_sub(1)),
+                rw as u32,
+                rh as u32,
+                pw,
+                phh,
+                far,
+                gfx::denoise::NOMINAL_DT_MS,
+                f,
+                reset,
+                false,
+            );
+            let mut err = Ok(());
+            let img = frame(f, &mut |d, cmd| {
+                err = eng.record(d, cmd, &cs, &rs);
+                // A failure here must not be swallowed by the closure's own
+                // Ok: `record` can fail before recording anything, and the
+                // command buffer would then run pack -> out with no engine,
+                // i.e. the passthrough, which passes `differs` against a
+                // DIFFERENT reference and looks like a working denoiser.
+                err.clone()
+            })?;
+            err?;
+            frames.push(img);
+        }
+
+        let mut finite = true;
+        let mut differs = 0usize;
+        let (mut mean_out, mut mean_in) = (0f64, 0f64);
+        let (mut lap_out, mut lap_in) = (0f64, 0f64);
+        for i in 0..npx {
+            let lo = lum(&frames[7], i);
+            let li = lum(&base, i);
+            if !lo.is_finite() {
+                finite = false;
+            }
+            if (lo - li).abs() > 1e-4 {
+                differs += 1;
+            }
+            mean_out += lo as f64;
+            mean_in += li as f64;
+            let (x, y) = (i % rw, i / rw);
+            if x > 0 && x + 1 < rw && y > 0 && y + 1 < rh {
+                let l4 = |f: &dyn Fn(usize) -> f32| {
+                    (4.0 * f(i) - f(i - 1) - f(i + 1) - f(i - rw) - f(i + rw)).abs() as f64
+                };
+                let fo = |j: usize| lum(&frames[7], j);
+                let fi = |j: usize| lum(&base, j);
+                lap_out += l4(&fo);
+                lap_in += l4(&fi);
+            }
+        }
+        let delta = |a: &[u8], b: &[u8]| -> f64 {
+            (0..npx).map(|i| (lum(a, i) - lum(b, i)).abs() as f64).sum::<f64>() / npx as f64
+        };
+        let d_early = delta(&frames[1], &frames[0]);
+        let d_late = delta(&frames[7], &frames[6]);
+        let d_restart = delta(&frames[8], &frames[7]);
+        println!(
+            "check-vk: V15 nrd ReBLUR ({rw}x{rh}, {} pipelines, {} dispatches (max {}), {} pool sets) — \
+             differs {differs}/{npx} | lap {:.4} -> {:.4} | mean {:.4} -> {:.4} | \
+             temporal {:.5} -> {:.5} | restart {:.5}",
+            eng.pipeline_count(),
+            eng.dispatch_count,
+            eng.dispatch_max,
+            eng.pool_sets,
+            lap_in / npx as f64,
+            lap_out / npx as f64,
+            mean_in / npx as f64,
+            mean_out / npx as f64,
+            d_early,
+            d_late,
+            d_restart,
+        );
+
+        let mut bad = Vec::new();
+        if !finite {
+            bad.push("non-finite");
+        }
+        if differs == 0 {
+            bad.push("output == the undenoised recompose (vacuous)");
+        }
+        if lap_out >= lap_in {
+            bad.push("Laplacian did not drop");
+        }
+        if (mean_out - mean_in).abs() > 0.25 * mean_in.max(1e-6) {
+            bad.push("mean drifted > 25%");
+        }
+        // TEMPORAL SHRINK IS THE ONE SCENE-DEPENDENT ARM, and it is gated on
+        // `structural` for the reason every other must-fire in this suite is:
+        // it asserts that ACCUMULATION is reducing frame-to-frame variance,
+        // which needs variance to reduce. MEASURED — san-miguel-low-poly at
+        // this pose reads 0.00195 -> 0.00199, i.e. FLAT, with `d_early` already
+        // BELOW the procedural scene's converged `d_late` of 0.00434: the input
+        // is at the floor by frame 1 and the residual is sampling noise that
+        // can go either way. The Laplacian still drops 72% there and RESTART
+        // still departs by 1.7x, so the denoiser is plainly working; the metric
+        // has simply run out of signal.
+        //
+        // What carries the accumulation claim on those scenes is RESTART: a
+        // reset frame departing from a converged one BY MORE than the converged
+        // pair differ is only possible if there was a history to throw away.
+        if structural && d_late >= d_early {
+            bad.push("temporal deltas not shrinking");
+        }
+        if d_restart <= d_late {
+            bad.push("RESTART did not depart (reset latch dead?)");
+        }
+        if !bad.is_empty() {
+            return Err(format!("nrd: {}", bad.join(", ")));
+        }
+
+        // ---- THE PLANE-ROUTING ARM, and it exists because a planted tooth
+        // proved the six above cannot see a plane swap. Routing IN_SPEC to the
+        // IN_DIFF image — same format, same descriptor type, so validation is
+        // silent — still leaves NRD a plausible radiance signal, so it still
+        // denoises, still accumulates and still restarts: measured, the whole
+        // six passed with the mean moved 6.6%, well inside the 25% band.
+        //
+        // What a swap CANNOT survive is a dependency test. If IN_SPEC is routed
+        // anywhere else then nothing reads the real IN_SPEC image, so ZEROING it
+        // between the pack and the engine changes the output by exactly nothing.
+        // This is M3d's texture probe once more — GPU-vs-GPU, one clear apart —
+        // and it is what makes V15 a statement about wiring as well as about
+        // behaviour.
+        //
+        // Both arms are RESET frames so the comparison is a function of the
+        // inputs rather than of whatever history the nine above accumulated, and
+        // the control is run TWICE first: two identical reset frames must agree
+        // BIT for bit, which both licenses the comparison and is a determinism
+        // assertion in its own right.
+        let spec_img = planes[gfx::denoise::Plane::InSpecRadianceHitDist.index()].0;
+        let mats = dlss::cam_matrices(&cam0, rw, rh, near, far);
+        let cs_probe = gfx::denoise::common_settings(
+            &mats,
+            &mats,
+            dlss::jitter_for(9),
+            dlss::jitter_for(8),
+            rw as u32,
+            rh as u32,
+            rw as u32,
+            rh as u32,
+            far,
+            gfx::denoise::NOMINAL_DT_MS,
+            9,
+            true,
+            false,
+        );
+        // IT SCORES OUT_SPEC, NOT THE RECOMPOSED COLOUR, and that correction is
+        // the whole reason this arm works. The colour was the obvious readback
+        // and it is CONFOUNDED: `cs_nrd_out` reconstructs the residual as
+        // `R = base − D_in·kd·m_d − S_in·f0`, so it reads IN_SPEC itself and
+        // zeroing that plane moves the colour by ~276 kB whatever the engine
+        // did — measured, with the swap planted and the gate still green. The
+        // engine's OWN output plane has exactly one upstream path.
+        let mut engine = |zero_spec: bool| -> Result<Vec<u8>, String> {
+            let mut err = Ok(());
+            let _ = frame(9, &mut |d, cmd| {
+                if zero_spec {
+                    unsafe {
+                        d.cmd_clear_color_image(
+                            cmd,
+                            spec_img,
+                            ash::vk::ImageLayout::GENERAL,
+                            &ash::vk::ClearColorValue { float32: [0.0; 4] },
+                            &[ash::vk::ImageSubresourceRange::default()
+                                .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1)],
+                        );
+                        // The clear is a TRANSFER write and the engine reads it
+                        // as a shader resource — without this the two are
+                        // unordered and the probe would be a race, not a test.
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                            ash::vk::DependencyFlags::empty(),
+                            &[ash::vk::MemoryBarrier::default()
+                                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)],
+                            &[],
+                            &[],
+                        );
+                    }
+                }
+                err = eng.record(d, cmd, &cs_probe, &rs);
+                err.clone()
+            })?;
+            err?;
+            tg.read_nrd_plane(hg, gfx::denoise::Plane::OutSpecRadianceHitDist.index())
+        };
+        let ctl_a = engine(false)?;
+        let ctl_b = engine(false)?;
+        let zeroed = engine(true)?;
+        let ctl_drift = ctl_a.iter().zip(ctl_b.iter()).filter(|(x, y)| x != y).count();
+        let moved = ctl_b.iter().zip(zeroed.iter()).filter(|(x, y)| x != y).count();
+        println!(
+            "check-vk: V15   in_spec dependency: control drift {ctl_drift} B | \
+             zeroing moved {moved}/{} B of OUT_SPEC",
+            ctl_b.len()
+        );
+        // The control BOUNDS the noise rather than assuming it away, and that
+        // is a measurement rather than a hedge: two identical RESET frames come
+        // back bit-identical in the recomposed COLOUR and NOT in OUT_SPEC —
+        // 90 B of 960000 here — because `ACCUM_RESTART` resets accumulation
+        // while NRD's permanent pool survives it, and the recompose quantises
+        // that residue away at f16. So the claim is that the effect DOMINATES
+        // the floor, which it does by ~6000x, not that the floor is zero.
+        let floor = ctl_drift.max(1) * 20;
+        if moved < floor || moved * 100 < ctl_b.len() {
+            return Err(format!(
+                "nrd: zeroing IN_SPEC moved {moved} B of OUT_SPEC — under the {floor} B \
+                 attributability floor or under 1% of the plane, i.e. the engine is not \
+                 reading that plane and its descriptor points somewhere else"
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V15 {e}");
+        ok = false;
+    }
+    eng.destroy(hg);
     ok
 }
 
@@ -16444,9 +16823,16 @@ fn run_check_vk_bridge(
         // The three IN planes are read back off the tracer's OWN images, which
         // exist whether or not a descriptor points at them — which is exactly
         // what makes an unwired bridge show up here as an untouched plane.
-        for (idx, name) in
-            [(3usize, "in_diff"), (4, "in_spec"), (2, "in_viewz")]
-        {
+        // Named and indexed off the SHARED vocabulary rather than a literal
+        // pair, so a reordering of `Plane::ALL` cannot leave this report
+        // labelling one plane with another's name — which would be a wrong
+        // DIAGNOSIS, the failure mode this suite's own history keeps producing.
+        for p in [
+            gfx::denoise::Plane::InDiffRadianceHitDist,
+            gfx::denoise::Plane::InSpecRadianceHitDist,
+            gfx::denoise::Plane::InViewZ,
+        ] {
+            let (idx, name) = (p.index(), p.name());
             let px = tg.read_nrd_plane(hg, idx)?;
             let nz = px.iter().filter(|b| **b != 0).count();
             eprintln!(
@@ -25283,6 +25669,22 @@ fn run_check(
         }
     };
 
+    // The NRD host's SHARED vocabulary — the plane enum both recorders index
+    // by, and the CommonSettings builder they both call. Pure, DLL-free and
+    // adapter-free, which is the point: it runs on every platform, so a Linux
+    // box gates the matrix convention, the UV motion-vector scale and the
+    // denoising-range lockstep that the WINDOWS recorder depends on. The
+    // injectivity arm is the sharpest of them — a duplicated ResourceType
+    // aliases two images inside `reg_for` and produces a wrong picture, never
+    // an error.
+    let dnv_ok = match gfx::denoise::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("denoise vocabulary self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
     // slip), cone sampling inside-and-covering the disc, the disc test agreeing
     // with the cone the sampler draws from, the DOME carrying no disc (the
@@ -28243,6 +28645,7 @@ fn run_check(
         ("bloom", bloom_ok),
         ("frd", frd_ok),
         ("remod", remod_ok),
+        ("denoise-vocab", dnv_ok),
         ("autoexp", autoexp_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),

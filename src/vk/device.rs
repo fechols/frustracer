@@ -317,6 +317,19 @@ pub struct DeviceInfo {
     /// proc-addr only when the extension is in `enabledExtensionNames`.
     /// Without it FFX calls through a null pointer during context creation.
     pub get_memory_requirements2: bool,
+    /// `VK_KHR_compute_shader_derivatives`, for NRD and nothing else. Four of
+    /// ReBLUR's fourteen kernels declare `ComputeDerivativeGroupQuadsKHR`, so a
+    /// device without it cannot run an NRD instance at all — `--check-vk`'s V15
+    /// SKIPs on that rather than dispatching modules whose declared capability
+    /// is unavailable, which RADV accepts silently and the validation layer
+    /// does not. Our own corpus declares no derivative capability, so this is
+    /// inert for every other stage.
+    ///
+    /// PRESENCE is what this records, not the feature bit. The extension's own
+    /// existence is what the `enabledExtensionNames` push needs, and a device
+    /// advertising the extension while reporting `computeDerivativeGroupQuads`
+    /// false would be malformed (the feature is the extension's only content).
+    pub compute_derivatives: bool,
 }
 
 impl DeviceInfo {
@@ -660,6 +673,39 @@ impl Vk {
             fdc = fdc.device_coherent_memory(true);
         }
 
+        // COMPUTE-SHADER DERIVATIVES, for NRD rather than for anything of ours.
+        // Four of ReBLUR's fourteen kernels declare `ComputeDerivativeGroupQuads`
+        // + `SPV_KHR_compute_shader_derivatives` — NRD uses quad derivatives for
+        // its own mip/gradient work — so a device created without them accepts
+        // the modules on RADV and reports a validation ERROR. That is the SAME
+        // way the ray-query list above was found: the layer named it, the driver
+        // did not. Our own corpus declares neither, so this is inert for
+        // everything except an NRD instance, which V6/V7/V9 coming back
+        // bit-identical is the proof of.
+        //
+        // ENABLED-WHEN-PRESENT, and the absence lands on a real arm rather than
+        // an invented one: `--nrd` is opt-in on this backend and V15 SKIPs
+        // loudly on a device that cannot run those four kernels, exactly as it
+        // does for an absent library. What must not happen is running them with
+        // the feature off, which is undefined and — as measured — silent.
+        // THE ONE HAND-DECLARED NAME IN THIS FILE, and it is a version gap
+        // rather than a design choice: `VK_KHR_compute_shader_derivatives`
+        // PROMOTED the NV extension in Vulkan header 1.3.291, and `ash 0.38.0`
+        // — the latest release — is generated against 1.3.281, so it carries
+        // only the NV spelling. The FEATURE STRUCT still comes from ash: the
+        // spec makes `...FeaturesNV` a literal alias of the KHR one (same
+        // fields, same sType 1000201000), which is why the validation message
+        // names both as acceptable. Only the extension string is missing, and
+        // NRD's blobs declare `SPV_KHR_compute_shader_derivatives` specifically,
+        // so it is the KHR name that must be enabled. Drop this the moment ash
+        // regenerates past 1.3.291.
+        const KHR_COMPUTE_SHADER_DERIVATIVES: &std::ffi::CStr = c"VK_KHR_compute_shader_derivatives";
+        let mut fcd = vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default();
+        if info.compute_derivatives {
+            exts.push(KHR_COMPUTE_SHADER_DERIVATIVES.as_ptr());
+            fcd = fcd.compute_derivative_group_quads(true);
+        }
+
         // The CORE features this backend enables, all ENABLED-WHEN-PRESENT and
         // none required, because each one's absence lands on a shipping arm
         // rather than on a degradation invented here: `--aniso 1` is the
@@ -690,6 +736,9 @@ impl Vk {
         }
         if info.device_coherent_memory {
             dci = dci.push_next(&mut fdc);
+        }
+        if info.compute_derivatives {
+            dci = dci.push_next(&mut fcd);
         }
         let device = unsafe { instance.create_device(phys, &dci, None) }
             .map_err(|e| format!("vkCreateDevice on {}: {e}", info.name))?;
@@ -787,6 +836,11 @@ impl Vk {
                 != 0,
             device_coherent_memory: has_ext(ash::amd::device_coherent_memory::NAME),
             get_memory_requirements2: has_ext(ash::khr::get_memory_requirements2::NAME),
+            // The KHR spelling specifically — NRD's blobs declare
+            // `SPV_KHR_compute_shader_derivatives`, and the NV extension this
+            // ash version knows about would satisfy neither the layer nor the
+            // module. See the enable block for why the name is a literal here.
+            compute_derivatives: has_ext(c"VK_KHR_compute_shader_derivatives"),
         };
 
         // Hard requirements, each traceable to a decision already made.
