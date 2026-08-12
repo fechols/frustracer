@@ -15984,7 +15984,37 @@ fn run_check_vk_render(
     let mut sum_c = [0.0f64; 3];
     let mut sum_g = [0.0f64; 3];
     let mut sum_abs = 0.0f64;
+    // NON-FINITE AND NEGATIVE ARE DIFFERENT FAILURES, and this gate counted
+    // them as one — the D3D12 suites' own correction (`check-dxr`'s radiance
+    // A/B, which carries the full argument) applied to the backend that never
+    // got it. A NaN or Inf is always a defect. A negative sample is not: the
+    // GI ladder's stochastic rungs estimate the ambient as
+    // `tail + (G - tail)/p`, an UNBIASED estimator of a non-negative quantity,
+    // and such an estimator may legitimately sample below zero — exactly when
+    // `G < tail*(1 - p)`. Conflated, a real NaN and the ladder's honest tail
+    // read identically, which is how this stage went red on a healthy tree.
+    //
+    // MEASURED HERE by sweeping the ladder, and the shape is the attribution:
+    //
+    //     rung   0    0.5    1     1.5    2
+    //     p      0    0.5    0     0.5    1.0
+    //     neg    0    453    0     11     5      (of 1.44M channels)
+    //
+    // The two DETERMINISTIC rungs read EXACTLY ZERO and every rung with a live
+    // correction reads non-zero, so `rtgi_corr_p > 0` is not a vacuous arming
+    // predicate — it is the line the data falls on. The count drops as p rises
+    // (the estimator's tail narrows), and 0.5 beats 1.5 at the same p because
+    // its correction sits at LEVEL 0, where `tail` is the primary surface's own
+    // ambient rather than a bounce's. Rung 2's residual 5 at p = 1.0 is fp
+    // cancellation in `tail + (G - tail)`, which is not exactly `G`.
+    //
+    // AND THE OLD `continue` DROPPED THE NEGATIVE TAIL FROM THE MEAN, which is
+    // worse than the miscount: clamping or excluding the low samples BIASES
+    // the statistic upward, and not biasing the mean is the one property the
+    // ladder exists to have. Negatives are now counted AND accumulated;
+    // only non-finites are skipped, and for a different reason (see below).
     let mut nonfinite = 0usize;
+    let mut negative = 0usize;
     // SPLIT BY WHAT THE PRIMARY RAY HIT, because the two populations fail for
     // different reasons and a single number cannot tell them apart: sky is the
     // dome + disc + the cloud caches with no material in sight, geometry is
@@ -15997,9 +16027,16 @@ fn run_check_vk_render(
     for i in 0..px * 3 {
         let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
         let g = gpu_a.get(i).copied().unwrap_or(f32::NAN) * inv;
-        if !g.is_finite() || g < 0.0 {
+        if !g.is_finite() {
             nonfinite += 1;
+            // SKIPPED FROM THE SUMS, unlike a negative: one NaN makes every
+            // statistic below it NaN, so a gate that kept it would report
+            // nothing about the 1.44M samples that are fine. The count is the
+            // assertion; the mean is for attribution.
             continue;
+        }
+        if g < 0.0 {
+            negative += 1;
         }
         sum_c[i % 3] += f64::from(c);
         sum_g[i % 3] += f64::from(g);
@@ -16037,7 +16074,7 @@ fn run_check_vk_render(
     }
     println!(
         "check-vk: V6 radiance A/B over {frames} frames: per-channel mean rel diff {:.3}% | \
-         mean abs px diff {:.4} | non-finite {nonfinite}",
+         mean abs px diff {:.4} | non-finite {nonfinite} | negative {negative}",
         mean_rel * 100.0,
         sum_abs / (px * 3) as f64
     );
@@ -16052,7 +16089,25 @@ fn run_check_vk_render(
         (hit_g - hit_c) / hit_c.max(1e-9) * 100.0
     );
     if nonfinite > 0 {
-        fail(&mut ok, format!("{nonfinite} non-finite/negative GPU channels"));
+        fail(&mut ok, format!("{nonfinite} non-finite GPU channels"));
+    }
+    // A stochastic rung may sample negative (see above); no other configuration
+    // may, and even an armed one only in the tail. The bound is on HOW MANY
+    // rather than on whether — 0.1% of samples, which is orders above anything
+    // the ladder produces and still catches a sign error, since that would flip
+    // a POPULATION rather than a fringe. `rtgi_corr_p` is the ONE derivation
+    // both the compile define and the runtime bit read, so this arms exactly
+    // when the correction does.
+    let neg_ok =
+        crate::gfx::frame::rtgi_corr_p(shade::rtgi_bounces()) > 0.0 && negative <= px * 3 / 1000;
+    if negative > 0 && !neg_ok {
+        fail(
+            &mut ok,
+            format!(
+                "{negative} negative GPU channels — legitimate only in a stochastic GI \
+                 rung's tail (--rtgi-bounces with a fractional part, or rung 2)"
+            ),
+        );
     }
     // Anti-vacuity: a pair of all-black images agrees perfectly.
     if sum_c.iter().sum::<f64>() <= 0.0 || sum_g.iter().sum::<f64>() <= 0.0 {
