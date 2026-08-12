@@ -26420,6 +26420,10 @@ fn cine_composite_hud(
                                 spp: 1,
                                 preset: 2,
                                 hud: true,
+                                // A Live row reads its value from HERE, and
+                                // Default is 0 ("off") — the shot must show
+                                // the real shipping default, not a lie.
+                                move_ease: camera::MOVE_EASE_S,
                                 ..Default::default()
                             };
                             // Headless capture renders Settings::default() —
@@ -28984,6 +28988,23 @@ fn run_check(
         }
         Err(e) => {
             eprintln!("cli self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Keyboard flight ease — the flycam integrator's pure half. The arm that
+    // matters is EXACT REST: the ramp must reach a bitwise zero on key
+    // release, or the integrator's idle early-out never re-arms and an idle
+    // session re-writes cam.pos forever, silently defeating plain
+    // accumulation / structure replay / every upscaler history. Lives in
+    // camera.rs precisely so it gates off Windows too (flycam is cfg'd).
+    let camera_ok = match camera::self_test() {
+        Ok(()) => {
+            eprintln!("camera self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("camera self-test: FAIL — {e}");
             false
         }
     };
@@ -31673,6 +31694,7 @@ fn run_check(
         ("upchain", upchain_ok),
         ("settings", settings_ok),
         ("cli", cli_ok),
+        ("camera", camera_ok),
         ("qa", qa_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
@@ -32495,6 +32517,7 @@ fn run_window(
         opts.tod.unwrap_or_else(scene::default_tod),
         scene.diag,
         attractors,
+        opts.move_ease,
     );
     // Audio lives here beside the FlyCam for the same reason: a resize
     // re-enters session(), and the loops must keep playing through the
@@ -34083,6 +34106,7 @@ fn session(
                 fireflies: fireflies::enabled(),
                 fireflies_count: fireflies::count(),
                 emissive_lights: emissive::enabled(),
+                move_ease: fly.move_ease(),
             };
             if hd.menu_open() && menu_rows_stale {
                 menu_rows_stale = false;
@@ -34139,6 +34163,11 @@ fn session(
                                 settings::MenuFx::CycleSpp => edges.cycle_spp = true,
                                 settings::MenuFx::Quality(n) => edges.quality = Some(n),
                                 settings::MenuFx::SetTod(t) => fly.set_tod(t),
+                                settings::MenuFx::MoveEase(s) => {
+                                    // Input response, not shading or
+                                    // visibility — no reset of any kind.
+                                    fly.set_move_ease(s);
+                                }
                                 settings::MenuFx::ToggleBloom => {
                                     // Display-stage — deliberately NO reset
                                     // (the --no-bloom bit-identity argument).
