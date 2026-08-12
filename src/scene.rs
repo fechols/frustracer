@@ -1998,7 +1998,17 @@ pub fn light_gain_self_test() -> Result<(), String> {
     // this gate is about what the gain does to it.
     sc.emissive.count = 2;
     for (i, (c, r)) in [([1.0f32, 2.0, 3.0], 7.0f32), ([0.25, 0.5, 0.75], 3.0)].iter().enumerate() {
-        sc.emissive.lights[i] = EmissiveLight { pos: [0.0; 3], rc2: 0.5, color: *c, r_infl2: *r };
+        // Isotropic (`axis` zero, `r_dir` 0.0) on purpose: this gate is about
+        // what the gain does to a cluster set, and the emission lobe is
+        // gain-invariant, so the exact-1.0 lobe arm keeps it out of the way.
+        sc.emissive.lights[i] = EmissiveLight {
+            pos: [0.0; 3],
+            rc2: 0.5,
+            color: *c,
+            r_infl2: *r,
+            axis: [0.0; 3],
+            r_dir: 0.0,
+        };
         sc.light_canon.el[i] = *c;
     }
     sc.light_canon.sun = sc.sun;

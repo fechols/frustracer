@@ -33,12 +33,14 @@ use crate::gfx::shaders::{waveviz_live, waveviz_on};
 use crate::scene::Scene;
 use glam::Vec3A;
 
-// Root-CBV alignment (256 B). FrameCb is 4576 bytes — 288 of struct plus the
+// Root-CBV alignment (256 B). FrameCb is 5616 bytes — 288 of struct plus the
 // MAX_SPP-entry jitter table (--spp), the SH sky rows, the MAX_FIREFLIES
-// pose rows, and the MAX_EMISSIVE_LIGHTS cluster-light row pairs, which are
+// pose rows, and the MAX_EMISSIVE_LIGHTS cluster-light row TRIPLES, which are
 // what set the size (raise the stride in lockstep with any cap; the const
-// asserts below police both directions).
-pub const CB_STRIDE: usize = 4608;
+// asserts below police both directions). 4608 -> 5632 when the emissive
+// lights gained their `el_c` emission lobe (the MAX_SPP-lockstep class; the
+// stride has moved 1536 -> 2048 -> 2560 -> 4608 -> 5632).
+pub const CB_STRIDE: usize = 5632;
 
 /// Hemisphere points per batch: bounds the transient hemi queue/pool memory
 /// (queues are sized to batch x 4^(depth-1) — bounded, cannot overflow;
@@ -463,6 +465,19 @@ pub struct FrameCb {
     /// pre-feature renderer by construction (the `apply_tod`/`night`
     /// precedent). 64 bits caps the split depth at `MAX_SPLIT_DEPTH` = 3.
     split: [u32; 4],
+    /// Cluster row c: xyz = the power-weighted mean emitter normal, stored
+    /// UNNORMALIZED so its length IS the mean resultant length R; w = that
+    /// same R, carried explicitly so the shader needs neither a normalize nor
+    /// a sqrt. Appended LAST so no offset above moves.
+    ///
+    /// The emission profile is `f = 1 - R + saturate(dot(v, w))` for `w` the
+    /// unit direction FROM the light TO the receiver — attenuation-only by
+    /// construction (`f <= 1`, since `saturate(dot(v,w)) <= |v| = R`), which is
+    /// what lets `r_infl2`, the exact-zero window and `cull_tile`'s exactness
+    /// argument stand completely unchanged. `R == 0` is today's isotropic
+    /// light, and the CPU and HLSL both BRANCH on it rather than computing a
+    /// `* 1.0`.
+    el_c: [[f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS],
 }
 
 /// Deepest quadtree level a `--dual-gpu` split may be assigned at: 4^3 = 64
@@ -1009,8 +1024,8 @@ pub fn split_self_test() -> std::result::Result<(), String> {
 // a size drift here corrupts every field after the drift point.
 // 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
 // block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky) +
-// 16·MAX_FIREFLIES (the firefly pose rows) + 16 + 32·MAX_EMISSIVE_LIGHTS
-// (the emissive cluster meta + row pairs).
+// 16·MAX_FIREFLIES (the firefly pose rows) + 16 + 48·MAX_EMISSIVE_LIGHTS
+// (the emissive cluster meta + row TRIPLES — a/b, plus c's emission lobe).
 const _: () = assert!(
     std::mem::size_of::<FrameCb>()
         == 320 - 32
@@ -1020,7 +1035,7 @@ const _: () = assert!(
             + 16 // cloud_grid
             + 16 // sway_mv_base
             + 16 // el_meta
-            + 32 * crate::emissive::MAX_EMISSIVE_LIGHTS
+            + 48 * crate::emissive::MAX_EMISSIVE_LIGHTS
             + 16 // split (dual-GPU tile ownership)
 );
 // ...and the whole thing must still fit a CB ring slot.
@@ -1043,10 +1058,12 @@ impl FrameCb {
         // precedent). Scene-static, so they ride the base.
         let mut el_a = [[0.0f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS];
         let mut el_b = [[0.0f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS];
+        let mut el_c = [[0.0f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS];
         for i in 0..scene.emissive.count as usize {
             let l = &scene.emissive.lights[i];
             el_a[i] = [l.pos[0], l.pos[1], l.pos[2], l.rc2];
             el_b[i] = [l.color[0], l.color[1], l.color[2], l.r_infl2];
+            el_c[i] = [l.axis[0], l.axis[1], l.axis[2], l.r_dir];
         }
         FrameCb {
             sky_sh,
@@ -1089,6 +1106,7 @@ impl FrameCb {
             el_meta: [scene.emissive.count, scene.light_gain.to_bits(), 0, 0],
             el_a,
             el_b,
+            el_c,
             prev_origin: [0.0; 4],
             prev_forward: [0.0; 4],
             prev_right: [0.0, 0.0, 0.0, near],
@@ -1159,6 +1177,13 @@ impl FrameCb {
         self.el_meta = fresh.el_meta;
         self.el_a = fresh.el_a;
         self.el_b = fresh.el_b;
+        // `el_c` (the emission lobe) is provably gain-INVARIANT today —
+        // `apply_light_gain` scales `color` and nothing else, so the axis and R
+        // a re-derive produces are bit-identical and this copy is a no-op. It
+        // is here so the three emissive rows cannot drift apart if that ever
+        // stops being true: the failure mode is a stale axis paired with fresh
+        // positions, which is silent.
+        self.el_c = fresh.el_c;
     }
 
     /// The per-frame fields folded onto the static base — the single source

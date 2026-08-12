@@ -162,6 +162,12 @@ mod texture;
 // The presentation curve — one source of truth for every swapchain encode,
 // shared by every CPU present arm and ported term-for-term into tonemap.hlsl.
 mod tone;
+// The Metal backend, peer of `gpu/` and `vk/` over the shared `gfx/` core.
+// FSR3 upscaling only today — headless and gated, no tracer. macOS-only
+// because it is Metal; see src/mtl/mod.rs for why it needs neither DXC nor any
+// of our own HLSL.
+#[cfg(target_os = "macos")]
+mod mtl;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
@@ -349,6 +355,7 @@ fn main() {
         check_nppd,
         nppd_dump,
         check_nrd,
+        check_fsr3,
         check_spirv,
         check_vk,
         check_gpu,
@@ -950,6 +957,11 @@ fn main() {
         || check_oidn
         || check_xess
         || check_fsr
+        // Listed here so a scene argument is ACCEPTED, ahead of the U4 stage
+        // that will consume it: the scored upscale renders a real frame pair
+        // through the CPU tracer, so the G-buffer it scores is the scene's.
+        // Today's stages are scene-independent.
+        || check_fsr3
         || check_nppd
         || check_nrd
         // Scene-keyed like the rest: the conditional-hit machinery
@@ -1200,6 +1212,30 @@ fn main() {
     if check_nrd {
         let code = run_check_nrd(&opts);
         std::process::exit(code);
+    }
+    if check_fsr3 {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_fsr3(&scene, &bvh, cam0, structural);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2, not a SKIP: an explicitly requested gate on the wrong OS
+            // is an ENVIRONMENT error (the --check-vk-on-Windows convention).
+            // A missing toolchain on the RIGHT OS is what SKIPs — reporting
+            // "nothing to run here" for a gate that was asked for exits 0 on a
+            // run that gated nothing.
+            eprintln!(
+                "--check-fsr3 gates the FidelityFX 1.1.x upscaler on METAL, so it is \
+                 macOS-only. The VULKAN arm of the same SDK is --check-vk's V11 (stock \
+                 ffx_vk on a device that suite already opens); this one exists separately \
+                 because Metal needs a hand-written FfxInterface, which is a different \
+                 subject. The pure half of the shared staging math runs everywhere in \
+                 --check-fsr."
+            );
+            std::process::exit(2);
+        }
     }
     if check_spirv {
         #[cfg(unix)]
@@ -18237,6 +18273,18 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             pass = false;
         }
 
+        // The upscale input trio's staging math, shared by the D3D12 recording
+        // (gpu/ffx_up.rs::record_upload, cfg(windows)) and the Metal one
+        // (src/mtl/). Gated HERE rather than in --check-fsr3 so a transcription
+        // drift between the two backends is caught on every platform, including
+        // the Windows CI that never builds either 1.1.x arm.
+        if let Err(e) = fsr::stage_self_test() {
+            eprintln!("{e}");
+            pass = false;
+        } else {
+            eprintln!("ffx-1.1.x: upscale input trio staging (colour/mvec/depth) OK");
+        }
+
         // The linked half, when it is linked. THE POINT IS THE PIN PAIR: this
         // reads the version out of the headers the objects were COMPILED
         // against, so fetching a different FFX_SRC_TAG without moving
@@ -18321,6 +18369,116 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
         eprintln!("FSR CHECK FAILED");
         1
     }
+}
+
+/// `--check-fsr3` — the FidelityFX 1.1.x upscaler arm, staged like `--check-vk`.
+///
+/// U0 pure (no device, no SDK) | U1 the transpiled metallib table | U2 a real
+/// Metal device | U3 an FSR3 context | U4 one scored upscale.
+///
+/// SKIP DISCIPLINE, which differs from the exit-2 above for a reason: reaching
+/// the right OS and finding the toolchain absent is an environment fact and the
+/// bare-checkout degrade every SDK gate here follows, so it prints loudly and
+/// exits 0 having gated its pure half. Being asked for the gate on a platform
+/// that cannot host it is not.
+#[cfg(target_os = "macos")]
+fn run_check_fsr3(
+    _scene: &scene::Scene,
+    _bvh: &bvh::Bvh,
+    _cam0: Camera,
+    _structural: bool,
+) -> i32 {
+    let mut ok = true;
+    let mut fail = |m: String| {
+        eprintln!("check-fsr3: FAIL {m}");
+        ok = false;
+    };
+
+    // ---- U0: the input trio's staging math ----------------------------------
+    //
+    // Runs with no device and no SDK, and is the same function `--check-fsr`
+    // calls on every platform — repeated here so this gate is self-contained
+    // rather than depending on someone having run the other one.
+    match fsr::stage_self_test() {
+        Ok(()) => eprintln!("check-fsr3: U0 input trio staging (colour/mvec/depth) OK"),
+        Err(e) => fail(format!("U0 {e}")),
+    }
+
+    // ---- U1: the transpiled metallib table ----------------------------------
+    #[cfg(ffx_fsr3_metal)]
+    {
+        match mtl::fsr3::table_self_test() {
+            Ok(()) => eprintln!(
+                "check-fsr3: U1 metallib table OK — {} permutations, {} KiB",
+                mtl::fsr3::metallibs().len(),
+                mtl::fsr3::metallibs().iter().map(|(_, b)| b.len()).sum::<usize>() / 1024
+            ),
+            Err(e) => fail(format!("U1 {e}")),
+        }
+    }
+    #[cfg(not(ffx_fsr3_metal))]
+    {
+        // Name which half is missing. Both are opt-in and neither is fetched by
+        // a plain checkout, so "it did not build" is the expected state on a
+        // fresh clone and must not read as a defect.
+        eprintln!(
+            "check-fsr3: SKIP U1 (the FSR3 Metal arm was not built — needs the SDK source \
+             via `./install-prerequisites.sh fsr3src`, the committed SPIR-V under \
+             SDKs/FidelityFX-SDK-prebuilt/, and spirv-cross + Xcode at build time; the \
+             build prints one FSR3-Metal line saying which was absent)"
+        );
+    }
+
+    // ---- U2: a real Metal device --------------------------------------------
+    let mtl = match mtl::device::Mtl::new() {
+        Ok(m) => {
+            eprintln!("check-fsr3: U2 device — {}", m.line());
+            // A texture round-trip through the SHIPPING staging encoder, so
+            // "the upscaler produced nothing" and "our texture plumbing never
+            // carried the bytes" stay separable — they otherwise arrive
+            // together and read identically.
+            match mtl::device::self_test(&m) {
+                Ok(()) => eprintln!("check-fsr3: U2 texture round-trip + submit OK"),
+                Err(e) => fail(format!("U2 {e}")),
+            }
+            Some(m)
+        }
+        Err(e) if e.absent => {
+            eprintln!("check-fsr3: SKIP U2 ({e})");
+            None
+        }
+        Err(e) => {
+            // NOT a skip: Metal is present and something refused. Environment,
+            // so exit 2 rather than folding into the gate-failure code — but a
+            // gate that ALREADY failed outranks it, or a broken U0 would report
+            // as "your machine" on the way past.
+            eprintln!("check-fsr3: U2 {e}");
+            return if ok { 2 } else { 1 };
+        }
+    };
+
+    // The four FFX-on-Metal bugs that shipped in the reference implementation
+    // were ALL invisible without the validation layers, and each masked the one
+    // after it (the layer aborts on the first error per command buffer). The
+    // process cannot arm them itself — Metal reads them at init — so saying so
+    // is the honest maximum. The `FR_VK_VALIDATION=0 — running UNVALIDATED`
+    // line is the same shape.
+    if mtl.is_some()
+        && std::env::var("MTL_DEBUG_LAYER").is_err()
+        && std::env::var("MTL_SHADER_VALIDATION").is_err()
+    {
+        eprintln!(
+            "check-fsr3: NOTE MTL_DEBUG_LAYER / MTL_SHADER_VALIDATION unset — the \
+             validation-only failure class (padded constant buffers, image-atomic buffer \
+             aliasing, clear-on-buffer-backed, RenderTarget usage) is INVISIBLE in this run. \
+             Re-run with both =1."
+        );
+    }
+
+    if ok {
+        eprintln!("check-fsr3: PASSED");
+    }
+    i32::from(!ok)
 }
 
 /// The rendered-frame half of --check-fsr at one resolution: frame A at
