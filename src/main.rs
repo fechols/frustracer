@@ -162,6 +162,12 @@ mod texture;
 // The presentation curve — one source of truth for every swapchain encode,
 // shared by every CPU present arm and ported term-for-term into tonemap.hlsl.
 mod tone;
+// The Metal backend, peer of `gpu/` and `vk/` over the shared `gfx/` core.
+// FSR3 upscaling only today — headless and gated, no tracer. macOS-only
+// because it is Metal; see src/mtl/mod.rs for why it needs neither DXC nor any
+// of our own HLSL.
+#[cfg(target_os = "macos")]
+mod mtl;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
@@ -349,6 +355,7 @@ fn main() {
         check_nppd,
         nppd_dump,
         check_nrd,
+        check_fsr3,
         check_spirv,
         check_vk,
         check_gpu,
@@ -950,6 +957,11 @@ fn main() {
         || check_oidn
         || check_xess
         || check_fsr
+        // Listed here so a scene argument is ACCEPTED, ahead of the U4 stage
+        // that will consume it: the scored upscale renders a real frame pair
+        // through the CPU tracer, so the G-buffer it scores is the scene's.
+        // Today's stages are scene-independent.
+        || check_fsr3
         || check_nppd
         || check_nrd
         // Scene-keyed like the rest: the conditional-hit machinery
@@ -1200,6 +1212,30 @@ fn main() {
     if check_nrd {
         let code = run_check_nrd(&opts);
         std::process::exit(code);
+    }
+    if check_fsr3 {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_fsr3(&scene, &bvh, cam0, structural);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2, not a SKIP: an explicitly requested gate on the wrong OS
+            // is an ENVIRONMENT error (the --check-vk-on-Windows convention).
+            // A missing toolchain on the RIGHT OS is what SKIPs — reporting
+            // "nothing to run here" for a gate that was asked for exits 0 on a
+            // run that gated nothing.
+            eprintln!(
+                "--check-fsr3 gates the FidelityFX 1.1.x upscaler on METAL, so it is \
+                 macOS-only. The VULKAN arm of the same SDK is --check-vk's V11 (stock \
+                 ffx_vk on a device that suite already opens); this one exists separately \
+                 because Metal needs a hand-written FfxInterface, which is a different \
+                 subject. The pure half of the shared staging math runs everywhere in \
+                 --check-fsr."
+            );
+            std::process::exit(2);
+        }
     }
     if check_spirv {
         #[cfg(unix)]
@@ -3998,7 +4034,10 @@ fn write_tex_at(
 
 /// f16 bit pattern -> monotone integer (ulp distances work across the sign,
 /// unlike raw bits).
-#[cfg(windows)]
+///
+/// Portable since B3: `gate_xess_feed` below is now called by `--check-vk`'s
+/// V13 as well as by the two D3D12 suites, and this is its ulp metric.
+#[cfg(any(windows, unix))]
 fn mono16(b: u16) -> i32 {
     if b & 0x8000 != 0 { -((b & 0x7fff) as i32) } else { b as i32 }
 }
@@ -4008,7 +4047,14 @@ fn mono16(b: u16) -> i32 {
 /// under `precise`; sky BIT-EQUAL 0.0 + anti-vacuity), the mvec plane vs the
 /// pack within 1 f16 ulp, the color plane vs the 1-spp accum store within
 /// 1 f16 ulp (alpha a constant 1.0). `tag` prefixes the report lines.
-#[cfg(windows)]
+///
+/// PORTABLE, and its `#[cfg(windows)]` was incidental exactly as
+/// `unpack_gbuf_bytes`' was: every parameter is a plain slice, a
+/// `dlss::GBufs`, or a scalar, and the body names no D3D12 type. `--check-vk`
+/// V13 is the third caller, with its `gb2` oracle built by that same unpacker
+/// out of the Vulkan tracer's pack readback — a Vulkan-local copy of either
+/// would be the transcription hazard the derived layout exists to remove.
+#[cfg(any(windows, unix))]
 #[allow(clippy::too_many_arguments)]
 fn gate_xess_feed(
     tag: &str,
@@ -14609,17 +14655,20 @@ fn run_check_vk_fsr3(
                 &color,
                 &depth,
                 &motion,
-                // The renderer's own sample offset through the ONE constant
-                // that states this convention for both FidelityFX generations.
-                (jit.0 * jsign, jit.1 * jsign),
-                fsr::UPSCALE_MV_SIGN,
-                (near, far),
-                cam0.fov_y,
-                // A fixed clock, not a wall one: the nrd_gpu::NOMINAL_DT_MS
-                // precedent — a deterministic gate must not have a real timer
-                // reaching a vendor library's internal curves.
-                1000.0 / 60.0,
-                reset_every || f == 0,
+                vk::fsr3::Dispatch {
+                    // The renderer's own sample offset through the ONE constant
+                    // that states this convention for both FidelityFX
+                    // generations.
+                    jitter: (jit.0 * jsign, jit.1 * jsign),
+                    mv_scale: fsr::UPSCALE_MV_SIGN,
+                    near_far: (near, far),
+                    fov_y: cam0.fov_y,
+                    // A fixed clock, not a wall one: the nrd_gpu::NOMINAL_DT_MS
+                    // precedent — a deterministic gate must not have a real
+                    // timer reaching a vendor library's internal curves.
+                    dt_ms: 1000.0 / 60.0,
+                    reset: reset_every || f == 0,
+                },
             )?;
             if f == FRAMES - 1 {
                 out = f3.read_output(hg)?;
@@ -15202,20 +15251,32 @@ fn run_check_vk_render(
             return false;
         }
     };
-    // No pack on THIS tracer, deliberately: V12 builds its own at odd dims with
-    // `gbuf_full`, so every number V6/V7/V8/V9 record stays unmoved BY
-    // CONSTRUCTION rather than by care — the `--check-gpu` M7 / `--check-dxr`
-    // T4 shape, which both build a second pipeline for exactly this reason.
-    let tg =
-        match vk::tracer::VkTracer::new(hg, sp, scene, &vs, &vt, bvh, gw as u32, gh as u32, false) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("check-vk: FAIL V6 tracer init: {e}");
-                vt.destroy(hg);
-                vs.destroy(hg);
-                return false;
-            }
-        };
+    // No pack and no feed on THIS tracer, deliberately: V12 builds its own at
+    // odd dims with `gbuf_full` and V13 a third at render res with `feed`, so
+    // every number V6/V7/V8/V9 record stays unmoved BY CONSTRUCTION rather
+    // than by care — the `--check-gpu` M7 / `--check-dxr` T4 shape, which both
+    // build a second pipeline for exactly this reason. It is also what keeps
+    // this tracer's derived map at V5's recorded 46 slots: `feed` would add
+    // three storage images to it.
+    let tg = match vk::tracer::VkTracer::new(
+        hg,
+        sp,
+        scene,
+        &vs,
+        &vt,
+        bvh,
+        gw as u32,
+        gh as u32,
+        vk::tracer::TracerOpts::default(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V6 tracer init: {e}");
+            vt.destroy(hg);
+            vs.destroy(hg);
+            return false;
+        }
+    };
     // The texture line reports BYTES and SUBRESOURCES, not just a count: a run
     // that uploaded the table and one that uploaded a table of stubs have the
     // same count, and a chain that silently lost its mips has the same
@@ -15723,6 +15784,11 @@ fn run_check_vk_render(
         ok = false;
     }
 
+    // ---- V13: the GPU-fed feed, and FSR3 consuming it ----
+    if !run_check_vk_feed(hg, sp, scene, bvh, &vs, &vt, cam0, structural) {
+        ok = false;
+    }
+
     tg.destroy(hg);
     vt.destroy(hg);
     vs.destroy(hg);
@@ -15773,8 +15839,17 @@ fn run_check_vk_gbuf(
     // which vacuates the AO-bearing lanes a later feed gate will want.
     let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
 
-    let tg = match vk::tracer::VkTracer::new(hg, sp, scene, vs, vt, bvh, pw as u32, ph as u32, true)
-    {
+    let tg = match vk::tracer::VkTracer::new(
+        hg,
+        sp,
+        scene,
+        vs,
+        vt,
+        bvh,
+        pw as u32,
+        ph as u32,
+        vk::tracer::TracerOpts { gbuf_full: true, ..Default::default() },
+    ) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("check-vk: FAIL V12 pack tracer init: {e}");
@@ -15937,6 +16012,610 @@ fn run_check_vk_gbuf(
     }
 
     tg.destroy(hg);
+    ok
+}
+
+/// V13 — THE GPU-FED FEED: the tracer's own pack and radiance reaching FSR3
+/// through `cs_feed_xess` instead of through three host uploads.
+///
+/// B1 put FSR3 on this backend but CPU-fed, so the Vulkan tracer still fed
+/// nothing; B2 gave it the pack those planes come from. This closes the loop,
+/// and it is the shape every `--gpu`/`--dxr` session on D3D12 has used since
+/// the pack split.
+///
+/// THE COMPARISON IS BETWEEN TWO ROUTES, NOT TWO RENDERERS, and that is what
+/// makes it assertable where V11's quality claim is not. V11 can only REPORT
+/// whether FSR3 beats a bilinear control, because that answer is
+/// scene-dependent (it wins on the procedural scene and loses on san-miguel
+/// with identical wiring). Here BOTH arms consume the SAME frame from the SAME
+/// Vulkan tracer — one through `record_feed`, one through `Fsr3::frame`'s host
+/// upload of the identical readback — so any difference is wiring, and a tight
+/// bar is honest. Scoring a CPU-RENDERED arm against a GPU-rendered one would
+/// not be this test at all: different intersector, different RNG stream, so
+/// the two would differ by the renderer and the feed route would be invisible
+/// inside that.
+///
+/// `gate_xess_feed` is the real gate and the output comparison corroborates
+/// it: the planes are scored against the pack at ulp precision by the EXACT
+/// function `--check-gpu` M8 and `--check-dxr` use, with zero new tolerances
+/// and with B2's now-portable `unpack_gbuf_bytes` supplying the oracle.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_feed(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    vs: &vk::scene::VkScene,
+    vt: &vk::textures::VkTextures,
+    cam0: Camera,
+    structural: bool,
+) -> bool {
+    if !vk::fsr3::built() {
+        println!(
+            "check-vk: SKIP V13 (FidelityFX 1.1.4 source not compiled in — \
+             ./install-prerequisites.sh fsr3src)"
+        );
+        return true;
+    }
+    // V11's ratio and resolutions, so the two stages' numbers sit on one scale.
+    let (ow, oh) = (800usize, 600usize);
+    let (rw, rh) = (ow / 2, oh / 2);
+    const FRAMES: u32 = 8;
+    let (near, far) = dlss::near_far(scene.diag);
+    // `rtgi: false` for V12's reason (M7's): under RTGI `prim.ao` is 0
+    // everywhere, which vacuates lanes a feed gate wants.
+    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+
+    let tg = match vk::tracer::VkTracer::new(
+        hg,
+        sp,
+        scene,
+        vs,
+        vt,
+        bvh,
+        rw as u32,
+        rh as u32,
+        // `feed` implies `gbuf_full` and `nrd` implies `feed`; all three are
+        // spelled anyway, because a reader should not have to know the
+        // constructor forces them.
+        //
+        // ONE tracer for V13 AND V14, rather than the fourth the second and
+        // third were: the only thing V14 adds to a frame is the sig lanes, and
+        // those are a cbuffer bit over an assignment-only capture, so `accum`
+        // and therefore every number V13 reports are unmoved. Coupling them is
+        // a FEATURE — V13's figures holding across the bridge's arrival is the
+        // capture-invariance claim, stated across the two stages instead of
+        // asserted once — and it saves a whole DXC pass. V14 turns the bit off
+        // and on itself for the arm that gates it properly.
+        vk::tracer::TracerOpts { gbuf_full: true, feed: true, nrd: true },
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V13 feed tracer init: {e}");
+            return false;
+        }
+    };
+
+    // Two FFX contexts, one per route, stepped in lockstep on one frame
+    // sequence. Separate rather than one context run twice because FSR3 is
+    // TEMPORAL: a single context would carry the first route's history into
+    // the second and the comparison would measure the ordering.
+    let mk = || {
+        vk::fsr3::Fsr3::new(
+            hg,
+            (rw as u32, rh as u32),
+            (ow as u32, oh as u32),
+            vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+        )
+    };
+    let (fed, cpu) = match (mk(), mk()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            let e = a.err().or(b.err()).unwrap_or_default();
+            // V11's absent/told split verbatim: llvmpipe declines context
+            // creation outright, which is an environment fact.
+            if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+                println!("check-vk: SKIP V13 on a software device ({e})");
+            } else {
+                eprintln!("check-vk: FAIL V13 fsr3 context: {e}");
+                tg.destroy(hg);
+                return false;
+            }
+            tg.destroy(hg);
+            return true;
+        }
+    };
+
+    // Point the kernel's three output registers at THIS context's input
+    // images. Only the GPU-fed context is wired; the CPU-fed one keeps its
+    // host uploads, which is the whole comparison.
+    tg.wire_feed(hg, fed.feed_views());
+
+    // ANTI-VACUITY, and it has to be a sentinel rather than a zero check.
+    // These three images are written once per frame and read once; a feed that
+    // never dispatched leaves whatever was there before, and after frame 0
+    // that is a plausible-looking previous frame. 0xEE is a value no real
+    // plane produces (as R32F it is ~3.7e-13 in every texel, as f16 pairs a
+    // constant), so a survivor is proof the write never happened — V3's
+    // 0xEEEEEEEE and V9's re-flooded sentinel exist for this reason.
+    const POISON: u8 = 0xee;
+    if let Err(e) = fed.poison_inputs(hg, POISON) {
+        eprintln!("check-vk: FAIL V13 poison: {e}");
+        fed.destroy(hg);
+        cpu.destroy(hg);
+        tg.destroy(hg);
+        return false;
+    }
+
+    let basis = cam0.basis(rw, rh);
+    let mut ok = true;
+
+    let run = (|| -> Result<(), String> {
+        for f in 0..FRAMES {
+            let jit = dlss::jitter_for(f);
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: f,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                // A static camera, so the true motion is exactly zero and the
+                // two routes are compared on identical content — this stage is
+                // about the wire, and V12 is where the motion plane's VALUES
+                // are gated.
+                prev_cam: Some(basis),
+                q,
+                verify: false,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            tg.render_wavefront(hg, &p, true)?;
+
+            // The CPU route's planes, built from the SAME frame the GPU route
+            // is about to read on the device — which is what makes this a
+            // comparison of two routes rather than of two renderers.
+            let acc = hg.read_buffer(&tg.accum, rw * rh * 12)?;
+            let core = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+            let gb = unpack_gbuf_bytes(&core, None, rw, rh);
+            let color: Vec<f32> = (0..rw * rh * 3)
+                .map(|i| f32::from_le_bytes(acc[i * 4..][..4].try_into().unwrap()))
+                .collect();
+            let depth: Vec<f32> = (0..rw * rh)
+                .map(|i| {
+                    xess::view_z_to_clip_depth(
+                        f32::from_bits(gb.depth[i].load(Relaxed)),
+                        near,
+                        far,
+                    )
+                })
+                .collect();
+            let motion: Vec<u16> = (0..rw * rh * 2).map(|i| gb.mvec[i].load(Relaxed)).collect();
+
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: cam0.fov_y,
+                dt_ms: 1000.0 / 60.0,
+                reset: f == 0,
+            };
+            // The GPU route. `record_feed` lands in the SAME command buffer as
+            // the FFX dispatch that consumes its output — D3D12's own
+            // trace -> feed -> upscale on one list.
+            fed.frame_fed(hg, |d, cmd| unsafe { tg.record_feed(d, cmd) }, dp)?;
+            cpu.frame(hg, &color, &depth, &motion, dp)?;
+
+            if f == FRAMES - 1 {
+                let cbytes = fed.read_input(hg, 0)?;
+                let dbytes = fed.read_input(hg, 1)?;
+                let mbytes = fed.read_input(hg, 2)?;
+                let tb = hg.read_buffer(&tg.tbuf, rw * rh * 4)?;
+                let t: Vec<f32> =
+                    tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                // The sentinel check reads the DEPTH plane: R32F, so a
+                // surviving 0xEEEEEEEE word is unambiguous, where an f16 pair
+                // could in principle be a real value.
+                let alive = (0..rw * rh)
+                    .filter(|i| dbytes[i * 4..][..4] == [POISON; 4])
+                    .count();
+                if alive != 0 {
+                    eprintln!(
+                        "check-vk: FAIL V13 {alive} of {} depth texels still hold the 0x{POISON:02x} \
+                         sentinel — the feed did not write them",
+                        rw * rh
+                    );
+                    ok = false;
+                }
+                if !gate_xess_feed(
+                    "check-vk: V13",
+                    rw,
+                    rh,
+                    &dbytes,
+                    &mbytes,
+                    &cbytes,
+                    &acc,
+                    &gb,
+                    &t,
+                    near,
+                    far,
+                    structural,
+                ) {
+                    ok = false;
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V13 {e}");
+        ok = false;
+    }
+
+    // The end-to-end corroboration: same engine, same source frame, two feed
+    // routes. RELATIVE to the image's own magnitude for V6's reason — an
+    // absolute bar is a different bar on every scene.
+    if ok {
+        match (fed.read_output(hg), cpu.read_output(hg)) {
+            (Ok(a), Ok(b)) => {
+                let (mut sd, mut sa) = (0.0f64, 0.0f64);
+                for i in 0..a.len().min(b.len()) {
+                    sd += (a[i] - b[i]).abs() as f64;
+                    sa += a[i].abs() as f64;
+                }
+                let rel = if sa > 0.0 { sd / sa } else { 0.0 };
+                let finite = a.iter().all(|v| v.is_finite());
+                let nonzero = a.iter().filter(|v| **v != 0.0).count();
+                eprintln!(
+                    "check-vk: V13 gpu-fed vs cpu-fed FSR3 {rw}x{rh} -> {ow}x{oh}: \
+                     mean |d| / mean |gpu-fed| {rel:.5} | finite {finite} | non-zero ch {nonzero}"
+                );
+                if !finite {
+                    eprintln!("check-vk: FAIL V13 the GPU-fed frame carries non-finite channels");
+                    ok = false;
+                }
+                if nonzero < a.len() / 2 {
+                    eprintln!(
+                        "check-vk: FAIL V13 only {nonzero} of {} channels are non-zero",
+                        a.len()
+                    );
+                    ok = false;
+                }
+                // 2%, V6's shape and for its reason: the two routes differ
+                // only by where the f16 rounding happened, so a healthy run
+                // sits orders of magnitude under this, while a swapped or
+                // unbound plane moves it by orders of magnitude over.
+                if rel > 0.02 {
+                    eprintln!(
+                        "check-vk: FAIL V13 the two feed routes disagree by {rel:.5} — the \
+                         planes are gated above, so this is the upscaler seeing different inputs"
+                    );
+                    ok = false;
+                }
+            }
+            (a, b) => {
+                eprintln!(
+                    "check-vk: FAIL V13 output readback: {}",
+                    a.err().or(b.err()).unwrap_or_default()
+                );
+                ok = false;
+            }
+        }
+    }
+
+    // ---- V14: the NRD bridge, on V13's tracer and V13's engine planes. ----
+    if ok {
+        ok =
+            run_check_vk_bridge(hg, &tg, &fed, scene, &basis, q, rw, rh, near, far, structural);
+    }
+
+    fed.destroy(hg);
+    cpu.destroy(hg);
+    tg.destroy(hg);
+    ok
+}
+
+/// V14 — THE NRD BRIDGE, and a byte-identity that needs no reference image.
+///
+/// `cs_nrd_pack` and `cs_nrd_out` are the front and back halves of the ONE
+/// denoiser seam this renderer has. They are deliberately ENGINE-BLIND — the
+/// D3D12 `wire_nrd_feed`'s own doc says the kernels "neither know nor care
+/// which engine sits between them" — so proving them needs no engine at all,
+/// and that is what makes this stage cheap enough to precede one.
+///
+/// THE CLAIM, and it is an identity rather than a tolerance. The recompose is
+/// `col = R + D_out·kd·m_d + S_out·f0` with `R = base − D_in·kd·m_d − S_in·f0`,
+/// so with a PASSTHROUGH engine (`OUT == IN`, byte for byte) the correction is
+/// algebraically zero and `col` must collapse onto `base` — which is exactly
+/// the colour `cs_feed_xess` wrote. Any drift at all is the bridge's own
+/// arithmetic, its sig lanes, or its wiring; there is nothing else in the
+/// expression. This is `--check-gpu`'s N3, and it is the strongest shape in the
+/// suite precisely because it compares bytes against a value the SAME device
+/// produced moments earlier rather than against a model of one.
+///
+/// It runs on V13's tracer, which is not thrift: V13's feed is the only thing
+/// in this suite that produces the reference, so the two stages want the same
+/// tracer for the same reason F3 wanted `--check-gpu`'s.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_bridge(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    fed: &vk::fsr3::Fsr3,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    near: f32,
+    far: f32,
+    structural: bool,
+) -> bool {
+    const POISON: u8 = 0xee;
+    let mut ok = true;
+    // The bridge's own seven planes. `wire_feed` already pointed u16/u18/u19 at
+    // the engine's images, and those stay exactly where they are — the bridge
+    // WRITES the engine's colour and guides, which is the whole fold.
+    tg.wire_nrd(hg);
+
+    let run = (|| -> Result<(), String> {
+        // The reference: the colour plane exactly as the feed left it on V13's
+        // last frame.
+        let reference = fed.read_input(hg, 0)?;
+
+        // ANTI-VACUITY, and it has to be a SENTINEL rather than a zero check:
+        // the colour plane already holds the right answer, so a recompose that
+        // never dispatched would pass the byte compare on stale bytes (the M3d
+        // lesson — an operation that never happened compares clean).
+        //
+        // Poisoning all three planes is STRONGER than D3D12's F3, which smears
+        // one plane over the colour target: `cs_nrd_pack` writes the engine's
+        // depth and mvec guides itself — THE FOLD, which is why an NRD frame
+        // runs no separate feed at all — so re-running the plane gate below
+        // scores that half too, and it is a half the feed route cannot reach.
+        fed.poison_inputs(hg, POISON)?;
+        let dirty = fed.read_input(hg, 0)?;
+        let pre_diff = dirty
+            .iter()
+            .zip(reference.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        // The sequence, on ONE command buffer — `nrd_frame_step`'s ordering:
+        // pack -> engine -> recompose.
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        hg.run(|d, cmd| unsafe {
+            r1 = tg.record_nrd_pack(d, cmd);
+            r2 = tg.record_nrd_passthrough(d, cmd);
+            r3 = tg.record_nrd_out(d, cmd);
+        })?;
+        r1?;
+        r2?;
+        r3?;
+
+        let after = fed.read_input(hg, 0)?;
+        let bad = after
+            .iter()
+            .zip(reference.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "check-vk: V14 bridge passthrough ({rw}x{rh}): colour byte-diff {bad} \
+             (pre-dirty {pre_diff})"
+        );
+        if bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V14 the passthrough recompose is not byte-identical to the feed \
+                 — with OUT == IN the delta form's correction is exactly zero, so this is the \
+                 bridge's own arithmetic or its sig lanes"
+            );
+            ok = false;
+        }
+        if pre_diff == 0 {
+            eprintln!(
+                "check-vk: FAIL V14 anti-vacuity — the poison did not change the colour plane, \
+                 so a dead recompose would pass the compare above"
+            );
+            ok = false;
+        }
+
+        // DID THE PACK'S DATA ARRIVE? The byte identity above provably cannot
+        // answer that, and this is not a theory — a planted tooth that skipped
+        // the plane wiring entirely PASSED it. With the planes unbound the
+        // recompose reads zeros, so `D_out − D_in` is zero, `col` collapses
+        // onto `base`, and the identity holds for the wrong reason. A
+        // passthrough makes the delta zero BY CONSTRUCTION, so the arm that
+        // scores the recompose can never also score the pack.
+        //
+        // The three IN planes are read back off the tracer's OWN images, which
+        // exist whether or not a descriptor points at them — which is exactly
+        // what makes an unwired bridge show up here as an untouched plane.
+        for (idx, name) in
+            [(3usize, "in_diff"), (4, "in_spec"), (2, "in_viewz")]
+        {
+            let px = tg.read_nrd_plane(hg, idx)?;
+            let nz = px.iter().filter(|b| **b != 0).count();
+            eprintln!(
+                "check-vk: V14 pack arrival: {name} {nz}/{} non-zero bytes",
+                px.len()
+            );
+            // A tenth of the frame is far below any healthy figure and far
+            // above the zero an unwired plane reads, so it separates the two
+            // without pretending to know this scene's content.
+            if nz * 10 < px.len() {
+                eprintln!(
+                    "check-vk: FAIL V14 the pack left {name} essentially empty — the bridge's \
+                     front half wrote nowhere, and the byte identity above cannot see that"
+                );
+                ok = false;
+            }
+        }
+
+        // THE FOLD: the guides came back from the SAME dispatch that packed the
+        // denoiser's inputs, so V13's own plane gate re-run over them scores a
+        // half no feed route reaches. The poison above is what makes this a
+        // real question — depth and mvec were 0xEE bytes a moment ago.
+        let dbytes = fed.read_input(hg, 1)?;
+        let mbytes = fed.read_input(hg, 2)?;
+        let cbytes = fed.read_input(hg, 0)?;
+        let acc = hg.read_buffer(&tg.accum, rw * rh * 12)?;
+        let core = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+        let tb = hg.read_buffer(&tg.tbuf, rw * rh * 4)?;
+        let gb2 = unpack_gbuf_bytes(&core, None, rw, rh);
+        let tb2: Vec<f32> = (0..rw * rh)
+            .map(|i| f32::from_le_bytes(tb[i * 4..][..4].try_into().unwrap()))
+            .collect();
+        if !gate_xess_feed(
+            "check-vk: V14 fold",
+            rw,
+            rh,
+            &dbytes,
+            &mbytes,
+            &cbytes,
+            &acc,
+            &gb2,
+            &tb2,
+            near,
+            far,
+            structural,
+        ) {
+            ok = false;
+        }
+
+        // ---- THE CAPTURE INVARIANCE (N6b transplanted) ----
+        //
+        // Arming the sig lanes moves what the pack STORES, and the claim that
+        // makes that safe is that it moves nothing else: the exported values
+        // are already computed at the point of capture, so the capture is
+        // assignment-only and `accum` is bit-identical across the toggle. That
+        // is why the arming is a cbuffer bit here rather than a construction
+        // flag — two traces one bit apart need no recompile and no second
+        // tracer, and the claim becomes a gate instead of a comment.
+        let frame = |f: u32| gfx::frame::FrameParams {
+            cam: *basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(dlss::jitter_for(f)),
+            prev_cam: Some(*basis),
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        let ext_len = rw * rh * gfx::frame::GBUF_EXT_STRIDE as usize;
+        let mut arms: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for on in [true, false] {
+            tg.set_nrd_sig(on);
+            tg.render_wavefront(hg, &frame(0), true)?;
+            arms.push((
+                hg.read_buffer(&tg.accum, rw * rh * 12)?,
+                hg.read_buffer(&tg.gbuf_ext, ext_len)?,
+            ));
+        }
+        // Left as found — the N4 restore lesson: a stage that mutates shared
+        // state owes the next one the state it expected.
+        tg.set_nrd_sig(true);
+
+        let core2 = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+        let gb3 = unpack_gbuf_bytes(&core2, None, rw, rh);
+        let acc_diff = arms[0].0.iter().zip(arms[1].0.iter()).filter(|(a, b)| a != b).count();
+        // `sig` opens at byte 48 of the 72-byte ext record (nr | alb | spec |
+        // sig | sig2), and `sig.w`'s HIGH half is `m_d` — the exact-remodulation
+        // divisor, on loan from the `shadow_t` lane nothing decodes yet.
+        const SIG: usize = 48;
+        let (mut live, mut leaked, mut hits) = (0usize, 0usize, 0usize);
+        let (mut md_lo, mut md_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut md_moved = 0usize;
+        for i in 0..rw * rh {
+            if f32::from_bits(gb3.depth[i].load(Relaxed)) >= far {
+                continue; // sky: the pack zeroes sig there by construction
+            }
+            hits += 1;
+            let armed = &arms[0].1[i * 72 + SIG..][..16];
+            let off = &arms[1].1[i * 72 + SIG..][..16];
+            if armed.iter().any(|b| *b != 0) {
+                live += 1;
+            }
+            if off.iter().any(|b| *b != 0) {
+                leaked += 1;
+            }
+            let w = u32::from_le_bytes(armed[12..16].try_into().unwrap());
+            let md = vk::tracer::half_from_bits((w >> 16) as u16);
+            md_lo = md_lo.min(md);
+            md_hi = md_hi.max(md);
+            if md != 1.0 {
+                md_moved += 1;
+            }
+        }
+        eprintln!(
+            "check-vk: V14 sig capture invariance: accum-diff {acc_diff} | sig live {live}/{hits} \
+             | sig leaked (disarmed) {leaked} | m_d [{md_lo:.4}, {md_hi:.4}] moved {md_moved} px"
+        );
+        if acc_diff != 0 {
+            eprintln!(
+                "check-vk: FAIL V14 arming the sig lanes moved {acc_diff} accum bytes — the \
+                 capture is supposed to be assignment-only"
+            );
+            ok = false;
+        }
+        if leaked != 0 {
+            eprintln!("check-vk: FAIL V14 {leaked} px carry sig bytes with the lanes DISARMED");
+            ok = false;
+        }
+        if hits > 0 && live != hits {
+            eprintln!(
+                "check-vk: FAIL V14 only {live} of {hits} hit px carry sig — the pack's lanes \
+                 are what the bridge reads, so a partial capture is a partial denoise"
+            );
+            ok = false;
+        }
+        if hits > 0 && !(md_lo > 0.0 && md_hi <= 1.0) {
+            eprintln!("check-vk: FAIL V14 m_d outside (0, 1]");
+            ok = false;
+        }
+        // THE INERT NOTE, D3D12's N6b verbatim in intent — and here it fires on
+        // every committed gate pose, which is worth stating rather than hoping
+        // a reader infers it. `m_d` is `sk = 1 − 0.157·sheen` blended toward
+        // `sk·dcav`, only the `fabric` class sets sheen at all (matclass.rs's
+        // `tela`/`carpet`/`individual` vocabulary), and `dcav` needs the detail
+        // field's window OPEN, i.e. a magnified surface. The procedural scene
+        // has neither, and san-miguel's nine fabric materials are its
+        // tablecloths and chair fabric — present in the scene, absent from the
+        // fitted overview every `--check-vk` run uses.
+        //
+        // The pose that DOES exercise it is this tree's own documented
+        // glassware close-up, `--cam 0.71,1.55,0.45,0.71,1.25,-0.35` on
+        // san-miguel-low-poly, where this arm reads m_d [0.7700, 1.0000]. Note
+        // the rest of the suite is known-red there for reasons that predate
+        // this stage (`mv_selftest` median 3.156 against a 0.17 limit, plus the
+        // candidate-loop divergences a nearly-all-glass view amplifies), so
+        // that is a READ-THE-LOG configuration, not a passing one — the same
+        // caveat `--dxr-sbt 3` already carries for the identical pose.
+        if hits > 0 && md_moved == 0 {
+            eprintln!(
+                "check-vk: V14 NOTE — m_d is exactly 1.0 on every hit pixel, so the remodulation \
+                 is INERT at this pose and this arm proves it harmless, not correct (the \
+                 glassware close-up is what moves it — see the source)"
+            );
+        }
+        Ok(())
+    })();
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V14 {e}");
+        ok = false;
+    }
     ok
 }
 
@@ -17594,6 +18273,18 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             pass = false;
         }
 
+        // The upscale input trio's staging math, shared by the D3D12 recording
+        // (gpu/ffx_up.rs::record_upload, cfg(windows)) and the Metal one
+        // (src/mtl/). Gated HERE rather than in --check-fsr3 so a transcription
+        // drift between the two backends is caught on every platform, including
+        // the Windows CI that never builds either 1.1.x arm.
+        if let Err(e) = fsr::stage_self_test() {
+            eprintln!("{e}");
+            pass = false;
+        } else {
+            eprintln!("ffx-1.1.x: upscale input trio staging (colour/mvec/depth) OK");
+        }
+
         // The linked half, when it is linked. THE POINT IS THE PIN PAIR: this
         // reads the version out of the headers the objects were COMPILED
         // against, so fetching a different FFX_SRC_TAG without moving
@@ -17678,6 +18369,116 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
         eprintln!("FSR CHECK FAILED");
         1
     }
+}
+
+/// `--check-fsr3` — the FidelityFX 1.1.x upscaler arm, staged like `--check-vk`.
+///
+/// U0 pure (no device, no SDK) | U1 the transpiled metallib table | U2 a real
+/// Metal device | U3 an FSR3 context | U4 one scored upscale.
+///
+/// SKIP DISCIPLINE, which differs from the exit-2 above for a reason: reaching
+/// the right OS and finding the toolchain absent is an environment fact and the
+/// bare-checkout degrade every SDK gate here follows, so it prints loudly and
+/// exits 0 having gated its pure half. Being asked for the gate on a platform
+/// that cannot host it is not.
+#[cfg(target_os = "macos")]
+fn run_check_fsr3(
+    _scene: &scene::Scene,
+    _bvh: &bvh::Bvh,
+    _cam0: Camera,
+    _structural: bool,
+) -> i32 {
+    let mut ok = true;
+    let mut fail = |m: String| {
+        eprintln!("check-fsr3: FAIL {m}");
+        ok = false;
+    };
+
+    // ---- U0: the input trio's staging math ----------------------------------
+    //
+    // Runs with no device and no SDK, and is the same function `--check-fsr`
+    // calls on every platform — repeated here so this gate is self-contained
+    // rather than depending on someone having run the other one.
+    match fsr::stage_self_test() {
+        Ok(()) => eprintln!("check-fsr3: U0 input trio staging (colour/mvec/depth) OK"),
+        Err(e) => fail(format!("U0 {e}")),
+    }
+
+    // ---- U1: the transpiled metallib table ----------------------------------
+    #[cfg(ffx_fsr3_metal)]
+    {
+        match mtl::fsr3::table_self_test() {
+            Ok(()) => eprintln!(
+                "check-fsr3: U1 metallib table OK — {} permutations, {} KiB",
+                mtl::fsr3::metallibs().len(),
+                mtl::fsr3::metallibs().iter().map(|(_, b)| b.len()).sum::<usize>() / 1024
+            ),
+            Err(e) => fail(format!("U1 {e}")),
+        }
+    }
+    #[cfg(not(ffx_fsr3_metal))]
+    {
+        // Name which half is missing. Both are opt-in and neither is fetched by
+        // a plain checkout, so "it did not build" is the expected state on a
+        // fresh clone and must not read as a defect.
+        eprintln!(
+            "check-fsr3: SKIP U1 (the FSR3 Metal arm was not built — needs the SDK source \
+             via `./install-prerequisites.sh fsr3src`, the committed SPIR-V under \
+             SDKs/FidelityFX-SDK-prebuilt/, and spirv-cross + Xcode at build time; the \
+             build prints one FSR3-Metal line saying which was absent)"
+        );
+    }
+
+    // ---- U2: a real Metal device --------------------------------------------
+    let mtl = match mtl::device::Mtl::new() {
+        Ok(m) => {
+            eprintln!("check-fsr3: U2 device — {}", m.line());
+            // A texture round-trip through the SHIPPING staging encoder, so
+            // "the upscaler produced nothing" and "our texture plumbing never
+            // carried the bytes" stay separable — they otherwise arrive
+            // together and read identically.
+            match mtl::device::self_test(&m) {
+                Ok(()) => eprintln!("check-fsr3: U2 texture round-trip + submit OK"),
+                Err(e) => fail(format!("U2 {e}")),
+            }
+            Some(m)
+        }
+        Err(e) if e.absent => {
+            eprintln!("check-fsr3: SKIP U2 ({e})");
+            None
+        }
+        Err(e) => {
+            // NOT a skip: Metal is present and something refused. Environment,
+            // so exit 2 rather than folding into the gate-failure code — but a
+            // gate that ALREADY failed outranks it, or a broken U0 would report
+            // as "your machine" on the way past.
+            eprintln!("check-fsr3: U2 {e}");
+            return if ok { 2 } else { 1 };
+        }
+    };
+
+    // The four FFX-on-Metal bugs that shipped in the reference implementation
+    // were ALL invisible without the validation layers, and each masked the one
+    // after it (the layer aborts on the first error per command buffer). The
+    // process cannot arm them itself — Metal reads them at init — so saying so
+    // is the honest maximum. The `FR_VK_VALIDATION=0 — running UNVALIDATED`
+    // line is the same shape.
+    if mtl.is_some()
+        && std::env::var("MTL_DEBUG_LAYER").is_err()
+        && std::env::var("MTL_SHADER_VALIDATION").is_err()
+    {
+        eprintln!(
+            "check-fsr3: NOTE MTL_DEBUG_LAYER / MTL_SHADER_VALIDATION unset — the \
+             validation-only failure class (padded constant buffers, image-atomic buffer \
+             aliasing, clear-on-buffer-backed, RenderTarget usage) is INVISIBLE in this run. \
+             Re-run with both =1."
+        );
+    }
+
+    if ok {
+        eprintln!("check-fsr3: PASSED");
+    }
+    i32::from(!ok)
 }
 
 /// The rendered-frame half of --check-fsr at one resolution: frame A at

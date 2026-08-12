@@ -1382,7 +1382,25 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // one and go sub-linear where an emitter is brightest.
                 float einv = min(1.0 / (ed2 + el_a[ei].w), EL_E_MAX * scene_light_gain() / elum);
                 float ex = 1.0 - ed2 / er2;
-                float3 ee = ecol * (einv * ex * ex);
+                // The emission lobe (emissive::lobe's twin). `ewi` points from
+                // the shading point TO the light, so the direction FROM the
+                // light to the receiver is -ewi. R == 0 branches to exactly
+                // 1.0 — never a computed * 1.0 — so isotropic clusters keep
+                // the pre-lobe stream. Bounded by 1, so no in-range test, no
+                // influence radius and no tile cull is perturbed.
+                float er_dir = el_c[ei].w;
+                float elobe = er_dir <= 0.0
+                    ? 1.0
+                    : 1.0 - er_dir + saturate(dot(el_c[ei].xyz, -ewi));
+                float3 ee = ecol * (einv * ex * ex * elobe);
+                // The CPU's `if e == Vec3A::ZERO { continue }` twin, and it
+                // is the lobe that makes it worth having: at R = 1 the whole
+                // back hemisphere reads exactly 0, and without this those
+                // pixels would still pay the shadow ray the lobe exists to
+                // remove (helmet's clusters mean R = 0.986). Result-neutral
+                // — `ee * endl * evis` is 0 either way — so the arms differ
+                // only in a ray never traced.
+                if (all(ee == 0.0)) continue;
                 float3 evis = ABL_TQ_SHADOW(
                     p, ewi, 0.0,
                     max(edist - sqrt(el_a[ei].w) - 2.0 * SCENE_EPS, 0.0));

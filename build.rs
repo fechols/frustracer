@@ -219,9 +219,436 @@ fn build_ffx_fsr3() {
         println!("cargo:rustc-link-lib=dylib=vulkan");
         println!("cargo:rerun-if-changed=shim/ffx_fsr3_vk.cpp");
         println!("cargo:rerun-if-changed=shim/ffx_fsr3_vk.h");
+
+        // ONE CFG PER ARTIFACT. `ffx_fsr3_src` says the backend-NEUTRAL units
+        // built; it does NOT say `ffx_vk.cpp` and our shim did, and on macOS
+        // they provably did not — `want_vk` requires Linux, because that
+        // platform takes the Metal `FfxInterface` instead. `src/vk/fsr3.rs`
+        // declared its `frshim_fsr3vk_*` externs under the broader cfg, so any
+        // box with the FFX SDK source and no `want_vk` — every Mac — failed to
+        // LINK with three undefined symbols, while build.rs's own warning
+        // promised the arm had "stood down". The Linux-without-headers case was
+        // fine only by accident: its early `return` also skips `ffx_fsr3_src`.
+        println!("cargo:rustc-cfg=ffx_fsr3_vk");
     }
 
     println!("cargo:rustc-cfg=ffx_fsr3_src");
+
+    // The Metal half. Gated on the TARGET, not the host — `cfg(not(windows))`
+    // above is a HOST test (the M0 link-flag fix records that trap), and a
+    // Linux host cross-compiling to macOS must still get the metallibs.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let n = generate_fsr3_metallibs(&shaders);
+        if n > 0 {
+            println!("cargo:rustc-cfg=ffx_fsr3_metal");
+        }
+    }
+}
+
+/// FSR3-on-Metal shaders: transpile the committed FidelityFX SPIR-V permutations
+/// to `.metallib` for the hand-written `ffx_metal` backend. FidelityFX ships only
+/// `ffx_vk`/`ffx_dx12`, so Metal reuses the very blobs the Vulkan shaderblob
+/// accessor returns — SPIR-V is the interchange format, and no Metal shader
+/// artifact is committed.
+///
+/// ONLY THE NON-WAVE64 PERMUTATIONS. Apple GPUs are SIMD-32, so `ffx_metal`
+/// reports `waveLaneCountMax = 32` and FFX never requests the wave64 blobs (which
+/// would also mis-execute at width 32). Both fp32 and fp16 (`_16bit`) are kept
+/// because a pass picks between them at runtime.
+///
+/// Expect 80 of the 200 committed files, and the two skipped sets OVERLAP — a
+/// plain subtraction gets this wrong: 40 are permutation INDEX headers (consumed
+/// by C++, not shader blobs) of which 20 are themselves wave64, leaving 160
+/// shader blobs of which 80 are wave64. 200 - 40 - 80 = 80.
+///
+/// Each metallib is content-addressed by FNV-1a-64 of its SPIR-V bytes; at
+/// pipeline-create time the backend hashes `FfxShaderBlob.data` — the same bytes,
+/// from the same accessor — and loads the match. Emitted into `$OUT_DIR`:
+///   - `ffx_fsr3/<hash>.metallib` — `[12-byte LE threadgroup header][metallib]`
+///   - `ffx_fsr3_metallibs.rs`    — the `&[(u64, &[u8])]` table the Rust side `include!`s
+///
+/// THE DENOMINATOR IS EMITTED, not just warned about. A partial transpile —
+/// 79 of 80 — is otherwise invisible until a specific FSR3 pass asks for the one
+/// missing hash at pipeline-create time, which is a rare, scene-dependent runtime
+/// failure. `FFX_FSR3_PERMUTATIONS_FOUND` lets `--check-fsr3` compare enumerated
+/// against emitted and fail at gate time instead.
+///
+/// BEST-EFFORT, like the two degrades above: a failed permutation is counted and
+/// skipped, and an absent `spirv-cross` or Xcode leaves the table empty, which
+/// the Rust side reads as "FSR3-Metal unavailable" rather than a link error. The
+/// failures are reported as ONE aggregated line naming the first — 80
+/// `cargo:warning`s would bury the two degrade warnings above, which this
+/// function's own header protects. Returns the number emitted.
+#[cfg(not(windows))]
+fn generate_fsr3_metallibs(prebuilt: &std::path::Path) -> usize {
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let lib_dir = out_dir.join("ffx_fsr3");
+
+    // CONTENT-ADDRESSED CACHE, KEYED ON THE TOOLS AND THE RECIPE AS WELL AS THE
+    // INPUT. The file name is FNV-1a of the SPIR-V, so an existing
+    // `<hash>.metallib` is current with respect to its INPUT by construction —
+    // but not with respect to anything else that shapes the output, and there
+    // are two such things. spirv-cross, whose MSL emission is exactly what a
+    // Homebrew bump changes while every key stays identical; and OUR OWN
+    // recipe, which lives in this file. So both ride the stamp and a change
+    // wipes the directory rather than serving pre-change metallibs forever.
+    // `SPIRV_CROSS_ARGS` is on it verbatim, so editing the flag list
+    // invalidates BY CONSTRUCTION; `RECIPE` is the hand-bumped half, named at
+    // its declaration beside the two rules it covers. Without the cache every
+    // build re-runs 240 subprocesses (measured ~55 s).
+    let stamp_want = format!(
+        "v2 {} {RECIPE}\n{}\n{}\n",
+        SPIRV_CROSS_ARGS.join(" "),
+        tool_version(&mut std::process::Command::new(
+            std::env::var("SPIRV_CROSS").unwrap_or_else(|_| "spirv-cross".into())
+        )),
+        tool_version(&mut xcrun_tool("metal"))
+    );
+    let stamp_path = lib_dir.join(".toolstamp");
+    if std::fs::read_to_string(&stamp_path).ok().as_deref() != Some(stamp_want.as_str()) {
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+    if let Err(e) = std::fs::create_dir_all(&lib_dir) {
+        println!("cargo:warning=FSR3-Metal: cannot create {}: {e}", lib_dir.display());
+        return 0;
+    }
+    let entries = match std::fs::read_dir(prebuilt) {
+        Ok(rd) => rd,
+        Err(e) => {
+            println!("cargo:warning=FSR3-Metal: read_dir {}: {e}", prebuilt.display());
+            return 0;
+        }
+    };
+
+    let mut emitted: Vec<u64> = Vec::new();
+    let (mut found, mut cached) = (0usize, 0usize);
+    let mut failures: Vec<String> = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        if !name.ends_with(".h") || name.ends_with("_permutations.h") || name.contains("wave64") {
+            continue;
+        }
+        // Counted BEFORE the extraction, so the denominator is what was
+        // ENUMERATED rather than what parsed. Counting after made a header that
+        // lost its array shrink `found` alongside `emitted`, printing the
+        // self-contradictory `79/79 ... (1 failed)` — and, worse, hiding the
+        // loss from the gate's `libs.len() != found` bound, leaving only the
+        // `EXPECTED_PERMUTATIONS` one to catch it.
+        found += 1;
+        let spirv = match extract_spirv_from_header(&path) {
+            Some(b) if !b.is_empty() => b,
+            _ => {
+                failures.push(format!("{name}: no SPIR-V _data[] array"));
+                continue;
+            }
+        };
+        let hash = fnv1a64(&spirv);
+        let stem = lib_dir.join(format!("{hash:016x}"));
+        let lib = stem.with_extension("metallib");
+        // THE CACHE HIT VALIDATES THE SHAPE, not just the size. A bare
+        // `len() > 12` accepts a file left behind by a `metallib` that failed
+        // or was interrupted — truncated, or (the likelier window) complete but
+        // written before the 12-byte prefix landed, since that prefix is a
+        // second write. Such a file is >12 bytes forever, so it would be served
+        // as cached on every subsequent build and its container magic would be
+        // read as a threadgroup size. `table_self_test` does catch it, but at
+        // gate time and with no hint that the remedy is to delete OUT_DIR.
+        // Four bytes read here instead. (`transpile_ffx_metallib` additionally
+        // writes the combined file atomically now, so the window is closed at
+        // both ends.)
+        if std::fs::read(&lib)
+            .map(|b| b.len() > 16 && &b[12..16] == b"MTLB")
+            .unwrap_or(false)
+        {
+            emitted.push(hash);
+            cached += 1;
+            continue;
+        }
+        let spv = format!("{}.spv", stem.display());
+        if let Err(e) = std::fs::write(&spv, &spirv) {
+            failures.push(format!("{name}: write {spv}: {e}"));
+            continue;
+        }
+        match transpile_ffx_metallib(&spv, &stem.display().to_string(), &spirv) {
+            Ok(()) => emitted.push(hash),
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    let _ = std::fs::write(&stamp_path, &stamp_want);
+
+    // Sorted, because read_dir is unordered and the table is compiled into the
+    // binary — an unstable order would make two builds of one tree differ. The
+    // Rust side additionally gates strict-ascending, which is what makes the
+    // C side's linear scan for an equal hash unambiguous.
+    emitted.sort_unstable();
+    let mut rs = String::with_capacity(256 + emitted.len() * 96);
+    rs.push_str("// @generated by build.rs::generate_fsr3_metallibs — do not edit.\n");
+    rs.push_str("// FidelityFX FSR3 SPIR-V permutations transpiled to Metal, keyed by\n");
+    rs.push_str("// FNV-1a-64 of the SPIR-V bytes. shim/ffx_metal.mm hashes\n");
+    rs.push_str("// FfxShaderBlob.data with the byte-identical hash to find its metallib.\n");
+    rs.push_str("pub static FFX_FSR3_METALLIBS: &[(u64, &[u8])] = &[\n");
+    for hash in &emitted {
+        // include_bytes! resolves relative to this generated file, i.e. OUT_DIR.
+        rs.push_str(&format!(
+            "    (0x{hash:016x}u64, include_bytes!(\"ffx_fsr3/{hash:016x}.metallib\")),\n"
+        ));
+    }
+    rs.push_str("];\n\n");
+    rs.push_str("/// Non-wave64, non-index permutation headers ENUMERATED — the denominator.\n");
+    rs.push_str("/// A gap between this and the table's length is a partial transpile.\n");
+    rs.push_str(&format!("pub const FFX_FSR3_PERMUTATIONS_FOUND: usize = {found};\n"));
+    let rs_path = out_dir.join("ffx_fsr3_metallibs.rs");
+    if let Err(e) = std::fs::write(&rs_path, rs) {
+        println!("cargo:warning=FSR3-Metal: write {}: {e}", rs_path.display());
+        return 0;
+    }
+
+    // The tool version rides the success line deliberately: a spirv-cross bump
+    // that changes MSL emission is the most likely future breakage here, and
+    // this is the only forensic trail a past build leaves.
+    println!(
+        "cargo:warning=FSR3-Metal: {}/{found} non-wave64 permutations -> metallib \
+         ({cached} cached, {} failed) [{}]",
+        emitted.len(),
+        failures.len(),
+        stamp_want.lines().nth(1).unwrap_or("?")
+    );
+    if let Some(first) = failures.first() {
+        println!(
+            "cargo:warning=FSR3-Metal: {} permutation(s) failed, first: {first}",
+            failures.len()
+        );
+    }
+    emitted.len()
+}
+
+/// One line of a tool's `--version`, for the cache stamp. Absent tool =>
+/// "missing", which still makes a usable stamp (and the transpile then fails
+/// loudly per permutation rather than here).
+#[cfg(not(windows))]
+fn tool_version(cmd: &mut std::process::Command) -> String {
+    match cmd.arg("--version").output() {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(if o.stdout.is_empty() { &o.stderr } else { &o.stdout });
+            s.lines().next().unwrap_or("?").trim().to_string()
+        }
+        Err(_) => "missing".to_string(),
+    }
+}
+
+/// Pull the SPIR-V module out of a FidelityFX_SC-generated header — the
+/// `static const unsigned char g_..._data[] = { 0x.., ... };` array. One array
+/// per header (verified across all 200).
+#[cfg(not(windows))]
+fn extract_spirv_from_header(path: &std::path::Path) -> Option<Vec<u8>> {
+    let txt = std::fs::read_to_string(path).ok()?;
+    let key = txt.find("_data[]")?;
+    let open = key + txt[key..].find('{')?;
+    let close = open + txt[open..].find('}')?;
+    let mut out = Vec::with_capacity((close - open) / 5);
+    for tok in txt[open + 1..close].split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let hex = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))?;
+        out.push(u8::from_str_radix(hex, 16).ok()?);
+    }
+    Some(out)
+}
+
+/// 64-bit FNV-1a. `shim/ffx_metal.mm` implements the byte-identical hash — it is
+/// the ONLY thing the two sides agree on to find a permutation's metallib, so
+/// neither may be "cleaned up" without the other.
+#[cfg(not(windows))]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Recover a compute kernel's workgroup size from `OpExecutionMode <entry>
+/// LocalSize x y z`. Metal needs it HOST-side at dispatch (Vulkan and DXIL both
+/// reflect it out of the bytecode), so it is prepended to the metallib rather
+/// than looked up later.
+///
+/// `None` ON A PARSE MISS, DELIBERATELY, rather than a `[1,1,1]` fallback: that
+/// value is indistinguishable from a real 1x1x1 kernel — nonzero, product under
+/// Metal's 1024 ceiling, so the Rust-side header gate accepts it — and the
+/// dispatch would then run one thread per threadgroup, which is correct-looking
+/// output at ~1/64 the rate with no error anywhere. Every FFX compute kernel
+/// has a real group size (MEASURED over this corpus: 74x (8,8,1), 4x (256,1,1),
+/// 2x (64,1,1), and no [1,1,1] at all), so a miss is always a defect and is
+/// worth failing the permutation for. The realistic trigger is a blob using
+/// `OpExecutionModeId LocalSizeId`, which this does not decode.
+#[cfg(not(windows))]
+fn spirv_local_size(spv: &[u8]) -> Option<[u32; 3]> {
+    const MAGIC: u32 = 0x0723_0203;
+    const OP_EXECUTION_MODE: u16 = 16;
+    const EXEC_MODE_LOCAL_SIZE: u32 = 17;
+    if spv.len() < 20 || spv.len() % 4 != 0 {
+        return None;
+    }
+    let le = u32::from_le_bytes([spv[0], spv[1], spv[2], spv[3]]) == MAGIC;
+    let word = |i: usize| -> u32 {
+        let b = [spv[i * 4], spv[i * 4 + 1], spv[i * 4 + 2], spv[i * 4 + 3]];
+        if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) }
+    };
+    let n = spv.len() / 4;
+    let mut i = 5; // past the 5-word header
+    while i < n {
+        let op = word(i);
+        let count = (op >> 16) as usize;
+        if count == 0 || i + count > n {
+            break;
+        }
+        if (op & 0xffff) as u16 == OP_EXECUTION_MODE
+            && count >= 6
+            && word(i + 2) == EXEC_MODE_LOCAL_SIZE
+        {
+            return Some([word(i + 3), word(i + 4), word(i + 5)]);
+        }
+        i += count;
+    }
+    None
+}
+
+/// The spirv-cross invocation, in ONE place because it rides the cache stamp
+/// verbatim — editing it invalidates every cached metallib by construction,
+/// which is not true of anything expressed only at the call site.
+///
+/// `--msl-decoration-binding` is LOAD-BEARING: it makes the Metal argument index
+/// equal FFX's own VK binding number, which is what lets `ffx_metal` bind
+/// discretely (`setTexture:atIndex:` straight from the shaderblob reflection
+/// tables) instead of building descriptor sets. No push-constant relocation —
+/// FFX uses a real constant buffer, never `[[buffer(0)]]`.
+#[cfg(not(windows))]
+const SPIRV_CROSS_ARGS: &[&str] = &["--msl", "--msl-version", "30000", "--msl-decoration-binding"];
+
+/// The half of the recipe that is not a flag list, and therefore has to be
+/// bumped BY HAND when either of the two rules it names changes:
+///   - the 12-byte little-endian threadgroup prefix on each metallib, whose
+///     format `shim/ffx_metal.mm` strips back off;
+///   - the `binding - 1000` sampler remap in `remap_ffx_samplers`.
+/// Both change the emitted bytes while leaving every cache key identical, so
+/// without this the cache would serve pre-change output indefinitely.
+#[cfg(not(windows))]
+const RECIPE: &str = "hdr=le-u32x3 sampler=-1000";
+
+/// SPIR-V -> MSL -> AIR -> metallib for one FFX permutation.
+#[cfg(not(windows))]
+fn transpile_ffx_metallib(spv: &str, stem: &str, spv_bytes: &[u8]) -> Result<(), String> {
+    let spirv_cross =
+        std::env::var("SPIRV_CROSS").unwrap_or_else(|_| "spirv-cross".to_string());
+    let msl = format!("{stem}.metal");
+    let air = format!("{stem}.air");
+    let lib = format!("{stem}.metallib");
+
+    // Parsed FIRST, so a blob we cannot dispatch fails before three subprocesses
+    // are spent compiling it.
+    let [lx, ly, lz] = spirv_local_size(spv_bytes)
+        .ok_or("no OpExecutionMode LocalSize (a threadgroup size we cannot dispatch)")?;
+
+    let st = std::process::Command::new(&spirv_cross)
+        .args(SPIRV_CROSS_ARGS)
+        .arg("--output")
+        .arg(&msl)
+        .arg(spv)
+        .status()
+        .map_err(|e| format!("launch spirv-cross (`{spirv_cross}`): {e}"))?;
+    if !st.success() {
+        return Err(format!("spirv-cross failed ({st})"));
+    }
+
+    remap_ffx_samplers(std::path::Path::new(&msl))?;
+
+    for (tool, args) in [("metal", vec!["-c", &msl, "-o", &air]), ("metallib", vec![&air, "-o", &lib])]
+    {
+        let mut c = xcrun_tool(tool);
+        let st = c
+            .args(&args)
+            .status()
+            .map_err(|e| format!("launch {tool}: {e}"))?;
+        if !st.success() {
+            return Err(format!("{tool} failed ({st})"));
+        }
+    }
+
+    // Prepend the workgroup size. `ffx_metal` strips these 12 bytes back off.
+    //
+    // WRITTEN VIA A TEMP AND RENAMED, because `<hash>.metallib` existing IS the
+    // cache key: an in-place rewrite leaves a window in which the file is a
+    // complete but header-LESS metallib, and a build interrupted there would
+    // hand every later build a poisoned entry. `rename` within one directory is
+    // atomic on every filesystem this runs on, so the name only ever appears
+    // carrying both halves.
+    let lib_bytes = std::fs::read(&lib).map_err(|e| format!("read {lib}: {e}"))?;
+    let mut combined = Vec::with_capacity(12 + lib_bytes.len());
+    for v in [lx, ly, lz] {
+        combined.extend_from_slice(&v.to_le_bytes());
+    }
+    combined.extend_from_slice(&lib_bytes);
+    let tmp = format!("{lib}.tmp");
+    std::fs::write(&tmp, &combined).map_err(|e| format!("write {tmp}: {e}"))?;
+    std::fs::rename(&tmp, &lib).map_err(|e| format!("rename {tmp} -> {lib}: {e}"))
+}
+
+/// `$METAL` / `$METALLIB` (whitespace-split, overrides the whole command) else
+/// `xcrun -sdk macosx <tool>` — the active-Xcode default.
+#[cfg(not(windows))]
+fn xcrun_tool(tool: &str) -> std::process::Command {
+    if let Ok(p) = std::env::var(tool.to_uppercase()) {
+        let mut parts = p.split_whitespace();
+        if let Some(prog) = parts.next() {
+            let mut c = std::process::Command::new(prog);
+            c.args(parts);
+            return c;
+        }
+    }
+    let mut c = std::process::Command::new("xcrun");
+    c.args(["-sdk", "macosx", tool]);
+    c
+}
+
+/// Rewrite FFX's static-sampler indices into Metal's valid 0..15 range.
+///
+/// FFX binds its immutable samplers at VK binding 1000+ (`s_LinearClamp` = 1001,
+/// and MEASURED across this corpus that is the only one used at all); spirv-cross
+/// faithfully emits `[[sampler(1001)]]`, which `metal` rejects with "must be
+/// between 0 and 15". Without this, 112 of 160 permutations fail to compile and
+/// every one of them fails on exactly that line.
+///
+/// `ffx_metal` applies the identical `binding - 1000` rule when it binds the
+/// sampler — THE TWO SIDES MUST AGREE, so neither may be changed alone. Only
+/// `[[sampler(N)]]` with `N >= 1000` is touched; texture and buffer indices are
+/// left exactly as `--msl-decoration-binding` emitted them.
+#[cfg(not(windows))]
+fn remap_ffx_samplers(msl: &std::path::Path) -> Result<(), String> {
+    let src = std::fs::read_to_string(msl).map_err(|e| format!("read {}: {e}", msl.display()))?;
+    const NEEDLE: &str = "[[sampler(";
+    let mut out = String::with_capacity(src.len());
+    let (mut last, mut from) = (0usize, 0usize);
+    while let Some(rel) = src[from..].find(NEEDLE) {
+        let num_start = from + rel + NEEDLE.len();
+        let Some(p) = src[num_start..].find(')') else { break };
+        let num_end = num_start + p;
+        if let Ok(n) = src[num_start..num_end].trim().parse::<u32>() {
+            if n >= 1000 {
+                out.push_str(&src[last..num_start]);
+                out.push_str(&(n - 1000).to_string());
+                last = num_end;
+            }
+        }
+        from = num_end;
+    }
+    out.push_str(&src[last..]);
+    std::fs::write(msl, out).map_err(|e| format!("write {}: {e}", msl.display()))
 }
 
 fn main() {
@@ -230,6 +657,16 @@ fn main() {
     // builds this (it upscales through ffx-api v2.3.0), and an undeclared cfg
     // is a warning wherever the attribute is written.
     println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_src)");
+    // The Metal arm of the same feature: set when at least one SPIR-V
+    // permutation reached `.metallib`. (The ObjC++ `ffx_metal` backend joins
+    // this condition when it exists; today the cfg gates only the transpiled
+    // shader table.) Declared everywhere for the same reason as the line above.
+    println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_metal)");
+    // The Vulkan arm of the same feature: set when `ffx_vk.cpp` and
+    // shim/ffx_fsr3_vk.cpp actually compiled, which needs the distro's
+    // vulkan-headers and is Linux-only. Distinct from `ffx_fsr3_src` because
+    // the neutral units build on macOS too — see the note at the cfg's site.
+    println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_vk)");
     #[cfg(windows)]
     {
         // FidelityFX FFI shim: the ffx-api structs (pNext chains,

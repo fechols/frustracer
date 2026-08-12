@@ -362,12 +362,112 @@ cargo run --release -- --emissive-lights  # ARM emissive surfaces lighting the s
                                       # Each cluster is a Lambertian DISC
                                       # light: irradiance C/π/(d²+rc²) — the +rc² denominator IS
                                       # the near-field softening (no hot spot beside a large
-                                      # panel) — windowed by the fireflies' (1−d²/r²)² exact-zero
+                                      # panel) — × an EMISSION LOBE (2026-08-11, see below) and
+                                      # windowed by the fireflies' (1−d²/r²)² exact-zero
                                       # falloff at an influence radius derived from EL_MIN_E
                                       # (the ONE cost-vs-reach knob: the per-pixel scan pays a
                                       # shadow ray per in-range light), floored at 2·rc, capped
                                       # at EL_RMAX_K·diag_c, lum clamped under EL_E_MAX (f16
-                                      # headroom, the sun-disc lesson). Sampled in shade()'s
+                                      # headroom, the sun-disc lesson).
+                                      # THE EMISSION LOBE (2026-08-11): until then every cluster
+                                      # was ISOTROPIC — `irradiance(l, d2)` took no direction, so
+                                      # the C/(d²+rc²) the module documents as the ON-AXIS value
+                                      # of a Lambertian disc was delivered in EVERY direction, and
+                                      # a one-sided panel lit points behind it exactly as brightly
+                                      # as points in front (shadow rays hide much of it; what
+                                      # survives is over-lighting to the side and edge-on). The
+                                      # triangle normal was ANNIHILATED on the first line that
+                                      # touched it — `0.5*(b-a).cross(c-a).length()` — so nothing
+                                      # downstream could have known. Now `Cluster` accumulates
+                                      # nacc = Σ w·n beside the existing Σ w·centroid at the SAME
+                                      # weight (linear, so the agglomerative merge stays
+                                      # associative/index-ordered/byte-deterministic), and the
+                                      # mean resultant length R = |Σw·n|/Σw falls out free.
+                                      # MEASURED FIRST, and the measurement is what justified
+                                      # building it: helmet min 0.820 mean 0.986 max 1.000 (32 of
+                                      # 32 panel-like), bistro Exterior min 0.139 mean 0.620 max
+                                      # 1.000 (18 of 32, with 4 genuine bulbs under R=0.2) — real
+                                      # emissive content is strongly ORIENTED, and bistro is
+                                      # ideally MIXED so it exercises both ends.
+                                      # THE AXIS IS ORIENTED AGAINST THE AUTHORED VERTEX NORMALS,
+                                      # never by winding alone (derive_parts took a `normals`
+                                      # param for exactly this): the cross product's only
+                                      # orientation is index order, and this renderer does not
+                                      # otherwise trust it — surface_point keeps an unconditional
+                                      # face flip precisely for "a mesh whose winding disagrees
+                                      # with its authored vertex normals", a modeling error the
+                                      # loader PRESERVES. Harmless while the normal was discarded
+                                      # a line later; not harmless once the lobe points where it
+                                      # points, because every other emissive path is TWO-SIDED
+                                      # (the display add has no facing test, moller_trumbore is
+                                      # two-sided, the fb.gi gather takes emitters from either
+                                      # side) — so a reversed panel would keep glowing on screen
+                                      # AND keep lighting the room under GI while its NEE pool
+                                      # silently vanished, i.e. light removed where it belongs,
+                                      # which is strictly worse than the isotropic over-lighting
+                                      # this replaces. High R cannot detect it (R says the winding
+                                      # is CONSISTENT across a cluster, never that it points
+                                      # outward). The rule is surface_point's own: sum the three
+                                      # authored normals (one direction per face, robust to a
+                                      # single bad vertex) and flip when they disagree; no normal
+                                      # array, or a cancelling/NaN authored set, keeps winding
+                                      # BITWISE. Gated by self_test 9(f) with teeth BOTH ways —
+                                      # the quad whose winding normal is −Y, authored +Y, must
+                                      # read +Y with the array and −Y without it (the second arm
+                                      # is what stops the probe passing vacuously on geometry that
+                                      # never disagreed; the pre-fix first arm reads −1.0).
+                                      # RESIDUAL known-accept: a genuinely two-sided emissive
+                                      # plane (one-sided winding, no back face) now lights only
+                                      # its front — correct for a Lambertian emitter, and the
+                                      # display add showing it lit from behind is the pre-existing
+                                      # inconsistency, not this.
+                                      # The profile is `f = 1 − R + saturate(dot(v, w))` for v =
+                                      # R·n_c (stored UNNORMALIZED so |v| IS R) and w the unit
+                                      # direction FROM the light TO the receiver. R = 0 BRANCHES
+                                      # to exactly 1.0 (never a computed ×1.0), so a bulb — and
+                                      # every emissive-free scene — runs the pre-lobe stream
+                                      # bitwise; R = 1 is saturate(cos), exactly 0 at 90° and
+                                      # behind. ATTENUATION-ONLY, and that bound is the whole
+                                      # design rather than a taste call: saturate(dot(v,w)) ≤
+                                      # |v| = R gives f ≤ 1, so r_infl2 (a closed-form solve of
+                                      # the ISOTROPIC falloff against EL_MIN_E), the exact-zero
+                                      # window, and cull_tile's EXACTNESS argument — which is what
+                                      # lets CPU and GPU cull independently with no bit-parity
+                                      # contract — all stand completely unchanged, and the feature
+                                      # costs strictly LESS work than before. The energy-conserving
+                                      # variant `1 + R·(4·saturate(cos) − 1)` (sphere-mean exactly
+                                      # 1) is the physically complete form and peaks at 4×, so it
+                                      # needs r_infl re-derived from the profile MAXIMUM and the
+                                      # cull proof re-validated — deliberately not the first ship.
+                                      # KNOWN TRADE: this attenuates rather than redistributes, so
+                                      # directional clusters read dimmer overall and EL_BOOST (an
+                                      # artistic constant, already moved once for exactly this)
+                                      # is the retune knob — OWED: the feel-test, since the look
+                                      # is not gate-visible. Transport: el_c[64] appended LAST
+                                      # after `split` (xyz = v, w = R — R carried explicitly so
+                                      # neither shader needs a normalize or a sqrt), CB_STRIDE
+                                      # 4608 → 5632 and the FrameCb size assert 32 →
+                                      # 48·MAX_EMISSIVE_LIGHTS (the MAX_SPP-lockstep class; this
+                                      # does NOT touch the 64/64-full root signature, which
+                                      # governs raising the light CAP, not adding a row).
+                                      # Gates: emissive::self_test gate 9 — R=0 bit-exact 1.0 over
+                                      # a direction sweep, f ∈ [0,1] swept over R × direction (the
+                                      # bound the cull rests on), R=1 equals saturate(cos) with
+                                      # exact zeros behind, monotone in angle with the 1−R floor,
+                                      # and DERIVATION teeth BOTH ways: a flat quad must read
+                                      # R ≥ 0.99 and a CLOSED BOX must disarm to R ≈ 0 and land on
+                                      # the exact-1.0 arm (the bulb case — measured 0.000), plus
+                                      # 9(f), the winding arm above. NOTE the isotropic exact-1.0
+                                      # branch is near-VACUOUS on real content — bistro's dimmest
+                                      # cluster reads R = 0.139, not 0, so real bulbs take the
+                                      # computed arm at a mild ≤14% back-side attenuation; the
+                                      # branch is a structural guarantee for emissive-free and
+                                      # exactly-cancelling scenes, not the common path.
+                                      # Liveness proven by image A/B, not assumed (the N9 "the
+                                      # flag reached the pack but changed nothing" lesson):
+                                      # forcing lobe → 1.0 moves the armed helmet check frame
+                                      # (884AF885 → D42676D2) AND fails gate 9.
+                                      # Sampled in shade()'s
                                       # direct tier as the third entry after sun + fireflies —
                                       # AFTER cloud sun-transmittance (a lamp under the slab is
                                       # local), BEFORE the prim export (the light rides FSR-RR's
@@ -5756,10 +5856,15 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 47/78. Measured 7679015 B procedural
-                                      # vs 7680159 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 47/78. Measured 7747408 B procedural
+                                      # vs 7748552 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
-                                      # keying reaches. (A first draft printed 2-decimal MB and read
+                                      # keying reaches. (Refreshed 2026-08-11, TWICE in one day, and
+                                      # the second time is the evidence for the caveat: the ABSOLUTE
+                                      # figures drift with ANY shader edit — origin's auto-exposure
+                                      # light-gain change alone moved them +62315 B — so treat them as
+                                      # a snapshot; the +1144 B DELTA between the two scenes is the
+                                      # load-bearing part and did not move by a byte across it.) (A first draft printed 2-decimal MB and read
                                       # identical across all three: an instrument at the wrong
                                       # RESOLUTION cannot see the effect it was built for — the v1.5.3
                                       # lab lesson, in a different currency.) FR_SPIRV_LIST=1 names
@@ -7061,6 +7166,279 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # procedural + san-miguel-low-poly + rungholt, both
                                       # FR_VK_RES parities, --sw-rays, llvmpipe, --check-spirv and
                                       # tools/win-cross-check.sh
+                                      # V13 — THE GPU-FED FEED (B3, 2026-08-11): the tracer's own
+                                      # pack and 1-spp radiance reaching FSR3 through
+                                      # `cs_feed_xess` instead of through three host uploads. B1
+                                      # put FSR3 on this backend CPU-fed, so the Vulkan TRACER fed
+                                      # nothing; B2 gave it the pack those planes come from; this
+                                      # closes the loop, and it is the shape every --gpu/--dxr
+                                      # session on D3D12 has used since the pack split.
+                                      # FOUR THINGS THE CODE ALREADY GAVE, which is why one
+                                      # milestone is one pipeline and two methods: `TraceSources.
+                                      # feed` was already assembled portably (the M1 payoff);
+                                      # `layout.rs` already maps StorageImage -> STORAGE_IMAGE and
+                                      # sizes the pool by `desc_type`, so THREE NEW IMAGES ENTER
+                                      # THE LAYOUT WITH NO EDIT (M3a paying out a third time); the
+                                      # storage-image descriptor write already EXISTED at u14 for
+                                      # `cs_resolve`, so this extends a mechanism rather than
+                                      # inventing one (the plan had called it the last unwritten
+                                      # resource class, and exploration corrected that before any
+                                      # code); and `vk::fsr3::Img` already created its planes with
+                                      # STORAGE usage in exactly the formats the kernel writes.
+                                      # ONE ENTRY POINT of the several `feed.hlsl` declares, which
+                                      # is what keeps the footprint to three bindings: DXC drops
+                                      # every `feed_*` the kernel does not reference, so the unit
+                                      # contributes u16 (RGBA16F colour), u18 (R32F reversed-Z clip
+                                      # depth) and u19 (RG16F mvec) and NOTHING else — its other
+                                      # inputs (`accum` u0, `gbuf` u15 from trace_common) are the
+                                      # SAME declarations the tracer already binds, so they join no
+                                      # new slot. u16/u18/u19 are unclaimed by the tracer family
+                                      # (ladder u5..u9, hemi u10..u13, pack u15/u32) and the map's
+                                      # conflict detector is what would say so at build time.
+                                      # OPTIONAL BY CONSTRUCTION (`TracerOpts::feed`), and that is
+                                      # not thrift: the map is DERIVED, so compiling the unit
+                                      # unconditionally would move V5's slot count 46 -> 49 and
+                                      # every tracer's pool sizing — i.e. it would move recorded
+                                      # numbers for stages that never dispatch a feed. `TracerOpts`
+                                      # also retires the positional pile `VkTracer::new`'s own
+                                      # comment warned about at nine arguments; `feed` IMPLIES
+                                      # `gbuf_full` and the constructor FORCES it rather than
+                                      # asserting, since a feed over a stride-sized pack would read
+                                      # one texel's allocation per pixel.
+                                      # THE COMPARISON IS BETWEEN TWO ROUTES, NOT TWO RENDERERS,
+                                      # and that is what makes it assertable where V11's quality
+                                      # claim is not. V11 can only REPORT whether FSR3 beats a
+                                      # bilinear control, because that answer is scene-dependent
+                                      # (it wins on procedural and loses on san-miguel with
+                                      # identical wiring). Here BOTH arms consume the SAME frame
+                                      # from the SAME Vulkan tracer — one through `record_feed`,
+                                      # one through `Fsr3::frame`'s host upload of the identical
+                                      # readback — so any difference is wiring and a tight bar is
+                                      # honest. Scoring a CPU-RENDERED arm against a GPU-rendered
+                                      # one would not be this test at all: different intersector,
+                                      # different RNG stream, and the feed route would be invisible
+                                      # inside that difference. TWO FFX CONTEXTS, not one run
+                                      # twice, because FSR3 is TEMPORAL and one context would carry
+                                      # the first route's history into the second.
+                                      # `Fsr3::frame_fed` is `frame`'s sibling: it swaps the three
+                                      # buffer->image copies for transition-to-GENERAL, the caller's
+                                      # recorded kernel, and transition back — so both arms hand FFX
+                                      # images in the same layout BY CONSTRUCTION and only the
+                                      # writer differs — and both end in ONE shared `record_ffx`,
+                                      # which is what stops the dispatch desc drifting between the
+                                      # two arms of a comparison that would then be measuring
+                                      # itself.
+                                      # `gate_xess_feed` IS THE GATE, cfg-lifted exactly as B2
+                                      # lifted `unpack_gbuf_bytes` and for the same reason (plain
+                                      # slices, a `dlss::GBufs`, scalars; no D3D12 type in the
+                                      # body) — zero new tolerances, the --check-gpu M8 bar
+                                      # verbatim, with B2's now-portable unpacker supplying the
+                                      # `gb2` oracle out of the pack readback. `mono16` came with
+                                      # it, being its ulp metric.
+                                      # ANTI-VACUITY IS A SENTINEL, NOT A ZERO CHECK: the three
+                                      # images are written once and read once per frame, so a feed
+                                      # that never dispatched leaves the PREVIOUS frame's contents,
+                                      # which after frame 0 look entirely plausible (the M3d lesson
+                                      # — an operation that never happened compares clean; V3's
+                                      # 0xEEEEEEEE and V9's re-flooded sentinel exist for this).
+                                      # 0xEE is read back off the DEPTH plane because R32F makes a
+                                      # surviving word unambiguous where an f16 pair could be a
+                                      # real value.
+                                      # MEASURED (RADV, 400x300 -> 800x600, 8 frames): depth-ulp>4
+                                      # 0 (max 2) | sky-not-0.0 0 (sky px 34498) | mvec-ulp>1 0 |
+                                      # color-ulp>1 0, and gpu-fed vs cpu-fed mean |d| / mean
+                                      # |gpu-fed| **0.00081** against a 2% bar — 0.00074 on
+                                      # san-miguel-low-poly, 0.00072 on rungholt, 0.00081 under
+                                      # --sw-rays and at the other FR_VK_RES parity. Every
+                                      # pre-existing number unmoved (V5 46 slots / 45 pipelines, V6
+                                      # 0.045%, V7 0.00e0 / hot 0, V8 AO 0.0067 / GI 3.02%, V9 all
+                                      # zero, V11 0.01400, V12 mv median 1.528e-2). `FR_VK_MAP=1`
+                                      # prints `wire_feed <- 15 write(s) over 5 set-0 variant(s)` =
+                                      # 3 registers x 5 variants, which is the cheapest proof the
+                                      # three bindings really are in the derived map (the V13
+                                      # tracer does not print its own slot count; V5 reports V6's,
+                                      # and that staying at 46 is the point).
+                                      # THREE TEETH, all fired, and they SEPARATE — the B2
+                                      # absent-vs-wrong distinction again: skipping `wire_feed`
+                                      # trips BOTH arms (120000/120000 sentinel texels survive AND
+                                      # every plane gate fails); SWAPPING the depth and mvec views
+                                      # trips the plane gate alone (depth-ulp 85502, mvec-ulp
+                                      # 180962, colour untouched at 0) with the sentinel SILENT,
+                                      # which is the class a derived layout provably cannot catch
+                                      # since both are STORAGE_IMAGE to Vulkan and only the VALUES
+                                      # differ; and dropping `record_feed`'s `div_ceil` leaves
+                                      # exactly 1600 texels = 400 x the 4 rows 300/8 discards,
+                                      # caught by both. A FOURTH defect was found by the compiler
+                                      # rather than planted: the dead-code warning on `wire_feed`
+                                      # is what said the descriptors were never pointed at the
+                                      # images, before a single gate ran.
+                                      # `Fsr3::read_input`'s first draft named
+                                      # SHADER_READ_ONLY_OPTIMAL as a `vkCmdCopyImageToBuffer`
+                                      # source, which the spec forbids — the validation layer named
+                                      # the VUID exactly rather than the copy returning stale
+                                      # bytes, the good failure mode and the --gpu-debug argument
+                                      # for the third time in this port.
+                                      # COST: a third tracer takes --check-vk 26.7 -> 32.4 s, all
+                                      # of it DXC. That buys "V6-V12 unmoved" structurally rather
+                                      # than by care, and the odd-dimension coverage V12 needs.
+                                      # STILL NOT ASSERTED, and B1's owed half only half retired:
+                                      # this proves the two FEED ROUTES agree, not that the upscale
+                                      # is GOOD. That still wants a detail-preserving metric (the
+                                      # --check-oidn Laplacian shape) and a settled
+                                      # AUTO_EXPOSURE/preExposure.
+                                      # Touch `TracerOpts` / the feed unit list / `wire_feed` /
+                                      # `record_feed` / `Fsr3::frame_fed`/`record_ffx`/`feed_views`
+                                      # -> run --check (goldens byte-identical — B3 touches no
+                                      # shading path), cargo test, --check-vk on procedural +
+                                      # san-miguel-low-poly + rungholt, both FR_VK_RES parities,
+                                      # --sw-rays, llvmpipe (V11/V13 SKIP), --check-spirv,
+                                      # --check-fsr and tools/win-cross-check.sh
+                                      # V14 — THE NRD BRIDGE (B4a, 2026-08-11): `cs_nrd_pack` and
+                                      # `cs_nrd_out`, the front and back halves of the ONE denoiser
+                                      # seam this renderer has, running on Vulkan with a passthrough
+                                      # between them. The first denoiser-adjacent code on this
+                                      # backend, and the first consumer of the sig lanes B2
+                                      # allocated and deliberately left unarmed.
+                                      # THE BRIDGE IS NRD's OWN, which is why this is the NRD path's
+                                      # first half rather than a detour: the file is
+                                      # nrd_bridge.hlsl, the descriptor set is NRD_FEED_SET, the
+                                      # call is wire_nrd_feed, and FRD was the BORROWER
+                                      # (gpu/frd_gpu.rs's own header — "FrdGpu carries NrdGpu's
+                                      # exact plane contract, which is why arm_denoiser_for wires
+                                      # BOTH arms through this one call"). The kernels are
+                                      # engine-blind by design, so proving them needs no engine at
+                                      # all — which is what makes this cheap enough to precede one.
+                                      # IT JOINS THE TRACER FAMILY — no second layout, no new set
+                                      # variant — and that is a property of the SOURCE:
+                                      # `TraceSources::nrd_bridge()` pastes trace_common.hlsli, so
+                                      # it declares the tracer's registers plus u17, u20, u23..u27
+                                      # (all free) and u16/u18/u19, which are B3's feed images at
+                                      # the SAME descriptor kind. It declares no `t` register at
+                                      # all. So B4a is ONE conditional unit, B3's shape exactly,
+                                      # and `nrd_bridge()` being a METHOD rather than a keyed
+                                      # Option on this side meant the shared core changed by zero
+                                      # lines.
+                                      # ONE DIFFERENCE FROM D3D12, and it DELETES code: every
+                                      # plane rests in GENERAL for its whole life. That layout is
+                                      # legal for both SAMPLED_IMAGE and STORAGE_IMAGE, so the pass
+                                      # sequence needs only memory barriers and never a layout
+                                      # transition — D3D12's NPSR<->UA bracketing has no
+                                      # counterpart here and must not be invented. It pays again at
+                                      # readback: GENERAL is a legal copy SOURCE, unlike
+                                      # SHADER_READ_ONLY_OPTIMAL, which B3 learned from the
+                                      # validation layer.
+                                      # THE SIG LANES ARE A PER-FRAME CELL, not a construction
+                                      # flag, and that is what makes the invariance gateable:
+                                      # FLAG_FSR_SIG and its dependents are cbuffer bits over an
+                                      # assignment-only capture, so two traces one bit apart need
+                                      # no recompile and no second tracer. `remod_exact` rides
+                                      # ARMED with them, matching the D3D12 shipping default, so
+                                      # the two backends' packs agree about what sig.w's high half
+                                      # carries (m_d, on loan from shadow_t). nrd_rejitter stays
+                                      # OFF — it is NVIDIA's Jacobian, engine-gated on D3D12 for a
+                                      # stated reason, and no engine sits between the halves yet.
+                                      # ONE TRACER FOR V13 AND V14, not the fourth B2/B3 each
+                                      # added. The coupling is a FEATURE: the only thing V14 adds
+                                      # to a frame is a cbuffer bit, so V13's figures holding
+                                      # across the bridge's arrival IS the capture-invariance
+                                      # claim, stated across two stages instead of asserted once —
+                                      # and it saves a whole DXC pass (26.7 -> 30.5 s rather than
+                                      # ~37).
+                                      # THE CLAIM IS AN IDENTITY, not a tolerance: the recompose is
+                                      # col = R + D_out*kd*m_d + S_out*f0 with R = base −
+                                      # D_in*kd*m_d − S_in*f0, so with OUT == IN byte for byte the
+                                      # correction is algebraically ZERO and col must collapse onto
+                                      # base — exactly the colour cs_feed_xess wrote. That is N3
+                                      # transplanted, and it is the strongest shape in the suite
+                                      # because it compares bytes against a value the SAME device
+                                      # produced moments earlier rather than against a model of one.
+                                      # MEASURED (RADV, 400x300): colour byte-diff **0** on
+                                      # procedural, san-miguel-low-poly, rungholt, both FR_VK_RES
+                                      # parities and --sw-rays.
+                                      # AND THE IDENTITY ALONE IS NOT ENOUGH — a planted tooth
+                                      # PROVED it, which is the finding of this milestone. Skipping
+                                      # the plane wiring entirely left the gate GREEN: with the
+                                      # planes unbound the recompose reads zeros, D_out − D_in is
+                                      # zero, col collapses onto base, and the identity holds FOR
+                                      # THE WRONG REASON. A passthrough makes the delta zero BY
+                                      # CONSTRUCTION, so the arm that scores the recompose can
+                                      # never also score the pack. The missing half is asking
+                                      # whether the pack's data ARRIVED — M3d's texture probe in
+                                      # another currency — so V14 reads the three IN planes back
+                                      # off the tracer's own images (which exist whether or not a
+                                      # descriptor points at them, which is exactly what makes an
+                                      # unwired bridge show up as an untouched plane) and requires
+                                      # them non-trivial: measured in_diff 624463/960000 non-zero
+                                      # bytes, in_spec 517082, in_viewz 479311/480000.
+                                      # THE FOLD gets gated for free, and it is a half no feed
+                                      # route reaches: the dirty pass is `poison_inputs`, which
+                                      # floods ALL THREE engine planes rather than D3D12 F3's one,
+                                      # and `cs_nrd_pack` writes the engine's depth and mvec guides
+                                      # ITSELF (which is why an NRD frame runs no separate feed at
+                                      # all) — so V13's own plane gate re-run afterwards scores the
+                                      # fold. It comes back with V13's verdict to the digit
+                                      # (depth-ulp>4 0 max 2, sky px 34498, mvec-ulp 0, color-ulp
+                                      # 0) over bytes that were 0xEE a moment earlier.
+                                      # THE INVARIANCE ARM (N6b transplanted): two traces across
+                                      # the sig bit — accum BIT-IDENTICAL (measured 0 bytes), every
+                                      # hit pixel carrying sig when armed (85280/85280), ZERO
+                                      # leaking when disarmed, and m_d in (0, 1].
+                                      # THE INERT NOTE FIRES ON EVERY COMMITTED POSE, and that is
+                                      # worth stating rather than leaving a reader to infer: m_d is
+                                      # sk = 1 − 0.157*sheen blended toward sk*dcav, only the
+                                      # `fabric` class sets sheen at all (matclass.rs's
+                                      # tela/carpet/individual vocabulary), and dcav needs the
+                                      # detail window OPEN, i.e. a magnified surface. The
+                                      # procedural scene has neither; san-miguel's NINE fabric
+                                      # materials are its tablecloths and chair fabric — in the
+                                      # scene, absent from the fitted overview every --check-vk run
+                                      # uses. The pose that DOES move it is this tree's own
+                                      # documented glassware close-up, `--cam
+                                      # 0.71,1.55,0.45,0.71,1.25,-0.35` on san-miguel-low-poly,
+                                      # where the arm reads **m_d [0.7700, 1.0000]** and the note
+                                      # correctly stays silent. READ THE LOG, NOT THE EXIT CODE
+                                      # there: the rest of the suite is known-red at that pose for
+                                      # reasons predating this stage (mv_selftest median 3.156
+                                      # against a 0.17 limit — the exact figure already recorded
+                                      # for it — plus the candidate-loop divergences a
+                                      # nearly-all-glass view amplifies), the same caveat
+                                      # --dxr-sbt 3 already carries for the identical pose. V14's
+                                      # two arms PASS there.
+                                      # TEETH, four fired: skipping wire_nrd (identity green,
+                                      # arrival 0/960000 on all three — the two arms separating is
+                                      # the point); SWAPPING in_diff/in_spec at the descriptor
+                                      # write, same kind and same format, so the class a derived
+                                      # layout provably cannot catch (byte-diff 503359, and the
+                                      # arrival counts SWAP, which NAMES the bug rather than merely
+                                      # flagging it); dropping record_nrd_out's div_ceil (12784
+                                      # bytes ~= 400 px x the 4 rows 300/8 discards x 8 B); and
+                                      # decoding sig.w's LOW half instead of its high (reads
+                                      # [0.0017, 5.0938] — that is ao_t, a world-space hit
+                                      # distance, provably outside (0,1], which is what proves the
+                                      # lane is genuinely decoded and the high half is the right
+                                      # half).
+                                      # NOT DONE, and it is the whole point of the split: no
+                                      # ENGINE. B4b is libNRD.so (a Linux CMake build the installer
+                                      # currently skips only because a D3D12 session cannot load
+                                      # it — its own words), a libloading twin of nrd.rs's four
+                                      # cfg(windows) loader sites (the struct transcription,
+                                      # SpirvBindingOffsets, compute_shader_spirv and the
+                                      # GetLibraryDesc gate are ALREADY portable and already
+                                      # gated), and src/vk/nrd.rs — whose descriptor layout is the
+                                      # first in this backend DECLARED by a foreign library at its
+                                      # own binding offsets (SREG 0, BREG 2, UREG 3, TREG 20)
+                                      # rather than derived from our SPIR-V, so binding_of's
+                                      # never-a-literal rule does not apply there.
+                                      # Touch `TracerOpts::nrd` / the bridge unit list /
+                                      # `wire_nrd` / `record_nrd_*` / `NRD_REGS` / `read_nrd_plane`
+                                      # / write_cb's sig arming -> run --check (goldens
+                                      # byte-identical — B4a touches no shading path, only which
+                                      # lanes the pack writes, and accum is bit-identical across
+                                      # that by construction), cargo test, --check-vk on procedural
+                                      # + san-miguel-low-poly + rungholt, both FR_VK_RES parities,
+                                      # --sw-rays, llvmpipe, the glassware close-up above (for the
+                                      # m_d arm, reading the log), --check-spirv, --check-fsr and
+                                      # tools/win-cross-check.sh
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
@@ -7446,7 +7824,7 @@ cargo run --release -- --gpu --gpu-timing   # D3D12 timestamp queries around the
                                             # all (see Profiling)
 ```
 
-There are essentially no unit tests — the exception is **25 `#[cfg(test)]` SHADER-SOURCE gates, all of them in `gfx/shaders.rs`** (plus one field-coherence probe in `gfx/guides.rs`), run by `cargo test`, which CI runs alongside the executable suites. They assert ordering/monotonicity statements inside the HLSL that are load-bearing for soundness but that no CPU-only gate can reach (`--check-gpu`/`--check-dxr` need a real adapter). **They used to live in `gpu/trace.rs` and `gpu/dxr.rs`, i.e. inside `#[cfg(windows)]` modules, so a Linux `cargo test` reported "0 tests" and every one of these pins was simply absent** — they only ever assert things about `&'static str`s, so the platform gate was incidental, and moving the assembly to `gfx::shaders` in the Vulkan port's M1 is what un-stranded them (a test that cannot run where the developer works is a test that will rot). One packaging defect fell out of it and is fixed in `build.rs`: `intel_tex_2` ships precompiled objects referencing `__gxx_personality_v0` without asking for libstdc++, which `--release` hides via `--gc-sections` but which made ANY Linux `cargo test`/`cargo build` fail to link. The gates: the ftree overflow fallback rechecking stale distances before it lowers `best`, the empty-scene guards preceding the first `bvh_nodes[]` read, relief's full hardware interval + payload-carried logical bounds, and the continuation seam (LeafRec carries ONLY the opaque token, the leaf passes it through untouched, and the software provider validates it BEFORE its first `cut_pool[]` read — an ordering no CPU gate can see). Two of the 25 assert something else entirely and are flagged as such: `nrd_clean_room_tests` scans the four shader units we assemble for NVIDIA's distinctive NRD entry names — a LICENSE gate, not a soundness one, and the replacement for the physical impossibility the NRD submodule retired (see the `--nrd` entry). They are deliberately narrow — never assert formatting — and the live HLSL remains the executable specification. The same move retired one `--check` SKIP: **`gfx::frame::split_self_test`** (the dual-GPU tile-ownership arithmetic — the mask's bit math against the renderer's own midpoint-split rect geometry, the partition/complement contracts, the zero-share identity, and the `owns_px`-vs-`row_range` agreement sweep whose own doc records that nothing else checked it) is pure math that was hosted in `gpu/trace.rs`, so it never ran off Windows until `FrameCb` and `TileSplit` moved to `gfx::frame` — where they belong anyway, since the split IS 64 bits of that cbuffer. `gpu::dual::self_test` is the one gate that still SKIPs off Windows (it also drives `set_band` and a caps read, so it moves with `dual.rs`). **Otherwise `--check` is the test suite**: it renders a hybrid frame at **full depth and again through the depth-capped driver**, re-traces every pixel with a tmin=0 reference ray, and exits nonzero unless the `false-sky` and `tmin-overshoot` counters are exactly 0. In the capped pass, coarse (cell-flooded) pixels are excluded from every counter but must be > 0, and each capped tile's per-cell point samples (`KIND_LEAF`, see `sparse_fill`) ARE inside the gates like any leaf pixel and must also be > 0 whenever coarse pixels exist — proof the capped path ran (deterministic; no wall clock involved). It then warms a temporal cache with one frame and verifies five consumer passes the same way (static replay, forward dolly, dolly capped, dolly+yaw, pure yaw), asserting the temporal path demonstrably fired where that is structural (static: seeds and sky-tiles > 0; dolly and dolly-capped: seeds > 0; pure yaw: sky-tiles > 0). **`bvh::empty_self_test`** (the `empty-bvh` gate) covers the degenerate scene: a zero-triangle build must be an empty depth-0 hierarchy, and every scalar and cut-seeded traversal entry point must take its CLEAR-SPACE identity — `intersect`/`intersect_multi` `None`, `occluded`/`occluded_multi` `false`, `transmittance`/`transmittance_multi` exactly `Vec3A::ONE`, `nearest_geometry_distance_within` `None`, `refine_cut` empty — **without visiting a node**, which is what the gate actually asserts (`visits == 0`) and what a deliberately invalid `[u32::MAX]` root proves it does before dereferencing a caller-supplied id. That matters because the empty build is a COUNT-ZERO SENTINEL root, which is indistinguishable from an internal node to any consumer that reads it: on the GPU the same job is done at compile time by `trace::empty_defs`' `#define SCENE_EMPTY` (frustum.hlsli's `bound_query`/`refine_cut` and rt_sw.hlsli's three primitives return their identities ahead of the first `bvh_nodes[]` read; the wide tree instead ships one physically-present zero-occupancy root, see the two-tree bullet). The bounce integrators get the same treatment on a deterministic probe set: `sphcell::self_test` (closed-form Ω/PSA identities, exact partition, in-cell sampling), hemisphere AO and GI gates (`psa-viol`, `false-empty`, `tmin-overshoot`, `cut-miss` — all exactly 0) plus A/Bs against high-sample cosine references (AO: mean |Δ| < 0.02 and signed mean < 0.005 — the estimator is unbiased; GI: mean rel < 5% vs a reference running the same depth-1 policy `hemi::BOUNCE_Q` — that reference must integrate `sky::dome`, in lockstep with `hemi.rs`'s leaf miss, or it is scoring two different functions). The one-sky model has two closed-form gates: **`sh::self_test`** (basis orthonormality — projecting each band must return a unit coefficient, which pins every constant; the uniform-sky convention pin, radiance L in ⇒ exactly L out, which is what makes SH irradiance a drop-in for the old `AMBIENT · ao` and comparable to `hemi::gi`; accuracy vs a brute-force cosine-weighted reference, measured 0.035% mean / 0.188% worst; and projection determinism, since the byte-identical-build contract depends on it) and **`sky::self_test`** (the disc's radiance↔irradiance round-trip — the classic place to be off by 4π; cone sampling staying inside AND covering the disc; the disc test agreeing with the cone the sampler draws from; **the dome carrying no disc**, tested RELATIVE to the disc's own radiance since the Mie aureole legitimately peaks well above the dome's average; and the resulting ambient landing in a physically sane, blue-dominant band — the gate that pins `DOME_SCALE`). **Hemi sharing** gets its own family on 2×2 probe groups built under the renderer's exact predicate: the four zero-counters re-run PER MEMBER (each member re-validates the rep's folded empty claims, every leaf-ray tmin, and every recorded-cut traversal from ITS OWN apex), a paired same-seed shared-vs-unshared A/B (identical rng streams make common rays — fireflies included — cancel exactly; AO mean Δ < 0.005, GI rel Δ < 0.01; an unpaired construction was tried and measured the baseline estimator's firefly skew, not the sharing), same-seed share-on frame determinism and an fb-ao replay-vs-trace bit-identity pass (both with groups > 0 anti-vacuity), and `hemi-ao/gi (share off/on)` bench rows whose must-fires (groups > 0, fallbacks > 0, strictly fewer hemi queries) double as the KILL CRITERION guard: if share-on is not measurably faster on both the default scene and `--stress 5000`, the feature does not merge. Run it after any change to `frustum.rs`, `bvh.rs`, `render.rs`, `camera.rs`, `temporal.rs`, `hemi.rs`, `sky.rs`, `sh.rs`, `sphcell.rs`, or `shade.rs`. It also A/B benchmarks hybrid vs hemi-ao vs hemi-gi vs plain with node/ray counters and smoke-tests depth-capped dynamic frames at several caps. Three temporal-reuse gate families follow: **structure replay** (exact terminal pixel accounting; replay-vs-trace bit-identity of tbuf/info/accum at frame 0 AND at a warm jittered frame 1; a post-replay dolly verify on the frozen producer cache), the **claim ring** (exact pan-back must-fire ring hits — off the newest screen, answered verbatim by an older entry — plus a near-pose correctness pass), and the **query skip** (T1/T2 adoption must-fires; a 4-step dolly chain where the age cap must force requeries by step 4, every step reference-verified; and `dolly warm (adopt off/on)` A/B rows at preset q and 1-spp — the kill-criterion regression guard). **Multi-sampling** (`--spp`) gets its own `spp` gate family, at a FIXED spp=4 so a plain `--check` can never stop exercising it: the frame is rendered once per sample with `primary_sample = k` (the sample whose t lands in tbuf) and `verify_sampled` re-traces THAT sample's ray from tmin=0 — `false-sky`/`tmin-overshoot`/`hybrid-extra` exactly 0 for every k, which is the proof that an extra sample may ride the inherited t_start/cut (it is the same bug class, so it gets the same reference-ray proof); an accounting must-fire (primary rays exactly ×spp while frustum queries/nodes/tiles stay BIT-IDENTICAL — that inequality IS the amortization claim, and a regression there means multi-sampling started re-tracing the quadtree); a stability must-fire (mean inter-frame |Δ| strictly lower at spp=4 — if it isn't measurably quieter it isn't doing its job; structural, default scene); a pure-math distinctness gate (all MAX_SPP sub-pixel positions pairwise distinct — the Halton index must not wrap) plus a verify pass of the LAST sample at spp = MAX_SPP (the edge of the GPU's CB jitter table, invisible at spp=4); and an `spp=1|2|4|8|16` sweep whose printed cost-model fit (`ms(n) = F + m·n`) is where the "when do the returns stop" answer comes from. `--check-gpu` and `--check-dxr` carry the GPU halves (the same probe sweep — on the wavefront with the exact-zero gates AND the same-seed wavefront-vs-reference image A/B re-run at spp=4; on DXR as a per-sample CPU-vs-GPU t compare, which is what pins the CB's Halton jitter table to `dlss::jitter_for_sample`), plus interleaved-median spp bench rows (that row is warm-clock noisy — a cold first row can "measure" a physically impossible speedup). **The spp image A/B is gated RELATIVE to the image's own magnitude (mean |Δ| / mean |ref| < 1e-4), never absolutely** — and this is a correctness property of the gate, not a convenience. At spp=1 the two kernels are BIT-IDENTICAL; the divergence at spp>1 is per-sample fp rounding between two compile units' summations, which averages DOWN ~1/√N (the signature of independent rounding noise, not a bias) and scales with scene RADIANCE. So an absolute limit is a different limit on every scene: the original 1e-5 passed the default scene by 15% and failed `--stress 5000` outright (mean 1.46e-5) for no reason but that the stress field is brighter. The relative error is flat across scenes and vendors (default 1.95e-5, San Miguel 1.93e-5, stress 2.34e-5 NVIDIA / 2.69e-5 AMD — all at spp=4, the worst spp), so 1e-4 sits ~3.7× above the worst fp noise and ~100× below the ~1e-2 a real shading divergence produces. Gate-teeth are pinned: injecting a 0.1% error into the reference kernel's shade fails it at rel 1.02e-3 while the hot-channel count stays 0 — a systematic bias is invisible to the max/hot half and caught only by the relative mean, which is why BOTH halves exist. `--check --stress n` runs the same suite on the n-object stress field (deterministic sin-hash placement, `scene::stress_scene`) with the zero-counter gates intact but the "must fire" structural assertions skipped — those are tuned to the default scene's topology. Loaded OBJ scenes (`model.obj --check`) get the same structural skip: a real scene can lack the required features outright (a skyless view can't fire sky-tiles; a dense view legitimately overflows the replay recording arena), while the zero-counter gates run everywhere. **The rendered frame follows that same `structural` predicate, and this is a trap that bit once and is now closed by construction.** `check.png` / `check_gi.png` are TRACKED goldens — the *default* scene's frame, byte-compared by hand, and several features' bit-identity claims rest on nothing but a `git status` after a suite run. Every `--check` flavor used to write them, so `san-miguel-low-poly.obj --check` silently replaced the golden with San Miguel's frame and produced a `git status` that looks EXACTLY like a regression and is not one (the recovery is to re-run the plain `--check`, but only if you realize that is what happened). So a non-default scene now writes `check-<tag>.png` / `check-<tag>_gi.png` instead — `check-world`, `check-stress5000`, `check-san-miguel-low-poly`, `check-<stem>-tile2x2` — gitignored under `/check-*.png` (the goldens use `_`, the tagged files use `-`, which is what separates them), with the "wrote" line naming the files and saying the goldens were left alone. The asymmetry is deliberate and is not "never overwrite the golden": a DEFAULT-scene run still writes it under any lever, because a diff there is either a regression or a deliberate RE-BASELINE (the RTGI default flip was exactly that) and both are the signal you want. What can never be a golden is another scene's frame. **Consequence for A/B measurements on a loaded scene** (the `--no-slope-mips` liveness proof is one): the tagged file is gitignored, so "did the image move" is a hash compare between two runs, not a `git status` — which is the honest instrument anyway, since a scene with no committed baseline never had one. **AND THE GOLDENS ARE A WINDOWS CONTRACT.** The asymmetry above is what makes this bite off Windows: a DEFAULT-scene `--check` still writes them, so a Linux or macOS run overwrites the tracked pair — `git checkout -- check.png check_gi.png` after one, and never commit a headless platform's goldens. They differ legitimately: `sinf`/`cosf`/`expf`/`powf` come from the system libm and are permitted to differ between platforms, and the corpus uses them throughout (sky, clouds, GGX), so a cross-platform byte compare measures libm, not the renderer. Every byte-identity claim in this file (`--no-rtgi` reproducing the pre-RTGI image, the `--no-spec-aa` off arm, the capture-edit leak check) means *same platform, same binary lineage*. What DOES hold everywhere is the structural half — `false-sky`, `tmin-overshoot`, `claim-violation`, `hybrid-extra`, the coverage counters, and replay bit-identity are exact-zero on macOS as on Windows (measured, M0) — so a **counter** difference is a real failure and a **pixel** difference across platforms is not.
+There are essentially no unit tests — the exception is **25 `#[cfg(test)]` SHADER-SOURCE gates, all of them in `gfx/shaders.rs`** (plus one field-coherence probe in `gfx/guides.rs`), run by `cargo test`, which CI runs alongside the executable suites. They assert ordering/monotonicity statements inside the HLSL that are load-bearing for soundness but that no CPU-only gate can reach (`--check-gpu`/`--check-dxr` need a real adapter). **They used to live in `gpu/trace.rs` and `gpu/dxr.rs`, i.e. inside `#[cfg(windows)]` modules, so a Linux `cargo test` reported "0 tests" and every one of these pins was simply absent** — they only ever assert things about `&'static str`s, so the platform gate was incidental, and moving the assembly to `gfx::shaders` in the Vulkan port's M1 is what un-stranded them (a test that cannot run where the developer works is a test that will rot). One packaging defect fell out of it and is fixed in `build.rs`: `intel_tex_2` ships precompiled objects referencing `__gxx_personality_v0` without asking for libstdc++, which `--release` hides via `--gc-sections` but which made ANY Linux `cargo test`/`cargo build` fail to link. The gates: the ftree overflow fallback rechecking stale distances before it lowers `best`, the empty-scene guards preceding the first `bvh_nodes[]` read, relief's full hardware interval + payload-carried logical bounds, and the continuation seam (LeafRec carries ONLY the opaque token, the leaf passes it through untouched, and the software provider validates it BEFORE its first `cut_pool[]` read — an ordering no CPU gate can see). Two of the 25 assert something else entirely and are flagged as such: `nrd_clean_room_tests` scans the four shader units we assemble for NVIDIA's distinctive NRD entry names — a LICENSE gate, not a soundness one, and the replacement for the physical impossibility the NRD submodule retired (see the `--nrd` entry). They are deliberately narrow — never assert formatting — and the live HLSL remains the executable specification. The same move retired one `--check` SKIP: **`gfx::frame::split_self_test`** (the dual-GPU tile-ownership arithmetic — the mask's bit math against the renderer's own midpoint-split rect geometry, the partition/complement contracts, the zero-share identity, and the `owns_px`-vs-`row_range` agreement sweep whose own doc records that nothing else checked it) is pure math that was hosted in `gpu/trace.rs`, so it never ran off Windows until `FrameCb` and `TileSplit` moved to `gfx::frame` — where they belong anyway, since the split IS 64 bits of that cbuffer. `gpu::dual::self_test` is the one gate that still SKIPs off Windows (it also drives `set_band` and a caps read, so it moves with `dual.rs`). **Otherwise `--check` is the test suite**: it renders a hybrid frame at **full depth and again through the depth-capped driver**, re-traces every pixel with a tmin=0 reference ray, and exits nonzero unless the `false-sky` and `tmin-overshoot` counters are exactly 0. In the capped pass, coarse (cell-flooded) pixels are excluded from every counter but must be > 0, and each capped tile's per-cell point samples (`KIND_LEAF`, see `sparse_fill`) ARE inside the gates like any leaf pixel and must also be > 0 whenever coarse pixels exist — proof the capped path ran (deterministic; no wall clock involved). It then warms a temporal cache with one frame and verifies five consumer passes the same way (static replay, forward dolly, dolly capped, dolly+yaw, pure yaw), asserting the temporal path demonstrably fired where that is structural (static: seeds and sky-tiles > 0; dolly and dolly-capped: seeds > 0; pure yaw: sky-tiles > 0). **`bvh::empty_self_test`** (the `empty-bvh` gate) covers the degenerate scene: a zero-triangle build must be an empty depth-0 hierarchy, and every scalar and cut-seeded traversal entry point must take its CLEAR-SPACE identity — `intersect`/`intersect_multi` `None`, `occluded`/`occluded_multi` `false`, `transmittance`/`transmittance_multi` exactly `Vec3A::ONE`, `nearest_geometry_distance_within` `None`, `refine_cut` empty — **without visiting a node**, which is what the gate actually asserts (`visits == 0`) and what a deliberately invalid `[u32::MAX]` root proves it does before dereferencing a caller-supplied id. That matters because the empty build is a COUNT-ZERO SENTINEL root, which is indistinguishable from an internal node to any consumer that reads it: on the GPU the same job is done at compile time by `trace::empty_defs`' `#define SCENE_EMPTY` (frustum.hlsli's `bound_query`/`refine_cut` and rt_sw.hlsli's three primitives return their identities ahead of the first `bvh_nodes[]` read; the wide tree instead ships one physically-present zero-occupancy root, see the two-tree bullet). The bounce integrators get the same treatment on a deterministic probe set: `sphcell::self_test` (closed-form Ω/PSA identities, exact partition, in-cell sampling), hemisphere AO and GI gates (`psa-viol`, `false-empty`, `tmin-overshoot`, `cut-miss` — all exactly 0) plus A/Bs against high-sample cosine references (AO: mean |Δ| < 0.02 and signed mean < 0.005 — the estimator is unbiased; GI: mean rel < 5% vs a reference running the same depth-1 policy `hemi::BOUNCE_Q` — that reference must integrate `sky::dome`, in lockstep with `hemi.rs`'s leaf miss, or it is scoring two different functions). The one-sky model has two closed-form gates: **`sh::self_test`** (basis orthonormality — projecting each band must return a unit coefficient, which pins every constant; the uniform-sky convention pin, radiance L in ⇒ exactly L out, which is what makes SH irradiance a drop-in for the old `AMBIENT · ao` and comparable to `hemi::gi`; accuracy vs a brute-force cosine-weighted reference, measured 0.035% mean / 0.188% worst — **but that integrand is a STAND-IN**, a pure l=1 ramp with no aureole and no horizon step, so it scores the MACHINERY and must never be quoted as "the SH error"; and projection determinism, since the byte-identical-build contract depends on it) and **`sky::self_test`** (the disc's radiance↔irradiance round-trip — the classic place to be off by 4π; cone sampling staying inside AND covering the disc; the disc test agreeing with the cone the sampler draws from; **the dome carrying no disc**, tested RELATIVE to the disc's own radiance since the Mie aureole legitimately peaks well above the dome's average; the resulting ambient landing in a physically sane, blue-dominant band — the gate that pins `DOME_SCALE`; and **G6b, order-2 SH scored against brute force on the sky we ACTUALLY SHIP**, which is the gate the "order 2 is enough" claim was missing — it projects through the same `sky::gather` closure `refresh_sky_sh` uses, at three sun elevations, and reports two metrics because the per-channel one lies (its denominator collapses at the dim downward normal that is the worst probe in every case — the `fsr.rs` residual-gate shape). MEASURED 2026-08-11 and stable in the 4th decimal under a 64× sweep of BOTH the reference and `PROJ_SAMPLES`, i.e. genuine truncation rather than quadrature noise: noon 1.17%/4.36% per-channel and 0.9% of the scene's ambient scale, **low sun 5.12%/32.03% and 3.0%**, night 0.68%/3.19% and 0.8%. The noon worst is the l=4 band the cosine kernel does not annihilate (Â4/Â0 = 1/24 ≈ 4.2%, almost exactly); the LOW-SUN row is the one to know about and its cause is NOT the aureole but the horizon step and its `GROUND_ALBEDO` bounce — the Gibbs case the blend band softens without eliminating. Gated by a scene-scale bound (6%, the physical claim) plus per-case per-channel drift ceilings, with an anti-vacuity peak/mean assert so a flattened Mie term cannot leave the gate scoring a near-uniform sky. Teeth exercised both ways: `MIE_G` 0.76→0.90 fails the drift ceiling (noon mean 1.17→2.33%), and collapsing `BETA_M` fails the anti-vacuity at peak/mean 1.52). **Hemi sharing** gets its own family on 2×2 probe groups built under the renderer's exact predicate: the four zero-counters re-run PER MEMBER (each member re-validates the rep's folded empty claims, every leaf-ray tmin, and every recorded-cut traversal from ITS OWN apex), a paired same-seed shared-vs-unshared A/B (identical rng streams make common rays — fireflies included — cancel exactly; AO mean Δ < 0.005, GI rel Δ < 0.01; an unpaired construction was tried and measured the baseline estimator's firefly skew, not the sharing), same-seed share-on frame determinism and an fb-ao replay-vs-trace bit-identity pass (both with groups > 0 anti-vacuity), and `hemi-ao/gi (share off/on)` bench rows whose must-fires (groups > 0, fallbacks > 0, strictly fewer hemi queries) double as the KILL CRITERION guard: if share-on is not measurably faster on both the default scene and `--stress 5000`, the feature does not merge. Run it after any change to `frustum.rs`, `bvh.rs`, `render.rs`, `camera.rs`, `temporal.rs`, `hemi.rs`, `sky.rs`, `sh.rs`, `sphcell.rs`, or `shade.rs`. It also A/B benchmarks hybrid vs hemi-ao vs hemi-gi vs plain with node/ray counters and smoke-tests depth-capped dynamic frames at several caps. Three temporal-reuse gate families follow: **structure replay** (exact terminal pixel accounting; replay-vs-trace bit-identity of tbuf/info/accum at frame 0 AND at a warm jittered frame 1; a post-replay dolly verify on the frozen producer cache), the **claim ring** (exact pan-back must-fire ring hits — off the newest screen, answered verbatim by an older entry — plus a near-pose correctness pass), and the **query skip** (T1/T2 adoption must-fires; a 4-step dolly chain where the age cap must force requeries by step 4, every step reference-verified; and `dolly warm (adopt off/on)` A/B rows at preset q and 1-spp — the kill-criterion regression guard). **Multi-sampling** (`--spp`) gets its own `spp` gate family, at a FIXED spp=4 so a plain `--check` can never stop exercising it: the frame is rendered once per sample with `primary_sample = k` (the sample whose t lands in tbuf) and `verify_sampled` re-traces THAT sample's ray from tmin=0 — `false-sky`/`tmin-overshoot`/`hybrid-extra` exactly 0 for every k, which is the proof that an extra sample may ride the inherited t_start/cut (it is the same bug class, so it gets the same reference-ray proof); an accounting must-fire (primary rays exactly ×spp while frustum queries/nodes/tiles stay BIT-IDENTICAL — that inequality IS the amortization claim, and a regression there means multi-sampling started re-tracing the quadtree); a stability must-fire (mean inter-frame |Δ| strictly lower at spp=4 — if it isn't measurably quieter it isn't doing its job; structural, default scene); a pure-math distinctness gate (all MAX_SPP sub-pixel positions pairwise distinct — the Halton index must not wrap) plus a verify pass of the LAST sample at spp = MAX_SPP (the edge of the GPU's CB jitter table, invisible at spp=4); and an `spp=1|2|4|8|16` sweep whose printed cost-model fit (`ms(n) = F + m·n`) is where the "when do the returns stop" answer comes from. `--check-gpu` and `--check-dxr` carry the GPU halves (the same probe sweep — on the wavefront with the exact-zero gates AND the same-seed wavefront-vs-reference image A/B re-run at spp=4; on DXR as a per-sample CPU-vs-GPU t compare, which is what pins the CB's Halton jitter table to `dlss::jitter_for_sample`), plus interleaved-median spp bench rows (that row is warm-clock noisy — a cold first row can "measure" a physically impossible speedup). **The spp image A/B is gated RELATIVE to the image's own magnitude (mean |Δ| / mean |ref| < 1e-4), never absolutely** — and this is a correctness property of the gate, not a convenience. At spp=1 the two kernels are BIT-IDENTICAL; the divergence at spp>1 is per-sample fp rounding between two compile units' summations, which averages DOWN ~1/√N (the signature of independent rounding noise, not a bias) and scales with scene RADIANCE. So an absolute limit is a different limit on every scene: the original 1e-5 passed the default scene by 15% and failed `--stress 5000` outright (mean 1.46e-5) for no reason but that the stress field is brighter. The relative error is flat across scenes and vendors (default 1.95e-5, San Miguel 1.93e-5, stress 2.34e-5 NVIDIA / 2.69e-5 AMD — all at spp=4, the worst spp), so 1e-4 sits ~3.7× above the worst fp noise and ~100× below the ~1e-2 a real shading divergence produces. Gate-teeth are pinned: injecting a 0.1% error into the reference kernel's shade fails it at rel 1.02e-3 while the hot-channel count stays 0 — a systematic bias is invisible to the max/hot half and caught only by the relative mean, which is why BOTH halves exist. `--check --stress n` runs the same suite on the n-object stress field (deterministic sin-hash placement, `scene::stress_scene`) with the zero-counter gates intact but the "must fire" structural assertions skipped — those are tuned to the default scene's topology. Loaded OBJ scenes (`model.obj --check`) get the same structural skip: a real scene can lack the required features outright (a skyless view can't fire sky-tiles; a dense view legitimately overflows the replay recording arena), while the zero-counter gates run everywhere. **The rendered frame follows that same `structural` predicate, and this is a trap that bit once and is now closed by construction.** `check.png` / `check_gi.png` are TRACKED goldens — the *default* scene's frame, byte-compared by hand, and several features' bit-identity claims rest on nothing but a `git status` after a suite run. Every `--check` flavor used to write them, so `san-miguel-low-poly.obj --check` silently replaced the golden with San Miguel's frame and produced a `git status` that looks EXACTLY like a regression and is not one (the recovery is to re-run the plain `--check`, but only if you realize that is what happened). So a non-default scene now writes `check-<tag>.png` / `check-<tag>_gi.png` instead — `check-world`, `check-stress5000`, `check-san-miguel-low-poly`, `check-<stem>-tile2x2` — gitignored under `/check-*.png` (the goldens use `_`, the tagged files use `-`, which is what separates them), with the "wrote" line naming the files and saying the goldens were left alone. The asymmetry is deliberate and is not "never overwrite the golden": a DEFAULT-scene run still writes it under any lever, because a diff there is either a regression or a deliberate RE-BASELINE (the RTGI default flip was exactly that) and both are the signal you want. What can never be a golden is another scene's frame. **ONE LEVER BREAKS THAT RATIONALE AND HAS NO TAG: `--tod`.** `structural` keys on the SCENE alone (`stress.is_none() && obj.is_none() && !world_wanted`), so `--check --tod 2` — which the sky/star gates' own run list asks for — writes a NIGHT frame over the DAY goldens, and that diff is neither a regression nor a re-baseline but a different CONFIGURATION, exactly the class the scene tag exists to separate (measured: it moves both files). Until it is tagged like the rest, `git checkout -- check.png check_gi.png` after any `--check --tod` run, and never read the `git status` from one as a regression. **Consequence for A/B measurements on a loaded scene** (the `--no-slope-mips` liveness proof is one): the tagged file is gitignored, so "did the image move" is a hash compare between two runs, not a `git status` — which is the honest instrument anyway, since a scene with no committed baseline never had one. **AND THE GOLDENS ARE A WINDOWS CONTRACT.** The asymmetry above is what makes this bite off Windows: a DEFAULT-scene `--check` still writes them, so a Linux or macOS run overwrites the tracked pair — `git checkout -- check.png check_gi.png` after one, and never commit a headless platform's goldens. They differ legitimately: `sinf`/`cosf`/`expf`/`powf` come from the system libm and are permitted to differ between platforms, and the corpus uses them throughout (sky, clouds, GGX), so a cross-platform byte compare measures libm, not the renderer. Every byte-identity claim in this file (`--no-rtgi` reproducing the pre-RTGI image, the `--no-spec-aa` off arm, the capture-edit leak check) means *same platform, same binary lineage*. What DOES hold everywhere is the structural half — `false-sky`, `tmin-overshoot`, `claim-violation`, `hybrid-extra`, the coverage counters, and replay bit-identity are exact-zero on macOS as on Windows (measured, M0) — so a **counter** difference is a real failure and a **pixel** difference across platforms is not.
 
 **Build config.** `.cargo/config.toml` links with `rust-lld` (bundled with the rustup toolchain — nothing to install; mold is ELF-only and cannot link a PE binary, so it is not an option here). It must keep emitting a PDB: `debug = "line-tables-only"` exists so Tracy's sampler and PIX can symbolize release frames, so any link-arg that drops debug info is off the table. `release` is `lto = "thin"` + `codegen-units = 16` (was 1 until 2026-07-23 — cgu=1 serialized ThinLTO into a fat-LTO-shaped single pass; 16 measured a one-line-touch rebuild 198 → 45 s at a priced +1-2% CPU-tracer ms/frame, interleaved `--spin path` medians in the Cargo.toml comment — CPU numbers recorded before that date carry the offset). `[profile.quick]` (`lto = false`, `codegen-units = 16`) is an ITERATION-ONLY profile — a one-line touch rebuilds in ~25 s vs ~45 s under `release`, because the ThinLTO whole-program pass, not the linker, is the cost. **Never take a benchmark number from `quick`**: every measurement this project reports (the `--check` A/B bench rows, the hemi-share kill criterion, the adopt on/off regression guards) is only meaningful under `release`'s `lto`/`codegen-units`. Correctness gates are perf-independent and run fine there.
 
