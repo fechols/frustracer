@@ -2,12 +2,18 @@
 //! device, one command buffer, one fence, `run(|cmd| ...)`, and staging
 //! copies. No surface, no swapchain, no window.
 //!
-//! `VK_EXT_headless_surface` is deliberately NOT used here, and the reason is
-//! worth stating because the plan named it: that extension exists to run the
-//! PRESENTATION path without a window (a swapchain with nowhere to scan out).
-//! Compute needs no surface at all, so the harness every gate runs on has one
-//! less moving part than the plan assumed. The extension becomes relevant
-//! when the display stage wants gating, not before.
+//! `VK_EXT_headless_surface` is not used by the COMPUTE half here, and the
+//! reason is worth keeping because the plan originally named it as a
+//! prerequisite: that extension exists to run the PRESENTATION path without a
+//! window (a swapchain with nowhere to scan out), and compute needs no surface
+//! at all — so the harness every gate below the display stage runs on has one
+//! less moving part than the plan assumed.
+//!
+//! THAT MOMENT ARRIVED. `src/vk/swapchain.rs` uses it, this harness grew
+//! `run_present`/`wait_submit` to serve it (see their docs for why a present
+//! cannot use `run`), and the extension is enabled-when-present at instance
+//! level in `Vk::new`. Nothing above changes for the compute path: `run` is
+//! untouched, and a box without the extension loses the present gate alone.
 //!
 //! What the smoke test at the bottom proves is the same list `gpu::smoke_test`
 //! proves on D3D12, because it is the same shader: constants reaching a
@@ -74,6 +80,88 @@ impl VkHeadless {
                 .map_err(|e| format!("vkWaitForFences: {e}"))?;
         }
         Ok(())
+    }
+
+    /// `run`'s sibling for the present path: record and submit with a
+    /// semaphore pair, and DO NOT block.
+    ///
+    /// The split is what a present needs and `run` cannot express. A present
+    /// sits BETWEEN the submit and the wait — `vkQueuePresentKHR` waits on the
+    /// render-finished semaphore this submit signals — so a call that blocked
+    /// before returning would leave the caller presenting an image whose work
+    /// has already retired, which is the fence-only shape below rather than
+    /// the semaphore one.
+    ///
+    /// FENCE-ONLY WOULD ALSO WORK HERE, and saying so is the point of building
+    /// this anyway: same-queue submissions execute in order and the CPU has
+    /// already waited, so acquiring with a fence, blocking, running, and
+    /// presenting with zero wait semaphores is legal and simpler. It is also
+    /// not what a presenter does, and B6b needs the semaphore path — so rung 2
+    /// proves the synchronisation shape the window will inherit rather than a
+    /// gate-only shortcut that would have to be replaced with something
+    /// untested at exactly the point a window makes it hard to debug.
+    ///
+    /// The fence is still signalled, so `wait_submit` is what makes a readback
+    /// of anything this recorded safe.
+    pub fn run_present<F: FnOnce(&ash::Device, vk::CommandBuffer)>(
+        &self,
+        wait: &[vk::Semaphore],
+        wait_stages: &[vk::PipelineStageFlags],
+        signal: &[vk::Semaphore],
+        f: F,
+    ) -> Result<(), String> {
+        // A `VkSubmitInfo` pairs each wait semaphore with the stage that waits
+        // on it POSITIONALLY, so a length mismatch is not a type error but a
+        // read past the end of one array by the driver.
+        if wait.len() != wait_stages.len() {
+            return Err(format!(
+                "run_present: {} wait semaphore(s) against {} stage(s) — the arrays are \
+                 positionally paired",
+                wait.len(),
+                wait_stages.len()
+            ));
+        }
+        let d = &self.vk.device;
+        unsafe {
+            // Safe without a preceding wait ONLY because every path into this
+            // fences before recording again: `wait_submit` retires the
+            // previous submission, and the gate's cycle calls it before the
+            // next `run_present`. Resetting a pool whose buffer is in flight
+            // is undefined.
+            d.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
+                .map_err(|e| format!("vkResetCommandPool: {e}"))?;
+            let bi = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            d.begin_command_buffer(self.cmd, &bi)
+                .map_err(|e| format!("vkBeginCommandBuffer: {e}"))?;
+            f(d, self.cmd);
+            d.end_command_buffer(self.cmd).map_err(|e| format!("vkEndCommandBuffer: {e}"))?;
+
+            d.reset_fences(&[self.fence]).map_err(|e| format!("vkResetFences: {e}"))?;
+            let cmds = [self.cmd];
+            let si = vk::SubmitInfo::default()
+                .command_buffers(&cmds)
+                .wait_semaphores(wait)
+                .wait_dst_stage_mask(wait_stages)
+                .signal_semaphores(signal);
+            d.queue_submit(self.vk.queue, &[si], self.fence)
+                .map_err(|e| format!("vkQueueSubmit: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Block until the last `run_present` submission has retired.
+    ///
+    /// Separate from `run_present` for the reason that function documents, and
+    /// it is what makes a readback recorded by it safe as well as what licenses
+    /// the next call's command-pool reset.
+    pub fn wait_submit(&self) -> Result<(), String> {
+        unsafe {
+            self.vk
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| format!("vkWaitForFences: {e}"))
+        }
     }
 
     /// Device-local -> host, through a staging buffer and its own submit.

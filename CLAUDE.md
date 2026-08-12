@@ -8280,6 +8280,137 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # path), cargo test, --check-vk on procedural +
                                       # san-miguel-low-poly, both FR_VK_RES parities, --sw-rays,
                                       # llvmpipe, --check-spirv and tools/win-cross-check.sh
+                                      # V19 — THE PRESENT PATH (B6a rung 2, 2026-08-12): a swapchain
+                                      # over `VK_EXT_headless_surface`, so this backend PRESENTS.
+                                      # V18 proved it can rasterise; presentation is a different
+                                      # resource class (images the presentation engine owns, in a
+                                      # layout nothing else here enters) through a different API,
+                                      # and a real surface needs a window — which needs a windowing
+                                      # crate and an input design (B6b). The headless surface splits
+                                      # that: acquire, render, present, engine recycles, no display
+                                      # attached. What it CANNOT prove is pacing (no vblank, no
+                                      # scanout) — that is B6b's, and this module says so rather
+                                      # than implying otherwise. THE CLAIM IS A BYTE IDENTITY AT THE
+                                      # NEGOTIATED FORMAT: the same `Passes` into a swapchain image
+                                      # must produce the same bytes as into an offscreen image of
+                                      # that format — deliberately not V18's fixed sdr wire, since
+                                      # that decouples from format negotiation entirely and stays
+                                      # EXACT rather than a tolerance (the V14/V17 shape).
+                                      # THE IDENTITY ALONE IS VACUOUS, MEASURED NOT ARGUED:
+                                      # `record_to` opens with `LOAD_OP_CLEAR`, so deleting the draw
+                                      # gives BOTH targets the same zeros and the byte comparison
+                                      # PASSES — fired as a tooth, and the identity arm stayed
+                                      # silent while three others caught it. Those three: the CPU
+                                      # oracle (V18's `tone::map` comparison at the negotiated
+                                      # format's own tolerance — worst 2.37e-3, V18's sdr figure to
+                                      # the digit); ALPHA at maximum (both display pixel shaders
+                                      # write 1.0 unconditionally while the oracle compares RGB
+                                      # only, and a clear writes 0); and a `0xEE` SENTINEL flooded
+                                      # before the draw. THE SENTINEL IS THREE-WAY and free: the
+                                      # pattern = everything ran; the CLEAR colour = the render pass
+                                      # ran and the draw did not; the SENTINEL SURVIVING = the draw
+                                      # went to a DIFFERENT image than the one flooded and copied.
+                                      # Both middle and last outcomes were fired as separate teeth
+                                      # and give DIFFERENT diagnoses. Written by a draw-less
+                                      # `LOAD_OP_CLEAR` rather than `vkCmdClearColorImage`
+                                      # deliberately: the latter needs TRANSFER_DST, which the
+                                      # offscreen twin does not carry, so it would put a difference
+                                      # between the two images whose equality the gate asserts.
+                                      # THE PRESENT IS PROVED BY EXHAUSTION — nothing scans out, so
+                                      # `VK_SUCCESS` is a statement about a function call. Run
+                                      # `images.len() + 1` cycles: the last acquire can only succeed
+                                      # if the engine RELEASED one, and `ACQUIRE_TIMEOUT_NS` is
+                                      # FINITE so a present that did nothing reports rather than
+                                      # hangs. Acquire order is PRINTED, never asserted (the spec
+                                      # constrains none of it) — measured [0, 1, 0, 2, 0] over 4
+                                      # images, i.e. recycling visible by cycle 2.
+                                      # ONE RENDER-FINISHED SEMAPHORE PER IMAGE, and that is not a
+                                      # preference: a single shared one shipped first and the
+                                      # validation layer named it exactly ("is being signaled by
+                                      # VkQueue ..., but it may still be in use by VkSwapchainKHR").
+                                      # A binary semaphore may not be re-signalled while a wait is
+                                      # outstanding, and a present's wait has no CPU-visible
+                                      # completion — the harness fence covers the SUBMIT. Per-image
+                                      # makes reuse PROVABLY safe: acquiring image N means the
+                                      # engine released N, which means the present that waited on
+                                      # `render_done[N]` completed. The ACQUIRE semaphore needs no
+                                      # such treatment for a different reason, not by luck —
+                                      # `wait_submit` blocks before the next acquire.
+                                      # `Passes::record_to` takes (img, view, w, h) rather than
+                                      # `&Image` because a swapchain image owns no `VkDeviceMemory`
+                                      # and `Image::mem` is private and non-`Option`; `record` stays
+                                      # a thin wrapper so V18's recording is TEXTUALLY unchanged.
+                                      # Its two transitions were ALREADY right — `UNDEFINED ->
+                                      # COLOR_ATTACHMENT_OPTIMAL` is correct for a freshly acquired
+                                      # image and the tail to `TRANSFER_SRC_OPTIMAL` is exactly
+                                      # where a copy-before-present wants it — so rung 2 appends ONE
+                                      # barrier and edits neither.
+                                      # `display::rgb_offsets` IS THE DEFECT THIS CAUGHT BEFORE IT
+                                      # SHIPPED: `decode`'s catch-all read BGRA, right for the one
+                                      # 8-bit format rung 1 renders and silently wrong for the
+                                      # other — and the headless surface's OWN first format, on both
+                                      # ICDs here, is `R8G8B8A8_UNORM`, i.e. exactly what a present
+                                      # path taking the driver's preference negotiates. Inheriting
+                                      # it would have swapped R and B in 255 of every 256 texels of
+                                      # a hashed pattern while every other assertion stayed green,
+                                      # because a swizzle preserves alpha, coverage, AND a byte
+                                      # compare of two images that were BOTH swizzled. One statement
+                                      # of byte order now, consulted by `decode` and the identity,
+                                      # returning `Option` so an unknown format is REFUSED at
+                                      # negotiation rather than guessed (and `decode` returns NaN
+                                      # there, which fails every comparison it reaches).
+                                      # `_SRGB` is refused too: the pixel shader applies its own
+                                      # `pow(1/2.2)` and the hardware would encode it twice — a
+                                      # wrong image that still looks plausible.
+                                      # V19 SKIPS ON llvmpipe, AND THAT IS A MEASURED lavapipe
+                                      # DEFECT rather than a limitation: it advertises
+                                      # `VK_KHR_swapchain`, accepts a headless surface, and answers
+                                      # EVERY capability query — present support, formats, FIFO,
+                                      # `supportedUsageFlags` — and then `vkCreateSwapchainKHR`
+                                      # JUMPS TO ADDRESS ZERO inside its own frames (`#0 0x0 / #1..4
+                                      # libvulkan_lvp.so`), reproducing identically with validation
+                                      # DISABLED while RADV runs the same code clean. A segfault is
+                                      # not a failure mode a gate can report — it takes the process
+                                      # down mid-suite — and CI runs --check-vk on llvmpipe every
+                                      # push, so the skip is PRE-EMPTIVE (before the call) unlike
+                                      # V11/V13's skip-on-returned-error. `FR_VK_PRESENT_SOFTWARE=1`
+                                      # forces the attempt, verified live to still segfault, so the
+                                      # re-test is one variable the day Mesa fixes it. CONSEQUENCE:
+                                      # **V19 does NOT join ci.yml's forbidden-skip list** — it
+                                      # cannot run there — which is why the display stage's CI
+                                      # coverage stops at V18.
+                                      # `VkHeadless::run_present`/`wait_submit` are `run`'s siblings:
+                                      # a present sits BETWEEN the submit and the wait, so a call
+                                      # that blocked before returning could not express it.
+                                      # Fence-only WOULD work here (same-queue ordering + a CPU
+                                      # wait) and is recorded as the fallback, but B6b needs the
+                                      # semaphore path, so rung 2 proves the shape the window
+                                      # inherits rather than a gate-only shortcut.
+                                      # MEASURED (RADV, 64x32, 4 images, FIFO,
+                                      # `R8G8B8A8_UNORM`): byte-identical over 10240 texels across 5
+                                      # cycles, oracle worst 2.37e-3 (limit 3.92e-3), alpha full,
+                                      # sentinel survivors 0, validation clean — on procedural,
+                                      # san-miguel-low-poly, rungholt, both FR_VK_RES parities and
+                                      # --sw-rays. FOUR TEETH FIRED, each naming its own defect and
+                                      # all four SEPARATING: no draw (clear-colour outcome + oracle
+                                      # + alpha, identity SILENT); draw into another image (sentinel
+                                      # outcome + identity + oracle + alpha); pipeline format !=
+                                      # swapchain format (validation ONLY — every value arm passes,
+                                      # since both targets went through the same wrong pipeline and
+                                      # RADV honours the view's format, which is the sharpest
+                                      # argument in this file for CI running the layer armed);
+                                      # missing `PRESENT_SRC_KHR` transition (validation, named).
+                                      # Touch `src/vk/swapchain.rs` / `Passes::record_to` /
+                                      # `display::rgb_offsets` / `run_present`/`wait_submit` / the
+                                      # surface+swapchain extension enables in `device.rs` -> run
+                                      # --check (goldens byte-identical — rung 2 touches no shading
+                                      # path), cargo test, --check-vk on procedural +
+                                      # san-miguel-low-poly + rungholt, both FR_VK_RES parities,
+                                      # --sw-rays, llvmpipe (V19 SKIPs), --check-spirv, --check-fsr,
+                                      # --check-nrd and tools/win-cross-check.sh — the last is not
+                                      # optional here: `mod vk` is cfg(unix), so a new gate function
+                                      # needs `#[cfg(unix)]` and nothing else on this box catches
+                                      # its absence
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
