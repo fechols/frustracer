@@ -16040,9 +16040,19 @@ fn run_check_vk_feed(
         bvh,
         rw as u32,
         rh as u32,
-        // `feed` implies `gbuf_full`; spelled anyway, because a reader should
-        // not have to know the constructor forces it.
-        vk::tracer::TracerOpts { gbuf_full: true, feed: true },
+        // `feed` implies `gbuf_full` and `nrd` implies `feed`; all three are
+        // spelled anyway, because a reader should not have to know the
+        // constructor forces them.
+        //
+        // ONE tracer for V13 AND V14, rather than the fourth the second and
+        // third were: the only thing V14 adds to a frame is the sig lanes, and
+        // those are a cbuffer bit over an assignment-only capture, so `accum`
+        // and therefore every number V13 reports are unmoved. Coupling them is
+        // a FEATURE — V13's figures holding across the bridge's arrival is the
+        // capture-invariance claim, stated across the two stages instead of
+        // asserted once — and it saves a whole DXC pass. V14 turns the bit off
+        // and on itself for the arm that gates it properly.
+        vk::tracer::TracerOpts { gbuf_full: true, feed: true, nrd: true },
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -16263,9 +16273,313 @@ fn run_check_vk_feed(
         }
     }
 
+    // ---- V14: the NRD bridge, on V13's tracer and V13's engine planes. ----
+    if ok {
+        ok =
+            run_check_vk_bridge(hg, &tg, &fed, scene, &basis, q, rw, rh, near, far, structural);
+    }
+
     fed.destroy(hg);
     cpu.destroy(hg);
     tg.destroy(hg);
+    ok
+}
+
+/// V14 — THE NRD BRIDGE, and a byte-identity that needs no reference image.
+///
+/// `cs_nrd_pack` and `cs_nrd_out` are the front and back halves of the ONE
+/// denoiser seam this renderer has. They are deliberately ENGINE-BLIND — the
+/// D3D12 `wire_nrd_feed`'s own doc says the kernels "neither know nor care
+/// which engine sits between them" — so proving them needs no engine at all,
+/// and that is what makes this stage cheap enough to precede one.
+///
+/// THE CLAIM, and it is an identity rather than a tolerance. The recompose is
+/// `col = R + D_out·kd·m_d + S_out·f0` with `R = base − D_in·kd·m_d − S_in·f0`,
+/// so with a PASSTHROUGH engine (`OUT == IN`, byte for byte) the correction is
+/// algebraically zero and `col` must collapse onto `base` — which is exactly
+/// the colour `cs_feed_xess` wrote. Any drift at all is the bridge's own
+/// arithmetic, its sig lanes, or its wiring; there is nothing else in the
+/// expression. This is `--check-gpu`'s N3, and it is the strongest shape in the
+/// suite precisely because it compares bytes against a value the SAME device
+/// produced moments earlier rather than against a model of one.
+///
+/// It runs on V13's tracer, which is not thrift: V13's feed is the only thing
+/// in this suite that produces the reference, so the two stages want the same
+/// tracer for the same reason F3 wanted `--check-gpu`'s.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_bridge(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    fed: &vk::fsr3::Fsr3,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    near: f32,
+    far: f32,
+    structural: bool,
+) -> bool {
+    const POISON: u8 = 0xee;
+    let mut ok = true;
+    // The bridge's own seven planes. `wire_feed` already pointed u16/u18/u19 at
+    // the engine's images, and those stay exactly where they are — the bridge
+    // WRITES the engine's colour and guides, which is the whole fold.
+    tg.wire_nrd(hg);
+
+    let run = (|| -> Result<(), String> {
+        // The reference: the colour plane exactly as the feed left it on V13's
+        // last frame.
+        let reference = fed.read_input(hg, 0)?;
+
+        // ANTI-VACUITY, and it has to be a SENTINEL rather than a zero check:
+        // the colour plane already holds the right answer, so a recompose that
+        // never dispatched would pass the byte compare on stale bytes (the M3d
+        // lesson — an operation that never happened compares clean).
+        //
+        // Poisoning all three planes is STRONGER than D3D12's F3, which smears
+        // one plane over the colour target: `cs_nrd_pack` writes the engine's
+        // depth and mvec guides itself — THE FOLD, which is why an NRD frame
+        // runs no separate feed at all — so re-running the plane gate below
+        // scores that half too, and it is a half the feed route cannot reach.
+        fed.poison_inputs(hg, POISON)?;
+        let dirty = fed.read_input(hg, 0)?;
+        let pre_diff = dirty
+            .iter()
+            .zip(reference.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        // The sequence, on ONE command buffer — `nrd_frame_step`'s ordering:
+        // pack -> engine -> recompose.
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        hg.run(|d, cmd| unsafe {
+            r1 = tg.record_nrd_pack(d, cmd);
+            r2 = tg.record_nrd_passthrough(d, cmd);
+            r3 = tg.record_nrd_out(d, cmd);
+        })?;
+        r1?;
+        r2?;
+        r3?;
+
+        let after = fed.read_input(hg, 0)?;
+        let bad = after
+            .iter()
+            .zip(reference.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "check-vk: V14 bridge passthrough ({rw}x{rh}): colour byte-diff {bad} \
+             (pre-dirty {pre_diff})"
+        );
+        if bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V14 the passthrough recompose is not byte-identical to the feed \
+                 — with OUT == IN the delta form's correction is exactly zero, so this is the \
+                 bridge's own arithmetic or its sig lanes"
+            );
+            ok = false;
+        }
+        if pre_diff == 0 {
+            eprintln!(
+                "check-vk: FAIL V14 anti-vacuity — the poison did not change the colour plane, \
+                 so a dead recompose would pass the compare above"
+            );
+            ok = false;
+        }
+
+        // DID THE PACK'S DATA ARRIVE? The byte identity above provably cannot
+        // answer that, and this is not a theory — a planted tooth that skipped
+        // the plane wiring entirely PASSED it. With the planes unbound the
+        // recompose reads zeros, so `D_out − D_in` is zero, `col` collapses
+        // onto `base`, and the identity holds for the wrong reason. A
+        // passthrough makes the delta zero BY CONSTRUCTION, so the arm that
+        // scores the recompose can never also score the pack.
+        //
+        // The three IN planes are read back off the tracer's OWN images, which
+        // exist whether or not a descriptor points at them — which is exactly
+        // what makes an unwired bridge show up here as an untouched plane.
+        for (idx, name) in
+            [(3usize, "in_diff"), (4, "in_spec"), (2, "in_viewz")]
+        {
+            let px = tg.read_nrd_plane(hg, idx)?;
+            let nz = px.iter().filter(|b| **b != 0).count();
+            eprintln!(
+                "check-vk: V14 pack arrival: {name} {nz}/{} non-zero bytes",
+                px.len()
+            );
+            // A tenth of the frame is far below any healthy figure and far
+            // above the zero an unwired plane reads, so it separates the two
+            // without pretending to know this scene's content.
+            if nz * 10 < px.len() {
+                eprintln!(
+                    "check-vk: FAIL V14 the pack left {name} essentially empty — the bridge's \
+                     front half wrote nowhere, and the byte identity above cannot see that"
+                );
+                ok = false;
+            }
+        }
+
+        // THE FOLD: the guides came back from the SAME dispatch that packed the
+        // denoiser's inputs, so V13's own plane gate re-run over them scores a
+        // half no feed route reaches. The poison above is what makes this a
+        // real question — depth and mvec were 0xEE bytes a moment ago.
+        let dbytes = fed.read_input(hg, 1)?;
+        let mbytes = fed.read_input(hg, 2)?;
+        let cbytes = fed.read_input(hg, 0)?;
+        let acc = hg.read_buffer(&tg.accum, rw * rh * 12)?;
+        let core = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+        let tb = hg.read_buffer(&tg.tbuf, rw * rh * 4)?;
+        let gb2 = unpack_gbuf_bytes(&core, None, rw, rh);
+        let tb2: Vec<f32> = (0..rw * rh)
+            .map(|i| f32::from_le_bytes(tb[i * 4..][..4].try_into().unwrap()))
+            .collect();
+        if !gate_xess_feed(
+            "check-vk: V14 fold",
+            rw,
+            rh,
+            &dbytes,
+            &mbytes,
+            &cbytes,
+            &acc,
+            &gb2,
+            &tb2,
+            near,
+            far,
+            structural,
+        ) {
+            ok = false;
+        }
+
+        // ---- THE CAPTURE INVARIANCE (N6b transplanted) ----
+        //
+        // Arming the sig lanes moves what the pack STORES, and the claim that
+        // makes that safe is that it moves nothing else: the exported values
+        // are already computed at the point of capture, so the capture is
+        // assignment-only and `accum` is bit-identical across the toggle. That
+        // is why the arming is a cbuffer bit here rather than a construction
+        // flag — two traces one bit apart need no recompile and no second
+        // tracer, and the claim becomes a gate instead of a comment.
+        let frame = |f: u32| gfx::frame::FrameParams {
+            cam: *basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(dlss::jitter_for(f)),
+            prev_cam: Some(*basis),
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        let ext_len = rw * rh * gfx::frame::GBUF_EXT_STRIDE as usize;
+        let mut arms: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for on in [true, false] {
+            tg.set_nrd_sig(on);
+            tg.render_wavefront(hg, &frame(0), true)?;
+            arms.push((
+                hg.read_buffer(&tg.accum, rw * rh * 12)?,
+                hg.read_buffer(&tg.gbuf_ext, ext_len)?,
+            ));
+        }
+        // Left as found — the N4 restore lesson: a stage that mutates shared
+        // state owes the next one the state it expected.
+        tg.set_nrd_sig(true);
+
+        let core2 = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+        let gb3 = unpack_gbuf_bytes(&core2, None, rw, rh);
+        let acc_diff = arms[0].0.iter().zip(arms[1].0.iter()).filter(|(a, b)| a != b).count();
+        // `sig` opens at byte 48 of the 72-byte ext record (nr | alb | spec |
+        // sig | sig2), and `sig.w`'s HIGH half is `m_d` — the exact-remodulation
+        // divisor, on loan from the `shadow_t` lane nothing decodes yet.
+        const SIG: usize = 48;
+        let (mut live, mut leaked, mut hits) = (0usize, 0usize, 0usize);
+        let (mut md_lo, mut md_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut md_moved = 0usize;
+        for i in 0..rw * rh {
+            if f32::from_bits(gb3.depth[i].load(Relaxed)) >= far {
+                continue; // sky: the pack zeroes sig there by construction
+            }
+            hits += 1;
+            let armed = &arms[0].1[i * 72 + SIG..][..16];
+            let off = &arms[1].1[i * 72 + SIG..][..16];
+            if armed.iter().any(|b| *b != 0) {
+                live += 1;
+            }
+            if off.iter().any(|b| *b != 0) {
+                leaked += 1;
+            }
+            let w = u32::from_le_bytes(armed[12..16].try_into().unwrap());
+            let md = vk::tracer::half_from_bits((w >> 16) as u16);
+            md_lo = md_lo.min(md);
+            md_hi = md_hi.max(md);
+            if md != 1.0 {
+                md_moved += 1;
+            }
+        }
+        eprintln!(
+            "check-vk: V14 sig capture invariance: accum-diff {acc_diff} | sig live {live}/{hits} \
+             | sig leaked (disarmed) {leaked} | m_d [{md_lo:.4}, {md_hi:.4}] moved {md_moved} px"
+        );
+        if acc_diff != 0 {
+            eprintln!(
+                "check-vk: FAIL V14 arming the sig lanes moved {acc_diff} accum bytes — the \
+                 capture is supposed to be assignment-only"
+            );
+            ok = false;
+        }
+        if leaked != 0 {
+            eprintln!("check-vk: FAIL V14 {leaked} px carry sig bytes with the lanes DISARMED");
+            ok = false;
+        }
+        if hits > 0 && live != hits {
+            eprintln!(
+                "check-vk: FAIL V14 only {live} of {hits} hit px carry sig — the pack's lanes \
+                 are what the bridge reads, so a partial capture is a partial denoise"
+            );
+            ok = false;
+        }
+        if hits > 0 && !(md_lo > 0.0 && md_hi <= 1.0) {
+            eprintln!("check-vk: FAIL V14 m_d outside (0, 1]");
+            ok = false;
+        }
+        // THE INERT NOTE, D3D12's N6b verbatim in intent — and here it fires on
+        // every committed gate pose, which is worth stating rather than hoping
+        // a reader infers it. `m_d` is `sk = 1 − 0.157·sheen` blended toward
+        // `sk·dcav`, only the `fabric` class sets sheen at all (matclass.rs's
+        // `tela`/`carpet`/`individual` vocabulary), and `dcav` needs the detail
+        // field's window OPEN, i.e. a magnified surface. The procedural scene
+        // has neither, and san-miguel's nine fabric materials are its
+        // tablecloths and chair fabric — present in the scene, absent from the
+        // fitted overview every `--check-vk` run uses.
+        //
+        // The pose that DOES exercise it is this tree's own documented
+        // glassware close-up, `--cam 0.71,1.55,0.45,0.71,1.25,-0.35` on
+        // san-miguel-low-poly, where this arm reads m_d [0.7700, 1.0000]. Note
+        // the rest of the suite is known-red there for reasons that predate
+        // this stage (`mv_selftest` median 3.156 against a 0.17 limit, plus the
+        // candidate-loop divergences a nearly-all-glass view amplifies), so
+        // that is a READ-THE-LOG configuration, not a passing one — the same
+        // caveat `--dxr-sbt 3` already carries for the identical pose.
+        if hits > 0 && md_moved == 0 {
+            eprintln!(
+                "check-vk: V14 NOTE — m_d is exactly 1.0 on every hit pixel, so the remodulation \
+                 is INERT at this pose and this arm proves it harmless, not correct (the \
+                 glassware close-up is what moves it — see the source)"
+            );
+        }
+        Ok(())
+    })();
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V14 {e}");
+        ok = false;
+    }
     ok
 }
 

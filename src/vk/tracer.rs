@@ -128,6 +128,59 @@ struct Image {
     mem: vk::DeviceMemory,
 }
 
+// The NRD plane ordering — `NrdGpu`'s own (gpu/nrd_gpu.rs's `P_*`), minus the
+// validation plane, which is a debug dump this backend has no lever for yet.
+const N_IN_MV: usize = 0;
+const N_IN_NR: usize = 1;
+const N_IN_VIEWZ: usize = 2;
+const N_IN_DIFF: usize = 3;
+const N_IN_SPEC: usize = 4;
+const N_OUT_DIFF: usize = 5;
+const N_OUT_SPEC: usize = 6;
+const N_COUNT: usize = 7;
+
+/// `(bridge register, plane)` — the ONE place `nrd_bridge.hlsl`'s register map
+/// is transcribed on this backend, and it is a transcription of the SHADER,
+/// which is the only thing that can declare it. `u16`/`u18`/`u19` are absent on
+/// purpose: those are the engine's colour and guide planes, owned by whoever
+/// runs the upscaler, and `wire_feed` already points them at its images.
+const NRD_REGS: [(u32, usize); N_COUNT] = [
+    (17, N_IN_NR),
+    (20, N_OUT_SPEC),
+    (23, N_IN_MV),
+    (24, N_IN_DIFF),
+    (25, N_IN_SPEC),
+    (26, N_IN_VIEWZ),
+    (27, N_OUT_DIFF),
+];
+
+/// The NRD bridge: seven denoiser planes and the two kernels that pack into
+/// and recompose from them.
+///
+/// The planes carry `NrdGpu`'s formats exactly, because the bridge is
+/// deliberately ENGINE-BLIND — `wire_nrd_feed`'s own doc on the D3D12 side says
+/// the kernels "neither know nor care which engine sits between them" — so a
+/// plane whose format drifted here would be a plane a real NRD instance could
+/// not be handed.
+///
+/// ONE DIFFERENCE FROM D3D12, and it deletes code rather than adding it: every
+/// plane rests in `GENERAL` for its whole life. That layout is legal for both
+/// `SAMPLED_IMAGE` and `STORAGE_IMAGE`, so the pass sequence needs only memory
+/// barriers and never a layout transition — D3D12's NPSR<->UA bracketing has no
+/// counterpart here and must not be invented. The price is that GENERAL can
+/// disable framebuffer compression on some hardware, which is irrelevant to a
+/// gate and is the trade every compute-only engine makes.
+struct Nrd {
+    planes: [Image; N_COUNT],
+    /// `[cs_nrd_pack, cs_nrd_out]`.
+    pipes: [vk::Pipeline; 2],
+    /// The planes are created UNDEFINED, and the transition to GENERAL must
+    /// happen EXACTLY ONCE: `UNDEFINED` as an old layout licenses the driver to
+    /// discard contents, so re-transitioning per dispatch would wipe the pack
+    /// on the way to the recompose that reads it.
+    laid_out: std::cell::Cell<bool>,
+}
+
 /// The wavefront quadtree's own half: the queues, the indirect args, the
 /// frustum structure, the ladder kernels, and the two ping-pong descriptor
 /// sets. Kept `Option` so a future device or memory gate is expressible without
@@ -262,6 +315,17 @@ pub struct VkTracer {
     /// `cs_feed_xess`, under `TracerOpts::feed`. `None` is what makes
     /// `record_feed` refuse rather than dispatch a null pipeline.
     feed_pipe: Option<vk::Pipeline>,
+    /// The bridge, under `TracerOpts::nrd`. `None` is what makes
+    /// `record_nrd_*` refuse rather than dispatch a null pipeline.
+    nrd: Option<Nrd>,
+    /// Arm the pack's sig lanes on the frames this tracer records.
+    ///
+    /// A PER-FRAME CELL, not a construction flag, and that is what makes the
+    /// invariance gateable: `FLAG_FSR_SIG` and its dependents are cbuffer bits,
+    /// `accum` is bit-identical across them (the capture is assignment-only —
+    /// D3D12's N6b asserts exactly this), so two traces one bit apart need no
+    /// recompile and no second tracer. Defaults to the bridge's presence.
+    nrd_sig: std::cell::Cell<bool>,
     wave: Option<Wave>,
     hemi: Option<Hemi>,
     cb_base: FrameCb,
@@ -303,6 +367,22 @@ pub struct TracerOpts {
     /// stages that never dispatch a feed. It IMPLIES `gbuf_full` — the kernel
     /// reads the pack — and `new` forces that rather than trusting the caller.
     pub feed: bool,
+    /// Compile the NRD BRIDGE (`cs_nrd_pack` / `cs_nrd_out`) and allocate the
+    /// seven denoiser planes it packs into and recomposes from.
+    ///
+    /// The bridge joins the TRACER family rather than needing one of its own,
+    /// and that is a property of the source rather than a convenience:
+    /// `TraceSources::nrd_bridge()` pastes `trace_common.hlsli`, so it declares
+    /// the tracer's registers plus `u17`, `u20`, `u23`..`u27` — all free — and
+    /// `u16`/`u18`/`u19`, which are the feed's images at the SAME descriptor
+    /// kind. It declares no `t` register at all. Hence one more unit, not a
+    /// second layout.
+    ///
+    /// It IMPLIES `feed`, and not merely because both want `gbuf_full`: the
+    /// bridge's whole claim is that its recompose reproduces what the feed
+    /// wrote, so the feed's colour plane is the only reference V14 can score it
+    /// against. Forced in `new` for the same reason `feed` forces `gbuf_full`.
+    pub nrd: bool,
 }
 
 const P_REFERENCE: usize = 0;
@@ -348,8 +428,11 @@ impl VkTracer {
         // would read one texel's worth of allocation for every pixel. FORCED
         // rather than asserted: the two flags are not independent, and the
         // caller that gets it wrong is asking for the feed, which is the
-        // stronger request.
-        let gbuf_full = opts.gbuf_full || opts.feed;
+        // stronger request. The bridge wants both — `cs_nrd_pack` reads the
+        // pack's sig lanes, and its recompose is only checkable against the
+        // feed's own colour plane.
+        let want_feed = opts.feed || opts.nrd;
+        let gbuf_full = opts.gbuf_full || want_feed;
 
         // ONE assembly for both units, from the shipping entry point — the
         // snapshots come back with it, so the buffers below are SIZED against
@@ -405,6 +488,17 @@ impl VkTracer {
         // `gbuf` at u15, the latter from `trace_common.hlsli` — are the SAME
         // declarations the tracer already binds, so they join no new slot.
         let feed_units: [(&str, &str, &str); 1] = [(&srcs.feed, "cs_feed_xess", "feed-xess")];
+        // The NRD bridge. `nrd_bridge()` is a METHOD rather than a keyed
+        // `Option` field on this side (the DXR pipeline's `DxrSources` carries
+        // the Option), so nothing in the shared core had to change for this —
+        // it is assembled on demand and kept alive for the borrows below.
+        //
+        // TWO entry points from ONE source, the `frd_blur.hlsl` shape: the pack
+        // and the recompose are the bridge's front and back half and share
+        // every declaration between them.
+        let nrd_src = opts.nrd.then(|| srcs.nrd_bridge()).unwrap_or_default();
+        let nrd_units: [(&str, &str, &str); 2] =
+            [(&nrd_src, "cs_nrd_pack", "nrd-pack"), (&nrd_src, "cs_nrd_out", "nrd-out")];
         // Nothing turns these off today (see `Wave`'s doc). The flags stay
         // because the compile/allocate/write sites all key off them, so a
         // future gate — a device floor, a memory ceiling — is one expression
@@ -426,7 +520,8 @@ impl VkTracer {
             .iter()
             .chain(wave_units.iter().take(if want_wave { 9 } else { 0 }))
             .chain(hemi_units.iter().take(if want_hemi { 8 } else { 0 }))
-            .chain(feed_units.iter().take(if opts.feed { 1 } else { 0 }))
+            .chain(feed_units.iter().take(if want_feed { 1 } else { 0 }))
+            .chain(nrd_units.iter().take(if opts.nrd { 2 } else { 0 }))
             .collect();
         for (src, entry, tag) in all {
             let w = sp.compile(src, entry, "cs_6_5", tag, false)?;
@@ -459,6 +554,7 @@ impl VkTracer {
         let mut wpipes = [vk::Pipeline::null(); 9];
         let mut hpipes = [vk::Pipeline::null(); 8];
         let mut feed_pipe: Option<vk::Pipeline> = None;
+        let mut nrd_pipes: Option<[vk::Pipeline; 2]> = None;
         {
             let mut built: Vec<vk::Pipeline> = Vec::new();
             let mut make = |i: usize, entry: &str| -> Result<vk::Pipeline, String> {
@@ -482,12 +578,17 @@ impl VkTracer {
                         hpipes[j] = make(base + j, entry)?;
                     }
                 }
-                if opts.feed {
+                let mut i = units.len() + wave_units.len() + hemi_units.len();
+                if want_feed {
                     // Its index is the END of `all`, which is where the chain
                     // above put it — the same positional agreement the wave
                     // and hemi blocks rely on.
-                    let i = units.len() + wave_units.len() + hemi_units.len();
                     feed_pipe = Some(make(i, feed_units[0].1)?);
+                    i += 1;
+                }
+                if opts.nrd {
+                    nrd_pipes =
+                        Some([make(i, nrd_units[0].1)?, make(i + 1, nrd_units[1].1)?]);
                 }
                 Ok(())
             })();
@@ -686,6 +787,37 @@ impl VkTracer {
         };
 
         let hdr = create_image(vkd, rw, rh)?;
+        // The bridge's planes. Formats are `NrdGpu`'s, verbatim — see `Nrd`.
+        let nrd = match nrd_pipes {
+            None => None,
+            Some(pipes) => {
+                let f16x4 = vk::Format::R16G16B16A16_SFLOAT;
+                // NRD enc-2 packs the normal's L1-octahedral pair plus
+                // roughness into 10:10:10:2. Vulkan spells D3D12's
+                // R10G10B10A2_UNORM as A2B10G10R10_UNORM_PACK32 — the
+                // component ORDER in the name is reversed because one names
+                // memory order and the other names the packed word's high bits
+                // down, and they describe the same bytes.
+                let fmts = [
+                    f16x4,                                      // in_mv
+                    vk::Format::A2B10G10R10_UNORM_PACK32,       // in_nr
+                    vk::Format::R32_SFLOAT,                     // in_viewz
+                    f16x4,                                      // in_diff
+                    f16x4,                                      // in_spec
+                    f16x4,                                      // out_diff
+                    f16x4,                                      // out_spec
+                ];
+                let mut planes: Vec<Image> = Vec::with_capacity(N_COUNT);
+                for f in fmts {
+                    planes.push(create_image_fmt(vkd, rw, rh, f)?);
+                }
+                Some(Nrd {
+                    planes: planes.try_into().map_err(|_| "nrd plane count")?,
+                    pipes,
+                    laid_out: std::cell::Cell::new(false),
+                })
+            }
+        };
         let samp = |aniso: f32| -> Result<vk::Sampler, String> {
             let ci = vk::SamplerCreateInfo::default()
                 .mag_filter(vk::Filter::LINEAR)
@@ -796,6 +928,8 @@ impl VkTracer {
             layouts,
             pipes,
             feed_pipe,
+            nrd_sig: std::cell::Cell::new(nrd.is_some()),
+            nrd,
             wave,
             hemi,
             cb_base,
@@ -1162,6 +1296,249 @@ impl VkTracer {
         Ok(())
     }
 
+    /// Point the bridge's seven registers at the planes this tracer owns.
+    ///
+    /// Unlike `wire_feed`, which binds views it does NOT own (the upscaler's),
+    /// these planes belong to the tracer — the bridge is our own kernel pair
+    /// and the planes exist to sit between its halves. So this takes no
+    /// argument; it is "publish what I already have".
+    ///
+    /// Guarded on the map for `wire_feed`'s reason (a write to a binding the
+    /// layout lacks is not a harmless no-op), which also makes calling it on a
+    /// tracer built without `TracerOpts::nrd` inert rather than undefined.
+    pub fn wire_nrd(&self, hg: &VkHeadless) {
+        let Some(n) = &self.nrd else { return };
+        let d = &hg.vk.device;
+        let mut all: Vec<&[vk::DescriptorSet]> = vec![&self.sets];
+        if let Some(w) = &self.wave {
+            all.push(&w.sets_a);
+            all.push(&w.sets_b);
+        }
+        if let Some(h) = &self.hemi {
+            all.push(&h.sets_a);
+            all.push(&h.sets_b);
+        }
+        let infos: Vec<[vk::DescriptorImageInfo; 1]> = NRD_REGS
+            .iter()
+            .map(|(_, p)| {
+                [vk::DescriptorImageInfo::default()
+                    .image_view(n.planes[*p].view)
+                    .image_layout(vk::ImageLayout::GENERAL)]
+            })
+            .collect();
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+        for sets in &all {
+            for (i, (reg, _)) in NRD_REGS.iter().enumerate() {
+                let b = binding_of(Reg::U, *reg);
+                if !self.map.entries.contains_key(&(0, b)) {
+                    continue;
+                }
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(sets[0])
+                        .dst_binding(b)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&infos[i]),
+                );
+            }
+        }
+        if std::env::var_os("FR_VK_MAP").is_some() {
+            eprintln!(
+                "check-vk:   wire_nrd <- {} write(s) over {} set-0 variant(s)",
+                writes.len(),
+                all.len()
+            );
+        }
+        if !writes.is_empty() {
+            unsafe { d.update_descriptor_sets(&writes, &[]) };
+        }
+    }
+
+    /// Arm or disarm the pack's sig lanes for the frames recorded after this.
+    /// See the `nrd_sig` field: a cbuffer bit, so the two arms of the
+    /// capture-invariance gate need no second tracer.
+    pub fn set_nrd_sig(&self, on: bool) {
+        self.nrd_sig.set(on);
+    }
+
+    /// Read one bridge plane back, by the `N_*` index.
+    ///
+    /// THIS IS WHAT MAKES THE PASSTHROUGH GATE NON-VACUOUS, and the reason is
+    /// worth stating because a first draft shipped without it and a planted
+    /// tooth PASSED: with the planes unbound the recompose reads zeros, so
+    /// `D_out − D_in` is zero, `col` collapses onto `base`, and the byte
+    /// identity holds FOR THE WRONG REASON. A passthrough makes the delta zero
+    /// by construction, so byte-identity alone provably cannot separate "the
+    /// bridge computed a zero delta" from "the bridge read nothing". Asking
+    /// whether the pack's data ARRIVED is the missing half — M3d's texture
+    /// probe in another currency.
+    pub fn read_nrd_plane(&self, hg: &VkHeadless, idx: usize) -> Result<Vec<u8>, String> {
+        let n = self.nrd.as_ref().ok_or("this tracer was not built with TracerOpts::nrd")?;
+        let p = n.planes.get(idx).ok_or("nrd plane index")?;
+        // Bytes per texel, by the same table `new` created these with.
+        let bpp: u64 = match idx {
+            N_IN_NR => 4,
+            N_IN_VIEWZ => 4,
+            _ => 8,
+        };
+        let bytes = bpp * self.rw as u64 * self.rh as u64;
+        let dst = hg.vk.buffer(bytes, vk::BufferUsageFlags::TRANSFER_DST, true)?;
+        let region = [vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D { width: self.rw, height: self.rh, depth: 1 })];
+        // GENERAL is a legal copy SOURCE (unlike SHADER_READ_ONLY_OPTIMAL,
+        // which B3 learned the hard way), so the planes need no transition at
+        // all to be read — the one place resting everything in GENERAL pays
+        // for itself outright.
+        let r = hg.run(|d, cmd| unsafe {
+            d.cmd_copy_image_to_buffer(
+                cmd,
+                p.img,
+                vk::ImageLayout::GENERAL,
+                dst.buf,
+                &region,
+            );
+        });
+        let out = r.and_then(|_| hg.vk.read(&dst, bytes as usize));
+        hg.vk.free_buffer(&dst);
+        out
+    }
+
+    /// Bring the bridge's planes into `GENERAL`, once. See `Nrd::laid_out` for
+    /// why exactly once and not per dispatch.
+    unsafe fn nrd_lay_out(&self, d: &ash::Device, cmd: vk::CommandBuffer, n: &Nrd) {
+        if n.laid_out.replace(true) {
+            return;
+        }
+        let bs: Vec<vk::ImageMemoryBarrier> = n
+            .planes
+            .iter()
+            .map(|p| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(p.img)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    )
+                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+            })
+            .collect();
+        unsafe {
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &bs,
+            );
+        }
+    }
+
+    /// The bridge's FRONT half: `gbuf`/`gbuf_ext`/`accum` -> the five IN
+    /// planes, plus the engine's own depth and mvec guides (THE FOLD — those
+    /// stores moved into `cs_nrd_pack` on the D3D12 side, which is why an NRD
+    /// frame runs no separate engine feed at all).
+    ///
+    /// # Safety
+    /// `cmd` must be recording and `write_cb` must have run for THIS frame with
+    /// the sig lanes armed — a pack over unarmed lanes reads zeros and the
+    /// recompose then subtracts them.
+    pub unsafe fn record_nrd_pack(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+    ) -> Result<(), String> {
+        let n = self.nrd.as_ref().ok_or("this tracer was not built with TracerOpts::nrd")?;
+        unsafe {
+            self.nrd_lay_out(d, cmd, n);
+            barrier(d, cmd);
+            self.bind(d, cmd, &self.sets);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, n.pipes[0]);
+            d.cmd_dispatch(cmd, self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            barrier(d, cmd);
+        }
+        Ok(())
+    }
+
+    /// The bridge's BACK half: the delta-form recompose into the engine's
+    /// colour plane (`u16` — the same image `wire_feed` bound).
+    ///
+    /// # Safety
+    /// As `record_nrd_pack`, and the OUT planes must carry whatever the engine
+    /// produced from the IN ones.
+    pub unsafe fn record_nrd_out(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+    ) -> Result<(), String> {
+        let n = self.nrd.as_ref().ok_or("this tracer was not built with TracerOpts::nrd")?;
+        unsafe {
+            self.nrd_lay_out(d, cmd, n);
+            barrier(d, cmd);
+            self.bind(d, cmd, &self.sets);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, n.pipes[1]);
+            d.cmd_dispatch(cmd, self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            barrier(d, cmd);
+        }
+        Ok(())
+    }
+
+    /// A PASSTHROUGH denoiser: OUT = IN, byte for byte.
+    ///
+    /// This is N3's control arm — the engine that does nothing — and it is what
+    /// makes the bridge's claim checkable without an engine at all: with
+    /// `OUT == IN` the delta form's correction is exactly zero, so the
+    /// recompose must reproduce `base`, which is exactly what the feed wrote.
+    /// Any drift is the bridge's arithmetic or its wiring and nothing else.
+    ///
+    /// # Safety
+    /// `cmd` must be recording, and the IN planes must hold a completed pack.
+    pub unsafe fn record_nrd_passthrough(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+    ) -> Result<(), String> {
+        let n = self.nrd.as_ref().ok_or("this tracer was not built with TracerOpts::nrd")?;
+        let region = [vk::ImageCopy::default()
+            .src_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .dst_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .extent(vk::Extent3D { width: self.rw, height: self.rh, depth: 1 })];
+        unsafe {
+            self.nrd_lay_out(d, cmd, n);
+            barrier(d, cmd);
+            for (src, dst) in [(N_IN_DIFF, N_OUT_DIFF), (N_IN_SPEC, N_OUT_SPEC)] {
+                d.cmd_copy_image(
+                    cmd,
+                    n.planes[src].img,
+                    vk::ImageLayout::GENERAL,
+                    n.planes[dst].img,
+                    vk::ImageLayout::GENERAL,
+                    &region,
+                );
+            }
+            barrier(d, cmd);
+        }
+        Ok(())
+    }
+
     /// Write (or rewrite) the `texs[]` array.
     ///
     /// Found by KIND, not by register: it is the corpus's one unbounded
@@ -1238,12 +1615,27 @@ impl VkTracer {
         // ext. Core-only would fail that arm for a reason unrelated to the
         // pack.
         //
+        // THE SIG LANES follow the bridge, through a per-frame cell rather than
+        // the allocation: `cs_nrd_pack` reads `sig`/`sig2` out of `gbuf_ext` to
+        // build the diffuse and specular IN planes, so a bridge over unarmed
+        // lanes packs zeros and the recompose then subtracts them. They are
+        // safe to move per frame because the capture is assignment-only — the
+        // exported values are already computed — which is what makes `accum`
+        // bit-identical across the toggle and the invariance gateable without a
+        // second tracer.
+        //
+        // `remod_exact` rides ARMED, matching the D3D12 shipping default, so
+        // the two backends' packs agree about what `sig.w`'s high half carries
+        // (`m_d`, on loan from `shadow_t`). `nrd_sig` arms with it because
+        // `remod_exact` is derived from the conjunction.
+        //
         // The rest stay off, each structurally rather than as a default:
-        // `fsr_sig` is a shade-side export this backend does not capture (so
-        // `core.w`/the sig lanes stay 0, and `unpack_gbuf_bytes` drops them
-        // anyway), `nrd_sig`/`sky_ext_skip`/`remod_exact` need a wired
-        // denoiser, and `nrd_rejitter`/`rclamp` live in `cs_nrd_out`, which is
-        // not compiled here at all.
+        // `sky_ext_skip` is an optimization whose whole premise is that NRD is
+        // the SOLE ext subscriber, which a gate reading the pack back on the
+        // CPU is not; `nrd_rejitter` is NVIDIA's Jacobian and is engine-gated
+        // on D3D12 for a stated reason (an oracle sharing a post-process with
+        // the arm under test is not an oracle), and no engine sits between the
+        // bridge halves yet; `rclamp` is default-OFF there too.
         //
         // A POSITIONAL PILE THIS LONG IS A HAZARD, and this call site is the
         // evidence: the NRD exact-remodulation merge added `remod_exact` and
@@ -1252,8 +1644,9 @@ impl VkTracer {
         // HERE too — a wrong `false` would be silent where the missing
         // argument was loud.
         let g = self.gbuf_full;
+        let sig = g && self.nrd_sig.get();
         let mut cb =
-            self.cb_base.with_frame(p, g, false, g, false, false, false, false, (false, false));
+            self.cb_base.with_frame(p, g, sig, g, sig, false, false, sig, (false, false));
         cb.cloud_grid = if self.cloud_shadow_n == 0 || !p.clouds.enabled {
             [0.0; 4]
         } else {
@@ -1879,15 +2272,20 @@ impl VkTracer {
                 .chain(self.wave.iter().flat_map(|w| w.pipes.iter()))
                 .chain(self.hemi.iter().flat_map(|h| h.pipes.iter()))
                 .chain(self.feed_pipe.iter())
+                .chain(self.nrd.iter().flat_map(|n| n.pipes.iter()))
             {
                 d.destroy_pipeline(*p, None);
             }
             d.destroy_descriptor_pool(self.pool, None);
             d.destroy_sampler(self.samp_lin, None);
             d.destroy_sampler(self.samp_aniso, None);
-            d.destroy_image_view(self.hdr.view, None);
-            d.destroy_image(self.hdr.img, None);
-            d.free_memory(self.hdr.mem, None);
+            for i in std::iter::once(&self.hdr)
+                .chain(self.nrd.iter().flat_map(|n| n.planes.iter()))
+            {
+                d.destroy_image_view(i.view, None);
+                d.destroy_image(i.img, None);
+                d.free_memory(i.mem, None);
+            }
         }
         self.layouts.destroy(vkd);
         for b in [
@@ -1965,16 +2363,38 @@ fn barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
 }
 
 fn create_image(vkd: &crate::vk::device::Vk, rw: u32, rh: u32) -> Result<Image, String> {
+    create_image_fmt(vkd, rw, rh, vk::Format::R16G16B16A16_SFLOAT)
+}
+
+/// `create_image` with the format spelled, for the NRD planes — whose wire
+/// formats are `NrdGpu`'s and therefore not all RGBA16F (`in_viewz` is R32F and
+/// `in_nr` is the packed 10:10:10:2 NRD enc-2 normal+roughness).
+///
+/// TRANSFER_DST rides along with TRANSFER_SRC unconditionally: the bridge's
+/// passthrough control arm copies IN planes over OUT ones, and a usage bit
+/// added only under a gate would make the diagnostic's subject a specially
+/// built resource set rather than the shipping one — the `FR_SPLIT_AUDIT`
+/// lesson, which cost `vk::stage` the same bit one milestone earlier.
+fn create_image_fmt(
+    vkd: &crate::vk::device::Vk,
+    rw: u32,
+    rh: u32,
+    fmt: vk::Format,
+) -> Result<Image, String> {
     let d = &vkd.device;
     let ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::R16G16B16A16_SFLOAT)
+        .format(fmt)
         .extent(vk::Extent3D { width: rw, height: rh, depth: 1 })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)
+        .usage(
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+        )
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let img = unsafe { d.create_image(&ci, None) }
         .map_err(|e| format!("vkCreateImage: {e}"))?;
@@ -2001,7 +2421,7 @@ fn create_image(vkd: &crate::vk::device::Vk, rw: u32, rh: u32) -> Result<Image, 
             &vk::ImageViewCreateInfo::default()
                 .image(img)
                 .view_type(vk::ImageViewType::TYPE_2D)
-                .format(vk::Format::R16G16B16A16_SFLOAT)
+                .format(fmt)
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
