@@ -145,7 +145,7 @@ use objc2::rc::Retained;
 #[cfg(ffx_fsr3_metal)]
 use objc2::runtime::ProtocolObject;
 #[cfg(ffx_fsr3_metal)]
-use objc2_metal::{MTLPixelFormat, MTLTexture};
+use objc2_metal::{MTLStorageMode, MTLTexture};
 
 /// One transpiled permutation as the shim sees it — the `FrShimFsr3MetalLib` of
 /// `shim/ffx_fsr3_metal.h`, and the ONLY struct that crosses this ABI. Every
@@ -249,10 +249,10 @@ pub struct Fsr3 {
     upscale: (usize, usize),
     // Allocated ONCE at the max extents and dispatched as sub-rects — the
     // discipline `gpu/ffx_up.rs` states for the D3D12 arm, and the reason a
-    // dynamic render resolution costs no reallocation.
-    color: Retained<ProtocolObject<dyn MTLTexture>>,
-    depth: Retained<ProtocolObject<dyn MTLTexture>>,
-    motion: Retained<ProtocolObject<dyn MTLTexture>>,
+    // dynamic render resolution costs no reallocation. Shared with the MetalFX
+    // arm (`super::planes`), which is what makes the two upscalers' inputs
+    // identical by construction rather than by two call sites agreeing.
+    trio: super::planes::Trio,
     output: Retained<ProtocolObject<dyn MTLTexture>>,
 }
 
@@ -317,11 +317,9 @@ impl Fsr3 {
         // shim declares exactly these to FFX, which rebuilds its own views from
         // that description and ignores whatever we hold — so a mismatch between
         // what is allocated and what is declared is read as garbage rather than
-        // rejected. Keep the two in lockstep.
-        let tex = |w: usize, h: usize, f: MTLPixelFormat, what: &str| {
-            mtl.texture(w, h, f).map_err(|e| format!("{what}: {e}"))
-        };
-        let (rw, rh) = render;
+        // rejected. They live in `super::planes` so allocation and declaration
+        // read one constant.
+        //
         // THE PLANES ARE BUILT INTO LOCALS FIRST, and that is about the FAILURE
         // path rather than about style. From the `create` above, `handle` owns a
         // live FFX context, its backend, the three temporals and every pipeline
@@ -329,15 +327,19 @@ impl Fsr3 {
         // inside the struct literal would therefore return with all of that
         // leaked, which is exactly the shape that goes unnoticed: it is an
         // error path, and a gate builds several contexts in a loop.
-        let alloc = || -> Result<[Retained<ProtocolObject<dyn MTLTexture>>; 4], String> {
-            Ok([
-                tex(rw, rh, MTLPixelFormat::RGBA16Float, "color plane")?,
-                tex(rw, rh, MTLPixelFormat::R32Float, "depth plane")?,
-                tex(rw, rh, MTLPixelFormat::RG16Float, "motion plane")?,
-                tex(upscale.0, upscale.1, MTLPixelFormat::RGBA16Float, "output plane")?,
-            ])
+        let alloc = || -> Result<
+            (super::planes::Trio, Retained<ProtocolObject<dyn MTLTexture>>),
+            String,
+        > {
+            let trio = super::planes::Trio::new(mtl, render)?;
+            // Shared, unlike the MetalFX arm's output: FFX documents no storage
+            // requirement, so the plain `read` path applies.
+            let out = mtl
+                .texture(upscale.0, upscale.1, super::planes::OUTPUT, MTLStorageMode::Shared)
+                .map_err(|e| format!("output plane: {e}"))?;
+            Ok((trio, out))
         };
-        let [color, depth, motion, output] = match alloc() {
+        let (trio, output) = match alloc() {
             Ok(planes) => planes,
             Err(e) => {
                 // SAFETY: the context this function just created, never handed
@@ -347,16 +349,22 @@ impl Fsr3 {
                 return Err(e);
             }
         };
-        Ok(Fsr3 { handle, pipelines, max_render: render, upscale, color, depth, motion, output })
+        Ok(Fsr3 { handle, pipelines, max_render: render, upscale, trio, output })
     }
 
     /// Stage the input trio into the planes' top-left `rw x rh` sub-rect.
     ///
-    /// The encodings are `fsr::stage_*` — the SAME pure functions `--check-fsr`
-    /// gates on every platform, and the same ones the D3D12 arm's
-    /// `record_upload` uses. That sharing is the architecture: shared MATH,
-    /// duplicated RECORDING (`src/mtl/mod.rs`). Nothing about the three
-    /// encodings is decided in this file.
+    /// The planes and the recording both live in `super::planes::Trio`, shared
+    /// with the MetalFX arm — which is what makes "the two Metal upscalers see
+    /// identical inputs" true by construction rather than by inspection, and
+    /// therefore what makes reading one gate's verdict against the other's mean
+    /// anything. It is a dedup within ONE api, not the `trait Upscaler`
+    /// `src/mtl/mod.rs` rules out; that file and `planes.rs`'s own header carry
+    /// the argument, including the condition under which it must be un-shared.
+    ///
+    /// The encodings are `fsr::stage_*` either way — the SAME pure functions
+    /// `--check-fsr` gates on every platform. Nothing about them is decided
+    /// here or there.
     pub fn upload(
         &self,
         mtl: &super::device::Mtl,
@@ -366,20 +374,7 @@ impl Fsr3 {
         near: f32,
         far: f32,
     ) {
-        let (rw, rh) = render;
-        // Tight source pitches. `replaceRegion` takes an arbitrary
-        // `bytesPerRow` — there is no 256-byte rule to honour as in D3D12 — and
-        // the DESTINATION sub-rect is what makes this the sub-rect discipline,
-        // not the source packing.
-        let mut buf = vec![0u8; rw * rh * 8];
-        crate::fsr::stage_color(&mut buf, rw * 8, accum, rw, rh);
-        mtl.upload(&self.color, rw, rh, rw * 8, &buf);
-
-        crate::fsr::stage_mvec(&mut buf[..rw * rh * 4], rw * 4, &g.mvec, rw, rh);
-        mtl.upload(&self.motion, rw, rh, rw * 4, &buf[..rw * rh * 4]);
-
-        crate::fsr::stage_depth(&mut buf[..rw * rh * 4], rw * 4, &g.depth, rw, rh, near, far);
-        mtl.upload(&self.depth, rw, rh, rw * 4, &buf[..rw * rh * 4]);
+        self.trio.stage(mtl, accum, g, render, near, far);
     }
 
     /// Record one upscale, submit it, and block until the GPU is done.
@@ -421,9 +416,9 @@ impl Fsr3 {
                 frshim_fsr3_metal_dispatch(
                     self.handle,
                     cb as *const _ as *mut std::ffi::c_void,
-                    ptr(&self.color),
-                    ptr(&self.depth),
-                    ptr(&self.motion),
+                    ptr(&self.trio.color),
+                    ptr(&self.trio.depth),
+                    ptr(&self.trio.motion),
                     ptr(&self.output),
                     rw as u32,
                     rh as u32,

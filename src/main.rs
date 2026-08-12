@@ -356,6 +356,7 @@ fn main() {
         nppd_dump,
         check_nrd,
         check_fsr3,
+        check_metalfx,
         check_spirv,
         check_vk,
         check_gpu,
@@ -970,6 +971,10 @@ fn main() {
         // through the CPU tracer, so the G-buffer it scores is the scene's.
         // Today's stages are scene-independent.
         || check_fsr3
+        // Same reason as the line above: the scored upscale renders a real
+        // frame pair through the CPU tracer, so the G-buffer it scores is the
+        // scene's. Today's stages are otherwise scene-independent.
+        || check_metalfx
         || check_nppd
         || check_nrd
         // Scene-keyed like the rest: the conditional-hit machinery
@@ -1241,6 +1246,25 @@ fn main() {
                  because Metal needs a hand-written FfxInterface, which is a different \
                  subject. The pure half of the shared staging math runs everywhere in \
                  --check-fsr."
+            );
+            std::process::exit(2);
+        }
+    }
+    if check_metalfx {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_metalfx(&scene, &bvh, cam0, structural);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2, not a SKIP, for the reason the sibling above states: an
+            // explicitly requested gate on the wrong OS is an ENVIRONMENT error.
+            eprintln!(
+                "--check-metalfx gates Apple's MetalFX temporal upscaler, which exists only on \
+                 macOS — there is no equivalent to fall back to, unlike FidelityFX, whose \
+                 Vulkan arm is --check-vk's V11 and whose Metal arm is --check-fsr3. The pure \
+                 half of the shared input-plane staging math runs everywhere in --check-fsr."
             );
             std::process::exit(2);
         }
@@ -13927,7 +13951,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
             return i32::from(!ok);
         }
     };
-    println!("check-spirv: S1 libdxcompiler.so loaded from {dir}");
+    println!("check-spirv: S1 {} loaded from {dir}", vk::spirv::LIB_NAME);
 
     // ---- S2: assemble the corpus. ----
     /// A compile unit: how to target it, and how to find its entry points.
@@ -19190,6 +19214,711 @@ fn fsr3_upscale_check(
              look for edges SHARPER than the input at 2x, and for a static view that does not \
              wobble; a mirrored jitter or motion-vector sign reads as doubled wobble or as a \
              directional smear, neither of which any magnitude above can distinguish"
+        );
+    }
+    Ok(())
+}
+
+/// How far MetalFX's output must sit from a bilinear stretch of its own input.
+///
+/// MEASURED on this arm rather than inherited: `--check-fsr3`'s twin records
+/// 2.96e-2 for FidelityFX and sets its bound six times under, and that number
+/// describes FFX's reconstruction on this scene — not Apple's. The same SIX
+/// TIMES rule is applied here to this arm's own measurement, for the same
+/// reason it was there: the failure being rejected (a resampler in place of a
+/// reconstruction) lands at ~0, so a low bound loses no discrimination while a
+/// snug one fails on any pose that reconstructs less.
+#[cfg(target_os = "macos")]
+const MFX_BILINEAR_MIN: f64 = 4.5e-3;
+
+/// How strongly MetalFX's and FSR3's deviations from a common bilinear
+/// reference must agree. See the cross-check block in `metalfx_upscale_check`
+/// for why this is a CORRELATION and not a distance — the tempting distance
+/// form is mathematically unsound and was measured to be.
+///
+/// MEASURED, both arms, on the default scene: **0.655 correct, 0.479 with the
+/// MetalFX jitter sign mirrored one-sidedly** (`FR_MFX_JITTER=neg`). This is the
+/// only assertion in either Metal gate that can score a POLARITY, which
+/// `--check-fsr3`'s own dump-image note says no magnitude can.
+///
+/// THE FLOOR IS NOT MIDWAY, and the asymmetry is the choice rather than an
+/// accident: 0.5 sits 0.024 above the FAILING measurement and 0.155 below the
+/// passing one. That buys margin against false failures at the cost of margin
+/// against a blunt tooth, which is the right direction for a gate — a flaky red
+/// costs every future run, while a tooth that stops biting costs only the case
+/// it was aimed at, and the dump images remain the authority for polarity. The
+/// consequence to know: if a future scene or driver moves the MIRRORED reading
+/// up by 5%, this stops discriminating, and the symptom is a green run rather
+/// than a noisy one. Re-measure both arms before trusting it on new content.
+///
+/// THE SEPARATION IS REAL BUT NARROW, and saying so is the point. A mirrored
+/// jitter displaces detail by about a pixel; that is a subtle error, which is
+/// exactly why single-arm magnitudes cannot see it and why the correlation gap
+/// is 0.18 rather than an order of magnitude. Both numbers are reproducible
+/// here (every other comparison in this gate comes back bit-exact), so the
+/// thin margin is not flakiness on this scene — but on a scene that
+/// reconstructs less coherently it could become so, and the dump images stay
+/// the authority for polarity rather than this number.
+#[cfg(all(target_os = "macos", ffx_fsr3_metal))]
+const MFX_FSR3_CORR_MIN: f64 = 0.5;
+
+/// `--check-metalfx` — Apple's temporal upscaler over the same G-buffer
+/// `--check-fsr3` feeds FidelityFX.
+///
+/// A SEPARATE GATE rather than a stage of `--check-fsr3`, matching this tree's
+/// one-gate-per-SDK convention (`--check-oidn`, `--check-xess`, `--check-nrd`):
+/// the two have unrelated skip stories — this one turns on device support and a
+/// macOS version, that one on whether the FidelityFX SDK source and a
+/// build-time transpile were present — and folding Apple's upscaler into a flag
+/// named after FidelityFX would mislead every later reader. The one place they
+/// touch is X3's cross-check, which is compiled only where both exist.
+#[cfg(target_os = "macos")]
+fn run_check_metalfx(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    _structural: bool,
+) -> i32 {
+    let mut ok = true;
+    // Whether a MetalFX scaler was ever reachable in this run — see the NOTE at
+    // the bottom, which is about a failure class that needs one to hide in.
+    let mut ran = false;
+    let mut fail = |m: String| {
+        eprintln!("check-metalfx: FAIL {m}");
+        ok = false;
+    };
+
+    // ---- X0: the pure half -------------------------------------------------
+    // The staging math, which is `--check-fsr` on every platform and
+    // `--check-fsr3`'s U0 here. Duplicated deliberately so the gate is
+    // self-contained; it adds no MetalFX-specific coverage and is not described
+    // as if it does.
+    match fsr::stage_self_test() {
+        Ok(()) => println!("check-metalfx: X0 input trio staging (colour/mvec/depth) OK"),
+        Err(e) => fail(format!("X0 {e}")),
+    }
+
+    // ---- X1: a device, and MetalFX on it -----------------------------------
+    let m = match mtl::device::Mtl::new() {
+        Ok(m) => {
+            println!("check-metalfx: X1 device — {}", m.line());
+            match mtl::device::self_test(&m) {
+                Ok(()) => println!("check-metalfx: X1 texture round-trip + submit OK"),
+                Err(e) => fail(format!("X1 {e}")),
+            }
+            Some(m)
+        }
+        Err(e) if e.absent => {
+            println!("check-metalfx: SKIP X1 ({e})");
+            None
+        }
+        Err(e) => {
+            eprintln!("check-metalfx: {e}");
+            return if ok { 2 } else { 1 };
+        }
+    };
+
+    if let Some(m) = m.as_ref() {
+        // A LABELLED BLOCK, NOT `return`, so every exit below reaches the
+        // verdict line at the bottom of this function. A bare `return` here
+        // would print no PASSED/FAILED at all, which matters most in the case
+        // that reaches it first: X0 failing on a Mac without MetalFX support
+        // exits 1 with nothing in the log saying the run failed. `ran` is what
+        // keeps the validation NOTE honest on those paths — it advertises an
+        // invisible failure class, and there is no MetalFX run to hide one in
+        // until the scaler is actually reachable.
+        'device: {
+            if !mtl::mfx::Mfx::supported(m) {
+                // An environment fact, like the absent device above: MetalFX needs
+                // macOS 13 and hardware support, and a machine without it is a
+                // different Mac rather than a broken tree.
+                println!(
+                    "check-metalfx: SKIP X1 — MTLFXTemporalScalerDescriptor.supportsDevice is \
+                     false for this device"
+                );
+                break 'device;
+            }
+            let (smin, smax) = mtl::mfx::Mfx::scale_range(m);
+            println!(
+                "check-metalfx: X1 MetalFX supported — input scale range {smin:.2}x..{smax:.2}x"
+            );
+            // Asserted rather than discovered as an opaque nil from the factory: a
+            // ratio outside the range is an environment limit with a number on it.
+            if !(smin..=smax).contains(&2.0f32) {
+                fail(format!(
+                    "X1 this gate upscales exactly 2.0x, which is outside the device's supported \
+                     {smin:.2}x..{smax:.2}x"
+                ));
+                break 'device;
+            }
+            ran = true;
+
+            // ---- X2: the scaler builds, and our textures satisfy it --------
+            //
+            // DELIBERATELY NOT X3's EXTENTS. This stage's subject is creation,
+            // the usage contract and destruction, none of which X3 covers (it
+            // holds one scaler for its whole life), and running it at a second
+            // size is the cheap way to keep the answers from being a property
+            // of one hardcoded pair — the descriptor is where a rejected format
+            // or ratio surfaces, and it takes the extents as input. Still
+            // exactly 2.0x, which is what the range assertion above cleared.
+            let t0 = std::time::Instant::now();
+            match mtl::mfx::Mfx::new(m, (401, 227), (802, 454)) {
+                Ok(s) => {
+                    let u = s.required_usage();
+                    println!(
+                        "check-metalfx: X2 scaler created — 401x227 -> 802x454, {} ms \
+                         (synchronous init)",
+                        t0.elapsed().as_millis()
+                    );
+                    // READ OFF THE OBJECT, not assumed — the discipline
+                    // `--check-nrd`'s N1 applies to spirv_binding_offsets. Note
+                    // the narrowness: this is about USAGE, and the requirement
+                    // that actually bites on this API is the OUTPUT's STORAGE
+                    // MODE (Private), which no usage comparison can reach. That
+                    // one is enforced by construction in `mtl::mfx` and by the
+                    // validation layer, which is why the NOTE below is not
+                    // optional.
+                    let ours = (objc2_metal::MTLTextureUsage::ShaderRead
+                        | objc2_metal::MTLTextureUsage::ShaderWrite
+                        | objc2_metal::MTLTextureUsage::RenderTarget)
+                        .0;
+                    for (what, need) in [
+                        ("color", u.color),
+                        ("depth", u.depth),
+                        ("motion", u.motion),
+                        ("output", u.output),
+                    ] {
+                        if need.0 & !ours != 0 {
+                            fail(format!(
+                                "X2 the scaler needs {what} usage {:#x}, and Mtl::texture hands \
+                                 out {ours:#x} — not a superset",
+                                need.0
+                            ));
+                        }
+                    }
+                    println!(
+                        "check-metalfx: X2 texture usage OK — required color {:#x} depth {:#x} \
+                         motion {:#x} output {:#x}, all within the harness's {ours:#x}",
+                        u.color.0, u.depth.0, u.motion.0, u.output.0
+                    );
+                    drop(s);
+                    println!("check-metalfx: X2 scaler destroyed OK");
+                }
+                Err(e) => fail(format!("X2 {e}")),
+            }
+
+            // ---- X3: a real upscale, scored ----------------------------------
+            if let Err(e) = metalfx_upscale_check(m, scene, bvh, cam0) {
+                fail(format!("X3 {e}"));
+            }
+        }
+    }
+
+    // The FSR3 arm's NOTE, and it matters MORE here: MetalFX documents a
+    // storage-mode requirement for its output texture, and a storage/usage
+    // violation is precisely the class the validation layer catches and an
+    // unvalidated run does not.
+    //
+    // Gated on `ran` rather than on having a device: on a Mac where
+    // `supportsDevice` is false, nothing MetalFX-shaped executed, so advertising
+    // an invisible failure class would be advertising one that had nowhere to
+    // hide.
+    if ran
+        && std::env::var("MTL_DEBUG_LAYER").is_err()
+        && std::env::var("MTL_SHADER_VALIDATION").is_err()
+    {
+        println!(
+            "check-metalfx: NOTE MTL_DEBUG_LAYER / MTL_SHADER_VALIDATION unset — the \
+             validation-only failure class (texture storage modes, usage flags, unbound \
+             arguments) is INVISIBLE in this run. Re-run with both =1."
+        );
+    }
+    println!("check-metalfx: {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
+}
+
+/// X3: two real rendered frames through the real MetalFX scaler, scored.
+///
+/// The twin of `fsr3_upscale_check`, and deliberately the same vocabulary:
+/// finite, energy-preserving, history-differs, not-a-bilinear-stretch, plus the
+/// three plumbing probes baselined on the ACCUMULATING frame. What it does NOT
+/// inherit is any of that gate's NUMBERS — the vs-bilinear bound there records
+/// its own provenance ("MEASURED 2.96e-2 here, and the bound is deliberately
+/// SIX TIMES under it"), which is a fact about FidelityFX's reconstruction on
+/// this scene, not about Apple's. Copying the constant would be the single most
+/// likely way to ship a tooth that does not bite.
+#[cfg(target_os = "macos")]
+fn metalfx_upscale_check(
+    m: &mtl::device::Mtl,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> Result<(), String> {
+    use std::sync::atomic::AtomicU32;
+
+    // The same extents, quality, dolly and jitter as `fsr3_upscale_check`, so
+    // the two arms are read against each other on identical work.
+    let (rw, rh) = (321usize, 181usize);
+    let (uw, uh) = (rw * 2, rh * 2);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+
+    let render = |g: &dlss::GBufs,
+                  accum: &[AtomicU32],
+                  basis: camera::CamBasis,
+                  prev: Option<camera::CamBasis>,
+                  frame: u32,
+                  jitter: (f32, f32)| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: false,
+            rw,
+            rh,
+            accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(g),
+            fsr_buf: None,
+            prev_cam: prev,
+            frame_jitter: Some(jitter),
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+    };
+
+    // THE JITTER SIGN IS THE ONE CONVENTION APPLE DOES NOT DOCUMENT, so it rides
+    // a lever exactly as the Vulkan FSR3 arm's does. `mtl::mfx::JITTER_SIGN` is
+    // seeded at FFX's value; `FR_MFX_JITTER=raw|neg` walks it. No assertion
+    // below scores it — a magnitude cannot tell a correct sign from a mirrored
+    // one — so the dump images are the instrument and this is said, not hidden.
+    let jsign = match std::env::var("FR_MFX_JITTER").as_deref() {
+        Ok("raw") => 1.0f32,
+        Ok("neg") => -1.0f32,
+        Ok(v) => {
+            println!("check-metalfx: FR_MFX_JITTER={v:?} unrecognized — using the default");
+            mtl::mfx::JITTER_SIGN
+        }
+        Err(_) => mtl::mfx::JITTER_SIGN,
+    };
+    // TWO JITTERS, AND CONFLATING THEM MAKES THE LEVER TEST NOTHING. The
+    // renderer OFFSETS its samples by `jitter_for(f)`; the scaler is TOLD
+    // `JITTER_SIGN * jitter_for(f)` — `fsr.rs` states exactly that
+    // ("the jitter reported to BOTH ffx dispatches = JITTER_SIGN * the
+    // renderer's sample offset"). So the sign belongs on the REPORT alone.
+    //
+    // A first draft applied it to both, which made `FR_MFX_JITTER=neg` a
+    // CONSISTENT change of sample positions rather than a mirror — a different
+    // but perfectly valid jitter, correctly reported. Measured: it moved
+    // vs-bilinear 2.752e-2 -> 5.065e-2 and pushed the FSR3 correlation UP,
+    // 0.655 -> 0.931, i.e. the lever made the two arms agree MORE. That is the
+    // "probe that cannot move its target" class inverted — a probe that moved
+    // the wrong one — and it is invisible while `JITTER_SIGN` is 1.0, which is
+    // why `fsr3_upscale_check` carries the same conflation harmlessly today.
+    let jit_render = |f: u32| dlss::jitter_for(f);
+    let jit = |f: u32| {
+        let (jx, jy) = jit_render(f);
+        (jx * jsign, jy * jsign)
+    };
+
+    let accum_a = alloc32(rw * rh * 3);
+    let accum_b = alloc32(rw * rh * 3);
+    let ga = dlss::GBufs::new_slim(rw, rh);
+    let gb = dlss::GBufs::new_slim(rw, rh);
+    let basis_a = cam0.basis(rw, rh);
+    let cam_b = Camera { pos: cam0.pos + cam0.forward() * (0.02 * scene.diag), ..cam0 };
+    let basis_b = cam_b.basis(rw, rh);
+    render(&ga, &accum_a, basis_a, None, 0, jit_render(0));
+    render(&gb, &accum_b, basis_b, Some(basis_a), 1, jit_render(1));
+
+    // A fresh scaler per run: MetalFX's history is internal and per-object, so
+    // there is no other way to have a warmed and an unwarmed one.
+    let run_with = |seq: &[(u32, bool)],
+                    gb_over: Option<&dlss::GBufs>,
+                    jit_over: Option<(f32, f32)>|
+     -> Result<(Vec<f32>, Vec<u16>), String> {
+        let f = mtl::mfx::Mfx::new(m, (rw, rh), (uw, uh))?;
+        for &(frame, reset) in seq {
+            let (acc, g) =
+                if frame == 0 { (&accum_a, &ga) } else { (&accum_b, gb_over.unwrap_or(&gb)) };
+            f.stage(m, acc, g, near, far);
+            let mut jitter = jit(frame);
+            if frame == 1 {
+                if let Some(j) = jit_over {
+                    jitter = j;
+                }
+            }
+            f.dispatch(m, &mtl::mfx::MfxParams { jitter, reset })?;
+        }
+        Ok((f.read_output(m)?, f.read_output_bits(m)?))
+    };
+    let run = |seq: &[(u32, bool)]| run_with(seq, None, None);
+
+    let t0 = std::time::Instant::now();
+    let (warm, warm_bits) = run(&[(0, true), (1, false)])?;
+    let (cold, cold_bits) = run(&[(1, true)])?;
+    // Only the BITS of the repeats are used: the determinism claim below is an
+    // integer ULP distance, not a float comparison.
+    let (_warm2, warm2_bits) = run(&[(0, true), (1, false)])?;
+    let (_cold2, cold2_bits) = run(&[(1, true)])?;
+    let setup_ms = t0.elapsed().as_millis();
+
+    // ---- finite, non-negative, and actually written ------------------------
+    let bad = warm.iter().filter(|v| !v.is_finite() || **v < 0.0).count();
+    if bad != 0 {
+        return Err(format!("{bad} of {} output channels are non-finite or negative", warm.len()));
+    }
+    let mean = |v: &[f32]| {
+        v.chunks(4).map(|p| (p[0] + p[1] + p[2]) / 3.0).sum::<f32>() / (v.len() / 4) as f32
+    };
+    let in_mean = {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh * 3 {
+            s += f64::from(f32::from_bits(accum_b[i].load(Relaxed)));
+        }
+        (s / (rw * rh * 3) as f64) as f32
+    };
+    let out_mean = mean(&warm);
+    if out_mean <= 0.0 {
+        return Err("the output is uniformly zero — the scaler wrote nothing".into());
+    }
+    // THIS ASSERTION IS ONLY MEANINGFUL BECAUSE AUTO-EXPOSURE IS OFF. With it
+    // on, MetalFX computes a per-frame gain that multiplies the input colour and
+    // nothing documents it being un-applied on output, so this would score
+    // Apple's exposure heuristic rather than our wiring — and the temptation on
+    // failure would be to widen the one bound that catches colour-space
+    // mistakes. See `mtl::mfx`'s header.
+    let ratio = out_mean / in_mean;
+    if !(0.5..=2.0).contains(&ratio) {
+        return Err(format!(
+            "output mean {out_mean:.4} is {ratio:.3}x the input's {in_mean:.4} — an upscaler \
+             resamples, it does not expose"
+        ));
+    }
+
+    // ---- determinism, as an INTEGER claim ----------------------------------
+    //
+    // THE ULP DISTANCE IS THE HONEST FORM, and it is why `read_output_bits`
+    // exists. The FSR3 arm's own comment records the measured fact — differing
+    // channels differ "by EXACTLY ONE f16 ULP" — while its code asserts a
+    // relative bound of 1%, which is a tunable number. An ULP distance is not
+    // tunable: it is a statement about adjacent representable values, so a
+    // failure cannot be answered by moving a threshold.
+    //
+    // The claim is written STRICT — both regimes exactly reproducible — and left
+    // that way unless a measurement says otherwise WITH A NAMED CAUSE. FSR3
+    // earned its two-regime split from one (FidelityFX declares its internal
+    // resources FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED, corroborated by the
+    // count dropping to zero under MTL_SHADER_VALIDATION=1, which zero-fills).
+    // MetalFX's history is internal and opaque, so no such cause is available
+    // here in advance, and inheriting FSR3's bound on the assumption that the
+    // same mechanism applies would be describing an unmeasured thing in another
+    // vendor's vocabulary.
+    //
+    // `requiresSynchronousInitialization(true)` is a precondition of this whole
+    // block rather than a performance preference: Apple's default compiles a
+    // faster upscaler in the BACKGROUND, so a compile landing between two of the
+    // four runs above would have this comparing two different implementations
+    // and calling the difference residue.
+    let ulp = |a: &[u16], b: &[u16]| -> (usize, i32) {
+        let (mut n, mut worst) = (0usize, 0i32);
+        for (x, y) in a.iter().zip(b) {
+            if x != y {
+                n += 1;
+                worst = worst.max((i32::from(*x) - i32::from(*y)).abs());
+            }
+        }
+        (n, worst)
+    };
+    let (n_cold, ulp_cold) = ulp(&cold_bits, &cold2_bits);
+    let (n_warm, ulp_warm) = ulp(&warm_bits, &warm2_bits);
+    if n_cold != 0 {
+        return Err(format!(
+            "two reset-only dispatches into fresh scalers differ in {n_cold} of {} channels \
+             (worst {ulp_cold} ULP) — the one path with no history to read must be exactly \
+             reproducible",
+            cold_bits.len()
+        ));
+    }
+    if n_warm != 0 {
+        return Err(format!(
+            "an accumulating frame differs across scalers in {n_warm} of {} channels (worst \
+             {ulp_warm} ULP) — MetalFX's history is internal, so there is no known cause to \
+             attribute this to; investigate rather than widening a bound",
+            warm_bits.len()
+        ));
+    }
+
+    // ---- the history is REAL ------------------------------------------------
+    let hist: f64 = warm.iter().zip(&cold).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
+        / warm.len() as f64;
+    let rel_hist = hist / f64::from(out_mean.max(1e-6));
+    if rel_hist < 1e-3 {
+        return Err(format!(
+            "a warmed history and a reset one differ by {rel_hist:.2e} of the mean — MetalFX is \
+             not accumulating anything"
+        ));
+    }
+
+    // ---- NOT A BILINEAR STRETCH --------------------------------------------
+    let bilinear = |x: usize, y: usize, c: usize| -> f32 {
+        let (fx, fy) = ((x as f32 + 0.5) / 2.0 - 0.5, (y as f32 + 0.5) / 2.0 - 0.5);
+        let (x0, y0) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+        let (x1, y1) = ((x0 + 1).min(rw - 1), (y0 + 1).min(rh - 1));
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let s =
+            |xx: usize, yy: usize| f32::from_bits(accum_b[(yy * rw + xx) * 3 + c].load(Relaxed));
+        let a = s(x0, y0) * (1.0 - tx) + s(x1, y0) * tx;
+        let b = s(x0, y1) * (1.0 - tx) + s(x1, y1) * tx;
+        a * (1.0 - ty) + b * ty
+    };
+    let mut d_bil = 0.0f64;
+    for y in 0..uh {
+        for x in 0..uw {
+            for c in 0..3 {
+                d_bil += f64::from((warm[(y * uw + x) * 4 + c] - bilinear(x, y, c)).abs());
+            }
+        }
+    }
+    let rel_bil = d_bil / (uw * uh * 3) as f64 / f64::from(out_mean.max(1e-6));
+    // MEASURED for MetalFX specifically — see the doc comment. Same six-times
+    // rule as the FSR3 arm, applied to this arm's own number.
+    if rel_bil < MFX_BILINEAR_MIN {
+        return Err(format!(
+            "the output is within {rel_bil:.2e} of a bilinear stretch of its own input — \
+             nothing here proves a temporal reconstruction ran"
+        ));
+    }
+
+    eprintln!(
+        "check-metalfx: X3 upscale {rw}x{rh} -> {uw}x{uh} OK — energy {ratio:.3}x, history \
+         {rel_hist:.3e}, vs-bilinear {rel_bil:.3e}; both regimes bit-exact across scalers \
+         (reset {n_cold} ch, accumulating {n_warm} ch), 4 scalers in {setup_ms} ms"
+    );
+
+    // ---- the two upscalers sharpen the SAME EDGES --------------------------
+    //
+    // THE TOOTH THE SHARED `planes::Trio` EARNS, and the reason that sharing is
+    // justified as more than dedup: given byte-identical inputs, two correct
+    // temporal reconstructions should add detail in the same PLACES and the
+    // same DIRECTIONS, even though their kernels differ. So the claim is a
+    // correlation between the two arms' deviations from one common reference —
+    // scale-free, bounded in [-1, 1], and near ZERO for the failures it exists
+    // to catch (a mirrored convention on one side, a plane reaching one arm and
+    // not the other, a vendor quietly resampling).
+    //
+    // THE OBVIOUS FORMULATION IS MATHEMATICALLY UNSOUND AND WAS MEASURED TO BE —
+    // do not re-derive it. The first draft asserted the tempting
+    // `d(mfx, fsr3) < d(mfx, bilinear)`: "two reconstructions must resemble each
+    // other more than either resembles a resampler." That is not implied by
+    // anything. Bilinear is the SMOOTH image and both arms deviate from it by
+    // adding high-frequency detail; where those deviations are not identical
+    // they ADD rather than cancel, so the mutual distance can legitimately
+    // EXCEED each arm's distance from the smooth reference — approaching sqrt(2)
+    // times it for independent deviations. Measured here: mutual 2.999e-2
+    // against 2.752e-2 vs bilinear, a ratio of 1.09, i.e. the two are strongly
+    // correlated AND the inequality is false. The correlation below is what that
+    // 1.09 actually says, stated as the quantity it is.
+    //
+    // Compiled only where FidelityFX is available, so it SKIPs on a bare clone —
+    // which is the coupling "one gate per SDK" exists to avoid, taken
+    // deliberately and in one direction only (`--check-fsr3` does not know this
+    // gate exists).
+    #[cfg(ffx_fsr3_metal)]
+    {
+        let flags = mtl::fsr3::FLAG_HDR
+            | mtl::fsr3::FLAG_DEPTH_INVERTED
+            | mtl::fsr3::FLAG_AUTO_EXPOSURE;
+        let f = mtl::fsr3::Fsr3::new(m, (rw, rh), (uw, uh), flags)?;
+        for &(frame, reset) in &[(0u32, true), (1u32, false)] {
+            let (acc, g) = if frame == 0 { (&accum_a, &ga) } else { (&accum_b, &gb) };
+            f.upload(m, acc, g, (rw, rh), near, far);
+            f.dispatch(
+                m,
+                &mtl::fsr3::DispatchParams {
+                    render: (rw, rh),
+                    // FFX's OWN settled sign, never MetalFX's lever: that is
+                    // what makes `FR_MFX_JITTER=neg` a genuine ONE-SIDED mirror
+                    // and therefore a calibration point for the correlation
+                    // floor. Driving both arms from one lever would mirror them
+                    // together, which they would agree about.
+                    jitter: {
+                        let (jx, jy) = jit_render(frame);
+                        (jx * fsr::JITTER_SIGN, jy * fsr::JITTER_SIGN)
+                    },
+                    near,
+                    far,
+                    fov_y: cam0.fov_y,
+                    frame_time_ms: 1000.0 / 60.0,
+                    reset,
+                },
+            )?;
+        }
+        let other = f.read_output(m);
+        // Pearson correlation of the two arms' deviations from the SAME
+        // bilinear reference, over every colour channel of the frame.
+        let (mut sa, mut sb, mut n) = (0.0f64, 0.0f64, 0usize);
+        let mut dev = Vec::with_capacity(uw * uh * 3);
+        for y in 0..uh {
+            for x in 0..uw {
+                for c in 0..3 {
+                    let i = (y * uw + x) * 4 + c;
+                    let bil = bilinear(x, y, c);
+                    let (a, b) =
+                        (f64::from(warm[i] - bil), f64::from(other[i] - bil));
+                    sa += a;
+                    sb += b;
+                    n += 1;
+                    dev.push((a, b));
+                }
+            }
+        }
+        let (ma, mb) = (sa / n as f64, sb / n as f64);
+        let (mut caa, mut cbb, mut cab) = (0.0f64, 0.0f64, 0.0f64);
+        for (a, b) in &dev {
+            let (da, db) = (a - ma, b - mb);
+            caa += da * da;
+            cbb += db * db;
+            cab += da * db;
+        }
+        let corr = cab / (caa.sqrt() * cbb.sqrt()).max(1e-30);
+        let mut d_pair = 0.0f64;
+        for y in 0..uh {
+            for x in 0..uw {
+                for c in 0..3 {
+                    let i = (y * uw + x) * 4 + c;
+                    d_pair += f64::from((warm[i] - other[i]).abs());
+                }
+            }
+        }
+        let rel_pair = d_pair / (uw * uh * 3) as f64 / f64::from(out_mean.max(1e-6));
+        // MEASURED 0.655 correct against 0.479 with the MetalFX jitter sign
+        // mirrored — see `MFX_FSR3_CORR_MIN`. This is what SETTLED that sign:
+        // FidelityFX's is already settled, so the arm that agrees more with it
+        // is the one whose convention matches, and `mtl::mfx::JITTER_SIGN`
+        // being +1 (the same as FFX's) is a measurement rather than the
+        // inherited guess it started as.
+        if corr < MFX_FSR3_CORR_MIN {
+            return Err(format!(
+                "MetalFX and FSR3 deviate from a common bilinear reference with correlation \
+                 {corr:.3} on byte-identical inputs — two correct reconstructions add detail in \
+                 the same places, so at this level one of them is mis-wired or is not \
+                 reconstructing"
+            ));
+        }
+        eprintln!(
+            "check-metalfx: X3 cross-check OK — vs FSR3 corr {corr:.3} on identical inputs \
+             (planes::Trio); mutual {rel_pair:.3e}, each vs bilinear {rel_bil:.3e}"
+        );
+    }
+
+    // ---- the inputs are PLUMBED --------------------------------------------
+    //
+    // Each probe re-runs the ACCUMULATING sequence with exactly one input of
+    // frame B changed. The baseline MUST be the accumulating frame: on a reset
+    // frame there is no history, so the depth-derived disocclusion mask has
+    // nothing to reject and depth genuinely cannot change the output — a probe
+    // that cannot move its target fails whatever the code does.
+    //
+    // WHAT THESE CANNOT SEE, said rather than implied: they are magnitudes, so
+    // they fire whether a convention is right or mirrored. The jitter sign has a
+    // lever and the dump images; `setDepthReversed` is in the same class —
+    // pointing it the wrong way inverts disocclusion everywhere, and flattening
+    // the depth plane still moves the output by plenty.
+    let differs = |label: &str, other: &[f32]| -> Result<f64, String> {
+        let d: f64 = warm.iter().zip(other).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
+            / warm.len() as f64
+            / f64::from(out_mean.max(1e-6));
+        if d < 1e-3 {
+            return Err(format!(
+                "changing {label} moved the output by {d:.2e} of the mean — that input is not \
+                 reaching the scaler"
+            ));
+        }
+        Ok(d)
+    };
+
+    let d_jit = differs(
+        "the jitter offset",
+        &run_with(&[(0, true), (1, false)], None, Some((-jit(1).0, -jit(1).1)))?.0,
+    )?;
+
+    let d_depth = {
+        let flat = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            flat.depth[i].store(near.to_bits(), Relaxed);
+            flat.mvec[i * 2].store(gb.mvec[i * 2].load(Relaxed), Relaxed);
+            flat.mvec[i * 2 + 1].store(gb.mvec[i * 2 + 1].load(Relaxed), Relaxed);
+        }
+        differs("the depth plane", &run_with(&[(0, true), (1, false)], Some(&flat), None)?.0)?
+    };
+
+    let d_mv = {
+        let still = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            still.depth[i].store(gb.depth[i].load(Relaxed), Relaxed);
+        }
+        differs("the motion vectors", &run_with(&[(0, true), (1, false)], Some(&still), None)?.0)?
+    };
+
+    eprintln!(
+        "check-metalfx: X3 inputs plumbed — jitter {d_jit:.3e}, depth {d_depth:.3e}, motion \
+         {d_mv:.3e} (each one input away from the accumulating frame above)"
+    );
+
+    if std::env::var("FR_MFX_DUMP").is_ok() {
+        let px = |c: Vec3A| {
+            let t = tone::map(c, tone::ToneParams::SDR);
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+            (b(t.x) << 16) | (b(t.y) << 8) | b(t.z)
+        };
+        let mut inp = Vec::with_capacity(rw * rh);
+        for i in 0..rw * rh {
+            let g = |c: usize| f32::from_bits(accum_b[i * 3 + c].load(Relaxed));
+            inp.push(px(Vec3A::new(g(0), g(1), g(2))));
+        }
+        save_png("metalfx-input.png", &inp, rw, rh);
+        let mut out = Vec::with_capacity(uw * uh);
+        for i in 0..uw * uh {
+            out.push(px(Vec3A::new(warm[i * 4], warm[i * 4 + 1], warm[i * 4 + 2])));
+        }
+        save_png("metalfx-output.png", &out, uw, uh);
+        eprintln!(
+            "check-metalfx: wrote metalfx-input.png ({rw}x{rh}) and metalfx-output.png \
+             ({uw}x{uh}) — look for edges SHARPER than the input at 2x, and for a static view \
+             that does not wobble; a mirrored jitter sign reads as doubled wobble, which no \
+             magnitude above can distinguish (FR_MFX_JITTER=neg is the other arm)"
         );
     }
     Ok(())
