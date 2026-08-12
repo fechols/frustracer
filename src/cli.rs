@@ -730,6 +730,11 @@ pub struct Cli {
     pub check_nppd: bool,
     pub nppd_dump: bool,
     pub check_nrd: bool,
+    /// `--check-fsr3`: the FidelityFX 1.1.x upscaler arm — the metallib table,
+    /// a real device, a real FSR3 context, and one scored upscale of a
+    /// CPU-rendered G-buffer. macOS today (Metal); the Vulkan arm joins behind
+    /// the same flag, since the subject is the UPSCALER, not the backend.
+    pub check_fsr3: bool,
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
@@ -1020,6 +1025,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_nppd = false;
     let mut nppd_dump = false;
     let mut check_nrd = false;
+    let mut check_fsr3 = false;
     let mut check_spirv = false;
     let mut check_vk = false;
     let mut no_xess_explicit = false;
@@ -1079,6 +1085,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 nppd_dump = true;
             }
             "--check-nrd" => check_nrd = true,
+            "--check-fsr3" => check_fsr3 = true,
             "--check-spirv" => check_spirv = true,
             "--check-vk" => check_vk = true,
             "--nrd" => {
@@ -2358,6 +2365,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_nppd,
         nppd_dump,
         check_nrd,
+        check_fsr3,
         check_spirv,
         check_vk,
         check_gpu,
@@ -2567,6 +2575,11 @@ pub fn usage() {
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
                 eprintln!("  --check-fsr   headless: FSR signal-split/encoding/MV contract self-test (no GPU or DLL)");
+                eprintln!("  --check-fsr3  headless (macOS): the FidelityFX 1.1.x upscaler arm — the transpiled");
+                eprintln!("                metallib table, a real Metal device, an FSR3 context, and one scored");
+                eprintln!("                upscale of a CPU-rendered G-buffer. Needs the SDK source");
+                eprintln!("                (./install-prerequisites.sh fsr3src) plus spirv-cross + Xcode at build");
+                eprintln!("                time; without them the pure half still runs and the rest SKIPs");
                 eprintln!("  --fsr         force-start the upscaler chain at FSR4 + Ray Regeneration (K toggles;");
                 eprintln!("                RDNA4 only — elsewhere the chain falls to XeSS then FSR 3.1)");
                 eprintln!("  --fsr4        --fsr, but REQUIRED: exit(2) instead of falling through when FSR4 +");

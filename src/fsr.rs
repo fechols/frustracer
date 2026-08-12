@@ -419,6 +419,323 @@ pub fn fallback_render_res(out: (usize, usize), ratio: f32) -> (usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// The FSR3 upscale INPUT TRIO, staged into raw rows (pure; gated by
+// --check-fsr on every platform).
+//
+// FSR 3.1 upscale-only takes exactly three planes — RGBA16F linear HDR colour,
+// RG16F pixel-space current->previous y-down motion vectors, and R32F
+// reversed-Z clip depth — and the encodings are a property of the WIRE, not of
+// the graphics API. `gpu/ffx_up.rs::record_upload` is the D3D12 recording of
+// them and is `cfg(windows)`; `src/mtl/` is the Metal one. This is the MATH
+// both share, which is the split CLAUDE.md prescribes (share math and
+// vocabulary, duplicate recording) and the reason there is no `trait Upscaler`.
+//
+// `pitch` is a parameter for exactly one reason: D3D12 upload heaps require
+// 256-byte-aligned rows (`aligned_pitch`) while Metal's `replaceRegion:` takes
+// an arbitrary `bytesPerRow`. That is the ONLY difference between the two
+// backends' uploads.
+//
+// The Windows path deliberately still carries its own copy of these loops:
+// folding it onto these functions would edit the shipping D3D12 renderer, which
+// is what `check.png` guards. Consolidating them is a follow-on, not this
+// change.
+//
+// THE ROW CASTS HAVE AN ALIGNMENT PRECONDITION, and moving these loops off the
+// D3D12 path is what made it a caller's problem rather than a structural fact.
+// Each row is reinterpreted as `[f16; N]` or `f32` in place, so `dst`'s base
+// AND `pitch` must both carry the element alignment; `record_upload` got both
+// for free from a mapped upload heap (256-aligned base, `aligned_pitch` rows)
+// and had nothing to state. Here `dst` is an arbitrary slice — a `Vec<u8>` has
+// layout alignment 1 — and `pitch` is arbitrary too, because Metal's
+// `bytesPerRow` has no alignment rule at all where `aligned_pitch` had a
+// 256-byte one. Both are cheap to assert and neither was.
+// ---------------------------------------------------------------------------
+
+/// The row-cast precondition for the three staging encoders, in one place so
+/// the three cannot drift. Debug-only, like the bounds check it sits beside:
+/// every caller is ours, and this is a per-frame path.
+#[inline(always)]
+fn debug_check_rows(dst: &[u8], pitch: usize, rw: usize, rh: usize, bpp: usize, align: usize) {
+    debug_assert!(pitch >= rw * bpp, "pitch {pitch} < row {} B", rw * bpp);
+    debug_assert!(dst.len() >= pitch * rh, "buffer {} B < {} B", dst.len(), pitch * rh);
+    debug_assert_eq!(
+        dst.as_ptr() as usize % align,
+        0,
+        "staging buffer base is not {align}-aligned — the row cast is UB"
+    );
+    debug_assert_eq!(pitch % align, 0, "pitch {pitch} is not {align}-aligned — row 1 onward is UB");
+}
+
+/// Linear HDR colour -> RGBA16F. Saturating, never `+inf` (the wire discipline
+/// every f16 colour plane in this codebase follows); alpha is exactly 0.
+pub fn stage_color(dst: &mut [u8], pitch: usize, accum: &[AtomicU32], rw: usize, rh: usize) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 8, std::mem::align_of::<f16>());
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [[f16; 4]] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            let i = (y * rw + x) * 3;
+            let ld = |k: usize| f32::from_bits(accum[i + k].load(Relaxed));
+            p[0] = f16_sat(ld(0));
+            p[1] = f16_sat(ld(1));
+            p[2] = f16_sat(ld(2));
+            p[3] = f16::from_f32(0.0);
+        }
+    });
+}
+
+/// Motion vectors -> RG16F. A BIT COPY: `GBufs::mvec` already stores f16 in the
+/// plane's own pixel-space current->previous y-down convention, so re-encoding
+/// it would only add rounding. The polarity rides `UPSCALE_MV_SIGN` at dispatch
+/// (`motionVectorScale`), never here.
+pub fn stage_mvec(dst: &mut [u8], pitch: usize, mvec: &[AtomicU16], rw: usize, rh: usize) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 4, std::mem::align_of::<f16>());
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [[f16; 2]] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            let i = (y * rw + x) * 2;
+            p[0] = f16::from_bits(mvec[i].load(Relaxed));
+            p[1] = f16::from_bits(mvec[i + 1].load(Relaxed));
+        }
+    });
+}
+
+/// Linear view-Z -> [0,1] reversed-Z clip depth, through the ONE encoder
+/// (`xess::view_z_to_clip_depth`) the XeSS path already single-sources. The
+/// context is created with `DEPTH_INVERTED` to match, and sky's `view_z = far`
+/// lands on exactly 0.0 — a contract `--check-xess` already gates and this
+/// module's own self-test re-asserts.
+pub fn stage_depth(
+    dst: &mut [u8],
+    pitch: usize,
+    depth: &[AtomicU32],
+    rw: usize,
+    rh: usize,
+    near: f32,
+    far: f32,
+) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 4, std::mem::align_of::<f32>());
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [f32] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            let z = f32::from_bits(depth[y * rw + x].load(Relaxed));
+            *p = crate::xess::view_z_to_clip_depth(z, near, far);
+        }
+    });
+}
+
+/// The staging gates. Pure, DLL-free, GPU-free — so they run inside
+/// `--check-fsr` on Windows and Linux as well as macOS, which is the point: a
+/// transcription drift between the two backends' uploads is caught wherever
+/// anyone builds, not only where the Metal one runs.
+pub fn stage_self_test() -> Result<(), String> {
+    const SENTINEL: u8 = 0xa5;
+    let (near, far) = (0.17f32, 340.0f32);
+
+    // A native and an ODD resolution — the pair `fsr_frame_check` uses, because
+    // an odd width is what catches a row loop that assumed pitch == rw*bpp.
+    for &(rw, rh) in &[(64usize, 48usize), (37usize, 29usize)] {
+        let n = rw * rh;
+        // Every 11th component is deliberately PAST the f16 range, both signs.
+        // Without them nothing in this probe exercises `f16_sat`'s clamp, and
+        // the expectation below is computed with `f16_sat` too — so a swap to
+        // the plain `f16::from_f32` (which returns ±inf out of range) would
+        // change both sides together and pass. The over-range pixels get their
+        // own oracle-free assertion instead.
+        let accum: Vec<AtomicU32> = (0..n * 3)
+            .map(|i| {
+                let v = match i % 11 {
+                    0 => 1.0e30,
+                    5 => -1.0e30,
+                    _ => i as f32 * 0.37 - 2.0,
+                };
+                AtomicU32::new(v.to_bits())
+            })
+            .collect();
+        let mvec: Vec<AtomicU16> = (0..n * 2)
+            .map(|i| AtomicU16::new(f16::from_f32(i as f32 * 0.011 - 1.5).to_bits()))
+            .collect();
+        // Deliberately includes exact `far` (sky) and values NEARER than
+        // `near`. The sub-near case needs its own arm: the ramp starts at 0.05
+        // but steps by 0.31, so every index past 0 clears `near` — and index 0
+        // is the sky arm, which is why the first draft's "values below near"
+        // were claimed, exercised by nothing, and only found once the
+        // `near_seen` counter below made the omission fail the gate.
+        let depth: Vec<AtomicU32> = (0..n)
+            .map(|i| {
+                let z = match i % 7 {
+                    0 => far,
+                    3 => near * 0.5,
+                    _ => 0.05 + (i as f32) * 0.31,
+                };
+                AtomicU32::new(z.to_bits())
+            })
+            .collect();
+
+        // Over-wide pitch and over-tall buffer: everything past the sub-rect
+        // must survive, which is what `renderSize` < the allocation depends on.
+        let pitch_c = rw * 8 + 16;
+        let pitch_m = rw * 4 + 12;
+        let pitch_d = rw * 4 + 8;
+        let rows = rh + 2;
+        let mut c = vec![SENTINEL; pitch_c * rows];
+        let mut m = vec![SENTINEL; pitch_m * rows];
+        let mut d = vec![SENTINEL; pitch_d * rows];
+        stage_color(&mut c, pitch_c, &accum, rw, rh);
+        stage_mvec(&mut m, pitch_m, &mvec, rw, rh);
+        stage_depth(&mut d, pitch_d, &depth, rw, rh, near, far);
+
+        let (mut sky_seen, mut near_seen, mut over_seen) = (false, false, 0usize);
+        for y in 0..rh {
+            for x in 0..rw {
+                let i = y * rw + x;
+                // colour
+                let o = y * pitch_c + x * 8;
+                for k in 0..3 {
+                    let got = f16::from_bits(u16::from_le_bytes([c[o + k * 2], c[o + k * 2 + 1]]));
+                    let src = f32::from_bits(accum[i * 3 + k].load(Relaxed));
+                    let want = f16_sat(src);
+                    if got.to_bits() != want.to_bits() {
+                        return Err(format!(
+                            "stage_color {rw}x{rh} px({x},{y}).{k}: {got} != {want}"
+                        ));
+                    }
+                    // THE SATURATION CONTRACT, stated without reference to
+                    // `f16_sat`: an out-of-range radiance must land on the
+                    // finite ceiling of its own sign, never ±inf. An inf here
+                    // is not cosmetic — it propagates through FSR3's history
+                    // and poisons every pixel the accumulation pass touches.
+                    if src.abs() > f16::MAX.to_f32() {
+                        over_seen += 1;
+                        if !got.is_finite()
+                            || got.to_f32().abs() != f16::MAX.to_f32()
+                            || got.is_sign_negative() != src.is_sign_negative()
+                        {
+                            return Err(format!(
+                                "stage_color {rw}x{rh} px({x},{y}).{k}: {src:e} encoded to \
+                                 {got} — must saturate to the f16 ceiling of its own sign"
+                            ));
+                        }
+                    }
+                }
+                if u16::from_le_bytes([c[o + 6], c[o + 7]]) != 0 {
+                    return Err(format!("stage_color {rw}x{rh} px({x},{y}): alpha is not 0"));
+                }
+                // mvec — a BIT copy, so compare bits, not values (NaN-safe too)
+                let o = y * pitch_m + x * 4;
+                for k in 0..2 {
+                    let got = u16::from_le_bytes([m[o + k * 2], m[o + k * 2 + 1]]);
+                    let want = mvec[i * 2 + k].load(Relaxed);
+                    if got != want {
+                        return Err(format!(
+                            "stage_mvec {rw}x{rh} px({x},{y}).{k}: {got:#06x} != {want:#06x} \
+                             (must be a bit copy, not a re-encode)"
+                        ));
+                    }
+                }
+                // depth
+                let o = y * pitch_d + x * 4;
+                let got = f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+                let z = f32::from_bits(depth[i].load(Relaxed));
+                let want = crate::xess::view_z_to_clip_depth(z, near, far);
+                if got.to_bits() != want.to_bits() {
+                    return Err(format!("stage_depth {rw}x{rh} px({x},{y}): {got} != {want}"));
+                }
+                // THE RANGE CONTRACT, stated without reference to the encoder:
+                // FSR reads this plane as normalized device depth, so a value
+                // outside [0,1] is a wire violation however it arose. Asserted
+                // against `got` rather than checked inside
+                // `view_z_to_clip_depth` because the compare above is
+                // self-referential — it re-runs the same function — and would
+                // pass unchanged if that clamp were ever dropped.
+                if !(0.0..=1.0).contains(&got) {
+                    return Err(format!(
+                        "stage_depth {rw}x{rh} px({x},{y}): view_z {z} encoded to {got}, \
+                         outside the [0,1] normalized-depth range"
+                    ));
+                }
+                if z == far {
+                    sky_seen = true;
+                    // THE REVERSED-Z CONTRACT: sky must land on exactly 0.0, or
+                    // FSR reads the whole background as the near plane.
+                    if got != 0.0 {
+                        return Err(format!(
+                            "stage_depth: sky (view_z == far) encoded to {got}, not exactly 0.0"
+                        ));
+                    }
+                }
+                // The near end of the same contract, and the reason the probe
+                // carries sub-`near` values at all: reversed-Z puts the near
+                // plane at 1.0, and anything closer is clamped there rather
+                // than allowed past it. Without this the "values below `near`"
+                // in the probe were exercised but never scored.
+                //
+                // WHAT IT DOES AND DOES NOT PIN, measured rather than assumed:
+                // `view_z_to_clip_depth` clamps twice — `view_z.max(near)` and
+                // then `[0,1]` on the result — and EITHER alone lands sub-near
+                // input on exactly 1.0, so this fires only if both are lost. It
+                // is a pin on the WIRE contract (what FSR reads at the near
+                // plane), not on which line supplies it. The `[0,1]` check
+                // above is the one with independent teeth: dropping the outer
+                // clamp sends `z > far` negative and fires it, while the
+                // equality compare — which re-runs the same function — passes.
+                if z < near {
+                    near_seen = true;
+                    if got != 1.0 {
+                        return Err(format!(
+                            "stage_depth: view_z {z} is nearer than near={near} and encoded to \
+                             {got}, not clamped to exactly 1.0"
+                        ));
+                    }
+                }
+            }
+        }
+        if !sky_seen {
+            return Err("stage_self_test: no sky pixel in the probe — the 0.0 pin is vacuous".into());
+        }
+        if !near_seen {
+            return Err(
+                "stage_self_test: no sub-near view_z in the probe — the near-clamp pin is vacuous"
+                    .into(),
+            );
+        }
+        if over_seen == 0 {
+            return Err(
+                "stage_self_test: no out-of-range colour in the probe — the saturation pin \
+                 is vacuous, and `f16_sat` would be indistinguishable from `f16::from_f32`"
+                    .into(),
+            );
+        }
+
+        // The sub-rect discipline: pitch padding and the rows past `rh` are
+        // never touched, so one allocation at the range max can serve every
+        // smaller render resolution.
+        for (name, buf, pitch, bpp) in [
+            ("color", &c, pitch_c, 8usize),
+            ("mvec", &m, pitch_m, 4),
+            ("depth", &d, pitch_d, 4),
+        ] {
+            for y in 0..rows {
+                let tail = if y < rh { rw * bpp } else { 0 };
+                for x in tail..pitch {
+                    if buf[y * pitch + x] != SENTINEL {
+                        return Err(format!(
+                            "stage_{name} {rw}x{rh}: wrote outside the sub-rect at row {y} byte {x}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Provider selection (pure; gated by --check-fsr). FSR3.1 and FSR4 are the
 // SAME ffx-api effect — the provider is a per-context version choice
 // (ffxOverrideVersion), so "FSR3 support" is a pick over the enumeration
@@ -536,3 +853,4 @@ pub fn pick_fg_version(fg_versions: &[(u64, String)], fsr4_session: bool) -> Opt
     let (preferred, fallback) = if fsr4_session { (4, 3) } else { (3, 4) };
     best_of(preferred).or_else(|| best_of(fallback))
 }
+

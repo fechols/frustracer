@@ -172,6 +172,43 @@ windows = { version = "0.62", features = [
 libloading = "0.8"
 ash = "0.38"
 
+# The Metal backend (src/mtl/) — FSR3 upscaling, headless and gated. Generated
+# Objective-C bindings, not a framework: objc2 brings no allocator, no render
+# graph and no policy, exactly as `ash` brings none for Vulkan.
+#
+# `default-features = false` + a named feature per Metal header, because
+# objc2-metal gates each header behind a same-named feature and the default set
+# is the whole framework. The list is deliberately SHORT: the Rust side only
+# creates a device, textures and a command buffer and reads bytes back — it
+# never records a compute pass or builds a pipeline, because shim/ffx_metal.mm
+# does all of that on the FFX side. No MTLLibrary, no MTLComputePipeline, no
+# MTLSampler here.
+#
+# NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
+# are pulled in and compile there); this is additive and touches neither.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# NOTE objc2-foundation is deliberately NOT a direct dependency: nothing under
+# src/ names it, and the one Foundation type that reaches us (NSError, off
+# MTLCommandBuffer::error) arrives through objc2-metal's own dependency on it.
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    # MTLAllocation is not optional decoration: the MTLTexture TRAIT is
+    # re-exported under `all(MTLAllocation, MTLResource, MTLTexture)`, so
+    # without it the headers compile and the trait simply is not in the root
+    # ("no `MTLTexture` in the root").
+    "MTLAllocation",
+    "MTLDevice",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLBlitCommandEncoder",
+    "MTLTexture",
+    "MTLResource",
+    "MTLPixelFormat",
+    "MTLTypes",
+] }
+
 [build-dependencies]
 cc = "1"
 
