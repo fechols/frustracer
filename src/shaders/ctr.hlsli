@@ -28,9 +28,12 @@
 #define CTR_FRONTIER_RAYS    22u // primary ray samples reusing those handles
 #define CTR_FRONTIER_ENTRIES 23u // summed software-frontier widths
 #define CTR_SKY_PX       24u // stat: pixels inside proven-empty sky rects (zero rays)
-#define CTR_RTGI_RAYS    25u // stat: real-time-GI bounce rays (shade_full's RTGI block;
-                             // wavefront leaf units only — reference/DXR carry no counters)
-#define CTR_COUNT        26u
+#define CTR_RTGI_RAYS    25u // stat: LEVEL-0 GI gather rays (shade_full's RTGI block, and
+                             // at rung 0.5 its rouletted correction; wavefront leaf
+                             // units only — reference/DXR carry no counters)
+#define CTR_RTGI_RAYS2   26u // stat: LEVEL-1 GI gathers (the correction at rungs 1.5/2).
+                             // The PAIR is the ladder's rung signature.
+#define CTR_COUNT        27u
 
 // --- WIDTH_PROBE slots (FR_WIDTH=1 — trace::width_defs) --------------------
 // Each kernel reports its COMPILED wave width (WaveGetLaneCount()) — the
@@ -41,12 +44,12 @@
 // CTR_COUNT*4 bytes — so these slots are never zeroed, never gated, and
 // survive to the end-of-session readback BY CONSTRUCTION. LOCKSTEP with
 // trace.rs's consts AND the counters buffer size (CTR_TOTAL * 4).
-#define CTR_W_LEAF      26u // cs_leaf (leaf vs leaf-fb: whichever ran last)
-#define CTR_W_SKY       27u // cs_sky
-#define CTR_W_LEVEL     28u // cs_level / cs_level_wide (last writer wins)
-#define CTR_W_HEMI      29u // cs_hemi_leaf
-#define CTR_W_REFERENCE 30u // cs_reference (declares its OWN u3 view — below)
-#define CTR_TOTAL       31u
+#define CTR_W_LEAF      27u // cs_leaf (leaf vs leaf-fb: whichever ran last)
+#define CTR_W_SKY       28u // cs_sky
+#define CTR_W_LEVEL     29u // cs_level / cs_level_wide (last writer wins)
+#define CTR_W_HEMI      30u // cs_hemi_leaf
+#define CTR_W_REFERENCE 31u // cs_reference (declares its OWN u3 view — below)
+#define CTR_TOTAL       32u
 
 // Compile units that paste this file bind `counters` — rt.hlsli's cutout
 // loop keys its stat increment on this (the reference kernel and the DXR

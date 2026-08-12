@@ -4749,13 +4749,104 @@ cargo run --release -- --no-amb-bump  # A/B lever (2026-08-05, the flat-tops cam
                                       # uncapped formula). Settings row:
                                       # Effects/amb_bump (restart tier). Knobs: AMB_BUMP_K,
                                       # AMB_BUMP_CAP
-cargo run --release -- --no-rtgi      # kill lever: REAL-TIME GI off — the ambient tier reverts to
-                                      # flat SH-sky × AO, bit-identical to the pre-RTGI renderer
-                                      # (the GPU compiles the bounce block out via the RTGI define;
-                                      # a --no-rtgi --check reproduced the pre-feature check.png AND
-                                      # check_gi.png BYTE-EQUAL — the shipped proof). DEFAULT ON
-                                      # (2026-08-08, src/shade.rs's RTGI arm + shade.hlsli's
-                                      # shade_full block): ONE cosine-sampled bounce ray per pixel
+cargo run --release -- --rtgi-bounces 1.5  # THE GI LADDER (2026-08-12) — real-time GI as a BOUNCE
+                                      # BUDGET rather than a switch, so quality scales per GPU and
+                                      # resolution. Rungs 0 | 0.5 | 1 | 1.5 | 2 (any N in [0,2]
+                                      # parses — the implementation reads floor and fract, never a
+                                      # table; out of range EXITS 2 rather than clamping, the
+                                      # loud-lever rule, since a silently clamped quality knob
+                                      # reports the wrong arm in an A/B). DEFAULT 1.0 = the
+                                      # pre-ladder renderer BITWISE; --no-rtgi is an alias for 0 and
+                                      # --rtgi for 1, all three composing under ONE later-flags-win
+                                      # rule (cli::self_test pins the 11-case table). Settings row:
+                                      # Effects/rtgi_bounces, a Cycle over the five rungs (restart
+                                      # tier — both GPU blocks are compile defines; the old `rtgi`
+                                      # bool key is simply unknown to the new schema and ignored,
+                                      # the hdr10 precedent).
+                                      #
+                                      # THE HALF RUNGS ARE RUSSIAN ROULETTE ON THE DELTA OVER THE
+                                      # SH×AO TAIL, and that is the whole design. Every rung already
+                                      # ends in a tail approximating the transport a real gather
+                                      # would compute, so continuing with probability p and
+                                      # weighting the DIFFERENCE by 1/p gives
+                                      #     E[tail + (G−tail)/p·[continue]] = G
+                                      # — unbiased for the DETERMINISTIC rung above, with the
+                                      # variance riding on (G−tail)² instead of G² because the tail
+                                      # is a control variate (small in the open, largest in
+                                      # enclosures, which is exactly where the samples are worth
+                                      # spending). A plain coin flip between the two rungs delivers
+                                      # only p of the correction — BIASED, measured −0.0194 signed
+                                      # at rung 0.5 — and that trap is what the gate's teeth
+                                      # (FR_RTGI_NOWEIGHT=1) reproduce on demand. NEVER "simplify"
+                                      # the weighted delta into an average of two images.
+                                      #
+                                      # ONE FIELD CARRIES IT: `Quality::rtgi_bounces: f32`,
+                                      # DECREMENTED per level, so the budget IS the recursion bound
+                                      # — it replaced a `depth == 0` gate that could only ever
+                                      # express "one" and said nothing about the reflection/glass
+                                      # children (which set 0.0 explicitly and can never inherit
+                                      # one). Not a bool beside a probability, because
+                                      # `Quality { rtgi_bounces: 0.0, .. }` then pins the whole tier
+                                      # in a single token and the ~dozen composition gates that need
+                                      # a deterministic AO ambient cannot be left half-pinned.
+                                      # `shade::rtgi_gather` is the ONE gather both arms call, which
+                                      # is what makes the roulette's expectation land ON the
+                                      # deterministic rung rather than merely near it (the
+                                      # unbiasedness gate self-oracles against it).
+                                      #
+                                      # TRANSPORT — TWO compile defines AND TWO runtime bits, and
+                                      # the runtime half is NOT optional: `RTGI` (n ≥ 1, the
+                                      # deterministic gather) + `RTGI_CORR` = p (the correction) and
+                                      # `RTGI_CORR_L0` (n < 1, i.e. the correction is at level 0),
+                                      # beside FLAG_RTGI and FLAG_RTGI_CORR (bit 27). A
+                                      # COMPILE-ONLY correction shipped first and fired inside gates
+                                      # that had pinned the tier off — drawing rng, tracing, and
+                                      # folding into prim.direct_d in frames that asked for none of
+                                      # it (NRD n3 byte-diff 853, FRD F3, N7's sky-ext-skip
+                                      # hit-bad/hit-px landing on EXACTLY p). ANY new shading feature
+                                      # needs both halves. `gfx::frame::rtgi_corr_p` is the ONE
+                                      # derivation the define and the bit share: p = n for n < 1,
+                                      # else min(n−1, 1) — a plain fract(n) reads 0 at exactly 2.0
+                                      # and SILENTLY COMPILED the top rung's second bounce out
+                                      # (--check-gpu caught it as `level-1 0`); the CPU expresses
+                                      # rung 2 by recursing on a decremented budget, which HLSL
+                                      # cannot do, and this is that shape flattened to the two levels
+                                      # the GPU carries. The correction's gather-shade is SEQUENTIAL
+                                      # with the bounce's in shade_full, never nested, so peak
+                                      # register pressure is max() of the shade_split instances and
+                                      # not their sum — FR_WIDTH=1 reads leaf/sky/level 32/32/32
+                                      # unchanged at every rung.
+                                      #
+                                      # THE TAIL COSTS AN AO RAY, which is the one structural cost
+                                      # worth knowing: a correction needs `tail`, `tail` needs `ao`,
+                                      # so any surface running one traces an AO ray. Hence rung 0.5
+                                      # is DOMINATED by rung 1 (measured level on CPU 51.28 vs 51.61
+                                      # ms and on GPU — same image in expectation, more variance, no
+                                      # cheaper: it keeps the primary AO ray rung 1 elides), and
+                                      # hence GPU rung 2 traces an AO ray whose result is
+                                      # ALGEBRAICALLY CANCELLED (p = 1, so the correction removes
+                                      # exactly the tail the ray produced) where the CPU's
+                                      # deterministic depth-1 arm never enters that block at all —
+                                      # same value, one ray apart, absorbed by the statistical
+                                      # CPU-vs-GPU gates. Dropping rung 0.5's AO ray for a coarser
+                                      # control variate is the documented rescue; it changes
+                                      # prim.ao semantics, so it is not free.
+                                      #
+                                      # MEASURED (min-of-N, maiden discarded). CPU --spin path 120f
+                                      # procedural: 0 = 42.25, 0.5 = 51.28, 1 = 51.61, 1.5 = 55.58,
+                                      # 2 = 57.41 ms. GPU leaf region, 4090, procedural 3000f: 0.263
+                                      # / 0.373 / 0.292 / 0.361 / 0.374 ms; san-miguel-low-poly
+                                      # 2400f: 0.362 / — / 0.423 / 0.520 / 0.579. Two readings: on
+                                      # a heavy scene rung 1.5 buys rung 2's image for 62% of the
+                                      # 1→2 increment, and 1→2 is only ~4% of GPU frame span on the
+                                      # procedural scene — so FULL 2-bounce may simply be affordable
+                                      # without the trick. GPU WAVE DIVERGENCE blunts stochastic
+                                      # depth generally: a 32-lane wave pays for any lane that
+                                      # continues, and at p = 0.5 essentially every wave has one, so
+                                      # ray counts halve while wall clock moves much less.
+                                      #
+                                      # Everything below describes rung ≥ 1 and is unchanged by the
+                                      # ladder: ONE cosine-sampled bounce ray per pixel
                                       # per frame IS the ambient term — hit shades at hemi's
                                       # BOUNCE_Q leaf policy (1 shadow + 1 AO + SH×AO ambient, the
                                       # tail standing in for deeper bounces; bounce hits never
@@ -4808,9 +4899,13 @@ cargo run --release -- --no-rtgi      # kill lever: REAL-TIME GI off — the amb
                                       # sessions that veto BOTH (--no-emissive-lights with no
                                       # fold, or a mid-session denoiser shed).
                                       # CONTRACTS:
-                                      # the arm is Quality-gated (`Quality::rtgi`, constructors
-                                      # read shade::rtgi_enabled — check harnesses pin the FIELD
-                                      # per pass, never a global), draws 2 rng only when armed
+                                      # the arm is Quality-gated (`Quality::rtgi_bounces`,
+                                      # constructors read shade::rtgi_bounces — check harnesses pin
+                                      # the FIELD per pass, never a global), draws 2 rng only when
+                                      # armed (+1 for a rouletted rung's own continue/terminate
+                                      # decision, so a continued pixel's stream is LONGER than a
+                                      # terminated one's — sound because pixels have independent
+                                      # streams and nothing downstream reads a POSITION in one)
                                       # (off path textually skipped, never burned — the fb
                                       # precedent); shading-only, so every exact-zero soundness
                                       # gate and the temporal/replay machinery are untouched
@@ -4826,20 +4921,68 @@ cargo run --release -- --no-rtgi      # kill lever: REAL-TIME GI off — the amb
                                       # ReBLUR denoised only direct light, the "NRD isn't on"
                                       # user-report class; the
                                       # composition-gate family in check-gpu/check-dxr pins
-                                      # rtgi: false on its uq so the AO-term must-fires keep
+                                      # rtgi_bounces: 0.0 on its uq so the AO-term must-fires keep
                                       # teeth). GPU: rtgi_defs() in every SHADE_HLSLI unit (both
                                       # pipelines — the probe-reach rule), CTR_RTGI_RAYS = 25
-                                      # (CTR_COUNT 25→26, width slots 26..30, CTR_TOTAL 31 — the
-                                      # source-text asserts moved in lockstep); the wavefront-vs-
-                                      # reference same-seed A/B stays EXACT 0.00e0 armed. Gates:
-                                      # --check's `rtgi` liveness must-fire (armed > 0 /
-                                      # --no-rtgi exactly 0) + the `rtgi-ab` estimator/wiring A/B
+                                      # (level 0) + CTR_RTGI_RAYS2 = 26 (level 1 and deeper), so
+                                      # CTR_COUNT 26→27, width slots 27..31, CTR_TOTAL 32 — the
+                                      # source-text asserts are DERIVED from the consts now, since
+                                      # a hand-written literal pins the cross-language agreement
+                                      # PLUS a renumbering nobody promised not to do; the
+                                      # wavefront-vs-reference same-seed A/B stays EXACT 0.00e0
+                                      # armed at every rung. Gates: --check's `rtgi` must-fire, read
+                                      # as the RUNG SIGNATURE — the PAIR (level-0, level-1) must be
+                                      # (0,0) at rung 0, (>0,0) at 0.5 and 1, (>0,>0) at 1.5 and 2
+                                      # (the single-counter form read 0.5 and 1 as the same session;
+                                      # the zero arms are the teeth, since each rung's blocks are
+                                      # compile defines and a count on a rung that omits them means
+                                      # a define escaped its guard); the `rtgi-rr` UNBIASEDNESS gate
+                                      # (below); + the `rtgi-ab` estimator/wiring A/B
                                       # (32-frame RTGI accumulation vs 4-frame fb.gi, trimmed
                                       # mean rel measured 0.0124 / signed −0.0010 vs 0.08/0.02
                                       # limits — the probe-level GI gate already pins the bounce
                                       # MATH, its cosine reference IS this estimator; the A/B
-                                      # pins bq.rtgi per-Quality so it keeps teeth under
-                                      # --no-rtgi); check-gpu's CTR_RTGI_RAYS must-fire.
+                                      # pins bq.rtgi_bounces per-Quality so it keeps teeth under
+                                      # --no-rtgi); check-gpu's + check-vk V7's rung-signature
+                                      # must-fires.
+                                      # THE `rtgi-rr` GATE is the ladder's own correctness property
+                                      # and the only thing in the suite that can see whether the 1/p
+                                      # weight is RIGHT rather than merely present. SELF-ORACLING,
+                                      # which is what makes it strong: a stochastic rung estimates
+                                      # EXACTLY the deterministic rung above it, so the oracle is
+                                      # another SHIPPING setting rather than a synthetic reference
+                                      # that could drift. BOTH arms (0.5→1 and 1.5→2), because the
+                                      # level-1 failure modes are invisible at level 0 — the
+                                      # emissive-display double count (`gather_q`'s INHERITED flag:
+                                      # at rung 2 the deterministic arm runs at depth 1 where `el`
+                                      # is already None, so a bare el.is_none() would re-enable the
+                                      # add while NEE is live) and a budget that failed to
+                                      # decrement both need a budget left to spend. MEASURED
+                                      # (deterministic — primary_seed is a pure function of
+                                      # pixel/frame/sample, so these repeat exactly): signed
+                                      # +0.0004 on BOTH arms; the FR_RTGI_NOWEIGHT teeth −0.0194
+                                      # and −0.0056.
+                                      # ITS GATE-DESIGN LESSON, which cost a wrong bound first: the
+                                      # SIGNED mean is the verdict and `mean_abs` is a loose sanity
+                                      # bound only. Both arms are 1-spp, so the absolute statistic
+                                      # is dominated by per-pixel VARIANCE and is the same size as
+                                      # the bias being hunted — it reads 0.0149 unbiased against
+                                      # 0.0248 biased and CANNOT separate them, while the signed
+                                      # form reads +0.0004 against −0.0194, fifty times apart. Bias
+                                      # cancels nothing in a signed mean and everything in an
+                                      # absolute one; pick the statistic from the failure you are
+                                      # hunting (the --spp gate's own lesson from the other side).
+                                      # The gate costs 448 CPU frames on EVERY --check (2 arms ×
+                                      # 96 weighted + 96 naive + 32 oracle); whole suite 32 s.
+                                      # NEGATIVE RADIANCE IS CORRECT ON A STOCHASTIC RUNG and
+                                      # --check-dxr's `non-finite || negative` counter conflated it
+                                      # with NaN: an unbiased estimator of a non-negative quantity
+                                      # samples below zero exactly when G < tail·(1−p), measured
+                                      # 131/12/2 of 1.44M at p = 0.25/0.5/0.75 while the radiance
+                                      # mean stays flat at 0.044-0.053%. Clamping would reintroduce
+                                      # the bias the ladder exists to avoid, so the counter is SPLIT
+                                      # — non-finite always fails, negative is allowed only on a
+                                      # fractional rung and bounded at 0.1% of samples.
                                       # FR_ABL=nogi is the cost probe (drop ray + bounce shade,
                                       # the norefl shape; in nosec; dual-homed CPU+GPU).
                                       # MEASURED (--spin path 1080p procedural, on vs off): CPU
@@ -4860,12 +5003,39 @@ cargo run --release -- --no-rtgi      # kill lever: REAL-TIME GI off — the amb
                                       # already red pre-RTGI (1902 hot ch vs 720 at --no-rtgi —
                                       # helmet is outside the documented two-device scene set)
                                       # and RTGI nudges it (2102) — pre-existing, not this
-                                      # feature. Settings row: Effects/rtgi (restart tier — the
-                                      # GPU block is a compile define, a live enable in a session
-                                      # built without it would silently diverge CPU vs GPU).
+                                      # feature. LADDER known-accepts: rung 0.5 is dominated by
+                                      # rung 1 (above); a stochastic rung's correction rides FSR's
+                                      # un-denoised residual, so the deterministic rungs are the
+                                      # recommendation for FSR4-RR sessions; rung 0.5 re-arms the
+                                      # documented amb_irradiance-vs-sh_irradiance approximation
+                                      # (prim.ao is REAL there, so the bridge's ao·amb term is back
+                                      # — the same approximation every non-RTGI NRD session already
+                                      # carries); ReBLUR's own anti-firefly WILL clamp 1/p spikes,
+                                      # so --nrd-no-anti-firefly is the A/B when measuring (FRD is
+                                      # already correct by argument — its GI-fold exempts the
+                                      # diffuse lane for the K ≥ 1/p reason frd.rs states).
                                       # Follow-ons documented here: the FSR-RR indirect-diffuse
                                       # signal (shim desc + 12th plane + pack lane) if RDNA4
-                                      # sessions show residual noise; an N-bounce chain lever.
+                                      # sessions show residual noise; STRATIFYING the roulette over
+                                      # frames (a golden-ratio-rotated per-pixel sequence, the
+                                      # clouds::dither_jk shape) instead of an independent
+                                      # Bernoulli per frame — worth real noise at the ~10-30
+                                      # effective frames a denoiser integrates; throughput-driven p
+                                      # (a natural --rtgi-bounces auto); rungs above 2, which
+                                      # generalize as written on the CPU and want an outer loop over
+                                      # the (trace → shade_split → correct) block on the GPU.
+                                      # Touch shade.rs's ambient tier / rtgi_gather / gather_q /
+                                      # shade.hlsli's correction + amb_tail export / rtgi_corr_p /
+                                      # the counter pair → run --check at ALL FIVE rungs (+ the
+                                      # goldens byte-compared at 0 and 1), --check-gpu and
+                                      # --check-dxr at all five, --check-gpu on san-miguel-lp at 0.5
+                                      # and 1.5, cargo test, and the enclosure feel-test below.
+                                      # THE HONEST QUALITY READ IS PERCENTILES, NOT MEANS (the
+                                      # still-camera-darkening lesson): each real gather replaces an
+                                      # over-bright approximation with the truth, so expect the
+                                      # shadowed p10 to DROP and contrast to RISE as the ladder
+                                      # climbs — enclosures read darker and better-structured, not
+                                      # brighter. Open scenes barely move.
                                       # (The NEE-keep follow-on SHIPPED same-day — the XeSS
                                       # feel-test objected on schedule; see the EMISSIVE
                                       # paragraph above.)

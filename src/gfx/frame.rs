@@ -290,6 +290,40 @@ pub const FLAG_NRD_RCLAMP: u32 = 33554432;
 /// check scene with no transmissive geometry still proves the wiring).
 pub const FLAG_NRD_RCLAMP_HARD: u32 = 67108864;
 
+/// The GI ladder's ROULETTED CORRECTION is live this frame — the runtime half
+/// of the `RTGI_CORR` compile define, exactly as FLAG_RTGI is the runtime half
+/// of `RTGI`.
+///
+/// It exists because the compile define alone is NOT enough, and the gates
+/// proved it: a dozen composition gates pin `Quality { rtgi_bounces: 0.0, .. }`
+/// to get a deterministic AO ambient, the deterministic gather honours that
+/// through FLAG_RTGI, and a compile-only correction fired anyway — drawing rng,
+/// tracing a gather and folding into `prim.direct_d` in frames that had asked
+/// for none of it. Every rung must be pinnable PER QUALITY; that is the
+/// check-harness contract the RTGI arm already documents.
+///
+/// The probability itself stays a compile constant (`rtgi_defs`); this bit only
+/// says whether that block runs, which is all a per-Quality pin needs to
+/// express: budget 0 clears both bits (rung 0), budget 1 clears this one alone
+/// (rung 1). Lockstep with trace_common.hlsli's FLAG_RTGI_CORR.
+pub const FLAG_RTGI_CORR: u32 = 134217728;
+
+/// The GI ladder's correction probability for a bounce budget, as the GPU sees
+/// it — the ONE derivation `rtgi_defs` (the compile constant) and `with_frame`
+/// (the runtime bit) both read, so the two can never disagree about whether a
+/// rung has a correction at all.
+///
+/// `n < 1` puts the correction at level 0 with probability `n`; otherwise at
+/// level 1 with `n - 1`, SATURATED at 1.0 so rung 2 is a CERTAIN second gather.
+/// A plain `fract(n)` reads 0 at exactly 2.0 and would silently compile the
+/// second bounce out of the top rung — which it did, and `--check-gpu` caught
+/// it as `level-1 0`. The CPU expresses rung 2 by recursing on a decremented
+/// budget instead, which HLSL cannot do; this is that shape flattened to the
+/// two levels the GPU carries.
+pub fn rtgi_corr_p(n: f32) -> f32 {
+    if n < 1.0 { n.max(0.0) } else { (n - 1.0).min(1.0) }
+}
+
 /// `FR_NRD_RCLAMP=off|on|hard` — the residual spike cap's lever. DEFAULT OFF,
 /// deliberately unlike `FR_NRD_REJITTER`/`FR_NRD_REMOD`: those are restoration
 /// and a bug fix respectively, while this is a QUALITY TRADE with a known
@@ -1274,7 +1308,12 @@ impl FrameCb {
             // define; this runtime bit covers the fb stand-down) × NOT a
             // hemi frame — the still-frame tiers take precedence, so
             // shade_full's bounce block keys on the bit alone.
-            | ((p.q.rtgi && fb_mode_of(&p.q) == 0) as u32 * FLAG_RTGI)
+            | ((p.q.rtgi_bounces >= 1.0 && fb_mode_of(&p.q) == 0) as u32 * FLAG_RTGI)
+            // The rouletted correction, gated per QUALITY like the gather above
+            // it — see FLAG_RTGI_CORR for why the compile define alone left the
+            // composition gates unable to pin the tier off.
+            | ((rtgi_corr_p(p.q.rtgi_bounces) > 0.0 && fb_mode_of(&p.q) == 0) as u32
+                * FLAG_RTGI_CORR)
             // The --no-detail-tex lever, read at CB-build time (the
             // depth-tint shape) — shade.hlsli's post-match detail block,
             // gated per material on Mat.detail_scale > 0 (untextured

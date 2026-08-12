@@ -3671,7 +3671,7 @@ impl GpuContext {
                     frame_ms,
                     reset,
                     self.frd_sun,
-                    d.nrd_sig() && p.q.rtgi,
+                    d.nrd_sig() && p.q.rtgi_bounces > 0.0,
                     &|| d.record_nrd_pack(&d3d.list, slot),
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
@@ -3811,7 +3811,7 @@ impl GpuContext {
                     frame_ms,
                     fc.reset,
                     self.frd_sun,
-                    d.nrd_sig() && p.q.rtgi,
+                    d.nrd_sig() && p.q.rtgi_bounces > 0.0,
                     &|| d.record_nrd_pack(&d3d.list, slot),
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
@@ -4251,7 +4251,7 @@ impl GpuContext {
                     frame_ms,
                     reset,
                     self.frd_sun,
-                    tg.nrd_sig() && p.q.rtgi,
+                    tg.nrd_sig() && p.q.rtgi_bounces > 0.0,
                     &|| tg.record_nrd_pack(&d3d.list, slot),
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );
@@ -4603,7 +4603,7 @@ impl GpuContext {
                     frame_ms,
                     fc.reset,
                     self.frd_sun,
-                    tg.nrd_sig() && p.q.rtgi,
+                    tg.nrd_sig() && p.q.rtgi_bounces > 0.0,
                     &|| tg.record_nrd_pack(&d3d.list, slot),
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );

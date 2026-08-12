@@ -556,13 +556,25 @@ pub struct Opts {
     /// under sky light). Runtime shading lever — the depth-tint class; a
     /// no-op on flat-shaded geometry (n_s == n_g).
     pub amb_bump: bool,
-    /// `--no-rtgi` clears (`shade::set_rtgi`): real-time GI OFF — the ambient
-    /// tier goes back to flat `SH sky irradiance × AO`, bit-identical to the
-    /// pre-RTGI renderer (the GPU compiles the bounce block out). DEFAULT ON:
-    /// one cosine-sampled bounce ray per pixel per frame replaces the ambient
-    /// term, shaded at the hemi BOUNCE_Q policy, integrated by the temporal
-    /// denoisers / accumulation. Still-frame hemi tiers (H) take precedence.
-    pub rtgi: bool,
+    /// `--rtgi-bounces N` (`shade::set_rtgi_bounces`): the GI ladder, as a
+    /// BOUNCE BUDGET. DEFAULT 1.0 — one cosine-sampled gather per pixel per
+    /// frame replaces the ambient term, shaded at the hemi BOUNCE_Q policy and
+    /// integrated by the temporal denoisers / accumulation, which is the
+    /// renderer this field used to spell as a bool.
+    ///
+    /// The five canonical rungs are 0 | 0.5 | 1 | 1.5 | 2. `0` is the flat
+    /// `SH sky irradiance × AO` ambient, bit-identical to the pre-RTGI
+    /// renderer (and what `--no-rtgi` spells); `2` is two real bounces. A
+    /// HALF rung buys the rung above at a fraction of its ray cost: the SH×AO
+    /// tail is kept as a control variate and a real gather is rouletted over
+    /// it at that probability, which is unbiased for the rung above rather
+    /// than an average of the two (see shade.rs's ambient tier).
+    ///
+    /// Any value in [0, 2] parses — the continuum costs nothing (the
+    /// implementation reads floor and fract, never a table) and it is what
+    /// lets a feel-test find a probability the five rungs do not name.
+    /// Still-frame hemi tiers (H) take precedence at every rung.
+    pub rtgi_bounces: f32,
     /// `--no-auto-exposure` clears (`autoexp::set_enabled`): a display-stage
     /// controller eases a clamped EV toward what the presented frame's mean
     /// log2-luminance asks for (src/autoexp.rs) — enclosures open up,
@@ -994,7 +1006,7 @@ pub fn defaults() -> Opts {
         detail_ao_strength: 0.125,
         detail_untex_scale: 1.0,
         amb_bump: true,
-        rtgi: true,
+        rtgi_bounces: 1.0,
         autoexp: true,
         exposure_bias: 0.0,
         autoexp_guard: true,
@@ -1477,9 +1489,30 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--no-amb-bump" => opts.amb_bump = false,
             // --no-rtgi: real-time GI off — the ambient tier reverts to flat
             // SH×AO (bit-identical pre-RTGI arm; the GPU kernels compile the
-            // bounce block out). --rtgi spells the default (later flags win).
-            "--no-rtgi" => opts.rtgi = false,
-            "--rtgi" => opts.rtgi = true,
+            // bounce block out). --rtgi spells the default. Both are aliases
+            // for a point on the --rtgi-bounces ladder, so all three arms
+            // compose under one later-flags-win rule.
+            "--no-rtgi" => opts.rtgi_bounces = 0.0,
+            "--rtgi" => opts.rtgi_bounces = 1.0,
+            // --rtgi-bounces N: the ladder itself. Out of range EXITS rather
+            // than clamping — a quality lever that silently clamps reports the
+            // wrong arm in an A/B, which is the whole failure the loud-lever
+            // rule exists to prevent. NaN falls out of the range test too.
+            "--rtgi-bounces" => {
+                let v = args.next().unwrap_or_default();
+                let n: f32 = v
+                    .parse()
+                    .ok()
+                    .filter(|n: &f32| (0.0..=2.0).contains(n))
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--rtgi-bounces needs a bounce budget in 0..=2 \
+                             (the rungs are 0, 0.5, 1, 1.5, 2), got {v:?}"
+                        );
+                        std::process::exit(2);
+                    });
+                opts.rtgi_bounces = n;
+            }
             // --auto-exposure ARMS the display-stage aperture controller
             // (DEFAULT OFF — RTGI lights enclosures for real, so the
             // aperture holds at a fixed 1.0, plus any --exposure-bias).
@@ -2813,10 +2846,18 @@ pub fn usage() {
                 eprintln!("                irradiance response to the shading normal's deviation (normal");
                 eprintln!("                maps + detail bump read flat under sky light again; a no-op on");
                 eprintln!("                flat-shaded geometry)");
-                eprintln!("  --no-rtgi     real-time GI off: the ambient tier reverts to flat SH-sky x AO");
-                eprintln!("                (the pre-RTGI renderer bit-exactly). Default ON: one cosine bounce");
-                eprintln!("                ray per pixel per frame IS the ambient — real one-bounce GI the");
-                eprintln!("                temporal denoisers/accumulation integrate (--rtgi spells the default)");
+                eprintln!("  --rtgi-bounces N  the GI ladder, as a BOUNCE BUDGET. Rungs 0 | 0.5 | 1 | 1.5 | 2");
+                eprintln!("                (any N in 0..=2 parses; DEFAULT 1 = one cosine gather per pixel per");
+                eprintln!("                frame as the ambient term, the renderer this flag used to be a bool");
+                eprintln!("                for). A HALF rung buys the rung above at a fraction of its rays:");
+                eprintln!("                the SH-sky x AO tail is kept as a control variate and a real gather");
+                eprintln!("                is rouletted over it at that probability, which is UNBIASED for the");
+                eprintln!("                rung above rather than an average of the two — so the temporal");
+                eprintln!("                denoisers converge it to the upper rung's image. Scale it per GPU");
+                eprintln!("                and resolution; 1.5 is the interesting one on a heavy scene");
+                eprintln!("  --no-rtgi     real-time GI off — an alias for --rtgi-bounces 0: the ambient tier");
+                eprintln!("                reverts to flat SH-sky x AO (the pre-RTGI renderer bit-exactly).");
+                eprintln!("                --rtgi spells rung 1; all three compose, later flags winning");
                 eprintln!("  --no-auto-exposure  kill the display-stage aperture controller: exposure holds at");
                 eprintln!("                exactly 1.0 plus any --exposure-bias (the pre-feature look). Default ON:");
                 eprintln!("                exposure eases toward mid-grey, clamped to +-2 EV, so enclosures open up");
@@ -2969,7 +3010,7 @@ fn lever_snapshot() -> String {
         scene::detail_ao_strength(),
         scene::detail_untex_scale(),
         scene::amb_bump(),
-        crate::shade::rtgi_enabled(),
+        crate::shade::rtgi_bounces(),
         crate::autoexp::enabled(),
         crate::autoexp::bias(),
         crate::autoexp::guard(),
@@ -3036,6 +3077,8 @@ pub fn self_test() -> Result<(), String> {
         "0.25",
         "--no-amb-bump",
         "--no-rtgi",
+        "--rtgi-bounces",
+        "1.5",
         "--no-auto-exposure",
         "--no-autoexp-spike-guard",
         "--autoexp-spike-strength",
@@ -3142,7 +3185,7 @@ pub fn self_test() -> Result<(), String> {
         ("detail_ao_strength", o.detail_ao_strength == 0.5),
         ("detail_untex_scale", o.detail_untex_scale == 0.25),
         ("amb_bump", !o.amb_bump),
-        ("rtgi", !o.rtgi),
+        ("rtgi_bounces", o.rtgi_bounces == 1.5),
         // Default ON: "moved" means KILLED (the argv passes --no-auto-exposure).
         ("autoexp", !o.autoexp),
         ("exposure_bias", o.exposure_bias == 1.5),
@@ -3247,6 +3290,62 @@ pub fn self_test() -> Result<(), String> {
     }
     if parse_argv(&["--no-aniso", "--aniso", "8"]).opts.aniso != 8 {
         return Err("--no-aniso --aniso 8 must land on 8".into());
+    }
+    // ---- the RTGI ladder ---------------------------------------------------
+    // The default is the rung this renderer shipped with, and it is what makes
+    // a flagless session byte-identical to the pre-ladder build. A drift here
+    // would move every golden without moving a single gate.
+    if defaults().rtgi_bounces != 1.0 {
+        return Err("the default rtgi-bounces must be 1.0 (the pre-ladder renderer)".into());
+    }
+    for (argv, want) in [
+        (vec![], 1.0f32),
+        (vec!["--no-rtgi"], 0.0),
+        (vec!["--rtgi"], 1.0),
+        (vec!["--rtgi-bounces", "0"], 0.0),
+        (vec!["--rtgi-bounces", "0.5"], 0.5),
+        (vec!["--rtgi-bounces", "1"], 1.0),
+        (vec!["--rtgi-bounces", "1.5"], 1.5),
+        (vec!["--rtgi-bounces", "2"], 2.0),
+        // The three spellings are one ladder, so later flags win ACROSS them —
+        // an alias that could not be overridden by the numeric form (or vice
+        // versa) would be a second lever wearing the first one's name.
+        (vec!["--rtgi-bounces", "2", "--no-rtgi"], 0.0),
+        (vec!["--no-rtgi", "--rtgi-bounces", "1.5"], 1.5),
+        (vec!["--rtgi-bounces", "0.5", "--rtgi"], 1.0),
+    ] {
+        let got = parse_argv(&argv).opts.rtgi_bounces;
+        if got != want {
+            return Err(format!("{argv:?} resolved rtgi-bounces {got}, want {want}"));
+        }
+    }
+    // The settings row's default must agree with the CLI's, for the
+    // autoexp_mode tripwire's reason: a flip that moved cli.rs and shade.rs but
+    // forgot settings.rs leaves a settings FILE silently re-selecting another
+    // rung on every launch that has one.
+    let rrow = crate::settings::menu_items()
+        .iter()
+        .find(|i| i.id == "rtgi_bounces")
+        .ok_or("settings.rs has no rtgi_bounces row")?;
+    match rrow.control {
+        crate::settings::Control::Cycle { options, default_ix } => {
+            if options.get(default_ix).copied() != Some(defaults().rtgi_bounces.to_string().as_str())
+            {
+                return Err(format!(
+                    "settings.rs's rtgi_bounces default is {:?}, cli.rs's is {}",
+                    options.get(default_ix),
+                    defaults().rtgi_bounces
+                ));
+            }
+            // Every rung the menu offers must be a rung the parser accepts.
+            for o in options {
+                let got = parse_argv(&["--rtgi-bounces", o]).opts.rtgi_bounces;
+                if got.to_string() != *o {
+                    return Err(format!("settings rung {o:?} parsed as {got}"));
+                }
+            }
+        }
+        _ => return Err("rtgi_bounces' menu row is no longer a Cycle".into()),
     }
     if parse_argv(&["--dual-gpu", "3", "--no-dual-gpu"]).opts.dual_gpu.is_some() {
         return Err("--dual-gpu 3 --no-dual-gpu must disarm".into());

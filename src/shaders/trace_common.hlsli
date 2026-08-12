@@ -96,6 +96,11 @@
                                // waveviz — the sibling branched before the
                                // detail flags landed); detail keeps it,
                                // waveviz takes the next free bit.
+#define FLAG_RTGI_CORR 134217728u // the GI ladder's rouletted correction is
+                                  // live this frame (gfx/frame.rs's twin) --
+                                  // the runtime half of RTGI_CORR, so a gate
+                                  // that pins Quality{rtgi_bounces: 0} really
+                                  // gets no gather
 #define FLAG_RTGI      524288u // real-time GI live THIS frame (shade_full's
                                // #ifdef RTGI bounce block — --no-rtgi
                                // compiles the block out, so the bit is only
