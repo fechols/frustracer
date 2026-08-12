@@ -364,6 +364,8 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         sky_sh: crate::sh::Sh9::ZERO,
         sky_scale: 1.0,
         night: 0.0,
+        light_gain: 1.0,
+        light_canon: crate::scene::LightCanon::default(),
         sway: None,
         sway_regions,
         diag: 0.0,

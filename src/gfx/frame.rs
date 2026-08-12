@@ -437,7 +437,11 @@ pub struct FrameCb {
     /// Set through `arm_sway_mv` beside FLAG_SWAY_MV so the pair cannot
     /// split.
     sway_mv_base: [u32; 4],
-    /// Emissive cluster lights (src/emissive.rs): x = count, yzw unused.
+    /// Emissive cluster lights (src/emissive.rs): x = count, y = the SCENE
+    /// LIGHT GAIN's f32 bits (`Scene::light_gain`, exactly 1.0 outside
+    /// `--autoexp-mode lights`), zw unused. The gain rode a free lane rather
+    /// than moving `CB_STRIDE` — the `ff_count`/`_pad3` idiom — and the HLSL
+    /// reads it back through `scene_light_gain()`.
     /// Scene-static — filled by `base` from `Scene::emissive`; FLAG_EMISSIVE
     /// mirrors it per frame (× the live lever × fb_mode != 2).
     el_meta: [u32; 4],
@@ -1082,7 +1086,7 @@ impl FrameCb {
             // ownership test, so the whole feature is off by default.
             split: [0; 4],
             sway_mv_base: [0; 4],
-            el_meta: [scene.emissive.count, 0, 0, 0],
+            el_meta: [scene.emissive.count, scene.light_gain.to_bits(), 0, 0],
             el_a,
             el_b,
             prev_origin: [0.0; 4],
@@ -1146,6 +1150,15 @@ impl FrameCb {
         self.sky_sh = fresh.sky_sh;
         self.sky_scale = fresh.sky_scale;
         self.night = fresh.night;
+        // The emissive rows too, which used to ride the static base alone.
+        // They are scene-static under a fixed aperture, but `--autoexp-mode
+        // lights` scales `EmissiveLight::color` per gain move, and this is the
+        // one path that pushes a re-derived scene to the GPU — leaving them
+        // behind would brighten every emitter's DISPLAY add (which reads the
+        // gain from el_meta.y) while its cluster NEE stayed dark.
+        self.el_meta = fresh.el_meta;
+        self.el_a = fresh.el_a;
+        self.el_b = fresh.el_b;
     }
 
     /// The per-frame fields folded onto the static base — the single source

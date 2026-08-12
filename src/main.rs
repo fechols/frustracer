@@ -723,6 +723,18 @@ fn main() {
     if opts.exposure_bias != 0.0 {
         eprintln!("exposure-bias: {:+} EV", opts.exposure_bias);
     }
+    autoexp::set_mode(opts.autoexp_mode);
+    // DEFAULT Lights — only a DEPARTURE prints, so the loud line moved to the
+    // other arm with the default. It still earns one: the two arms differ in
+    // what the denoisers integrate and in whether the spike guard exists at
+    // all, so a later A/B must never be able to forget which one was live.
+    if opts.autoexp_mode != autoexp::Mode::Lights {
+        eprintln!(
+            "autoexp mode: TONEMAP — the aperture is a multiply at the \
+             presentation curve (the pre-feature arm; the spike guard is live \
+             here and only here)"
+        );
+    }
     autoexp::set_guard(opts.autoexp_guard);
     autoexp::set_guard_strength(opts.autoexp_guard_strength);
     // Also default ON — only departures print. Both spellings are worth a line:
@@ -1146,7 +1158,7 @@ fn main() {
                 None => stem,
             })
         };
-        let code = run_check(&scene, &bvh, cam0, structural, img_tag.as_deref());
+        let code = run_check(&mut scene, &bvh, cam0, structural, img_tag.as_deref());
         std::process::exit(code);
     }
     if check_dlss {
@@ -1164,7 +1176,7 @@ fn main() {
     if check_gpu {
         #[cfg(windows)]
         {
-            let code = run_check_gpu(&scene, &bvh, cam0, &opts, structural);
+            let code = run_check_gpu(&mut scene, &bvh, cam0, &opts, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -4659,7 +4671,7 @@ fn dn_kind(opts: &Opts) -> Option<gpu::DnKind<'_>> {
 /// gates pass, 1 = a gate failed, 2 = environment (no DLLs / no support).
 #[cfg(windows)]
 fn run_check_gpu(
-    scene: &scene::Scene,
+    scene: &mut scene::Scene,
     bvh: &bvh::Bvh,
     cam0: Camera,
     opts: &Opts,
@@ -4809,7 +4821,7 @@ fn run_check_gpu(
             return 1;
         }
     };
-    let tg = match gpu::trace::TraceGpu::new(
+    let mut tg = match gpu::trace::TraceGpu::new(
         &dev,
         &dxc,
         scene,
@@ -4860,6 +4872,180 @@ fn run_check_gpu(
         Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
     };
 
+    // -- LIGHT-GAIN LINEARITY ON THE GPU (`--autoexp-mode lights`) ------------
+    //
+    // `--check`'s `light-gain-ab` proves the RENDERER is linear in the gain.
+    // This proves the gain REACHES the GPU, which is a different claim and the
+    // one nothing else in the tree makes. Five of the six emitter families ride
+    // cbuffer rows the scene already transports, so they need no shader change
+    // at all -- but the other two do: the emissive DISPLAY add and the star
+    // field read `el_meta.y` through `scene_light_gain()`, and three ABSOLUTE
+    // ceilings (EL_E_MAX / STAR_L_MAX / FF_GLOW_L_MAX) scale with it. The most
+    // fragile line of the lot is `FrameCb::refresh_sky_rows`' el_a/el_b copy:
+    // without it a gain move brightens every emitter's display add while its
+    // cluster NEE stays dark -- a HALF-applied gain, which is exactly the shape
+    // a loose bound swallows.
+    //
+    // GPU vs GPU, one `refresh_sky` apart -- deliberately NOT GPU vs CPU. The
+    // two intersectors legitimately disagree at grazing edges (T1/T2's
+    // statistical bars exist for that), and folding that in would blunt the one
+    // comparison this gate is for. The arms differ ONLY in the gain.
+    //
+    // DXR gets no twin, and that is an argument rather than an omission:
+    // `DxrGpu::refresh_sky` is textually `TraceGpu::refresh_sky`, both
+    // delegating to the ONE `FrameCb::refresh_sky_rows`, and shade.hlsli /
+    // trace_common.hlsli are one TEXT compiled against two root signatures --
+    // so a second arm would re-measure identical wiring (the N8 argument).
+    let light_gain_gpu_ok = 'lg_gpu: {
+        const G: f32 = 4.0; // 2 stops -- EV_MAX, and exact in f32
+        const LG_FRAMES: u32 = 4;
+        let lgpx = gw * gh;
+        // WHICH families this scene can exercise. The procedural check scene is
+        // a day scene with no emissive at all, so a green run there covers
+        // sun + dome + SH and NOTHING else -- say so rather than let the row
+        // read as blanket GPU coverage (`--check-gpu --tod 2` on an emissive
+        // scene is what reaches the other four; the N6b INERT note).
+        let live = {
+            let mut v: Vec<&str> = vec!["sun", "dome+SH"];
+            if scene.night > 0.0 {
+                v.push("stars");
+                if crate::fireflies::enabled() {
+                    v.push("fireflies");
+                }
+            }
+            if scene.emissive.count > 0 {
+                v.push("emissive-NEE");
+            }
+            if scene.materials.iter().any(|m| m.emissive != glam::Vec3A::ZERO) {
+                v.push("emissive-display");
+            }
+            v
+        };
+        // `scene` is taken as a PARAMETER rather than captured, so the closure
+        // holds no borrow across the `apply_light_gain` calls between traces.
+        let lg_trace = |hg: &mut gpu::trace::HeadlessGpu,
+                        tg: &gpu::trace::TraceGpu,
+                        sc: &scene::Scene|
+         -> Result<Vec<f32>, String> {
+            for f in 0..LG_FRAMES {
+                tg.write_cb(0, &gpu::trace::FrameParams {
+                    sway_prev_time: None,
+                    cam: basis,
+                    frame: f,
+                    accumulate: true,
+                    jitter: false,
+                    frame_jitter: None,
+                    prev_cam: None,
+                    q,
+                    verify: false,
+                    spp: 1,
+                    probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(sc.diag),
+                    fireflies: crate::fireflies::Fireflies::check(sc),
+                    sway_time: check_sway,
+                    replay: false,
+                });
+                hg.run(|l| tg.record_reference(l, 0))?;
+            }
+            // Read back inline rather than through `read_f32`: that closure's
+            // parameter lifetimes are inferred from its OTHER call sites, so
+            // feeding it a reference derived from this closure's own `tg`
+            // parameter makes the borrow escape.
+            let b = hg.read_buffer(&tg.accum, ua, lgpx * 3 * 4)?;
+            Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        };
+
+        // A BAD CANON MUST NOT BE ACTED ON (the `--check` gate's rule): the
+        // gain is written FROM `light_canon`, so touching it on a scene whose
+        // canon was never captured would replace the real lights with
+        // placeholders for every gate below.
+        if scene.light_gain != 1.0 {
+            eprintln!(
+                "check-gpu: FAIL a headless scene must load at light_gain 1.0, got {}",
+                scene.light_gain
+            );
+            break 'lg_gpu false;
+        }
+
+        macro_rules! lg_try {
+            ($e:expr, $what:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL light-gain {}: {e}", $what);
+                        break 'lg_gpu false;
+                    }
+                }
+            };
+        }
+        let base = lg_try!(lg_trace(&mut hg, &tg, scene), "base trace");
+        scene::apply_light_gain(scene, G);
+        tg.refresh_sky(scene);
+        let gained = lg_try!(lg_trace(&mut hg, &tg, scene), "gained trace");
+        scene::apply_light_gain(scene, 1.0);
+        tg.refresh_sky(scene);
+        // Both the scene AND the cbuffer must come back bitwise: every gate
+        // below traces from this same `tg`, and T1/T2 compare against the CPU.
+        let restored = lg_try!(lg_trace(&mut hg, &tg, scene), "restore trace");
+        let restore_ok = base.iter().zip(&restored).all(|(a, b)| a.to_bits() == b.to_bits());
+
+        // Relative to the image's own magnitude (the --spp A/B's shape): an
+        // ABSOLUTE bound would be a different bound on every scene.
+        let (mut num, mut den, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+        for (g, b) in gained.iter().zip(&base) {
+            let want = *b as f64 * G as f64;
+            num += (*g as f64 - want).abs();
+            den += want.abs();
+            if want.abs() > 1e-3 {
+                worst = worst.max(((*g as f64 - want) / want).abs());
+            }
+        }
+        let rel = if den > 0.0 { num / den } else { 0.0 };
+        let moved = gained.iter().zip(&base).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        eprintln!(
+            "check-gpu: light-gain linearity x{G} over {LG_FRAMES}f: mean rel {rel:.3e} \
+             worst {worst:.3e}, {moved}/{} ch moved, live families [{}]",
+            base.len(),
+            live.join(" ")
+        );
+        let mut ok = true;
+        if den <= 0.0 || moved == 0 {
+            eprintln!(
+                "check-gpu: FAIL light-gain gate is vacuous (unlit scene, or the gain did nothing)"
+            );
+            ok = false;
+        }
+        if !(rel < 1e-4) {
+            eprintln!("check-gpu: FAIL the GPU is not linear in the light gain (mean rel {rel:.3e})");
+            ok = false;
+        }
+        if !restore_ok {
+            eprintln!(
+                "check-gpu: FAIL the scene/cbuffer did not restore bitwise after a gain \
+                 (every gate below traces from them)"
+            );
+            ok = false;
+        }
+        // TEETH: the bound must reject a WRONG gain. Half a stop is subtler
+        // than any plausible missing-family bug and must blow it outright.
+        let wrong: f64 = {
+            let (mut n, mut d) = (0.0f64, 0.0f64);
+            for (g, b) in gained.iter().zip(&base) {
+                let want = *b as f64 * (G as f64 * 1.5);
+                n += (*g as f64 - want).abs();
+                d += want.abs();
+            }
+            if d > 0.0 { n / d } else { 0.0 }
+        };
+        if !(wrong > 1e-4) {
+            eprintln!("check-gpu: FAIL light-gain teeth: a 1.5x-wrong gain also passes the bound");
+            ok = false;
+        }
+        ok
+    };
+    // Everything below wants the shared borrow; the gate above was the only
+    // writer, and it left the scene (and `tg`'s cbuffer) canonical.
+    let scene: &scene::Scene = scene;
     // CPU counterpart: the plain per-pixel reference (hybrid = false).
     let stats = Stats::default();
     let accum: Vec<AtomicU32> = (0..gw * gh * 3).map(|_| AtomicU32::new(0)).collect();
@@ -4978,7 +5164,13 @@ fn run_check_gpu(
     for (x, y, ct, gt) in &edge_px {
         eprintln!("check-gpu:   two-intersector edge px ({x},{y}): cpu t {ct:.6} | gpu-ref t {gt:.6}");
     }
-    let mut ok = true;
+    // Folded in rather than early-returned so a bound failure still lets the
+    // rest of the suite report; the gate itself already broke out on any
+    // dispatch/canon error, where continuing would measure nothing.
+    let mut ok = light_gain_gpu_ok;
+    if !light_gain_gpu_ok {
+        eprintln!("check-gpu: FAIL light-gain gates (the aperture does not reach the GPU)");
+    }
     eprintln!(
         "check-gpu: reference visibility ({px} px): class-mismatch {class_mismatch} | rel-t > 1e-3: {t_viol} | max rel t err {max_rel:.2e}"
     );
@@ -5532,6 +5724,7 @@ fn run_check_gpu(
         };
     let mut false_sky = 0usize;
     let mut overshoot = 0usize;
+    let mut cand_edge = 0usize;
     let mut hybrid_extra = 0usize;
     let mut max_rel_t = 0.0f32;
     let mut culprits: Vec<String> = Vec::new();
@@ -5551,6 +5744,40 @@ fn run_check_gpu(
             }
         }
     }
+
+    // WHICH BUCKET a t-overshoot belongs in, defined ONCE because this function
+    // asks the question TWICE: in the wavefront/reference loop below, and again
+    // in the --spp sub-gate, which re-runs that comparison over this same
+    // `t_start_of` and `edge_mask`. Two hand-kept copies of a predicate that
+    // must agree is exactly the drift that left the Vulkan twin printing a
+    // wrong diagnosis for a milestone (`bc7::should_compress` discipline).
+    //
+    // THE SPLIT. A leaf primary searches (t_start, inf), so when the
+    // reference's OWN hit lies inside that interval no value of t_start could
+    // have hidden it: the inherited bound is innocent BY CONSTRUCTION, and what
+    // is left is two intersector RUNS disagreeing about a grazing cutout edge.
+    // At or below t_start the bound IS the suspect and stays a hard failure —
+    // this is a decomposition, not an allowance bolted onto the old counter.
+    // The interval is OPEN and the test therefore STRICT, which matters only in
+    // a case that cannot occur (t_start comes from an AABB frustum bound and rt
+    // from a triangle intersection, so exact equality is unreachable) — but
+    // acceptance is strictly beyond TMin, so a hit AT t_start is one the bound
+    // would have hidden, and the strict form is the one that says so.
+    //
+    // `non_opaque` is the same derived predicate that drops
+    // GEOMETRY_FLAG_OPAQUE, i.e. it answers exactly "does `trace_closest` take
+    // its `Proceed()` arm", and `--sw-rays` replaces that arm with our own
+    // fixed-order walk — so on an opaque scene, or under that lever, the split
+    // cannot fire at all and every counter below is the pre-split one bitwise.
+    // MEASURED on the Vulkan twin (san-miguel-low-poly --tile 2, 22.5M tris,
+    // RADV): the hardware arm disagrees with the reference at ONE pixel,
+    // FR_ABL=noalpha and --sw-rays both return it to 0.00e0, and FR_ABL=tzero
+    // does not move it — which attributes the phenomenon to the driver's
+    // candidate enumeration rather than to the inherited bound.
+    let cand_loop = gpu::trace::non_opaque(scene) && !gpu::trace::sw_rays();
+    let cand_arm = if cand_loop { "armed" } else { "off" };
+    let cand_edge_px =
+        |i: usize, rt: f32| cand_loop && t_start_of[i].is_finite() && rt > t_start_of[i];
 
     // THE soundness contract, asserted directly instead of by proxy: the region
     // a tile proved empty — frustum ∩ ball(origin, t_start) — must not contain
@@ -5613,10 +5840,17 @@ fn run_check_gpu(
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    overshoot += 1;
+                    // ONE predicate, two call sites — see its definition above.
+                    let (label, bucket) = if cand_edge_px(i, rt) {
+                        cand_edge += 1;
+                        ("cand-edge", "candidate-loop edge, bound innocent")
+                    } else {
+                        overshoot += 1;
+                        ("overshoot", "INSIDE the claimed-empty ball")
+                    };
                     if culprits.len() < 8 {
                         culprits.push(format!(
-                            "overshoot px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            "{label} px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6} — {bucket}",
                             t_start_of[i]
                         ));
                     }
@@ -5673,7 +5907,7 @@ fn run_check_gpu(
     }
     let img_mean = img_sum / (px * 3) as f64;
     eprintln!(
-        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
+        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | cand-edge px {cand_edge} (arm {cand_arm}) | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
     );
     if claim_viol != 0 {
         eprintln!("check-gpu: FAIL inherited-tmin claim violated (t_start past real geometry — THE bug class)");
@@ -5683,11 +5917,6 @@ fn run_check_gpu(
         eprintln!("check-gpu: FAIL wavefront visibility gates (the inherited-tmin bug class)");
         ok = false;
     }
-    if !culprits.is_empty() {
-        for c in &culprits {
-            eprintln!("check-gpu:   {c}");
-        }
-    }
     // The hardware-edge pixels are bounded by the SAME statistical allowance the
     // reference-vs-CPU gate uses — they are the same phenomenon, seen from the
     // other side. A flood of them is a real signal (a broken cut would surface
@@ -5695,6 +5924,28 @@ fn run_check_gpu(
     if edge_skipped as f64 > px as f64 * 5e-4 {
         eprintln!("check-gpu: FAIL {edge_skipped} wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
         ok = false;
+    }
+    // The candidate-loop edge bucket rides that SAME allowance, for the same
+    // reason. WHERE THE TEETH ARE, because the obvious answer is wrong: the
+    // innocence predicate is NOT selective on a passing run — `claim_viol == 0`
+    // already asserts t_start <= min(cpu_t, ref_t) * (1+1e-4), so it holds at
+    // every leaf pixel bar a 1e-4-wide relative band. The split discriminates
+    // only once a claim is ALREADY violated, i.e. in the case it must not
+    // soften. What carries the gate is the ARM (off by construction on an
+    // opaque scene and under `--sw-rays`, hence printed beside the count),
+    // this 0.05% bound (a genuinely bad claim is a property of a whole TILE, so
+    // it arrives as thousands of pixels), `claim-violation` itself, and the
+    // image half below — a cand-edge pixel is NOT added to `edge_mask`, so its
+    // colour is still gated at 1e-2 under an independent 0.05% count.
+    if cand_edge as f64 > px as f64 * 5e-4 {
+        eprintln!("check-gpu: FAIL {cand_edge} candidate-loop edge disagreements above the 0.05% allowance");
+        ok = false;
+    }
+    // Below all four t-bucket verdicts, so a reader meets the FAIL lines
+    // grouped and then the pixels that explain them (the culprits name their
+    // own bucket, so one list serves every verdict above).
+    for c in &culprits {
+        eprintln!("check-gpu:   {c}");
     }
     // The same-seed image A/B, in three parts that between them are strictly
     // stronger than the old `mean || max` pair — and, unlike it, do not assume
@@ -6839,10 +7090,30 @@ fn run_check_gpu(
             // information about multi-sampling), and the image comparison is
             // mean + a bounded hot COUNT rather than an absolute max, which
             // would otherwise be set by a grazing binary occlusion flip.
-            let (mut fs, mut ov, mut he, mut edge) = (0usize, 0usize, 0usize, 0usize);
+            // The overshoot bucket splits here too, through the SAME
+            // `cand_edge_px` the spp=1 loop uses. `t_start_of` is a snapshot
+            // from the structural frame, and it is valid at these frames
+            // because the quadtree is a pure function of (scene, BVH, basis,
+            // rw, rh) and this block re-traces `cam: basis` — spp moves the
+            // samples inside a pixel, never the tiles (the same premise the
+            // `edge_mask` reuse just below already rests on).
+            //
+            // Undecomposed, a tiled cutout run on hardware whose candidate
+            // enumeration differs fails HERE with a diagnosis naming
+            // MULTI-SAMPLING — a worse wrong answer than the spp=1 loop's was,
+            // since nothing about the extra samples is implicated. And this arm
+            // is the likelier one to fire: five probes at five in-pixel sample
+            // positions are five independent draws at the same knife-edge.
+            let (mut fs, mut ov, mut he, mut edge, mut ce) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            // Same diagnostic discipline as the spp=1 culprit list and this
+            // gate's own hot_diag: a failure must NAME its pixels.
+            let mut vis_diag: Vec<String> = Vec::new();
             for i in 0..px {
-                let disagree = match (rt4[i].is_finite(), wt4[i].is_finite()) {
-                    (true, true) => rt4[i] != wt4[i],
+                let (rt, wt) = (rt4[i], wt4[i]);
+                let (x, y) = (i % gw, i / gw);
+                let disagree = match (rt.is_finite(), wt.is_finite()) {
+                    (true, true) => rt != wt,
                     (false, false) => false,
                     _ => true,
                 };
@@ -6850,14 +7121,41 @@ fn run_check_gpu(
                     edge += 1;
                     continue;
                 }
-                match (rt4[i].is_finite(), wt4[i].is_finite()) {
+                match (rt.is_finite(), wt.is_finite()) {
                     (true, true) => {
-                        if (wt4[i] - rt4[i]) / rt4[i].max(1e-6) > 1e-4 {
-                            ov += 1;
+                        let rel = (wt - rt) / rt.max(1e-6);
+                        if rel > 1e-4 {
+                            let (label, bucket) = if cand_edge_px(i, rt) {
+                                ce += 1;
+                                ("cand-edge", "candidate-loop edge, bound innocent")
+                            } else {
+                                ov += 1;
+                                ("overshoot", "INSIDE the claimed-empty ball")
+                            };
+                            if vis_diag.len() < 8 {
+                                vis_diag.push(format!(
+                                    "spp={spp} probe={probe} {label} px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6} — {bucket}",
+                                    t_start_of[i]
+                                ));
+                            }
                         }
                     }
-                    (true, false) => fs += 1,
-                    (false, true) => he += 1,
+                    (true, false) => {
+                        fs += 1;
+                        if vis_diag.len() < 8 {
+                            vis_diag.push(format!(
+                                "spp={spp} probe={probe} false-sky px ({x},{y}): ref t {rt:.6}, wave = sky"
+                            ));
+                        }
+                    }
+                    (false, true) => {
+                        he += 1;
+                        if vis_diag.len() < 8 {
+                            vis_diag.push(format!(
+                                "spp={spp} probe={probe} hybrid-extra px ({x},{y}): ref = sky, wave t {wt:.6}"
+                            ));
+                        }
+                    }
                     (false, false) => {}
                 }
             }
@@ -6899,15 +7197,30 @@ fn run_check_gpu(
             let hot_limit = (px * 3) as f64 * 5e-4;
             let nonfinite = wa4.iter().filter(|v| !v.is_finite()).count();
             eprintln!(
-                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | hw-edge px {edge} | same-seed image mean |d| {mean:.2e} (rel {rel:.2e} of {ref_mag:.3e}) max {mx:.2e} | hot ch {hot}"
+                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | hw-edge px {edge} | cand-edge px {ce} | same-seed image mean |d| {mean:.2e} (rel {rel:.2e} of {ref_mag:.3e}) max {mx:.2e} | hot ch {hot}"
             );
-            if fs != 0 || ov != 0 || he != 0 {
+            let vis_fail = fs != 0 || ov != 0 || he != 0;
+            let ce_fail = ce as f64 > px as f64 * 5e-4;
+            if vis_fail {
                 eprintln!("check-gpu: FAIL spp visibility gates (a multi-sample ray broke the inherited-tmin claim)");
                 ok = false;
             }
             if edge as f64 > px as f64 * 5e-4 {
                 eprintln!("check-gpu: FAIL {edge} spp wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
                 ok = false;
+            }
+            // The spp arm's half of the same split, under the same bound as its
+            // `edge` sibling above — see `cand_edge_px` for where the teeth are.
+            if ce_fail {
+                eprintln!("check-gpu: FAIL {ce} spp candidate-loop edge disagreements above the 0.05% allowance");
+                ok = false;
+            }
+            // ONE dump for both t-bucket failures: they share `vis_diag`, so a
+            // per-fail print would emit the same list twice.
+            if vis_fail || ce_fail {
+                for d in &vis_diag {
+                    eprintln!("check-gpu:   {d}");
+                }
             }
             // 1e-4 relative: ~3.7x the worst fp noise measured across scenes and
             // vendors (2.69e-5 — default 1.95e-5, San Miguel 1.93e-5, stress
@@ -7092,7 +7405,7 @@ fn run_check_gpu(
                         // A/B below is comparing two different functions. Same
                         // sky_scale AND night sources as hemi's leaf miss, same
                         // reason (night carries the star field's smooth mean).
-                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night),
+                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night, scene.light_gain),
                         Some(hh) => shade::shade(
                             scene,
                             bvh,
@@ -16235,15 +16548,19 @@ fn run_check_vk_wavefront(
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    // WHICH BUCKET. A leaf primary searches [t_start, inf), so
+                    // WHICH BUCKET. A leaf primary searches (t_start, inf), so
                     // when the reference's OWN hit lies inside that interval no
                     // value of t_start could have hidden it: the inherited
                     // bound is innocent BY CONSTRUCTION and what is left is two
                     // intersector RUNS disagreeing about a grazing cutout edge.
-                    // Below t_start the bound IS the suspect and stays hard —
-                    // which is the whole reason this is a decomposition and not
-                    // an allowance bolted onto the old counter.
-                    let innocent = t_start_of[i].is_finite() && rt >= t_start_of[i];
+                    // At or below t_start the bound IS the suspect and stays
+                    // hard — which is the whole reason this is a decomposition
+                    // and not an allowance bolted onto the old counter. The
+                    // interval is OPEN because acceptance is strictly beyond
+                    // TMin, so a hit AT t_start is one the bound would have
+                    // hidden; keep this STRICT in lockstep with the D3D12 twin
+                    // (`run_check_gpu`'s `cand_edge_px`) — one predicate.
+                    let innocent = t_start_of[i].is_finite() && rt > t_start_of[i];
                     let (label, bucket) = if cand_loop && innocent {
                         cand_edge += 1;
                         ("cand-edge", "candidate-loop edge, bound innocent")
@@ -16670,7 +16987,7 @@ fn run_check_vk_hemi(
                         // two different functions. Same sky_scale and night
                         // sources as the hemi leaf miss (night carries the star
                         // field's smooth mean).
-                        None => sky::gather(d, sun, scene.sky_scale, scene.night),
+                        None => sky::gather(d, sun, scene.sky_scale, scene.night, scene.light_gain),
                         Some(hh) => shade::shade(
                             scene,
                             bvh,
@@ -23962,7 +24279,7 @@ fn waveviz_dump(label: &str, bits: &[u32], w: usize, h: usize) {
 /// keeps a scene-keyed diagnostic run from dirtying the default scene's
 /// committed frame — see the derivation at the call site for the asymmetry.
 fn run_check(
-    scene: &scene::Scene,
+    scene: &mut scene::Scene,
     bvh: &bvh::Bvh,
     cam0: Camera,
     structural: bool,
@@ -23978,6 +24295,229 @@ fn run_check(
         None => ("check.png".to_string(), "check_gi.png".to_string()),
         Some(t) => (format!("check-{t}.png"), format!("check-{t}_gi.png")),
     };
+
+    // -- LIGHT-GAIN LINEARITY (`--autoexp-mode lights`) -- the claim the whole
+    // feature rests on, tested against `accum` and never against the tonemap:
+    //
+    //     the renderer is LINEAR in emitted radiance, so scaling every emitter
+    //     by g scales every path's radiance by exactly g.
+    //
+    // That is what makes the lights arm the same image as the tonemap arm's
+    // pre-curve multiply, and it is a property of the RENDERER, so it is worth
+    // measuring on real traced frames rather than deriving. Runs FIRST, while
+    // `scene` is still uniquely borrowed; the gate restores the canonical
+    // scene bitwise (`apply_light_gain(_, 1.0)` writes from `light_canon`)
+    // before anything else in the suite touches it.
+    //
+    // Deliberately not a byte compare: the two arms multiply in a different
+    // ORDER (`(e*g)*ndl` vs `(e*ndl)*g`), so they agree to fp reassociation,
+    // not to the bit. Everything that could have made them differ STRUCTURALLY
+    // is arranged not to: no rng draw, no branch and no clamp SELECTION
+    // depends on g (each absolute ceiling scales with it, so `min` picks the
+    // same side -- see `emissive::irradiance`), which is why a ~1e-6 result is
+    // the expected one and 1e-4 is a bound with three orders of headroom.
+    let light_gain_ab_ok = 'light_gain: {
+        const G: f32 = 4.0; // 2 stops -- EV_MAX, and exact in f32
+        const FRAMES: u32 = 4;
+        let (gw, gh) = (200usize, 150usize);
+        let gcam = cam0.basis(gw, gh);
+        let gstats = Stats::default();
+        let render = |sc: &scene::Scene| -> Vec<f32> {
+            let accum: Vec<AtomicU32> = (0..gw * gh * 3).map(|_| AtomicU32::new(0)).collect();
+            let info: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+            let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+            for f in 0..FRAMES {
+                let ctx = FrameCtx {
+                    sway_mv: None,
+                    scene: sc,
+                    bvh,
+                    cam: gcam,
+                    q,
+                    frame: f,
+                    jitter: false,
+                    rw: gw,
+                    rh: gh,
+                    accum: &accum,
+                    info: &info,
+                    tbuf: &tbuf,
+                    stats: &gstats,
+                    sun: render::sun_dir(sc),
+                    clouds: crate::clouds::Clouds::check(sc.diag),
+                    fireflies: crate::fireflies::Fireflies::check(sc),
+                    tcache_cur: None,
+                    tcache_prev: &[],
+                    accumulate: true,
+                    gbuf: None,
+                    fsr_buf: None,
+                    prev_cam: None,
+                    frame_jitter: None,
+                    spp: 1,
+                    primary_sample: 0,
+                    adaptive: false,
+                    hemi_share: false,
+                    replay_rec: None,
+                    cut_cur: None,
+                    cut_prev: None,
+                    discard_seeds: false,
+                    defer_shade: false,
+                };
+                render::render_frame(&ctx, true);
+            }
+            (0..gw * gh * 3).map(|i| f32::from_bits(accum[i].load(Relaxed))).collect()
+        };
+        // Which families this scene can actually exercise. A green run on a
+        // scene whose stars/fireflies/emissive are all structurally absent
+        // proves the gain HARMLESS there, not correct -- say so rather than
+        // let the row read as blanket coverage (the N6b INERT note).
+        let live = {
+            let mut v: Vec<&str> = vec!["sun", "dome+SH"];
+            if scene.night > 0.0 {
+                v.push("stars");
+                if crate::fireflies::enabled() {
+                    v.push("fireflies");
+                }
+            }
+            if scene.emissive.count > 0 {
+                v.push("emissive-NEE");
+            }
+            if scene.materials.iter().any(|m| m.emissive != glam::Vec3A::ZERO) {
+                v.push("emissive-display");
+            }
+            v
+        };
+
+        // CANON AGREEMENT, checked on the REAL loaded scene before anything
+        // is gained. `light_canon` is what `apply_light_gain` writes FROM, so
+        // a load path that forgot to capture it does not fail loudly — it
+        // silently replaces the scene's lights with LightCanon's placeholders
+        // the first time anything re-applies the gain, which `refresh_sky_sh`
+        // does on every load. That is not hypothetical: it shipped for one
+        // build and clobbered the sun in every session, and the A/B below is
+        // structurally blind to it (both arms render from the same already-
+        // wrong scene). This is the assertion that sees it.
+        let canon_ok = {
+            let c = &scene.light_canon;
+            let vec_eq = |a: glam::Vec3A, b: glam::Vec3A| {
+                a.to_array().iter().zip(b.to_array().iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+            };
+            let sun_ok = vec_eq(c.sun.e_over_pi, scene.sun.e_over_pi)
+                && vec_eq(c.sun.radiance, scene.sun.radiance)
+                && vec_eq(c.sun.dir, scene.sun.dir);
+            let sky_ok = c.sky_scale.to_bits() == scene.sky_scale.to_bits()
+                && c.sky_sh.c.iter().zip(scene.sky_sh.c.iter()).all(|(a, b)| vec_eq(*a, *b));
+            let el_ok = (0..scene.emissive.count as usize).all(|i| {
+                c.el[i].iter().zip(scene.emissive.lights[i].color.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+            });
+            if scene.light_gain != 1.0 {
+                eprintln!(
+                    "check: FAIL a headless scene must load at light_gain 1.0, got {}",
+                    scene.light_gain
+                );
+                false
+            } else if !(sun_ok && sky_ok && el_ok) {
+                eprintln!(
+                    "check: FAIL light_canon disagrees with the loaded scene \
+                     (sun {sun_ok}, sky {sky_ok}, emissive {el_ok}) — \
+                     a load path did not capture it"
+                );
+                false
+            } else {
+                true
+            }
+        };
+
+        // A BAD CANON MUST NOT BE ACTED ON, and that is a property of the SUITE
+        // rather than of this gate: `apply_light_gain` writes FROM the canon, so
+        // touching the gain on a scene whose canon was never captured replaces
+        // its real lights with LightCanon's placeholders -- and everything below
+        // would then render from the clobbered scene, INCLUDING the tracked
+        // golden, which the user would have to `git checkout` back. One red line
+        // beats a cascade of them plus a rewritten check.png.
+        if !canon_ok {
+            eprintln!(
+                "check: light-gain-ab SKIPPED (the canon is unusable, so the gain was never \
+                 applied -- the scene below is untouched)"
+            );
+            break 'light_gain false;
+        }
+
+        let base = render(scene);
+        // The g == 1.0 arm must be BITWISE the ungained render -- the branch in
+        // `apply_light_gain`, seen from the renderer's side.
+        scene::apply_light_gain(scene, 1.0);
+        let unit = render(scene);
+        let unit_ok = base.iter().zip(&unit).all(|(a, b)| a.to_bits() == b.to_bits());
+        scene::apply_light_gain(scene, G);
+        let gained = render(scene);
+        scene::apply_light_gain(scene, 1.0);
+        // Restored bitwise? The suite below renders the tracked goldens from
+        // this scene, so a leak here would move check.png.
+        let restored = render(scene);
+        let restore_ok = base.iter().zip(&restored).all(|(a, b)| a.to_bits() == b.to_bits());
+
+        // Relative to the image's own magnitude (the --spp A/B's shape): an
+        // ABSOLUTE bound would be a different bound on every scene, since the
+        // error scales with radiance.
+        let (mut num, mut den, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+        for (g, b) in gained.iter().zip(&base) {
+            let want = *b as f64 * G as f64;
+            num += (*g as f64 - want).abs();
+            den += want.abs();
+            if want.abs() > 1e-3 {
+                worst = worst.max(((*g as f64 - want) / want).abs());
+            }
+        }
+        let rel = if den > 0.0 { num / den } else { 0.0 };
+        // Anti-vacuity, both halves: the scene must carry light at all, and
+        // the gain must have visibly moved the image -- otherwise `rel` is
+        // 0/0 and the gate passes having measured nothing.
+        let moved = gained.iter().zip(&base).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        eprintln!(
+            "check: light-gain linearity x{G} over {FRAMES}f: mean rel {rel:.3e} worst {worst:.3e}, \
+             {moved}/{} ch moved, live families [{}]",
+            base.len(),
+            live.join(" ")
+        );
+        let mut ok = true; // canon_ok is the early-out above
+        if den <= 0.0 || moved == 0 {
+            eprintln!(
+                "check: FAIL light-gain gate is vacuous (an unlit scene, or the gain did nothing)"
+            );
+            ok = false;
+        }
+        if !(rel < 1e-4) {
+            eprintln!("check: FAIL the renderer is not linear in the light gain (mean rel {rel:.3e})");
+            ok = false;
+        }
+        if !unit_ok {
+            eprintln!("check: FAIL apply_light_gain(1.0) is not bitwise inert as seen by the renderer");
+            ok = false;
+        }
+        if !restore_ok {
+            eprintln!("check: FAIL the scene did not restore bitwise after a gain (check.png would move)");
+            ok = false;
+        }
+        // TEETH: the bound must be tight enough to reject a WRONG gain. Half a
+        // stop is far subtler than any plausible missing-family bug on a scene
+        // where that family is live, and it must blow the bound outright.
+        let wrong: f64 = {
+            let (mut n, mut d) = (0.0f64, 0.0f64);
+            for (g, b) in gained.iter().zip(&base) {
+                let want = *b as f64 * (G as f64 * 1.5);
+                n += (*g as f64 - want).abs();
+                d += want.abs();
+            }
+            if d > 0.0 { n / d } else { 0.0 }
+        };
+        if !(wrong > 1e-4) {
+            eprintln!("check: FAIL light-gain teeth: a 1.5x-wrong gain also passes the bound");
+            ok = false;
+        }
+        ok
+    };
+    // Everything below wants the shared immutable borrow; the gate above was
+    // the only writer, and it left the scene canonical.
+    let scene: &scene::Scene = scene;
 
     // Foliage-sway pose for the WHOLE suite (v0.2): bake at the pinned check
     // clock — NONZERO, so every gate that follows (verify's reference
@@ -24112,6 +24652,13 @@ fn run_check(
         Ok(()) => true,
         Err(e) => {
             eprintln!("tod self-test: FAIL — {e}");
+            false
+        }
+    };
+    let light_gain_ok = match scene::light_gain_self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("light-gain self-test: FAIL — {e}");
             false
         }
     };
@@ -25217,7 +25764,7 @@ fn run_check(
                         // gather, NOT radiance — a GATHER path, mirroring
                         // hemi.rs's leaf-ray miss exactly (see sky.rs),
                         // including its sky_scale and night sources.
-                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night),
+                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night, scene.light_gain),
                         Some(h) => shade::shade(
                             scene,
                             bvh,
@@ -27002,6 +27549,8 @@ fn run_check(
         ("rtgi", rtgi_ok),
         ("rtgi-ab", rtgi_ab_ok),
         ("tod", tod_ok),
+        ("light-gain", light_gain_ok),
+        ("light-gain-ab", light_gain_ab_ok),
         ("bloom", bloom_ok),
         ("frd", frd_ok),
         ("remod", remod_ok),
@@ -28895,6 +29444,12 @@ fn session(
     // is session-local: a re-entry's first dt spans the rebuild and step
     // clamps it to one bounded ease.
     let mut aexp_ev: f32 = p0.map_or(0.0, |p| p.autoexp_ev);
+    // The gain in STOPS currently applied to the scene's emitters — the CPU
+    // meter's de-gain reference (that meter is same-frame, so the value in
+    // force when it was measured is simply the one still applied). Seeded from
+    // the restored EV; if the scene came back through a resize at a different
+    // gain, the scene half's bit compare reconciles it on the first pass.
+    let mut aexp_gain_ev: f32 = autoexp::light_gain_ev(aexp_ev);
     let mut aexp_t = Instant::now();
     let mut aexp_trace_t = Instant::now();
     // The cloud clock. Advanced by the last frame's measured render time at
@@ -29022,17 +29577,39 @@ fn session(
         {
             let dt = (now - aexp_t).as_secs_f64() as f32;
             aexp_t = now;
-            if let Some(m) = gpu.take_meter().or_else(|| present.take_meter()) {
+            // DE-GAIN before stepping. Under `--autoexp-mode lights` the
+            // aperture is an input to the RENDERER, so a raw measurement would
+            // close a servo loop around a FRAMES_IN_FLIGHT-delayed readback;
+            // subtracting the stops that frame was rendered with recovers the
+            // scene-referred value and leaves the controller exactly the
+            // open-loop one the tonemap arm has always used. The GPU meter
+            // carries its own per-slot stamp (the readback is frames old); the
+            // CPU meter is the PREVIOUS iteration's resolve, and the gain has
+            // not moved since — this block is the only writer, and it applies
+            // below.
+            let m = match gpu.take_meter() {
+                Some((v, gev)) => Some(autoexp::degain(v, gev)),
+                None => present.take_meter().map(|v| autoexp::degain(v, aexp_gain_ev)),
+            };
+            if let Some(m) = m {
                 aexp_ev = autoexp::step(aexp_ev, m, dt);
                 if autoexp::trace_on() && aexp_trace_t.elapsed().as_secs_f64() >= 1.0 {
                     aexp_trace_t = now;
                     eprintln!(
-                        "autoexp: measured {m:+.3} ev {aexp_ev:+.3} scale {:.3}",
-                        autoexp::exposure(aexp_ev)
+                        "autoexp: measured {m:+.3} ev {aexp_ev:+.3} scale {:.3} ({})",
+                        autoexp::exposure(aexp_ev),
+                        autoexp::mode().as_str()
                     );
                 }
             }
-            gpu.set_exposure(autoexp::exposure(aexp_ev));
+            // Exactly one destination is armed (autoexp::Mode): the tonemap
+            // arm's gain is exactly 1.0 and the lights arm's display exposure
+            // is exactly 1.0, so both writes are unconditional and the idle
+            // one restores its identity. The SCENE half lands further down,
+            // where `scene` is borrowed mutably (beside the TOD block, whose
+            // reset semantics it shares).
+            gpu.set_exposure(autoexp::display_exposure(aexp_ev));
+            gpu.set_light_gain_ev(autoexp::light_gain_ev(aexp_ev));
         }
 
         // Menu OPEN routes events to Slint (toggle keys can't fire); the
@@ -29400,6 +29977,7 @@ fn session(
                 exposure_bias: autoexp::bias(),
                 autoexp_guard: autoexp::guard(),
                 autoexp_guard_strength: autoexp::guard_strength(),
+                autoexp_mode: autoexp::mode().as_str(),
                 clouds: clouds::enabled(),
                 fireflies: fireflies::enabled(),
                 fireflies_count: fireflies::count(),
@@ -29474,6 +30052,17 @@ fn session(
                                 }
                                 settings::MenuFx::ExposureBias(ev) => {
                                     autoexp::set_bias(ev);
+                                }
+                                settings::MenuFx::AutoExpMode(m) => {
+                                    // No reset here either: the controller
+                                    // tick writes BOTH destinations every
+                                    // frame, so the flip lands as the idle
+                                    // one being restored to its identity and
+                                    // the newly-armed one taking the EV. The
+                                    // scene half's own bit compare then fires
+                                    // (or un-fires) with the TOD block's
+                                    // frame=0-histories-kept semantics.
+                                    autoexp::set_mode(m);
                                 }
                                 settings::MenuFx::ToggleAutoExpGuard => {
                                     // Display-stage like its parent row: the
@@ -29597,6 +30186,29 @@ fn session(
             sh_tod = cur_tod;
             gpu.refresh_sky(scene);
             frame = 0;
+        }
+        // ── Auto-exposure, SCENE half (`--autoexp-mode lights`): spend the
+        // controller's EV on every emitter instead of on the presentation
+        // curve. Deliberately sited beside the TOD block, because it IS the
+        // same class of event and wants exactly the same handling — a
+        // LIGHTING change, so plain accumulation restarts (`frame = 0`) while
+        // every upscaler/denoiser history, the temporal frustum cache, the
+        // claim ring and structure replay are KEPT (geometry-only claims;
+        // replay re-shades from the fresh ctx).
+        //
+        // The bit compare is the whole guard: the controller's deadband parks
+        // it, so a converged session leaves `light_gain` bitwise unchanged and
+        // never enters this block — which is what lets a still frame keep
+        // accumulating, and what makes the tonemap arm (gain permanently
+        // exactly 1.0) structurally unable to reach it at all.
+        {
+            let g = autoexp::light_gain(aexp_ev);
+            if g.to_bits() != scene.light_gain.to_bits() {
+                scene::apply_light_gain(scene, g);
+                aexp_gain_ev = autoexp::light_gain_ev(aexp_ev);
+                gpu.refresh_sky(scene);
+                frame = 0;
+            }
         }
         // ── HUD overlay (compass / clock / motion-gated keymap). Purely
         // display-stage: Slint software-renders into its persistent CPU

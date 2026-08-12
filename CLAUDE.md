@@ -3585,6 +3585,14 @@ cargo run --release -- --no-autoexp-spike-guard  # A/B lever: let the aperture b
                                       # lever must not kill the bugs. Their glow splats are
                                       # Gaussian and several px wide, so the K_MAX arm is what
                                       # shields them.
+                                      # WHERE the aperture is spent is itself a lever —
+                                      # `--autoexp-mode`, below — and since `lights` became the
+                                      # DEFAULT this guard is INERT unless a session passes
+                                      # `--autoexp-mode tonemap`. It is display-stage BY NATURE (it
+                                      # relaxes a per-PIXEL display exposure, which the lights arm
+                                      # holds at exactly 1.0), so this is inherent rather than a
+                                      # wiring gap: keep that in mind before reading a firefly
+                                      # report as evidence about the guard.
                                       # Levers: --autoexp-spike-guard spells the default;
                                       # --autoexp-spike-strength K (0..=1, default 1 = the
                                       # outlier is presented exactly as if auto-exposure were
@@ -3694,6 +3702,248 @@ cargo run --release -- --no-autoexp-spike-guard  # A/B lever: let the aperture b
                                       # by the invariant above; frame-border pixels are never
                                       # guarded. OWED: the user's feel-test — the constants are
                                       # measured but the LOOK is not gate-visible
+cargo run --release -- --autoexp-mode tonemap  # WHERE the aperture is spent. DEFAULT
+                                      # `lights` since 2026-08-11 (the user's call, after a
+                                      # feel-test): the controller's EV becomes a gain on the
+                                      # SCENE'S LIGHTS (src/autoexp.rs's `Mode`,
+                                      # scene::apply_light_gain) and the presentation curve holds
+                                      # at exactly 1.0. `--autoexp-mode tonemap` is the pre-feature
+                                      # presentation-curve multiply, the opt-out AND the A/B
+                                      # partner. The default is TRIPLICATED in autoexp.rs's MODE
+                                      # initializer, cli.rs's defaults() and settings.rs's
+                                      # `Cycle { default_ix }` — flip all three in lockstep;
+                                      # cli::self_test pins that they AGREE (it reads the menu row
+                                      # back, so a flip that forgot settings.rs — which would let a
+                                      # settings FILE silently re-select the other arm on every
+                                      # launch that has one — fails loudly). Settings row:
+                                      # Effects/autoexp_mode (Live). NOTE the default makes the
+                                      # SPIKE GUARD inert: its arming test is `exposure > 1.0` and
+                                      # this arm leaves display exposure at exactly 1.0, so
+                                      # `--autoexp-spike-guard` (itself default-ON) only does
+                                      # anything under `--autoexp-mode tonemap`. Inherent, not an
+                                      # oversight — a global light gain has no per-pixel lever.
+                                      # THE PHYSICS, which is why it is cheap AND why it buys less
+                                      # than it looks: the rendering equation is LINEAR in emitted
+                                      # radiance, so scaling every emitter by g scales every path's
+                                      # radiance by exactly g — the same image the tonemap arm's
+                                      # pre-curve multiply produces. That is not asserted, it is
+                                      # GATED (`light-gain-ab` below) and MEASURED live: the same
+                                      # pose, the same +2 EV, one arm each, 1920x1080 DXR on
+                                      # DamagedHelmet at --tod 22 with --emissive-lights, reads
+                                      # mean |d| 0.0000/255, worst 1 LSB, mean level 24.24 vs 24.24.
+                                      # FIVE of the six emitter families take the gain as DATA, so
+                                      # they reach BOTH renderers with ZERO shader edits (the
+                                      # EL_BOOST parity-by-data precedent — the cbuffer already
+                                      # transports every one of them): sun/moon (`e_over_pi` AND the
+                                      # cached disc `radiance` — a fix that moved only the first
+                                      # would leave the disc behind and no arithmetic gate would
+                                      # notice), the dome (`Scene::sky_scale`), the SH ambient
+                                      # (`Sh9::scaled` — projection is LINEAR, so scaling nine
+                                      # coefficients IS the projection of the scaled dome; NEVER
+                                      # re-project, that is the measured 235 -> 17 fps stall),
+                                      # fireflies (the baked `w` lane, which both the point light
+                                      # and the glow multiply by), and the emissive NEE clusters
+                                      # (`EmissiveLight::color`). The two that CANNOT ride data take
+                                      # one CB float (`FrameCb::light_gain`, riding el_meta.y's free
+                                      # lane rather than moving CB_STRIDE — the ff_count/_pad3
+                                      # idiom; HLSL reads it through `scene_light_gain()`): the
+                                      # emissive DISPLAY add, whose magnitude lives in the
+                                      # SERIALIZED material stream — and which is exactly the term
+                                      # a first draft would forget, leaving emitters reading as
+                                      # DIMMING as the aperture opens — and the star field, whose
+                                      # constants are mirrored HLSL literals.
+                                      # THE THREE ABSOLUTE CEILINGS SCALE WITH IT (EL_E_MAX 1000,
+                                      # FF_GLOW_L_MAX 512, STAR_L_MAX 4096) and that is what keeps
+                                      # linearity EXACT rather than approximate: each is f16
+                                      # HEADROOM, i.e. a property of the presented magnitude, so a
+                                      # fixed bound would clip a gained value against an ungained
+                                      # one and go sub-linear precisely where an emitter is
+                                      # brightest. Scaling them also keeps `min` selecting the same
+                                      # side, so NO branch, clamp selection or rng draw depends on
+                                      # g — which is why the gate reads EXACTLY 0.000e0 at a
+                                      # power-of-two gain rather than merely small (x4 is an
+                                      # exponent bump, so the reassociation `(e*g)*ndl` vs
+                                      # `(e*ndl)*g` is exact too).
+                                      # REACH AND COST ARE INVARIANT, for free: `r_infl2` is derived
+                                      # ONCE at load from EL_MIN_E, and the gain multiplies
+                                      # `color` PER FRAME without re-running `derive_parts`, so every
+                                      # cluster keeps its influence radius, its per-pixel scan cost,
+                                      # its shadow-ray count and its `emissive::cull_tile` sets. The
+                                      # deliberate opposite of EL_BOOST, which lands INSIDE the
+                                      # derivation and doubles r_infl2 with the power.
+                                      # NON-COMPOUNDING: `Scene::light_canon` holds the ungained
+                                      # values and `apply_light_gain` is ABSOLUTE, always writing
+                                      # FROM it — a ratio against the live values would compound its
+                                      # own rounding over a session's thousands of controller steps
+                                      # and make "the same EV" depend on how the session got there.
+                                      # Each producer captures what IT produces (`finalize_scalars`
+                                      # the sun + dome scale, `refresh_sky_sh` the SH — separately,
+                                      # since the interactive scrub throttles re-projection at
+                                      # SH_TOD_STEP and the two legitimately disagree mid-scrub,
+                                      # `apply_tod_lit` the sun + dome scale again after a TOD
+                                      # write). Derived, never serialized (the sky_sh precedent — no
+                                      # CACHE_VERSION move, no lever word).
+                                      # THE BUG THIS SHIPPED WITH, because the shape recurs: a first
+                                      # draft ended `refresh_sky_sh` with a whole
+                                      # `apply_light_gain`, which writes the sun FROM the canon —
+                                      # and on a FLAGLESS session nothing had captured the canon yet
+                                      # (`apply_tod_lit` is structurally unreachable without --tod),
+                                      # so every session silently traded its real sun for
+                                      # LightCanon's straight-up placeholder. `check.png` caught it;
+                                      # the light-gain A/B could not, because it renders BOTH arms
+                                      # from the same already-clobbered scene. TWO fixes, and the
+                                      # second is the transferable one: capture in
+                                      # `finalize_scalars` (the one funnel every load path runs),
+                                      # and SCOPE `refresh_sky_sh`'s re-gain to the coefficients it
+                                      # just produced — which makes the clobber unrepresentable AND
+                                      # leaves an uncaptured canon VISIBLE to the canon-agreement
+                                      # gate instead of hiding it by making canon and scene agree.
+                                      # A guard that the bug itself satisfies is not a guard.
+                                      # THE CONTROLLER STAYS OPEN-LOOP, which is the one thing this
+                                      # arm genuinely had to add. Today's meter reads a frame the
+                                      # aperture never touched; here the gain feeds the RENDERER, so
+                                      # a raw measurement would close a servo loop around a
+                                      # FRAMES_IN_FLIGHT-delayed readback. `autoexp::degain`
+                                      # subtracts the stops the measured frame was RENDERED with
+                                      # (gpu/autoexp.rs carries it PER RING SLOT beside `pending`,
+                                      # since the readback lands frames later; the CPU meter is
+                                      # same-frame and uses the value still applied), which recovers
+                                      # log2(L) exactly and makes the controller mathematically
+                                      # identical to the tonemap arm's — so its convergence,
+                                      # deadband and clamp gates transfer unchanged. VERIFIED LIVE:
+                                      # both arms settle on `measured -10.004 ev +1.850 scale 3.605`
+                                      # to three decimals (FR_AEXP_TRACE=1, same pose); without the
+                                      # subtraction the lights arm would have read -8.154.
+                                      # An EV move is a LIGHTING change, so it takes the TOD block's
+                                      # semantics VERBATIM and sits beside it in session(): plain
+                                      # accumulation resets (frame = 0) while every upscaler/
+                                      # denoiser history, the temporal frustum cache, the claim ring
+                                      # and structure replay are KEPT. The controller's DEADBAND is
+                                      # what makes that affordable — a converged session leaves
+                                      # `light_gain` bitwise unchanged and never enters the block,
+                                      # so a still frame keeps accumulating.
+                                      # WHAT IT COSTS — accepted when it became the default,
+                                      # so read this as the standing known-accept rather than an
+                                      # argument against:
+                                      # (a) NO SPIKE GUARD. `autoexp::guard_scale` works by relaxing
+                                      # a per-PIXEL DISPLAY exposure toward 1.0, and this arm leaves
+                                      # display exposure at exactly 1.0, so the guard's own arming
+                                      # test (`exposure > 1.0`) is false by construction. A global
+                                      # light gain has no per-pixel lever, so this is inherent, not
+                                      # an omission — the arm re-opens the firefly issue the guard
+                                      # closed. (b) an EV move is a per-frame lighting change the
+                                      # temporal histories must absorb (they do — the TOD-scrub
+                                      # class — but the tonemap arm has nothing to absorb).
+                                      # WHAT IT BUYS: the upscalers and denoisers integrate the
+                                      # BRIGHTENED signal, so their absolute clamps
+                                      # (--fsr-max-radiance, NRD/FRD's firefly caps) act at the
+                                      # PRESENTED brightness rather than at a fixed scene
+                                      # brightness — arguably where they belong. That is the
+                                      # thing worth A/B-ing, and it is the reason both arms ship
+                                      # (and, on the user's feel-test, why this one became the
+                                      # default).
+                                      # `--exposure-bias` composes into either arm through the same
+                                      # `autoexp::ev_total`, so `--no-auto-exposure --exposure-bias 2
+                                      # --autoexp-mode lights` is a fixed "make the scene physically
+                                      # 4x brighter" lever — and is exactly how the image A/B above
+                                      # is taken (no controller, no easing, no guard).
+                                      # HEADLESS IS UNREACHABLE: the controller only ticks in
+                                      # session(), so --check*/--spin/--cinematic hold the gain at
+                                      # exactly 1.0 and every multiply is branched around it.
+                                      # check.png/check_gi.png byte-identical — verified, and it is
+                                      # the check that earned its keep here.
+                                      # Gates: `light-gain` (scene::light_gain_self_test in --check
+                                      # — pure, scene-independent: bitwise inertness at 1.0 from
+                                      # BOTH directions, non-compounding along several paths to the
+                                      # same g, every magnitude scaling EXACTLY at powers of two,
+                                      # both of the sun's, REACH invariance, and the
+                                      # scale-vs-re-project SH identity); `light-gain-ab` (the
+                                      # end-to-end renderer gate — canon agreement on the real
+                                      # loaded scene, a g==1.0 render bitwise equal to the ungained
+                                      # one, a bitwise RESTORE after a gain, and the linearity
+                                      # itself at mean rel < 1e-4 relative to the image's own
+                                      # magnitude (the --spp A/B's shape — an absolute bound is a
+                                      # different bound on every scene), with teeth both ways: a
+                                      # 1.5x-wrong gain must blow the bound, and the row PRINTS
+                                      # which families the scene could exercise, since a green run
+                                      # on a scene with no stars/fireflies/emissive proves the gain
+                                      # HARMLESS there, not correct — the N6b INERT note). TEETH
+                                      # EXERCISED, not claimed: un-gaining the emissive DISPLAY add
+                                      # takes the helmet arm to 6.594e-2 (660x over) and dropping
+                                      # the finalize_scalars capture fails four assertions naming
+                                      # `sun false`. A bad canon EARLY-OUTS rather than gaining:
+                                      # apply_light_gain writes FROM the canon, so acting on an
+                                      # uncaptured one would replace the real lights with
+                                      # placeholders for every gate below — including the TRACKED
+                                      # golden, which the user would then have to `git checkout`
+                                      # back. One red line beats a cascade plus a rewritten
+                                      # check.png.
+                                      # AND THE GPU HALF HAS ITS OWN GATE (`light-gain` in
+                                      # --check-gpu, 2026-08-11): the CPU arm proves the RENDERER
+                                      # is linear, which is a different claim from the gain
+                                      # REACHING the GPU — five families ride cbuffer rows the
+                                      # scene already transports, but the emissive DISPLAY add and
+                                      # the star field read el_meta.y through scene_light_gain(),
+                                      # three absolute ceilings scale with it, and
+                                      # FrameCb::refresh_sky_rows' el_a/el_b copy is the most
+                                      # fragile line of the lot (without it a gain move brightens
+                                      # every emitter's display add while its cluster NEE stays
+                                      # dark — a HALF-applied gain, exactly what a loose bound
+                                      # swallows). GPU vs GPU, one refresh_sky apart, never GPU vs
+                                      # CPU (the two intersectors legitimately disagree at grazing
+                                      # edges — T1/T2's statistical bars exist for that, and
+                                      # folding it in would blunt the one comparison this gate is
+                                      # for). DXR gets NO twin by argument, not omission:
+                                      # DxrGpu::refresh_sky is textually TraceGpu::refresh_sky,
+                                      # both delegating to the ONE refresh_sky_rows, and
+                                      # shade.hlsli/trace_common.hlsli are one TEXT compiled
+                                      # against two root signatures (the N8 argument). MEASURED
+                                      # exactly 0.000e0 on every arm; TEETH exercised BOTH ways —
+                                      # dropping the el_a/el_b copy reads 3.126e-4 with worst
+                                      # EXACTLY 0.75 (= 1 − 1/4, the NEE contribution missing its
+                                      # whole 4x, the signature that names the bug), and pinning
+                                      # scene_light_gain() to 1.0 reads 1.423e-1 on the helmet and
+                                      # 5.274e-2 on --tod 2 alone (so the night procedural scene
+                                      # covers the star half without needing an emissive scene).
+                                      # NOTE the el_a/el_b plant is only 3.1x over the bound —
+                                      # emissive NEE is a small share of frame energy — which is
+                                      # precisely why the bound stays at 1e-4 and why the default
+                                      # procedural run, whose families line reads [sun dome+SH]
+                                      # ALONE, proves the GPU wiring harmless rather than correct:
+                                      # `--check-gpu --tod 2` and an emissive scene are what reach
+                                      # the other four. `cli::self_test` pins the vocabulary, both
+                                      # later-flags-win orders, and that the parse never touches the
+                                      # live mode (lever_snapshot's `amode`) — which matters here
+                                      # more than usual, since --check runs autoexp::self_test and a
+                                      # parse that moved the mode would have that gate scoring the
+                                      # wrong arm. autoexp::self_test arms 15/16 pin the
+                                      # exactly-one-destination split (display x light == exposure,
+                                      # BITWISE) and the de-gain identity with teeth.
+                                      # Run after touching autoexp.rs / scene.rs's canon+gain /
+                                      # sky.rs's star gain / the shade.hlsli + trace_common.hlsli
+                                      # twins: --check (+ byte-compare BOTH goldens), --check
+                                      # --stress 5000, --check --tod 2 (stars + fireflies live),
+                                      # --check-gpu, --check-gpu --tod 2, --check-dxr, and a scene
+                                      # with real emissive (helmet or bistro --tod 22
+                                      # --emissive-lights) so BOTH families lines read all six.
+                                      # Known-red on that last one and NOT this feature: the helmet
+                                      # fails --check-gpu's two-device gates on a plain DAY run
+                                      # too, where the gain is structurally inert — the documented
+                                      # helmet-is-outside-the-two-device-scene-set caveat.
+                                      # finalize_scalars debug_asserts light_gain == 1.0 (it
+                                      # CAPTURES the canon, so it must not run on a gained scene;
+                                      # true at all eleven call sites today — all load-time, and
+                                      # the one live scene edit, the Y/Z frustum snapshot,
+                                      # rebuilds only the BVH — but capturing a gained value would
+                                      # compound the gain permanently and silently, the same class
+                                      # as the sun clobber). apply_tod_lit is the other capture
+                                      # site and legitimately runs gained: it recomputes the sun
+                                      # from the hour first, so what it captures is canonical by
+                                      # construction. Follow-on documented in
+                                      # autoexp.rs: a per-family weighting would make the arm a look
+                                      # tool rather than an equivalent — deliberately NOT built,
+                                      # since the uniform arm's whole value is being provably the
+                                      # same image
 cargo run --release -- --gpu-debug    # D3D12 debug layer + GPU-BASED VALIDATION, draining to stderr
                                       # (`d3d12::drain_debug`, called from every present and every
                                       # headless submit). All three halves are load-bearing: the
@@ -7010,11 +7260,71 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # the shared HLSL), while this one VANISHES under it. Same lever, same
                                       # scene, opposite verdicts — which is exactly why the lever is the
                                       # instrument and a plausible story is not.
-                                      # OWED: the D3D12 twin has the identical predicate and no measurement,
-                                      # so `--check-gpu san-miguel-low-poly.obj --tile 2 --prefer-amd` joins
-                                      # the Windows run's list. It was deliberately NOT changed here — a gate
-                                      # edit on a platform this box cannot run is worse than a divergence
-                                      # that is written down.
+                                      # AND SAY WHAT THE PREDICATE IS NOT, because the obvious reading
+                                      # over-trusts it: `rt > t_start` is true at essentially EVERY leaf
+                                      # pixel, since `claim-violation == 0` asserts exactly
+                                      # t_start <= min(cpu_t, ref_t)·(1+1e-4) — so innocence fails only in
+                                      # a 1e-4-wide relative band, and on a PASSING run the split barely
+                                      # discriminates at all. It discriminates precisely when a claim is
+                                      # already violated, i.e. in the case it must not soften, which is the
+                                      # sense in which it is a decomposition rather than an allowance. The
+                                      # teeth are therefore the ARM, the 0.05% BOUND, `claim-violation`
+                                      # itself, and the untouched IMAGE half (a cand-edge pixel is NOT added
+                                      # to edge_mask, so its colour is still gated at 1e-2 under its own
+                                      # independent 0.05% count) — NOT the selectivity of the predicate.
+                                      # The comparison is STRICT (`rt > t_start`, tightened from `>=` when
+                                      # the D3D12 twin landed): acceptance is strictly beyond TMin, so a hit
+                                      # AT t_start is one the bound WOULD have hidden and belongs in the hard
+                                      # bucket. Unreachable in practice — t_start is an AABB frustum bound
+                                      # and rt a triangle intersection, so exact equality does not occur —
+                                      # but the strict form is the one that states the open interval the
+                                      # innocence argument rests on, and the two backends move together.
+                                      # THE VULKAN HALF OF THAT TIGHTENING WAS MADE FROM WINDOWS AND IS
+                                      # COMPILE-UNVERIFIED — say so rather than let the paragraph below
+                                      # imply nothing blind was done. It is one operator inside an existing
+                                      # expression (no new identifier, no new borrow, syntactically
+                                      # unchanged in shape) and it can only move a case from the soft
+                                      # bucket to the HARD one, so the worst outcome is a stricter gate;
+                                      # against that, leaving the two backends' predicates DIVERGENT is the
+                                      # very drift the shared-closure discipline above exists to prevent.
+                                      # `--check-vk san-miguel-low-poly.obj --tile 2` on the next Linux run
+                                      # is what closes it.
+                                      # OWED, PAID ON THE D3D12 SIDE (2026-08-11): `run_check_gpu` carries
+                                      # the same decomposition now — and it had TWO undecomposed copies, not
+                                      # one, since the --spp sub-gate re-runs the same comparison over the
+                                      # same t_start_of and edge_mask (Vulkan has no spp gate, so there was
+                                      # no twin here to decline). Both take ONE closure, so that pair cannot
+                                      # drift the way the two BACKENDS just did; the spp arm also gained the
+                                      # culprit list it never had, since undecomposed it fails a tiled cutout
+                                      # run naming MULTI-SAMPLING — a worse wrong answer than the spp=1
+                                      # loop's, nothing about the extra samples being implicated — and it is
+                                      # the likelier arm to fire (five probes = five draws at one knife-edge).
+                                      # The D3D12 summary line prints the ARM STATE beside the count, because
+                                      # `cand-edge 0` armed and unarmed are different facts; owed BACK to
+                                      # V7's line next Linux run.
+                                      # MEASURED (2026-08-11, 4090 + Arc Pro B70): `cand-edge 0 (arm off)`
+                                      # on the procedural default and under `--sw-rays` on san-miguel — the
+                                      # two provably-zero teeth — and `cand-edge 0 (arm armed)` on
+                                      # san-miguel-low-poly untiled AND at `--tile 2` (22.5M tris) on BOTH
+                                      # vendors, primary and every spp probe, at `max rel t err 0.00e0`. So
+                                      # the bucket is REACHED and swallows nothing where the hardware is
+                                      # bit-exact. And the arm is not cosmetic even on a clean run: the
+                                      # SAME scene and pose reads 3966 alpha-cutout rejections on the 4090
+                                      # against 2951 on the B70, i.e. the candidate loops demonstrably
+                                      # enumerate differently while their reported t still agrees exactly —
+                                      # which is the phenomenon existing and simply not manifesting here.
+                                      # STILL OWED: THE VENDOR, not the code and not the scale. The discrete
+                                      # R9700 is gone from the Windows box and the only AMD adapter left is
+                                      # the 7950X3D iGPU, which fails --check-gpu at the spp READBACK
+                                      # (pre-existing environment) — and that failure lands BEFORE the spp
+                                      # comparison loop, so it cannot reach the second twin even in
+                                      # principle. `--check-gpu san-miguel-low-poly.obj --tile 2
+                                      # --prefer-amd` stays on the list for the next discrete AMD card.
+                                      # NOTE THE DIFFERENT JUDGEMENT from the decline this paragraph used to
+                                      # record, because the two look alike: that was an edit to a gate this
+                                      # box could not RUN or even typecheck; the D3D12 one compiles and runs
+                                      # on Windows on two vendors, and only the vendor that produced the
+                                      # phenomenon is missing — a measurement gap, not a blind edit.
                                       # THE FRUSTUM TREE IS THE ONE STREAM THIS FILE UPLOADS: t0 space0 takes
                                       # ftree::FTree::quantized() (the QFNode wire format — the per-processor
                                       # split verdict, not a shortcut: the CPU keeps f32 nodes and the GPU
@@ -7439,12 +7749,12 @@ The full algorithm — quadtree frustum tracing with inherited tmin + node cuts,
 
 **Hemi on GPU** (H cycles off → AO → GI; still frames, wavefront path only): its own wavefront over `HemiPointRec`s appended by the leaf pass (fb mode splits shade: `partial` = ambient-free color, `ambw` = kd; `compose` is the single accum splat site), processed in `HEMI_BATCH` slices whose per-batch counter/pool reset bounds transient memory (queues sized to batch × 4^(depth−1) — bounded, cannot overflow). Results land in a fixed-point (2^18) atomic accumulator — order-independent adds ⇒ run-to-run determinism; leaf-ray RNG is keyed by (pixel, hemi path, frame, salt), never the atomic slot index. All hemi.rs soundness contracts carry over verbatim (apex t_start = 0 not eps, root cut `[0]`, blocked-must-subdivide, AO's None-means-open-within-radius); `sky_cell` is ported iteratively (no HLSL recursion).
 
-**`--check-gpu` is the GPU test suite** (needs real hardware, unlike the other checks): M1 dispatch plumbing; the vanilla reference tracer vs the CPU plain reference (visibility classification + 64-frame radiance A/B — *statistical*, hardware watertight intersection ≠ möller-trumbore at edges and the RNG streams differ by design); the resolve pass vs accum; then the transplanted **exact-zero gates**: **claim-violation** (THE soundness contract, asserted DIRECTLY: the tile's inherited `t_start` must not exceed the true nearest hit, ground-truthed as the EARLIEST t either intersector reports — the most pessimistic bar available, since a hit either one finds is a real triangle inside the tile frustum), false-sky, tmin-overshoot, hybrid-extra, exactly-once pixel coverage (an info sentinel), and queue accounting (leaf+sky rects partition the screen exactly, tile queues drained, overflow 0). **The wavefront-vs-reference comparison is NOT exact-zero, and must not be made so** — see the AMD note below; it is `claim-violation` that guards the contract, and the old `wave_t > ref_t => overshoot` inference was a *consequence* of an overshoot, not the invariant (a consequence has other causes). The same-seed image A/B is gated in three parts that together are strictly stronger than the old mean/max pair: mean < 1e-5 (a systematic shading bug moves it), a HOT COUNT of channels past 1e-2 bounded by the same 0.05% two-intersector allowance (a localized bug lights up far more), and all-finite (a catastrophic single pixel the counts would miss). The wavefront runs the same quadtree as the CPU (its tile counts matched `--check`'s when hand-compared; no gate asserts that).
+**`--check-gpu` is the GPU test suite** (needs real hardware, unlike the other checks): M1 dispatch plumbing; the vanilla reference tracer vs the CPU plain reference (visibility classification + 64-frame radiance A/B — *statistical*, hardware watertight intersection ≠ möller-trumbore at edges and the RNG streams differ by design); the resolve pass vs accum; then the transplanted **exact-zero gates**: **claim-violation** (THE soundness contract, asserted DIRECTLY: the tile's inherited `t_start` must not exceed the true nearest hit, ground-truthed as the EARLIEST t either intersector reports — the most pessimistic bar available, since a hit either one finds is a real triangle inside the tile frustum), false-sky, tmin-overshoot, hybrid-extra, exactly-once pixel coverage (an info sentinel), and queue accounting (leaf+sky rects partition the screen exactly, tile queues drained, overflow 0). **`tmin-overshoot` is SPLIT** (2026-08-11 — the D3D12 half of the `--check-vk` M3k decomposition; that block carries the attribution chain, which was run on RADV): a pixel whose reference hit lies STRICTLY beyond its tile's own `t_start` cannot have been hidden by that bound, so where the hardware candidate loop is live (`gfx::shaders::non_opaque` and not `--sw-rays`) it is counted as **`cand-edge`** under the same 0.05% allowance `hw-edge` and the image-hot count already carry; at or below `t_start` the bound is the suspect and it stays a hard failure — strict because acceptance is strictly beyond TMin, so a hit AT `t_start` is one the bound would have hidden (unreachable in practice, `t_start` being an AABB frustum bound and the hit a triangle intersection, but the strict form is the one that states the interval correctly, and BOTH backends carry it). **BOTH** the spp=1 loop and the `--spp` sub-gate take that predicate from ONE closure — the spp arm had the identical undecomposed copy (Vulkan has no spp gate at all, so this site has no twin there), and undecomposed it fails a tiled cutout run with a diagnosis naming MULTI-SAMPLING. The summary line prints the ARM STATE beside the count, because `cand-edge 0` armed and unarmed are different facts. Note what the existing `hw-edge` mask never covered and this does: `edge_mask` excuses only pixels the reference-vs-CPU gate already flagged, and the class here is one where the reference and the CPU AGREE and the wavefront is the odd one out. **The wavefront-vs-reference comparison is NOT exact-zero, and must not be made so** — see the AMD note below; it is `claim-violation` that guards the contract, and the old `wave_t > ref_t => overshoot` inference was a *consequence* of an overshoot, not the invariant (a consequence has other causes). The same-seed image A/B is gated in three parts that together are strictly stronger than the old mean/max pair: mean < 1e-5 (a systematic shading bug moves it), a HOT COUNT of channels past 1e-2 bounded by the same 0.05% two-intersector allowance (a localized bug lights up far more), and all-finite (a catastrophic single pixel the counts would miss). The wavefront runs the same quadtree as the CPU (its tile counts matched `--check`'s when hand-compared; no gate asserts that).
 
 **AMD RT hardware re-origins the ray at TMin** (measured on a Radeon AI PRO R9700; NVIDIA does not). Two consequences, both benign, both permanent — do NOT "fix" either by tightening the gates back:
   1. *A grazing shared edge can flip accept/reject with TMin.* The reference kernel (TMin = 0) and a leaf ray (TMin = t_start) are the SAME intersector but not the same ray, so at a pixel where a ray grazes a triangle edge they can hit different geometry. Measured: default scene px (381,258), cpu t 28.546 / gpu-ref t 21.897 / wavefront t 28.546 — i.e. the wavefront agrees with the CPU and the *reference* takes the edge, while `t_start` (6.499) sits 15 units short of either. Such pixels are ALREADY known-disagreeing from the reference-vs-CPU gate, so `--check-gpu` masks them out of the wavefront comparison by that mask and bounds their count at the same 0.05%.
   2. *The reported t differs by 1-2 ulp for one ray at two TMins.* That shifts the hit point by ulps, which shifts the shadow/AO ray origin, which at a grazing angle flips a BINARY occlusion bit — 2 ulp of geometry becomes ~0.02 of color. Measured 18 hot channels of 1.44M on the default scene, 3 on San Miguel. No amount of correct code prevents this: a discrete decision on a continuous input is discontinuous by construction. It is why the image max is a bounded COUNT and not an absolute limit.
-Both `--check-gpu` and `--check-dxr` pass on NVIDIA and AMD (`--prefer-amd`), on the default scene, `--stress`, and San Miguel; on NVIDIA every counter above is still exactly 0 / 0.00e0, so nothing was traded away where the hardware permits bit-identity. Hemi gates run on a CPU-generated probe set with `FLAG_VERIFY` (psa-viol / false-empty / tmin-overshoot == 0, PSA accounts to π in H.w) plus multi-seed A/Bs at the CPU suite's tolerances (AO mean |Δ| < 0.02, signed < 0.005; GI mean rel < 5% vs BOUNCE_Q references), a frame-level accounting gate (hemi points == hit pixels), and a bench (1080p, RTX 4090: GPU hybrid ~2.0 ms, GPU plain reference ~0.3 ms, +hemi-GI ~113 ms, CPU hybrid ~36 ms — the plain-reference number is the honest baseline: RT-core root traversal is cheap enough that software frustum queries cost more than they save for primary visibility; the wavefront's shallow levels underutilize the GPU, the noted optimization being a wave-cooperative level kernel). `--check-gpu --stress n` skips the structural must-fires, mirroring `--check`. In the interactive window `--gpu` keeps R (wavefront vs reference — both write the pack, so the A/B works under RR/XeSS too), C (on-GPU verify of the current view at the SESSION render res — clobbers and resets the accumulation), H (plain sub-mode only; upscaler frames pin fb OFF), P (screenshots the upscaler's window-res output; plain saves the render-res hdr at its own dims), G/X (toggle the session's WIRED upscaler vs plain — wiring is init-time, you can't toggle into an upscaler the session didn't start with), and 1–3 (plain sub-mode; upscaler frames pin the 1-spp quality); T/O/N/M print notes; SPACE/F leave the arm live (the mode cycle — --gpu is no longer a locked session). `FRUSTRACER_STAB=1` works in the GPU arm (healthy statics: RR ≈ 0.14/255, XeSS ≈ 1.0/255 — both match their CPU-fed baselines). Run `--check-gpu` after touching anything under `src/shaders/`, `src/gpu/trace.rs`, or `src/gpu/dxc.rs`; run `--check` too when the change mirrors CPU semantics (the kernels are ports — the CPU files are their source of truth).
+Both `--check-gpu` and `--check-dxr` pass on NVIDIA and AMD (`--prefer-amd`), on the default scene, `--stress`, and San Miguel; on NVIDIA every counter above is still exactly 0 / 0.00e0, so nothing was traded away where the hardware permits bit-identity. The `cand-edge` split is measured **NVIDIA and Intel only, and the missing arm is the one that matters**: it exists because RADV's candidate enumeration produced the phenomenon, and the AMD half cannot be re-run here — the discrete R9700 is gone from this box and the only AMD adapter left is the 7950X3D iGPU, which fails this suite at the spp READBACK (pre-existing environment, already noted under `--sw-rays`), landing BEFORE the spp comparison loop it would have to reach. So `--check-gpu san-miguel-low-poly.obj --tile 2 --prefer-amd` stays owed for the next discrete AMD card. What IS established: 4090 and B70 both read `cand-edge 0 (arm armed)` at `--tile 2` with `max rel t err 0.00e0`, so the bucket is reached and swallows nothing where the hardware is bit-exact. Hemi gates run on a CPU-generated probe set with `FLAG_VERIFY` (psa-viol / false-empty / tmin-overshoot == 0, PSA accounts to π in H.w) plus multi-seed A/Bs at the CPU suite's tolerances (AO mean |Δ| < 0.02, signed < 0.005; GI mean rel < 5% vs BOUNCE_Q references), a frame-level accounting gate (hemi points == hit pixels), and a bench (1080p, RTX 4090: GPU hybrid ~2.0 ms, GPU plain reference ~0.3 ms, +hemi-GI ~113 ms, CPU hybrid ~36 ms — the plain-reference number is the honest baseline: RT-core root traversal is cheap enough that software frustum queries cost more than they save for primary visibility; the wavefront's shallow levels underutilize the GPU, the noted optimization being a wave-cooperative level kernel). `--check-gpu --stress n` skips the structural must-fires, mirroring `--check`. In the interactive window `--gpu` keeps R (wavefront vs reference — both write the pack, so the A/B works under RR/XeSS too), C (on-GPU verify of the current view at the SESSION render res — clobbers and resets the accumulation), H (plain sub-mode only; upscaler frames pin fb OFF), P (screenshots the upscaler's window-res output; plain saves the render-res hdr at its own dims), G/X (toggle the session's WIRED upscaler vs plain — wiring is init-time, you can't toggle into an upscaler the session didn't start with), and 1–3 (plain sub-mode; upscaler frames pin the 1-spp quality); T/O/N/M print notes; SPACE/F leave the arm live (the mode cycle — --gpu is no longer a locked session). `FRUSTRACER_STAB=1` works in the GPU arm (healthy statics: RR ≈ 0.14/255, XeSS ≈ 1.0/255 — both match their CPU-fed baselines). Run `--check-gpu` after touching anything under `src/shaders/`, `src/gpu/trace.rs`, or `src/gpu/dxc.rs`; run `--check` too when the change mirrors CPU semantics (the kernels are ports — the CPU files are their source of truth). **AND ADD `--tile 2` TO THE LIST** (2026-08-11, the D3D12 half of M3k's coverage lesson — "reach is a property of which scene somebody ran"): `--check-gpu` had no tiled arm at all, and `scenes/san-miguel/san-miguel-low-poly.obj --tile 2` is 22.5M tris, which is what puts the `--blas-split` **vertex-GATHER** arm through this suite (`1 chunk(s) vertex-gathered — id range over the 16777216 ceiling`; untiled San Miguel has ~2.8M vertices, so no chunk can clear the ceiling and no untiled scene reaches the arm). Note the two backends' PARTITIONS legitimately differ on this scene and their images do not — 974 chunks here (457 foliage-sway cells + 517 static) against `--check-vk`'s 718, because the Vulkan backend builds the rest-pose TLAS and never calls `foliage::split_plan`; `tri_of` follows whatever partition it was handed. Compaction differs wildly by vendor too — the two-device family uploads the same scene to both adapters in one run, so the comparison is like-for-like: 4090 1205 → 467 MB, B70 3017 → 1078, against RADV's 3400 → 2803, which is the same vendor-cliff warning the `--no-blas-split` entry already gives for scratch. **KNOWN EXIT 1 AT THIS ARM, and it is NOT the tiling — read the log, not the exit code** (the `--dxr-sbt 3` glassware-pose precedent): `--tile 2` trips **N9**'s magnitude tooth on BOTH vendors — `live 1036 px, correction 1.0146e-1 of folded 1.2156e2` = 8.35e-4 on the 4090 and `1037 px, 1.0156e-1 of 1.2199e2` = 8.33e-4 on the B70, a hair under its 1e-3 bar. PRE-EXISTING, and measured rather than argued: the 4090 numbers are BYTE-FOR-BYTE the same on a build with the `cand-edge` change stashed, and untiled san-miguel passes N9 on the same binary at `6.4663e-1 of 2.4254e2` = 2.67e-3, i.e. **3.2x** the tiled ratio — so the tiling genuinely moves the measured quantity rather than jittering it across a bar. Read the whole log for a second reason too — the `primary-t split` animated arm passes at 101 of 206 px against a limit of 103, i.e. TWO pixels of margin, so this arm sits near two thresholds and not one. The tiled framing is stress-style, so the visible sheen/translucency/cavity population shifts and its correction lands just below a threshold tuned on the untiled pose — new coverage surfacing a marginal gate, which is what new coverage is for. Every OTHER gate is green at this arm on both vendors, `cand-edge` included; resolving N9's threshold (or giving it the INERT-style note N6b already prints when the feature cannot fire) is its own item.
 
 **GPU-born G-buffers → the chain's wired upscaler.** With `--gpu` the upscaler composes ON the tracer, whichever level the chain wired: DLSS-RR, FSR4-RR, XeSS, or FSR3 (`--no-upscale` = plain); OIDN stays CPU-only. The render res is **LOCKED per session** (`--lock-res`, `quantize_res`-clamped into the upscaler's queried range; `TraceGpu` is built once at that res — no DRS, no per-frame rw/rh). The default is the session's one — **native (100%)**, `xess::DEFAULT_LOCK_SCALE`, the SAME scale the CPU renderer takes (the ONE-scale-for-every-arm rule dates to the 2026-07-26 `Opts::gpu_lock_scale` retirement: an upscaler is the reconstruction stage in every arm, so which tracer happens to be live is not a reason to change how many pixels get traced, and F/SPACE cycling arms never moves the render res. The default has moved four times — quality 2/3 until 2026-07-31, native 100% (DLAA-shaped) until 2026-08-08, quality again for part of that day, native again since — the user's call). The flagless session IS the DLAA arm; `--lock-res quality` spells the 2/3 arm, and any explicit `--lock-res` means the same thing in whichever arm renders (F toggles between them — the res discontinuity is already a history-reset latch). **Two notes from the quality windows — CLOSED again under the native default, but load-bearing for reading numbers recorded in the quality windows (2026-07-26..07-31 and part of 2026-08-08).** (1) **"Plain" means two resolutions** only under an explicit sub-native `--lock-res`: toggling the wired upscaler OFF mid-session (G/X/K) leaves the tracer at its LOCKED res, so a sub-native lock presents the plain image as a stretched blit through `fullscreen_to_backbuffer`, `P` saves the locked dims, and `C` verifies at them (the title's `grw×grh` field is the ground truth); the flagless native session presents plain at window res. (2) **`main::vendor_defaults`' Intel entry is measured at the res a flagless session traces again** — during a sub-native window it is not, because the arms don't scale together (`depth_full` is 6 at 1920 AND 1280, so the level ladder is res-independent while `leaf`/`sky` and all of `dxr-rays` are per-pixel); the RES-BASIS DEBT paragraph in `vendor_defaults` records the history. The leaf/sky/reference kernels write a **SPLIT G-buffer pack**: `GBufCore` at u15 (`trace::GBUF_STRIDE` = **16 B/px** — mv.xy | view_z | prev_z), stored by every upscaler session, plus `GBufExt` at u32/`RP_GBUF_EXT` (`GBUF_EXT_STRIDE` = **72 B/px** — normal+rough | diff_alb | spec_alb+spec_hit_t | sig | sig2), stored only under **FLAG_GBUF_EXT** (a wired RR/FSR-RR feed, or NPPD; derived per frame like `fsr_sig`, since the tracer is built BEFORE `wire_feed` runs and `--quinlight` wires several kinds at once). It was one 88 B/px record until 2026-07-24; splitting it is worth **−33% of the B70's world frame** because an XeSS or FSR 3.1 session reads 12 of those 88 bytes and now stores 16 instead of 88 — see the pack-split paragraph in Profiling for the numbers, the write-allocate mechanism, and the two probe traps it exposed. Both halves go through `gbuf_write_hit/_sky` in trace_common.hlsli — term-for-term ports of render.rs's `write_gbuf_*`, MVs from `project_prev` (the HLSL `CamBasis::project` against a prev-camera CB block; FrameCb is 1488 B / CB_STRIDE 1536 — the base 304 B, minus the 32 B of rect-light rows the sun's three replace, plus the spp block and its MAX_SPP jitter table, plus 9 float4 rows of order-2 SH sky; near/far ride the prev rows' w slots, and `scene.eps`/`ao_radius` were rehomed onto `sun_e.w`/`sun_l.w` when the rect light's rows died). `shade_split` exposes the capture as a `PrimSurf` out-param filled at lap 0 only — a pure copy of already-computed values, **zero added rng draws**, so the same-seed wavefront-vs-reference bit-identity gates hold. Every write is gated by `FLAG_GBUF`: the plain-session pack is a GBUF_STRIDE-byte dummy and root-descriptor UAVs have no bounds check — that branch is memory safety, not an optimization. **The last three pack fields are FSR-RR-only** (`FLAG_FSR_SIG`, armed solely by a `FeedKind::FsrRr` wiring): `mv.z` = the prev-camera linear view-Z of the same hit point (sky stores CAM_FAR, so the denoiser's depth delta is exactly 0), `sig` = the f16x2-packed **demodulated** `direct_d`/`direct_s`, and `sig2` = the same packing of `ao` and the demodulated `ind_s` (`shade.hlsli`'s lap-0 export — assignment-only, zero rng draws; the demodulation divides by the un-floored WIRE F0 via `sqrt_wire`, `fsr::split_signals`' twin with the pack's f32 storage in place of the CPU's f16 hop). `ind_s` is the one capture the flattened GPU DFS cannot read off a single lap: a reflected ray that hits glass continues its own transmission chain, so `shade_split` carries an `in_refl` tag through its lap/stash state and accumulates EVERY contribution descending from the root's reflection child (the CPU gets it for free — its `tput * rcol` is one recursive call). Every other wiring writes zeros there and its pack bytes are unchanged — gated by a same-seed **FLAG_FSR_SIG on/off accum bit-identity** pass. Per frame one **feed kernel** (`feed.hlsl`; texture UAVs u16..u27 on a second range of the u14 descriptor table — the range grew for `cs_feed_fsr_rr`'s five extra planes, shifting NPPD's root UAVs to u28..u31, whose nppd.hlsl register literals must stay in lockstep with `NPPD_REG_BASE`; wired per session by `trace::wire_feed` with a typed-UAV-store format gate) fans pack+accum into the live upscaler's input planes **in place** — rr.rs/xr.rs/ffx_rr.rs/ffx_up.rs planes gained ALLOW_UNORDERED_ACCESS, and `record_feed`'s NPSR→UAV→NPSR transitions double as the write→read sync and keep the NGX/XeSS state-at-use contracts truthful. The CPU convert-and-upload paths (`rr/xr/ffx_rr/ffx_up::record_upload`) still serve the CPU renderer; the GPU chains (`present_trace_rr`/`_xess`/`_fsr_rr`/`_fsr3`) have **zero per-frame CPU→GPU traffic**. Upscaler frames follow the CPU contracts exactly: fresh 1-spp (accumulate off, free-running index, frame-uniform Halton via `frame_jitter`), q pinned (1 shadow / 1 AO / reflections / fb OFF), reset on quality/R/G/X/C but never on motion, and ONE camera pose feeds both the shader MVs and `frame_constants`' prev matrices. In RR sessions the whole list — ExecuteIndirect, DXR RayQuery, AS builds, feed, the raw-NGX evaluate — executes on the one native queue (the SL proxy died with the retirement). XeSS depth is a `precise` HLSL port of `view_z_to_clip_depth` (the quotient must be `precise` too or DXC lowers it to rcp+mul); RR depth is raw view-Z passthrough. `--check-gpu` gates (all DLL-free): the pack read back into CPU `GBufs` through the **exact existing `dlss::mv_selftest`** at odd dims (533×400) plus coverage (every px view_z > 0, sky == far bit-equal); XeSS feed depth vs the CPU encode ≤ 4 f32 ulp (D3D's divide is ~2.5 ulp even `precise`; observed max 2) with **sky bit-equal 0.0** and mvec/color ≤ 1 f16 ulp; RR feed depth **bit-equal** and EVERY other plane gated too (color/normal-rough/spec-hit ≤ 1 f16 ulp, albedo/spec-albedo ≤ 1 UNORM LSB) so a wiring-order swap cannot pass the suite; the **FSR3 feed** through the same `gate_xess_feed` over `FeedKind::Fsr3`-wired planes; the **FSR4-RR feed** over all eleven planes (see the `--check-dxr` list below — same `gate_fsr_rr_feed` helper). One tolerance there is deliberately NOT an ulp count: the **residual** is a near-cancellation (`color − dd⊗kd − ds⊗f0 − ao·amb(n)⊗kd − is⊗f0`), so its f32 slop is bounded by the CANCELLED terms (every subtracted product enters the bound), not by the tiny result — gating it at 1 f16 ulp of the remainder would shrink the limit toward zero exactly where the error doesn't, and lit pixels whose residual lands near 0 fail on ordinary rounding (measured: 19/640k channels). The bound is absolute — a few f32 ulps of the largest cancelled term plus the residual's own f16 step — and still catches any wiring/formula error, which moves the residual by the size of a whole term. The sky gates carry `must_fire` anti-vacuity (sky px > 0 on the default scene). The rr/xr upload rings (and the XeSS post-denoise readback) allocate lazily on first CPU use — GPU-fed sessions never commit that memory. Run `--check-gpu` + `--check` + `--check-dlss` + `--check-xess` + `--check-fsr` after touching feed.hlsl, nppd.hlsl, the pack helpers in trace_common.hlsli, shade.hlsli's PrimSurf, rr.rs/xr.rs/ffx_rr.rs/ffx_up.rs plane creation, or the present_trace_* chains. `--gpu --nppd` composes the GPU-resident NPPD stage into the XeSS chain (see the NPPD section — the frame splits around the ORT run on the shared queue; gated by M10).
 

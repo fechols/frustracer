@@ -144,29 +144,57 @@ pub struct Fireflies {
     /// this is not `Scene::diag`). Rides the CB's `ff_scale` lane.
     pub scale: f32,
     /// Baked poses: xyz = `p_i(time)` world position, w = brightness
-    /// (tier · slow pulse · night). Rows past `count` are zero.
+    /// (tier · slow pulse · night · the scene light gain). Rows past `count`
+    /// are zero.
+    ///
+    /// Folding `--autoexp-mode lights`' gain into `w` is what makes the swarm
+    /// follow the aperture on BOTH renderers with no shader edit: `w` is the
+    /// CPU's baked f32 and rides the `ff[]` cbuffer rows verbatim, and both
+    /// the point light (`irradiance`) and the glow splat multiply by it
+    /// linearly (the `EL_BOOST` parity-by-data precedent).
     pub pos: [[f32; 4]; MAX_FIREFLIES],
+    /// The scene light gain these poses were baked with — 1.0 in every
+    /// default and headless session. Carried only so `glow` can scale its own
+    /// `FF_GLOW_L_MAX` ceiling with it; the light half needs nothing, its
+    /// near-field clamp being a DISTANCE bound and therefore scale-free.
+    pub gain: f32,
 }
 
 impl Fireflies {
     /// The structural off state (day sessions never even reach `bake`).
     pub fn off() -> Fireflies {
-        Fireflies { count: 0, scale: 1.0, pos: [[0.0; 4]; MAX_FIREFLIES] }
+        Fireflies { count: 0, scale: 1.0, gain: 1.0, pos: [[0.0; 4]; MAX_FIREFLIES] }
     }
     /// Fully explicit constructor — the self-test's handle on both arms
     /// (enabled × night) without touching the session statics. `cmin`/`cmax`
     /// is the placement box (`Scene::content_min/max`).
-    pub fn new(enabled: bool, n: u32, night: f32, cmin: Vec3A, cmax: Vec3A, time: f32) -> Fireflies {
+    pub fn new(
+        enabled: bool,
+        n: u32,
+        night: f32,
+        cmin: Vec3A,
+        cmax: Vec3A,
+        time: f32,
+        gain: f32,
+    ) -> Fireflies {
         let scale = (cmax - cmin).length().max(1e-3);
         if !enabled || night <= 0.0 || n == 0 {
-            return Fireflies { count: 0, scale, ..Fireflies::off() };
+            return Fireflies { count: 0, scale, gain, ..Fireflies::off() };
         }
-        bake(n.min(MAX_FIREFLIES as u32), night, cmin, cmax, time)
+        bake(n.min(MAX_FIREFLIES as u32), night, cmin, cmax, time, gain)
     }
     /// The live interactive state: session statics + the scene's TOD fade +
     /// main.rs's clock (`cloud_time` — the shared animation clock).
     pub fn live(scene: &crate::scene::Scene, time: f32) -> Fireflies {
-        Fireflies::new(enabled(), count(), scene.night, scene.content_min, scene.content_max, time)
+        Fireflies::new(
+            enabled(),
+            count(),
+            scene.night,
+            scene.content_min,
+            scene.content_max,
+            time,
+            scene.light_gain,
+        )
     }
     /// The pinned headless state — the clouds' `CLOUD_CHECK_TIME`, so every
     /// CPU-reference-vs-GPU gate pair compares the same swarm (day checks
@@ -179,6 +207,7 @@ impl Fireflies {
             scene.content_min,
             scene.content_max,
             crate::clouds::CLOUD_CHECK_TIME,
+            scene.light_gain,
         )
     }
     /// --spin's clock: a pure function of the frame index.
@@ -190,6 +219,7 @@ impl Fireflies {
             scene.content_min,
             scene.content_max,
             idx as f32 * crate::clouds::CLOUD_SPIN_DT,
+            scene.light_gain,
         )
     }
     /// --cinematic's clock — the `clouds::Clouds::cine` twin, on the SHARED
@@ -204,6 +234,7 @@ impl Fireflies {
             scene.content_min,
             scene.content_max,
             out_frame as f32 / fps.max(1) as f32,
+            scene.light_gain,
         )
     }
 }
@@ -227,7 +258,7 @@ fn curl_dir(p: Vec3A, scale: f32) -> Vec3A {
 /// precedent): the lookup point travels at `FF_WIND_K·scale`/s from a hashed
 /// start, so each firefly wanders a decorrelated path through the shared
 /// field — organic, non-repeating, and exactly bounded.
-fn pose(i: u32, night: f32, cmin: Vec3A, cmax: Vec3A, time: f32) -> [f32; 4] {
+fn pose(i: u32, night: f32, cmin: Vec3A, cmax: Vec3A, time: f32, gain: f32) -> [f32; 4] {
     use crate::sky::{hash01, pcg_mix};
     let scale = (cmax - cmin).length().max(1e-3);
     let h0 = pcg_mix(i.wrapping_mul(0x9E37_79B9) ^ 0xF1EF_11E5);
@@ -289,15 +320,15 @@ fn pose(i: u32, night: f32, cmin: Vec3A, cmax: Vec3A, time: f32) -> [f32; 4] {
     let tier = 0.7 + 0.6 * hash01(pcg_mix(h7));
     let q = 0.5 + 0.5 * ((0.3 + 0.5 * hash01(h6)) * time + tau * hash01(h0)).sin();
     let pulse = 0.25 + 0.75 * q * q;
-    [p.x, p.y, p.z, tier * pulse * night]
+    [p.x, p.y, p.z, tier * pulse * night * gain]
 }
 
 /// Bake all poses for one frame — the only caller of `pose`.
-fn bake(n: u32, night: f32, cmin: Vec3A, cmax: Vec3A, time: f32) -> Fireflies {
+fn bake(n: u32, night: f32, cmin: Vec3A, cmax: Vec3A, time: f32, gain: f32) -> Fireflies {
     let scale = (cmax - cmin).length().max(1e-3);
-    let mut ff = Fireflies { count: n, scale, pos: [[0.0; 4]; MAX_FIREFLIES] };
+    let mut ff = Fireflies { count: n, scale, gain, pos: [[0.0; 4]; MAX_FIREFLIES] };
     for i in 0..n {
-        ff.pos[i as usize] = pose(i, night, cmin, cmax, time);
+        ff.pos[i as usize] = pose(i, night, cmin, cmax, time, gain);
     }
     ff
 }
@@ -365,7 +396,7 @@ pub fn glow(ff: &Fireflies, o: Vec3A, d: Vec3A, t_max: f32, half_angle: f32) -> 
             continue;
         }
         let l = (e * ff.pos[i][3] / (s * s * std::f32::consts::TAU * sigma * sigma))
-            .min(FF_GLOW_L_MAX);
+            .min(FF_GLOW_L_MAX * ff.gain);
         acc += FF_COLOR * (l * g);
     }
     acc
@@ -383,7 +414,7 @@ pub fn self_test() -> Result<(), String> {
     // 1. Structural off: disabled, day, and zero-count all snapshot count 0 —
     //    the arm every flagless session takes (bit-identity by construction).
     for (en, night, n) in [(false, 1.0, 8u32), (true, 0.0, 8), (true, 1.0, 0)] {
-        let ff = Fireflies::new(en, n, night, cmin, cmax, 3.0);
+        let ff = Fireflies::new(en, n, night, cmin, cmax, 3.0, 1.0);
         if ff.count != 0 {
             return Err(format!("off arm ({en}, {night}, {n}) has count {}", ff.count));
         }
@@ -391,8 +422,8 @@ pub fn self_test() -> Result<(), String> {
 
     // 2. Determinism: two bakes at one clock are bit-identical (the replay /
     //    same-seed contracts consume poses as pure data).
-    let a = Fireflies::new(true, 16, 1.0, cmin, cmax, 7.5);
-    let b = Fireflies::new(true, 16, 1.0, cmin, cmax, 7.5);
+    let a = Fireflies::new(true, 16, 1.0, cmin, cmax, 7.5, 1.0);
+    let b = Fireflies::new(true, 16, 1.0, cmin, cmax, 7.5, 1.0);
     if a != b {
         return Err("bake is not deterministic".into());
     }
@@ -417,7 +448,7 @@ pub fn self_test() -> Result<(), String> {
     for i in 0..MAX_FIREFLIES as u32 {
         for step in 0..200 {
             let t = step as f32 * 3.7;
-            let p = pose(i, 1.0, cmin, cmax, t);
+            let p = pose(i, 1.0, cmin, cmax, t, 1.0);
             if p[1] <= cmin.y {
                 return Err(format!("firefly {i} at t {t} below ground: y {}", p[1]));
             }
@@ -511,7 +542,7 @@ pub fn self_test() -> Result<(), String> {
 
     // 6. The parse-time levers round-trip (through the explicit constructor —
     //    the statics belong to the session and are not mutated here).
-    if Fireflies::new(true, 999, 1.0, cmin, cmax, 0.0).count != MAX_FIREFLIES as u32 {
+    if Fireflies::new(true, 999, 1.0, cmin, cmax, 0.0, 1.0).count != MAX_FIREFLIES as u32 {
         return Err("count not clamped to MAX_FIREFLIES".into());
     }
 

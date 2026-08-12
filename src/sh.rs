@@ -62,6 +62,28 @@ pub struct Sh9 {
 impl Sh9 {
     pub const ZERO: Sh9 = Sh9 { c: [Vec3A::ZERO; N] };
 
+    /// Scale the field's radiance by `k`.
+    ///
+    /// Projection is LINEAR, so this is EXACTLY the field `project` would
+    /// return for `k·f` — which is what lets `scene::apply_light_gain` brighten
+    /// the sky ambient by scaling nine coefficients instead of re-projecting.
+    /// That distinction is not a micro-optimization: `Sh9::project` is a
+    /// 16,384-point quadrature and calling it per frame was measured as a
+    /// 235 -> 17 fps stall (see `scene::apply_tod_lit`'s note).
+    ///
+    /// `k == 1.0` returns the field BITWISE (a branch, never `* 1.0`) — the
+    /// structural-off discipline the whole light-gain feature rests on.
+    pub fn scaled(self, k: f32) -> Sh9 {
+        if k == 1.0 {
+            return self;
+        }
+        let mut out = self;
+        for c in &mut out.c {
+            *c *= k;
+        }
+        out
+    }
+
     /// Project a radiance function over the whole sphere.
     ///
     /// Deterministic quadrature (Fibonacci sphere, uniform solid-angle weight
