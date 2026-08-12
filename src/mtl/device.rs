@@ -101,8 +101,12 @@ impl Mtl {
     }
 
     /// A raw `id<MTLDevice>` for the ObjC++ shim. The `Retained` keeps it
-    /// alive for as long as `self`, and the shim never retains it.
-    // Consumed by shim/ffx_metal.mm's `create`, which does not exist yet.
+    /// alive for as long as `self`, and the shim never retains it — which is
+    /// what makes `Mtl` the sole owner and its lifetime the binding one.
+    ///
+    /// Consumed by `shim/ffx_fsr3_metal.mm`'s `create`. The `allow` stays
+    /// because that call site is behind `cfg(ffx_fsr3_metal)`: a checkout
+    /// without the FFX SDK builds this harness and nothing that uses it.
     #[allow(dead_code)]
     pub fn device_ptr(&self) -> *mut c_void {
         Retained::as_ptr(&self.device) as *mut c_void

@@ -50,10 +50,14 @@ xess_gbuf_*.png
 # `git status` that is only ever dirty when YOU dirtied it is the instrument
 # several bit-identity claims in this tree rest on, so nothing a dev lever
 # writes belongs in it. FR_CHECK_AB_DUMP's CPU/GPU/diff/water dumps,
-# FR_NRD_DEBUG's OUT_VALIDATION frame, FRUSTRACER_HUD_STATS' buffer dump.
+# FR_NRD_DEBUG's OUT_VALIDATION frame, FRUSTRACER_HUD_STATS' buffer dump, and
+# FR_FSR3_DUMP's input/output pair (the polarity check no magnitude can make —
+# see --check-fsr3's U4).
 /check_ab_*.png
 /nrd-validation.png
 /hud-buffer-dump.png
+/fsr3-input.png
+/fsr3-output.png
 # --cinematic output: PNG/PNG16 sequences, EXR masters and encoded video. These
 # are working files — often tens of GB for one 4K60 sequence. Only the curated,
 # downscaled results under docs/media/ are committed.

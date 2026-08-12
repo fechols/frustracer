@@ -747,14 +747,14 @@ pub struct Cli {
     /// metallib table, a real device, a real FSR3 context, and one scored
     /// upscale of a CPU-rendered G-buffer.
     ///
-    /// Metal-only, and that is now a decision rather than a placeholder: the
-    /// VULKAN arm of the same SDK lives in `--check-vk` (stage V11), because
-    /// there it rides the stock `ffx_vk` backend on a device that suite already
-    /// opens, while Metal has no backend at all until `shim/ffx_metal.mm`
-    /// supplies a hand-written `FfxInterface` — a different subject with a
-    /// different failure surface. An earlier draft of this comment promised the
-    /// Vulkan arm would join this flag; it did not, and one gate per BACKEND is
-    /// the arrangement that shipped.
+    /// Metal-only, and that is a decision rather than a placeholder: the VULKAN
+    /// arm of the same SDK lives in `--check-vk` (stage V11), because there it
+    /// rides the stock `ffx_vk` backend on a device that suite already opens,
+    /// while Metal has no stock backend at all — `shim/ffx_fsr3_metal.mm`
+    /// supplies a hand-written `FfxInterface`, which is a different subject
+    /// with a different failure surface. An earlier draft of this comment
+    /// promised the Vulkan arm would join this flag; it did not, and one gate
+    /// per BACKEND is the arrangement that shipped.
     pub check_fsr3: bool,
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.

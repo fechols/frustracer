@@ -18069,9 +18069,9 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
 /// that cannot host it is not.
 #[cfg(target_os = "macos")]
 fn run_check_fsr3(
-    _scene: &scene::Scene,
-    _bvh: &bvh::Bvh,
-    _cam0: Camera,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
     _structural: bool,
 ) -> i32 {
     let mut ok = true;
@@ -18143,6 +18143,76 @@ fn run_check_fsr3(
         }
     };
 
+    // ---- U3: the FSR3 context, i.e. every metallib becoming a pipeline ------
+    //
+    // The stage that carries this gate's whole risk. Context creation drives
+    // `fpCreatePipeline` across every FSR3 pass, so it is where all 80
+    // transpiled permutations are loaded, specialized against the device's
+    // linear-texture alignment, and built into compute pipeline states — a
+    // spirv-cross output Metal will not accept, a mis-keyed hash, or a
+    // caps/wave64 divergence all fail HERE, loudly, instead of at whichever
+    // later dispatch happens to need the one missing permutation.
+    #[cfg(ffx_fsr3_metal)]
+    if let Some(m) = mtl.as_ref() {
+        // A non-square, non-power-of-two, odd render extent against a 2x
+        // upscale: FSR3's own passes round their dispatch grids up, and a
+        // tidy extent would let an off-by-one in that rounding pass unnoticed.
+        let (rw, rh) = (401usize, 227usize);
+        let (uw, uh) = (802usize, 454usize);
+        let flags = mtl::fsr3::FLAG_HDR
+            | mtl::fsr3::FLAG_DEPTH_INVERTED
+            | mtl::fsr3::FLAG_AUTO_EXPOSURE;
+        let t0 = std::time::Instant::now();
+        match mtl::fsr3::Fsr3::new(m, (rw, rh), (uw, uh), flags) {
+            Ok(fsr) => {
+                eprintln!(
+                    "check-fsr3: U3 context created — {rw}x{rh} -> {uw}x{uh}, {} pipelines \
+                     built of {} metallibs offered, {:.0} ms",
+                    fsr.pipelines(),
+                    mtl::fsr3::metallibs().len(),
+                    t0.elapsed().as_secs_f32() * 1e3
+                );
+                // ANTI-VACUITY, and it is not redundant with the Ok above: a
+                // backend that answered every fpCreatePipeline with an empty
+                // success would create a context and build nothing, which no
+                // return code distinguishes. FSR3 has eleven passes; the floor
+                // sits just under so a pass count that legitimately moves with
+                // an SDK bump does not fail, while zero or a handful does.
+                //
+                // NOT a coverage claim: MEASURED, one creation requests ELEVEN
+                // of the 80 permutations (one per pass at the option word its
+                // flags select) and all eight flag combinations together reach
+                // only 14, because most passes ignore most option bits and the
+                // 40 fp32 variants are never requested at all — the caps report
+                // fp16. U1 proves all 80 are well-formed; this proves eleven of
+                // them become pipeline states.
+                if fsr.pipelines() < 10 {
+                    fail(format!(
+                        "U3 built only {} pipelines — FSR3 has eleven passes, so the backend \
+                         answered fpCreatePipeline without building anything",
+                        fsr.pipelines()
+                    ));
+                }
+                // Destroying it here rather than at scope end is the point of
+                // the drop(): it runs fpDestroyPipeline and fpDestroyResource
+                // back through our own backend callbacks, which nothing else
+                // in this gate exercises, and a double release or a missing
+                // one is a crash we want attributed to U3.
+                drop(fsr);
+                eprintln!("check-fsr3: U3 context destroyed OK");
+            }
+            Err(e) => fail(format!("U3 {e}")),
+        }
+    }
+
+    // ---- U4: a real upscale, scored -----------------------------------------
+    #[cfg(ffx_fsr3_metal)]
+    if let Some(m) = mtl.as_ref() {
+        if let Err(e) = fsr3_upscale_check(m, scene, bvh, cam0) {
+            fail(format!("U4 {e}"));
+        }
+    }
+
     // The four FFX-on-Metal bugs that shipped in the reference implementation
     // were ALL invisible without the validation layers, and each masked the one
     // after it (the layer aborts on the first error per command buffer). The
@@ -18165,6 +18235,433 @@ fn run_check_fsr3(
         eprintln!("check-fsr3: PASSED");
     }
     i32::from(!ok)
+}
+
+/// U4: two real rendered frames through the real FSR3 pipelines, scored.
+///
+/// Everything above it in `--check-fsr3` proves a piece in isolation — the
+/// staging math, the metallib table, a texture round-trip, that the pipelines
+/// build. This is the only stage where the whole chain runs and the RESULT is
+/// examined, and it is written around the fact that an upscaler is very easy to
+/// gate vacuously: a pass-through copy, a bilinear stretch and a working
+/// temporal reconstruction all produce a plausible, finite, correctly-sized
+/// image. So every assertion here is paired with something it must be DIFFERENT
+/// from.
+#[cfg(ffx_fsr3_metal)]
+fn fsr3_upscale_check(
+    m: &mtl::device::Mtl,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> Result<(), String> {
+    use std::sync::atomic::AtomicU32;
+
+    // Small on purpose: the CPU tracer renders every frame here, and U4 needs
+    // five of them. Odd-ish and non-square so a stride assumption cannot hide.
+    let (rw, rh) = (321usize, 181usize);
+    let (uw, uh) = (rw * 2, rh * 2);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+
+    // The G-buffer is the SLIM variant — mvec + depth and nothing else — which
+    // is exactly the FSR 3.1 upscale-only session's plane set. Using the full
+    // one would allocate and fill four guide planes no part of this path reads.
+    let render = |g: &dlss::GBufs,
+                  accum: &[AtomicU32],
+                  basis: camera::CamBasis,
+                  prev: Option<camera::CamBasis>,
+                  frame: u32,
+                  jitter: (f32, f32)| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: false,
+            rw,
+            rh,
+            accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(g),
+            fsr_buf: None,
+            prev_cam: prev,
+            frame_jitter: Some(jitter),
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+    };
+
+    // REAL jitter, unlike every other frame gate in this file. The two
+    // reconstruction gates (`mv_check_at`, `fsr_frame_check`) pin it to
+    // (0,0) because they reconstruct world positions and assume pixel centres;
+    // here jitter is a genuine FSR3 INPUT — it is what the temporal
+    // accumulation resolves sub-pixel detail from — so pinning it would leave
+    // the one input this renderer feeds and the reference never did untested.
+    let jit = |f: u32| {
+        let (jx, jy) = dlss::jitter_for(f);
+        (jx * fsr::JITTER_SIGN, jy * fsr::JITTER_SIGN)
+    };
+
+    let accum_a = alloc32(rw * rh * 3);
+    let accum_b = alloc32(rw * rh * 3);
+    let ga = dlss::GBufs::new_slim(rw, rh);
+    let gb = dlss::GBufs::new_slim(rw, rh);
+    let basis_a = cam0.basis(rw, rh);
+    // The same 0.02·diag forward dolly `fsr_frame_check` uses, so the motion
+    // vectors this exercises are the ones that gate already proves correct.
+    let cam_b = Camera {
+        pos: cam0.pos + cam0.forward() * (0.02 * scene.diag),
+        ..cam0
+    };
+    let basis_b = cam_b.basis(rw, rh);
+    render(&ga, &accum_a, basis_a, None, 0, jit(0));
+    render(&gb, &accum_b, basis_b, Some(basis_a), 1, jit(1));
+
+    let flags =
+        mtl::fsr3::FLAG_HDR | mtl::fsr3::FLAG_DEPTH_INVERTED | mtl::fsr3::FLAG_AUTO_EXPOSURE;
+    let params = |frame: u32, reset: bool| mtl::fsr3::DispatchParams {
+        render: (rw, rh),
+        jitter: jit(frame),
+        near,
+        far,
+        fov_y: cam0.fov_y,
+        frame_time_ms: 1000.0 / 60.0,
+        reset,
+    };
+
+    // `warm`: A with reset, then B against A's history — the ordinary
+    // steady-state frame. `cold`: B alone into a fresh context — the same
+    // inputs with NO history. Two contexts, because FFX's temporal state is
+    // per-context and there is no other way to have both.
+    // `gb_over` replaces frame B's G-buffer, which is how the plumbing probes
+    // below change exactly one input and nothing else.
+    let run_with = |seq: &[(u32, bool)],
+                    gb_over: Option<&dlss::GBufs>,
+                    jit_over: Option<(f32, f32)>|
+     -> Result<Vec<f32>, String> {
+        let f = mtl::fsr3::Fsr3::new(m, (rw, rh), (uw, uh), flags)?;
+        for &(frame, reset) in seq {
+            let (acc, g) = if frame == 0 {
+                (&accum_a, &ga)
+            } else {
+                (&accum_b, gb_over.unwrap_or(&gb))
+            };
+            f.upload(m, acc, g, (rw, rh), near, far);
+            let mut p = params(frame, reset);
+            if frame == 1 {
+                if let Some(j) = jit_over {
+                    p.jitter = j;
+                }
+            }
+            f.dispatch(m, &p)?;
+        }
+        Ok(f.read_output(m))
+    };
+    let run = |seq: &[(u32, bool)]| run_with(seq, None, None);
+
+    let warm = run(&[(0, true), (1, false)])?;
+    let cold = run(&[(1, true)])?;
+    let warm2 = run(&[(0, true), (1, false)])?;
+    let cold2 = run(&[(1, true)])?;
+
+    // ---- finite, non-negative, and actually written ------------------------
+    // `Fsr3::dispatch` clears the output plane before every dispatch, so "all
+    // zeros" is what a no-op leaves; a NaN is what an unbound argument or a
+    // mis-strided atomic leaves.
+    let bad = warm.iter().filter(|v| !v.is_finite() || **v < 0.0).count();
+    if bad != 0 {
+        return Err(format!("{bad} of {} output channels are non-finite or negative", warm.len()));
+    }
+    let mean = |v: &[f32]| v.chunks(4).map(|p| (p[0] + p[1] + p[2]) / 3.0).sum::<f32>() / (v.len() / 4) as f32;
+    let in_mean = {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh * 3 {
+            s += f64::from(f32::from_bits(accum_b[i].load(Relaxed)));
+        }
+        (s / (rw * rh * 3) as f64) as f32
+    };
+    let out_mean = mean(&warm);
+    if out_mean <= 0.0 {
+        return Err("the output is uniformly zero — the dispatch wrote nothing".into());
+    }
+    // An UPSCALER preserves energy: it resamples, it does not expose. A factor
+    // of two either way is loose enough for a jittered temporal reconstruction
+    // of two frames and tight enough to catch an exposure or colour-space
+    // mistake, which move it by orders of magnitude.
+    let ratio = out_mean / in_mean;
+    if !(0.5..=2.0).contains(&ratio) {
+        return Err(format!(
+            "output mean {out_mean:.4} is {ratio:.3}x the input's {in_mean:.4} — an upscaler \
+             resamples, it does not expose"
+        ));
+    }
+
+    // ---- determinism, in the two regimes it genuinely has ------------------
+    //
+    // THE SPLIT IS MEASURED, and the obvious single bitwise claim is WRONG in a
+    // way that took the measurement to see. Two fresh contexts given identical
+    // inputs:
+    //
+    //   * a RESET-only frame -> EXACTLY bit-identical, every time (4/4, and
+    //     with the output plane deliberately left uncleared, which also proves
+    //     FSR3 writes every output texel);
+    //   * an ACCUMULATING frame -> 100-2800 of 929616 channels differ, each by
+    //     EXACTLY ONE f16 ULP, with the count varying run to run.
+    //
+    // The second is not a defect and not GPU non-determinism. FSR3 declares
+    // essentially every internal resource — the three shared temporals included
+    // — as FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED, and ffx_vk.cpp skips its
+    // init copy for exactly that type, so texels a reset frame never wrote hold
+    // per-allocation residue BY CONTRACT. A following frame reads them at an
+    // accumulation weight near zero, which is why the effect is a tipped f16
+    // rounding boundary and never more. Zeroing the temporals anyway was tried
+    // and made it WORSE (median 388 -> 1050 differing channels), so the residue
+    // is not the whole story either — it is simply not ours to control.
+    //
+    // CORROBORATED FROM THE OTHER SIDE, which is what settles it: under
+    // MTL_SHADER_VALIDATION=1 the accumulating count drops to EXACTLY ZERO,
+    // because that layer zero-fills allocations. Execution-order
+    // non-determinism would be untouched by it; per-allocation residue is
+    // removed by it entirely. So the validated run is also the STRICTEST run —
+    // a reason to prefer it beyond the four gotchas.
+    //
+    // So the exact claim is made where it holds, and the accumulating path gets
+    // a bound instead. Both have teeth: garbage propagating at full magnitude
+    // fails the ULP test, and a genuine backend race (the image-atomic aliasing
+    // class) fails the exact one.
+    let ndiff = cold.iter().zip(&cold2).filter(|(a, b)| a != b).count();
+    if ndiff != 0 {
+        return Err(format!(
+            "two reset-only dispatches into fresh contexts differ in {ndiff} of {} channels — \
+             the one path with no history to read must be exactly reproducible, so this is a \
+             race or an uninitialised read in the backend itself",
+            cold.len()
+        ));
+    }
+    let (mut n_acc, mut worst_rel) = (0usize, 0.0f32);
+    for (a, b) in warm.iter().zip(&warm2) {
+        if a != b {
+            n_acc += 1;
+            let rel = (a - b).abs() / a.abs().max(b.abs()).max(1e-6);
+            worst_rel = worst_rel.max(rel);
+        }
+    }
+    // 1% separates a tipped f16 ULP (2^-11 relative at worst) from anything
+    // carrying real garbage, by two orders of magnitude in each direction.
+    if worst_rel > 0.01 {
+        return Err(format!(
+            "an accumulating frame differs across contexts by {worst_rel:.2e} relative — the \
+             uninitialised-residue path bounds this at one f16 ULP, so something larger is \
+             reaching the output"
+        ));
+    }
+    // A hard ceiling on HOW MANY, so a backend that started diverging broadly
+    // cannot hide behind each difference being individually small.
+    let frac = n_acc as f32 / warm.len() as f32;
+    if frac > 0.02 {
+        return Err(format!(
+            "an accumulating frame differs across contexts in {n_acc} of {} channels ({:.2}%) \
+             — far past the contract-permitted residue band",
+            warm.len(),
+            frac * 100.0
+        ));
+    }
+
+    // ---- the history is REAL ------------------------------------------------
+    // Same frame, same inputs, one with a warmed history and one without. If
+    // these agree, FFX is not accumulating and every temporal claim this arm
+    // makes is false — which a finite, correctly-sized, energy-preserving
+    // image would otherwise sail past.
+    let hist: f64 = warm
+        .iter()
+        .zip(&cold)
+        .map(|(a, b)| f64::from((a - b).abs()))
+        .sum::<f64>()
+        / warm.len() as f64;
+    let rel_hist = hist / f64::from(out_mean.max(1e-6));
+    if rel_hist < 1e-3 {
+        return Err(format!(
+            "a warmed history and a reset one differ by {rel_hist:.2e} of the mean — FFX is \
+             not accumulating anything"
+        ));
+    }
+
+    // ---- NOT A BILINEAR STRETCH --------------------------------------------
+    // THE assertion that carries this stage. Everything above is satisfied by a
+    // competent resampler; only this says a temporal reconstruction happened.
+    // The reference is built here rather than taken from a library so it is
+    // unambiguously the same pixels: a plain 2x box-centre bilinear lift of
+    // frame B's own colour.
+    let bilinear = |x: usize, y: usize, c: usize| -> f32 {
+        let (fx, fy) = ((x as f32 + 0.5) / 2.0 - 0.5, (y as f32 + 0.5) / 2.0 - 0.5);
+        let (x0, y0) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+        let (x1, y1) = ((x0 + 1).min(rw - 1), (y0 + 1).min(rh - 1));
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let s = |xx: usize, yy: usize| f32::from_bits(accum_b[(yy * rw + xx) * 3 + c].load(Relaxed));
+        let a = s(x0, y0) * (1.0 - tx) + s(x1, y0) * tx;
+        let b = s(x0, y1) * (1.0 - tx) + s(x1, y1) * tx;
+        a * (1.0 - ty) + b * ty
+    };
+    let mut d_bil = 0.0f64;
+    for y in 0..uh {
+        for x in 0..uw {
+            for c in 0..3 {
+                d_bil += f64::from((warm[(y * uw + x) * 4 + c] - bilinear(x, y, c)).abs());
+            }
+        }
+    }
+    let rel_bil = d_bil / (uw * uh * 3) as f64 / f64::from(out_mean.max(1e-6));
+    // MEASURED 2.96e-2 here, and the bound is deliberately SIX TIMES under it
+    // rather than just below. The failure this rejects — someone swapping the
+    // reconstruction for a resampler — lands at ~0, so a low bound loses no
+    // discrimination, while a bound set snugly under the measurement would fail
+    // on any scene or pose that happens to reconstruct less.
+    if rel_bil < 5e-3 {
+        return Err(format!(
+            "the output is within {rel_bil:.2e} of a bilinear stretch of its own input — \
+             nothing here proves a temporal reconstruction ran"
+        ));
+    }
+
+    eprintln!(
+        "check-fsr3: U4 upscale {rw}x{rh} -> {uw}x{uh} OK — energy {ratio:.3}x, history \
+         {rel_hist:.3e}, vs-bilinear {rel_bil:.3e}; reset frame bit-exact across contexts, \
+         accumulating {n_acc} ch ({:.3}%) at <= {worst_rel:.1e} rel",
+        frac * 100.0
+    );
+
+    // ---- the inputs are PLUMBED --------------------------------------------
+    //
+    // Three confidently-wrong failures none of the scoring above can see: a
+    // jitter that never reaches the evaluate, a depth plane bound to the wrong
+    // argument, motion vectors read as zero. Each probe re-runs the ACCUMULATING
+    // sequence with exactly one input of frame B changed, so a null result
+    // attributes to that input and to nothing else.
+    //
+    // THE BASELINE MUST BE THE ACCUMULATING FRAME, and the first draft of this
+    // used the reset one — which reported depth at EXACTLY 0.00e0 and looked
+    // like a plumbing bug in the backend. It is not: on a reset frame there is
+    // no history, so the depth-derived disocclusion mask has nothing to reject
+    // and depth genuinely cannot change the output. A probe that cannot move
+    // its target fails whatever the code does, which is the mirror of a probe
+    // that cannot fail — and depth and motion vectors are BOTH in that class.
+    let differs = |label: &str, other: &[f32]| -> Result<f64, String> {
+        let d: f64 = warm.iter().zip(other).map(|(a, b)| f64::from((a - b).abs())).sum::<f64>()
+            / warm.len() as f64
+            / f64::from(out_mean.max(1e-6));
+        // Two orders of magnitude above the contract-permitted residue band
+        // measured above (~1e-5 of the mean), so this cannot pass on noise.
+        if d < 1e-3 {
+            return Err(format!(
+                "changing {label} moved the output by {d:.2e} of the mean — that input is not \
+                 reaching the shaders"
+            ));
+        }
+        Ok(d)
+    };
+
+    // Half a pixel the other way, still inside the legal [-0.5, 0.5): a valid
+    // frame, not a torture test.
+    let d_jit = differs(
+        "the jitter offset",
+        &run_with(&[(0, true), (1, false)], None, Some((-jit(1).0, -jit(1).1)))?,
+    )?;
+
+    // Everything at the near plane — the opposite end of the reversed-Z
+    // encoding from sky, so every pixel reads as disoccluded against a history
+    // built from real depth. MVs stay real, which is what isolates depth.
+    let d_depth = {
+        let flat = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            flat.depth[i].store(near.to_bits(), Relaxed);
+            flat.mvec[i * 2].store(gb.mvec[i * 2].load(Relaxed), Relaxed);
+            flat.mvec[i * 2 + 1].store(gb.mvec[i * 2 + 1].load(Relaxed), Relaxed);
+        }
+        differs("the depth plane", &run_with(&[(0, true), (1, false)], Some(&flat), None)?)?
+    };
+
+    // Zero motion against a camera that really moved: the history reprojects to
+    // the wrong place everywhere. Depth stays real, isolating the MV plane —
+    // and this is the one probe that would catch a plane bound but never read,
+    // which is exactly what the D3D12 arm's `mv_scale` sign guards against on
+    // the other side.
+    let d_mv = {
+        let still = dlss::GBufs::new_slim(rw, rh);
+        for i in 0..rw * rh {
+            still.depth[i].store(gb.depth[i].load(Relaxed), Relaxed);
+        }
+        differs("the motion vectors", &run_with(&[(0, true), (1, false)], Some(&still), None)?)?
+    };
+
+    eprintln!(
+        "check-fsr3: U4 inputs plumbed — jitter {d_jit:.3e}, depth {d_depth:.3e}, motion \
+         {d_mv:.3e} (each one input away from the accumulating frame above)"
+    );
+
+    // ---- the images, for the half no gate can score ------------------------
+    //
+    // Every number above is a magnitude, and a magnitude cannot tell a
+    // CORRECTLY signed jitter from a mirrored one — both move the output by
+    // about as much. The plan names that explicitly: the reset-differs and
+    // not-a-bilinear teeth catch gross wiring, and polarity needs eyes. So
+    // rather than pretend, this writes the frames out and says what to look
+    // for. Both go through the SAME tonemap the renderer presents with, so the
+    // input and the output are comparable by eye rather than by exposure.
+    if std::env::var("FR_FSR3_DUMP").is_ok() {
+        let px = |c: Vec3A| {
+            let t = tone::map(c, tone::ToneParams::SDR);
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+            (b(t.x) << 16) | (b(t.y) << 8) | b(t.z)
+        };
+        let mut inp = Vec::with_capacity(rw * rh);
+        for i in 0..rw * rh {
+            let g = |c: usize| f32::from_bits(accum_b[i * 3 + c].load(Relaxed));
+            inp.push(px(Vec3A::new(g(0), g(1), g(2))));
+        }
+        save_png("fsr3-input.png", &inp, rw, rh);
+        let (ow, oh) = (uw, uh);
+        let mut out = Vec::with_capacity(ow * oh);
+        for i in 0..ow * oh {
+            out.push(px(Vec3A::new(warm[i * 4], warm[i * 4 + 1], warm[i * 4 + 2])));
+        }
+        save_png("fsr3-output.png", &out, ow, oh);
+        eprintln!(
+            "check-fsr3: wrote fsr3-input.png ({rw}x{rh}) and fsr3-output.png ({ow}x{oh}) — \
+             look for edges SHARPER than the input at 2x, and for a static view that does not \
+             wobble; a mirrored jitter or motion-vector sign reads as doubled wobble or as a \
+             directional smear, neither of which any magnitude above can distinguish"
+        );
+    }
+    Ok(())
 }
 
 /// The rendered-frame half of --check-fsr at one resolution: frame A at
