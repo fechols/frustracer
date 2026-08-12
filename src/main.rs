@@ -16110,6 +16110,21 @@ fn run_check_vk_feed(
         }
     };
 
+    // Hoisted above the FFX contexts (it is a pure function of `cam0` and the
+    // render size) so V17 below can use it.
+    let basis = cam0.basis(rw, rh);
+
+    // ---- V17: structure replay WITH THE PACK ARMED. ----
+    // BEFORE the FFX contexts, deliberately. This arm needs only the tracer,
+    // and everything after context creation is unreachable on a software ICD,
+    // where V11/V13 SKIP outright — so placing it here is what gives the one
+    // pure-tracer gate in this function the same llvmpipe coverage V6/V7/V8/V9
+    // have, i.e. what keeps it gateable in CI without a GPU.
+    if !run_check_vk_replay_pack(hg, &tg, scene, &basis, q, rw, rh) {
+        tg.destroy(hg);
+        return false;
+    }
+
     // Two FFX contexts, one per route, stepped in lockstep on one frame
     // sequence. Separate rather than one context run twice because FSR3 is
     // TEMPORAL: a single context would carry the first route's history into
@@ -16161,7 +16176,6 @@ fn run_check_vk_feed(
         return false;
     }
 
-    let basis = cam0.basis(rw, rh);
     let mut ok = true;
 
     let run = (|| -> Result<(), String> {
@@ -16355,6 +16369,122 @@ fn run_check_vk_feed(
     cpu.destroy(hg);
     tg.destroy(hg);
     ok
+}
+
+/// V17 — STRUCTURE REPLAY WITH THE PACK ARMED.
+///
+/// V9 proves a replayed frame is bit-identical to a produced one, but its
+/// tracer is built `TracerOpts::default()`, i.e. `gbuf_full: false` — so there
+/// the pack is not merely unchecked, it is not ALLOCATED (`VkTracer::new`
+/// collapses it to a one-element dummy). And V13/V14/V15/V16 all run on a
+/// pack-armed tracer that never replays. So "replay with the pack armed" was
+/// exercised by no gate in either direction.
+///
+/// That stopped being academic when the capture arm started doing exactly it:
+/// `CineVk::output_frame` replays every sub-frame after the first, on a tracer
+/// carrying the pack, the feed planes and NRD's. This is the gate that licenses
+/// it.
+///
+/// The claim is V9's, one configuration further out. The terminal structure is
+/// a pure function of (scene, BVH, basis, rw, rh) while spp/jitter/frame ride
+/// the cbuffer; the PACK is written by the leaf and sky passes, which a replay
+/// re-dispatches. So a replayed frame must reproduce a produced one BYTE for
+/// byte in `accum` and in both halves of the pack — and the ladder must
+/// provably not have run.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_replay_pack(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+) -> bool {
+    use gfx::shaders as gs;
+    let px = rw * rh;
+    // The capture arm's own frame shape: a fresh 1-spp upscaler frame, not
+    // V9's accumulating one — this gate is about the configuration that
+    // actually ships, and `accumulate` changes which store the leaf takes.
+    let mk = |replay: bool| gfx::frame::FrameParams {
+        cam: *basis,
+        frame: 7,
+        accumulate: false,
+        jitter: false,
+        frame_jitter: Some(dlss::jitter_for(7)),
+        prev_cam: Some(*basis),
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay,
+    };
+    let grab = |tag: &str| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u32>), String> {
+        Ok((
+            hg.read_buffer(&tg.accum, px * 3 * 4).map_err(|e| format!("{tag} accum: {e}"))?,
+            hg.read_buffer(&tg.gbuf, px * gfx::frame::GBUF_STRIDE as usize)
+                .map_err(|e| format!("{tag} gbuf: {e}"))?,
+            hg.read_buffer(&tg.gbuf_ext, px * gfx::frame::GBUF_EXT_STRIDE as usize)
+                .map_err(|e| format!("{tag} gbuf_ext: {e}"))?,
+            tg.read_counters(hg).map_err(|e| format!("{tag} counters: {e}"))?,
+        ))
+    };
+
+    let r = (|| -> Result<(), String> {
+        tg.render_wavefront(hg, &mk(false), true).map_err(|e| format!("produce: {e}"))?;
+        let (a0, g0, e0, c0) = grab("produce")?;
+        tg.render_wavefront_replay(hg, &mk(true), true).map_err(|e| format!("replay: {e}"))?;
+        let (a1, g1, e1, c1) = grab("replay")?;
+
+        // ANTI-VACUITY FIRST, because every assertion below is satisfied by two
+        // buffers that were never written: an all-zero pack compares clean.
+        let nz = g0.iter().filter(|b| **b != 0).count();
+        if nz == 0 {
+            return Err("the produced pack is entirely zero — the comparison is vacuous".into());
+        }
+        let c = |v: &[u32], i: u32| v.get(i as usize).copied().unwrap_or(0);
+        if c(&c0, gs::CTR_SPLIT) == 0 {
+            return Err("the producing frame ran no ladder — nothing was replayed".into());
+        }
+        // The ladder must provably NOT have run on the replay: a "replay" that
+        // quietly re-traced everything is bit-identical by construction, which
+        // is V9's own anti-vacuity argument.
+        for (name, i) in [
+            ("split", gs::CTR_SPLIT),
+            ("tile-a", gs::CTR_TILE_A),
+            ("tile-b", gs::CTR_TILE_B),
+        ] {
+            if c(&c1, i) != 0 {
+                return Err(format!("replay ran the ladder ({name} {})", c(&c1, i)));
+            }
+        }
+        for (name, p, r) in
+            [("accum", &a0, &a1), ("gbuf", &g0, &g1), ("gbuf-ext", &e0, &e1)]
+        {
+            let d = p.iter().zip(r.iter()).filter(|(x, y)| x != y).count();
+            if d != 0 || p.len() != r.len() {
+                return Err(format!("{name}: {d} of {} bytes differ under replay", p.len()));
+            }
+        }
+        println!(
+            "check-vk: V17 replay with the pack armed {rw}x{rh}: accum/gbuf/gbuf-ext byte-diff 0 \
+             | pack non-zero {nz} B | ladder produce split {} -> replay 0",
+            c(&c0, gs::CTR_SPLIT)
+        );
+        Ok(())
+    })();
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V17 {e}");
+            false
+        }
+    }
 }
 
 /// V16 — THE COMPOSED FRAME: trace -> pack -> ReBLUR -> recompose -> FSR3.
@@ -16886,6 +17016,23 @@ fn run_check_vk_nrd(
             "check-vk: SKIP V15 ({} not found); run `{}`",
             lib.display(),
             nrd::INSTALLER
+        );
+        return true;
+    }
+    // THE SKIP THE CODE ALREADY PROMISED AND DID NOT IMPLEMENT. Four of
+    // ReBLUR's fourteen kernels declare `ComputeDerivativeGroupQuadsKHR`, so
+    // `vk/device.rs` enables `VK_KHR_compute_shader_derivatives`
+    // when present — and its own comment there, plus CLAUDE.md, both stated
+    // that V15 skips on a device without it. Nothing did: the only skip was
+    // the missing-library one above, so this gate would have dispatched
+    // modules whose declared capability is unavailable, which the same
+    // comment calls "undefined and — as measured — silent". An environment
+    // fact, so SKIP at exit 0, matching the absent/told split.
+    if !hg.vk.info.compute_derivatives {
+        println!(
+            "check-vk: SKIP V15 (no VK_KHR_compute_shader_derivatives — four ReBLUR kernels \
+             declare ComputeDerivativeGroupQuads and dispatching them with the feature off is \
+             undefined)"
         );
         return true;
     }
@@ -23215,7 +23362,15 @@ fn run_cinematic_vk(
     }
     let want_dn = want_up && opts.nrd;
 
-    let mut built: Option<((usize, usize), CineVk)> = None;
+    // KEYED ON `recon` AS WELL AS THE RESOLUTION. The pack, the feed and the
+    // NRD planes are BUILD-time `TracerOpts`, so a key of size alone freezes
+    // the first shot's answer for every later shot at that size: a GI shot
+    // following a non-GI one would reuse an upscaler-armed tracer and take the
+    // reconstruction arm, which is exactly what "a GI shot always accumulates"
+    // forbids. D3D12 gets away with a size-only key because it decides per shot
+    // at the frame loop; here the decision is baked into the build, so it
+    // belongs in the key.
+    let mut built: Option<((usize, usize, bool), CineVk)> = None;
     let mut code = 0;
 
     for shot in shots {
@@ -23227,16 +23382,20 @@ fn run_cinematic_vk(
         // chain says. D3D12 does the same, for the same reason.
         let recon = want_up && !shot.gi;
 
-        if built.as_ref().map(|(r, _)| *r) != Some((rw, rh)) {
+        let key = (rw, rh, recon);
+        if built.as_ref().map(|(k, _)| *k) != Some(key) {
             if let Some((_, old)) = built.take() {
                 old.destroy(&hg);
             }
             built = Some((
-                (rw, rh),
+                key,
                 CineVk::build(&hg, &sp, scene, &vs, &vt, bvh, rw, rh, recon, want_dn, opts)?,
             ));
         }
         let cv = &mut built.as_mut().unwrap().1;
+        // A shot boundary is a HARD CUT, and the expensive half above is cached
+        // across it — so the per-shot temporal state has to be dropped by hand.
+        cv.begin_shot();
 
         let frames = shot.kind.frames();
         let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
@@ -23285,8 +23444,18 @@ struct CineVk {
     tg: vk::tracer::VkTracer,
     up: Option<vk::fsr3::Fsr3>,
     dn: Option<vk::nrd::VkNrd>,
-    /// Free-running across the WHOLE shot, so the Halton phase never restarts.
+    /// Free-running across ONE shot, so the Halton phase never restarts inside
+    /// it — and reset BY `begin_shot` at every shot boundary, because a new
+    /// shot is a hard cut. This struct is cached by resolution across shots
+    /// (the `islands` preset is seven at one res), so a `seq` that only ever
+    /// incremented gave the whole RUN a single `reset` and carried shot 1's
+    /// history into all six that followed. D3D12 declares its `seq` inside the
+    /// per-shot loop for exactly this reason.
     seq: u32,
+    /// The previous SUB-frame's pose — what the pack reprojects from, what
+    /// NRD's `prev_mats` is built from, and what decides whether the terminal
+    /// quadtree can be replayed. One per shot; see `cinematic::Temporal`.
+    temporal: cinematic::Temporal,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -23366,7 +23535,25 @@ impl CineVk {
         if dn.is_some() {
             tg.wire_nrd(hg);
         }
-        Ok(CineVk { tg, up, dn, seq: 0 })
+        Ok(CineVk {
+            tg,
+            up,
+            dn,
+            seq: 0,
+            temporal: cinematic::Temporal::default(),
+        })
+    }
+
+    /// A shot boundary is a HARD CUT: drop every temporal history.
+    ///
+    /// This is a method rather than a fresh `CineVk` because the expensive half
+    /// (the tracer's kernels, the FFX context, the NRD instance) is cached
+    /// across shots at one resolution and must survive — only the per-shot
+    /// state resets. Forgetting it is what let the `islands` preset reconstruct
+    /// shot 2's first frames out of shot 1's island.
+    fn begin_shot(&mut self) {
+        self.seq = 0;
+        self.temporal = cinematic::Temporal::default();
     }
 
     /// Render ONE output frame and return it as a linear f32 RGB image.
@@ -23404,13 +23591,22 @@ impl CineVk {
         for k in 0..warm + samples {
             let emit = k >= warm;
             let jit = dlss::jitter_for(self.seq);
+            // What the PREVIOUS sub-frame was, which is a different question
+            // from what this one is — and the question this arm used to answer
+            // with `basis` itself, zeroing every motion vector on a moving shot
+            // and telling NRD the camera had not moved for the whole tour.
+            // Inside an output frame the pose really is unchanged, so `st`
+            // reports prev == cur AND licenses a replay; at an output-frame
+            // boundary it reports the frame before and refuses one.
+            let st = self.temporal.step(&basis, &fs.cam, jit);
+            let replay = st.replay && opts.replay;
             let p = gfx::frame::FrameParams {
                 cam: basis,
                 frame: self.seq,
                 accumulate: false,
                 jitter: false,
                 frame_jitter: Some(jit),
-                prev_cam: Some(basis),
+                prev_cam: Some(st.prev_basis),
                 q,
                 verify: false,
                 spp: opts.spp,
@@ -23419,7 +23615,7 @@ impl CineVk {
                 fireflies: fs.fireflies,
                 sway_time: None,
                 sway_prev_time: None,
-                replay: false,
+                replay,
             };
             let dp = vk::fsr3::Dispatch {
                 jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
@@ -23427,9 +23623,19 @@ impl CineVk {
                 near_far: (near, far),
                 fov_y: fs.cam.fov_y,
                 dt_ms: gfx::denoise::NOMINAL_DT_MS,
-                reset: self.seq == 0,
+                reset: st.reset,
             };
-            self.tg.render_wavefront(hg, &p, true)?;
+            // Structure replay across a shot's sub-frames is why high sample
+            // counts are affordable — the terminal quadtree is a function of
+            // (scene, BVH, basis, rw, rh) and the pose is bit-equal here, so a
+            // 256-sample still ran the whole ladder 256 times for one answer.
+            // The accumulation arm three functions down has always done this;
+            // the arm that produces the shipped pictures did not.
+            if replay {
+                self.tg.render_wavefront_replay(hg, &p, true)?;
+            } else {
+                self.tg.render_wavefront(hg, &p, true)?;
+            }
 
             match self.dn.as_mut() {
                 // THE COMPOSED FRAME (B5a): pack -> ReBLUR -> recompose -> FFX,
@@ -23437,12 +23643,19 @@ impl CineVk {
                 // the recompose wrote the colour.
                 Some(eng) => {
                     let mats = dlss::cam_matrices(&fs.cam, rw, rh, near, far);
+                    // The PREVIOUS sub-frame's matrices, which is the whole
+                    // point: `common_settings` takes two equally-typed
+                    // `&CamMatrices` and `(&mats, &mats)` compiles cleanly, so
+                    // the compiler cannot tell a reprojection from an identity.
+                    // It is only correct where the pose provably did not move
+                    // — which is true of V15/V16 and was not true here.
+                    let prev_mats = dlss::cam_matrices(&st.prev_cam, rw, rh, near, far);
                     let (pw, ph) = eng.prev_size();
                     let cs = gfx::denoise::common_settings(
                         &mats,
-                        &mats,
+                        &prev_mats,
                         jit,
-                        dlss::jitter_for(self.seq.saturating_sub(1)),
+                        st.prev_jitter,
                         rw as u32,
                         rh as u32,
                         pw,
@@ -23450,7 +23663,7 @@ impl CineVk {
                         far,
                         gfx::denoise::NOMINAL_DT_MS,
                         self.seq,
-                        self.seq == 0,
+                        st.reset,
                         false,
                     );
                     let rs = gfx::denoise::reblur_settings();
@@ -23484,7 +23697,12 @@ impl CineVk {
                     rf?;
                 }
             }
+            // ADVANCE ONLY HERE, past every `?` above: a sub-frame that failed
+            // must not become the pose the next one reprojects from, nor the
+            // structure it replays. `nrd_frame_step`'s rule, and the reason
+            // `Temporal` splits `step` from `advance`.
             self.seq += 1;
+            self.temporal.advance(basis, fs.cam, jit);
             if emit && k + 1 == warm + samples {
                 out = up.read_output(hg)?;
             }
@@ -27642,8 +27860,14 @@ fn run_check(
             false
         }
     };
+    // A gate that reports green without running is worse than a missing one,
+    // because a suite reading PASSED is taken to have covered it. `dual_ok`
+    // below prints its SKIP; these two were silently `true`.
     #[cfg(not(windows))]
-    let quin_ok = true;
+    let quin_ok = {
+        eprintln!("quin self-test: SKIP (D3D12-hosted; pending its own move to gfx::)");
+        true
+    };
 
     // Raw-NGX DLSS-G guide self-test — the two conversions the --fg
     // evaluate feeds the FG snippet: clip depth must be the exact z-mapping
@@ -27662,8 +27886,15 @@ fn run_check(
             false
         }
     };
+    // Same shape as `quin_ok` above, and the same reason: ~64% of
+    // ngxfg_guides.rs is D3D12-free `glam` math and a pure self_test, so this
+    // is a `gfx::guides` candidate rather than a permanent skip — but until it
+    // moves, say so instead of reporting a gate that never ran.
     #[cfg(not(windows))]
-    let ngxfg_guides_ok = true;
+    let ngxfg_guides_ok = {
+        eprintln!("ngxfg-guides self-test: SKIP (D3D12-hosted; pending its own move to gfx::)");
+        true
+    };
 
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.

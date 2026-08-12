@@ -7776,6 +7776,46 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # + rungholt, both FR_VK_RES parities, --sw-rays, llvmpipe,
                                       # --check-spirv, --check-fsr, --check-nrd and
                                       # tools/win-cross-check.sh
+                                      # V17 — STRUCTURE REPLAY WITH THE PACK ARMED (B5c,
+                                      # 2026-08-12): the gate that licenses what the capture arm
+                                      # now ships. V9 proves a replayed frame is bit-identical to
+                                      # a produced one, but its tracer is `TracerOpts::default()`
+                                      # — `gbuf_full: false` — so there the pack is not merely
+                                      # unchecked, it is not ALLOCATED (`VkTracer::new` collapses
+                                      # it to a one-element dummy); and V13/V14/V15/V16 all run on
+                                      # a pack-armed tracer that never replays. So "replay with
+                                      # the pack armed" was exercised by no gate in EITHER
+                                      # direction — while `CineVk::output_frame` now replays every
+                                      # sub-frame after the first on a tracer carrying the pack,
+                                      # the feed planes and NRD's. The claim is V9's one
+                                      # configuration further out: the terminal structure is a
+                                      # pure function of (scene, BVH, basis, rw, rh) while
+                                      # spp/jitter/frame ride the cbuffer, and the PACK is written
+                                      # by the leaf and sky passes, which a replay re-dispatches —
+                                      # so a replayed frame must reproduce a produced one BYTE for
+                                      # byte in `accum` AND both pack halves, with the ladder
+                                      # provably not run. IT SITS BEFORE THE FFX CONTEXTS, and
+                                      # that placement is the point rather than tidiness:
+                                      # everything after context creation is unreachable on a
+                                      # software ICD (V11/V13 SKIP outright), so putting the one
+                                      # pure-tracer gate in that function ahead of them is what
+                                      # gives it the llvmpipe coverage V6/V7/V8/V9 have — i.e.
+                                      # what keeps it gateable in CI without a GPU. Anti-vacuity
+                                      # runs FIRST, because every assertion below it is satisfied
+                                      # by two buffers that were never written: the produced pack
+                                      # must be non-zero and the producing frame must have run a
+                                      # ladder at all. MEASURED (RADV, 400x300): byte-diff 0 with
+                                      # pack non-zero 1201522 B and split 65 -> 0, on procedural,
+                                      # san-miguel-low-poly, `--sw-rays`, both FR_VK_RES parities
+                                      # and llvmpipe (1194681 B — a different count because the
+                                      # software intersector differs at edges, which the
+                                      # self-vs-self comparison is indifferent to). TEETH, both
+                                      # fired and DISTINCT: a "replay" that quietly re-traces
+                                      # everything reads `replay ran the ladder (split 65)` — the
+                                      # anti-vacuity half, since such a replay is bit-identical BY
+                                      # CONSTRUCTION — and shading the replay at a different frame
+                                      # index reads `accum: 815314 of 1440000 bytes differ`, which
+                                      # is the byte comparison proving it bites.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
@@ -8405,6 +8445,74 @@ cargo run --release -- --cinematic tour --cinematic-res 3840x2160 --cinematic-fp
                                       # `VkTracer`/`Fsr3`/`VkNrd` have `destroy(&hg)` and NO `Drop`,
                                       # so a forgotten teardown leaks device memory across a
                                       # seven-shot preset.
+                                      # THE TEMPORAL STATE, FIXED (B5c, 2026-08-12). B5b shipped
+                                      # FOUR defects, all in the RECONSTRUCTION arm, all invisible
+                                      # to every gate — and the sharpest framing is that the
+                                      # capture arm's two arms DISAGREED: `accumulate` replayed
+                                      # and carried a comment saying why it was a pure win, while
+                                      # `output_frame` — the DEFAULT arm, the one that produced
+                                      # every shipped picture — did not. (1) It computed `basis`
+                                      # once and passed it as BOTH `cam` and `prev_cam`, so every
+                                      # moving shot's motion vectors were ZERO; this hit FSR3
+                                      # whether or not NRD was armed, i.e. `--no-nrd` too.
+                                      # (2) `common_settings(&mats, &mats, ..)` told NRD the
+                                      # camera had not moved, with `reset` only at seq 0, so a
+                                      # tour accumulated under ACCUM_CONTINUE against an identity
+                                      # reprojection for its whole length. (3) `replay: false`
+                                      # always, so a 256-sample still re-ran the whole quadtree
+                                      # ladder 256 times at one bit-identical pose. (4) `CineVk`
+                                      # is CACHED BY RESOLUTION across shots while `seq` only ever
+                                      # incremented, so ONE `reset` served an entire run — the
+                                      # `islands` preset is seven shots at one resolution, and
+                                      # shots 2-7 reconstructed their first frames out of shot 1's
+                                      # island. D3D12 declares its `seq` INSIDE the per-shot loop
+                                      # and says "reset fires once per shot"; hoisting the Vulkan
+                                      # equivalent into the cached struct is what broke it.
+                                      # THE FIX IS A DERIVATION, not a patch to two literals:
+                                      # `cinematic::Temporal` remembers the previous SUB-frame and
+                                      # `replay` becomes the FACT `render_wavefront_replay`'s own
+                                      # doc demands — the basis bit-equals the previous producing
+                                      # frame's — instead of the index heuristic `k > 0`. Per
+                                      # SUB-frame rather than per output frame is what makes it
+                                      # right at both seams: inside an output frame the pose is
+                                      # identical, so prev == cur AND replay is legal; at a frame
+                                      # boundary prev is the frame before and the structure must
+                                      # be re-traced. `step`/`advance` are separate calls for
+                                      # `nrd_frame_step`'s reason — a failed sub-frame must not
+                                      # become the pose the next one reprojects from. `begin_shot`
+                                      # drops it per shot. The tracer cache key gained `recon`,
+                                      # since pack/feed/NRD are BUILD-time options and a
+                                      # size-only key froze the first shot's GI answer for every
+                                      # later shot at that size.
+                                      # GATED IN `--check` (`cinematic::self_test`, pure, GPU-free,
+                                      # every platform): three sub-frames at pose A then two at B,
+                                      # asserting the prev sequence, the replay sequence, and that
+                                      # after the first sub-frame prev is never THIS one's own
+                                      # pose+jitter — plus a purity arm proving a failed frame
+                                      # cannot advance. TOOTH FIRED: planting the shipped defect
+                                      # reads "temporal step 1: prev jitter equals this
+                                      # sub-frame's own — the arm is reprojecting from itself".
+                                      # NOTE WHY THE DEVICE GATES COULD NOT HAVE CAUGHT IT: V15
+                                      # and V16 each render ONE pose repeatedly, where passing the
+                                      # same value twice is CORRECT, so they share the exact call
+                                      # shape that was wrong here — and nothing in the type system
+                                      # separates `common_settings`' two `&CamMatrices`.
+                                      # MEASURED, and one of them is a NEGATIVE worth keeping:
+                                      # replay fires on 71 of 72 sub-frames (verified by probe —
+                                      # `trace k=0` once per output frame, `replay k=1..71`) and
+                                      # buys NOTHING measurable (1080p 32-sample still, interleaved:
+                                      # 1.34/1.37 with vs 1.36/1.35 without — the arms overlap).
+                                      # A composed capture sub-frame also runs the pack, ~31 ReBLUR
+                                      # dispatches, the recompose and FFX, and `VkHeadless::run` is
+                                      # submit-and-wait, so the ladder is a far smaller share here
+                                      # than in the interactive D3D12 frame where -43% was
+                                      # measured. It ships because it is strictly less work and
+                                      # provably bit-identical (V17), NOT because it is faster.
+                                      # `accumulate` was deliberately NOT converted: its `k > 0`
+                                      # already IS the bit-equality its doc claims, it has no MV
+                                      # consumer, and it takes `&self` — the two arms disagreed
+                                      # because one was WRONG, not because they lacked a shared
+                                      # mechanism.
                                       # WORKS ON DAY ONE: stills, sequences, GI, overlay (the
                                       # `info` plane exists, so the quadtree overlay draws real
                                       # subdivision), --cinematic-hdr's PQ/EXR, --cinematic-encode,
