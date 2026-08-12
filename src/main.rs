@@ -574,14 +574,22 @@ fn main() {
     // LibraryDesc carries no perf bit, which is why the pick must be loud —
     // the version gate cannot tell the two DLLs apart after the fact.
     if opts.nrd_perf {
-        let perf_dir = format!("{}\\perf", opts.nrd_path);
-        if std::path::Path::new(&format!("{perf_dir}\\NRD.dll")).exists() {
-            eprintln!("nrd: performance-mode DLL selected ({perf_dir})");
-            opts.nrd_path = perf_dir;
+        // Ungated by platform, and correct on both since the Linux installer
+        // arm landed: `nrd::LIB_FILE` names the artifact and `Path::join` the
+        // separator, so this resolves a real `perf/libNRD.so` here exactly as
+        // it resolves `perf\NRD.dll` there. Gating it off on Linux would be
+        // the silent degrade the conventions forbid — the lever is real the
+        // moment the installer stages the second arm.
+        let perf_dir = std::path::Path::new(&opts.nrd_path).join("perf");
+        if perf_dir.join(nrd::LIB_FILE).exists() {
+            eprintln!("nrd: performance-mode library selected ({})", perf_dir.display());
+            opts.nrd_path = perf_dir.to_string_lossy().into_owned();
         } else {
             eprintln!(
-                "nrd: --nrd-perf requested but {perf_dir}\\NRD.dll not found — using the \
-                 standard DLL (run install-prerequisites.bat nrd to build both)"
+                "nrd: --nrd-perf requested but {} not found — using the standard library \
+                 (run `{}` to build both)",
+                perf_dir.join(nrd::LIB_FILE).display(),
+                nrd::INSTALLER
             );
         }
     }
@@ -16076,9 +16084,19 @@ fn run_check_vk_feed(
         bvh,
         rw as u32,
         rh as u32,
-        // `feed` implies `gbuf_full`; spelled anyway, because a reader should
-        // not have to know the constructor forces it.
-        vk::tracer::TracerOpts { gbuf_full: true, feed: true },
+        // `feed` implies `gbuf_full` and `nrd` implies `feed`; all three are
+        // spelled anyway, because a reader should not have to know the
+        // constructor forces them.
+        //
+        // ONE tracer for V13 AND V14, rather than the fourth the second and
+        // third were: the only thing V14 adds to a frame is the sig lanes, and
+        // those are a cbuffer bit over an assignment-only capture, so `accum`
+        // and therefore every number V13 reports are unmoved. Coupling them is
+        // a FEATURE — V13's figures holding across the bridge's arrival is the
+        // capture-invariance claim, stated across the two stages instead of
+        // asserted once — and it saves a whole DXC pass. V14 turns the bit off
+        // and on itself for the arm that gates it properly.
+        vk::tracer::TracerOpts { gbuf_full: true, feed: true, nrd: true },
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -16299,9 +16317,313 @@ fn run_check_vk_feed(
         }
     }
 
+    // ---- V14: the NRD bridge, on V13's tracer and V13's engine planes. ----
+    if ok {
+        ok =
+            run_check_vk_bridge(hg, &tg, &fed, scene, &basis, q, rw, rh, near, far, structural);
+    }
+
     fed.destroy(hg);
     cpu.destroy(hg);
     tg.destroy(hg);
+    ok
+}
+
+/// V14 — THE NRD BRIDGE, and a byte-identity that needs no reference image.
+///
+/// `cs_nrd_pack` and `cs_nrd_out` are the front and back halves of the ONE
+/// denoiser seam this renderer has. They are deliberately ENGINE-BLIND — the
+/// D3D12 `wire_nrd_feed`'s own doc says the kernels "neither know nor care
+/// which engine sits between them" — so proving them needs no engine at all,
+/// and that is what makes this stage cheap enough to precede one.
+///
+/// THE CLAIM, and it is an identity rather than a tolerance. The recompose is
+/// `col = R + D_out·kd·m_d + S_out·f0` with `R = base − D_in·kd·m_d − S_in·f0`,
+/// so with a PASSTHROUGH engine (`OUT == IN`, byte for byte) the correction is
+/// algebraically zero and `col` must collapse onto `base` — which is exactly
+/// the colour `cs_feed_xess` wrote. Any drift at all is the bridge's own
+/// arithmetic, its sig lanes, or its wiring; there is nothing else in the
+/// expression. This is `--check-gpu`'s N3, and it is the strongest shape in the
+/// suite precisely because it compares bytes against a value the SAME device
+/// produced moments earlier rather than against a model of one.
+///
+/// It runs on V13's tracer, which is not thrift: V13's feed is the only thing
+/// in this suite that produces the reference, so the two stages want the same
+/// tracer for the same reason F3 wanted `--check-gpu`'s.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_bridge(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    fed: &vk::fsr3::Fsr3,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    near: f32,
+    far: f32,
+    structural: bool,
+) -> bool {
+    const POISON: u8 = 0xee;
+    let mut ok = true;
+    // The bridge's own seven planes. `wire_feed` already pointed u16/u18/u19 at
+    // the engine's images, and those stay exactly where they are — the bridge
+    // WRITES the engine's colour and guides, which is the whole fold.
+    tg.wire_nrd(hg);
+
+    let run = (|| -> Result<(), String> {
+        // The reference: the colour plane exactly as the feed left it on V13's
+        // last frame.
+        let reference = fed.read_input(hg, 0)?;
+
+        // ANTI-VACUITY, and it has to be a SENTINEL rather than a zero check:
+        // the colour plane already holds the right answer, so a recompose that
+        // never dispatched would pass the byte compare on stale bytes (the M3d
+        // lesson — an operation that never happened compares clean).
+        //
+        // Poisoning all three planes is STRONGER than D3D12's F3, which smears
+        // one plane over the colour target: `cs_nrd_pack` writes the engine's
+        // depth and mvec guides itself — THE FOLD, which is why an NRD frame
+        // runs no separate feed at all — so re-running the plane gate below
+        // scores that half too, and it is a half the feed route cannot reach.
+        fed.poison_inputs(hg, POISON)?;
+        let dirty = fed.read_input(hg, 0)?;
+        let pre_diff = dirty
+            .iter()
+            .zip(reference.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        // The sequence, on ONE command buffer — `nrd_frame_step`'s ordering:
+        // pack -> engine -> recompose.
+        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+        hg.run(|d, cmd| unsafe {
+            r1 = tg.record_nrd_pack(d, cmd);
+            r2 = tg.record_nrd_passthrough(d, cmd);
+            r3 = tg.record_nrd_out(d, cmd);
+        })?;
+        r1?;
+        r2?;
+        r3?;
+
+        let after = fed.read_input(hg, 0)?;
+        let bad = after
+            .iter()
+            .zip(reference.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "check-vk: V14 bridge passthrough ({rw}x{rh}): colour byte-diff {bad} \
+             (pre-dirty {pre_diff})"
+        );
+        if bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V14 the passthrough recompose is not byte-identical to the feed \
+                 — with OUT == IN the delta form's correction is exactly zero, so this is the \
+                 bridge's own arithmetic or its sig lanes"
+            );
+            ok = false;
+        }
+        if pre_diff == 0 {
+            eprintln!(
+                "check-vk: FAIL V14 anti-vacuity — the poison did not change the colour plane, \
+                 so a dead recompose would pass the compare above"
+            );
+            ok = false;
+        }
+
+        // DID THE PACK'S DATA ARRIVE? The byte identity above provably cannot
+        // answer that, and this is not a theory — a planted tooth that skipped
+        // the plane wiring entirely PASSED it. With the planes unbound the
+        // recompose reads zeros, so `D_out − D_in` is zero, `col` collapses
+        // onto `base`, and the identity holds for the wrong reason. A
+        // passthrough makes the delta zero BY CONSTRUCTION, so the arm that
+        // scores the recompose can never also score the pack.
+        //
+        // The three IN planes are read back off the tracer's OWN images, which
+        // exist whether or not a descriptor points at them — which is exactly
+        // what makes an unwired bridge show up here as an untouched plane.
+        for (idx, name) in
+            [(3usize, "in_diff"), (4, "in_spec"), (2, "in_viewz")]
+        {
+            let px = tg.read_nrd_plane(hg, idx)?;
+            let nz = px.iter().filter(|b| **b != 0).count();
+            eprintln!(
+                "check-vk: V14 pack arrival: {name} {nz}/{} non-zero bytes",
+                px.len()
+            );
+            // A tenth of the frame is far below any healthy figure and far
+            // above the zero an unwired plane reads, so it separates the two
+            // without pretending to know this scene's content.
+            if nz * 10 < px.len() {
+                eprintln!(
+                    "check-vk: FAIL V14 the pack left {name} essentially empty — the bridge's \
+                     front half wrote nowhere, and the byte identity above cannot see that"
+                );
+                ok = false;
+            }
+        }
+
+        // THE FOLD: the guides came back from the SAME dispatch that packed the
+        // denoiser's inputs, so V13's own plane gate re-run over them scores a
+        // half no feed route reaches. The poison above is what makes this a
+        // real question — depth and mvec were 0xEE bytes a moment ago.
+        let dbytes = fed.read_input(hg, 1)?;
+        let mbytes = fed.read_input(hg, 2)?;
+        let cbytes = fed.read_input(hg, 0)?;
+        let acc = hg.read_buffer(&tg.accum, rw * rh * 12)?;
+        let core = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+        let tb = hg.read_buffer(&tg.tbuf, rw * rh * 4)?;
+        let gb2 = unpack_gbuf_bytes(&core, None, rw, rh);
+        let tb2: Vec<f32> = (0..rw * rh)
+            .map(|i| f32::from_le_bytes(tb[i * 4..][..4].try_into().unwrap()))
+            .collect();
+        if !gate_xess_feed(
+            "check-vk: V14 fold",
+            rw,
+            rh,
+            &dbytes,
+            &mbytes,
+            &cbytes,
+            &acc,
+            &gb2,
+            &tb2,
+            near,
+            far,
+            structural,
+        ) {
+            ok = false;
+        }
+
+        // ---- THE CAPTURE INVARIANCE (N6b transplanted) ----
+        //
+        // Arming the sig lanes moves what the pack STORES, and the claim that
+        // makes that safe is that it moves nothing else: the exported values
+        // are already computed at the point of capture, so the capture is
+        // assignment-only and `accum` is bit-identical across the toggle. That
+        // is why the arming is a cbuffer bit here rather than a construction
+        // flag — two traces one bit apart need no recompile and no second
+        // tracer, and the claim becomes a gate instead of a comment.
+        let frame = |f: u32| gfx::frame::FrameParams {
+            cam: *basis,
+            frame: f,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(dlss::jitter_for(f)),
+            prev_cam: Some(*basis),
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        let ext_len = rw * rh * gfx::frame::GBUF_EXT_STRIDE as usize;
+        let mut arms: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for on in [true, false] {
+            tg.set_nrd_sig(on);
+            tg.render_wavefront(hg, &frame(0), true)?;
+            arms.push((
+                hg.read_buffer(&tg.accum, rw * rh * 12)?,
+                hg.read_buffer(&tg.gbuf_ext, ext_len)?,
+            ));
+        }
+        // Left as found — the N4 restore lesson: a stage that mutates shared
+        // state owes the next one the state it expected.
+        tg.set_nrd_sig(true);
+
+        let core2 = hg.read_buffer(&tg.gbuf, rw * rh * gfx::frame::GBUF_STRIDE as usize)?;
+        let gb3 = unpack_gbuf_bytes(&core2, None, rw, rh);
+        let acc_diff = arms[0].0.iter().zip(arms[1].0.iter()).filter(|(a, b)| a != b).count();
+        // `sig` opens at byte 48 of the 72-byte ext record (nr | alb | spec |
+        // sig | sig2), and `sig.w`'s HIGH half is `m_d` — the exact-remodulation
+        // divisor, on loan from the `shadow_t` lane nothing decodes yet.
+        const SIG: usize = 48;
+        let (mut live, mut leaked, mut hits) = (0usize, 0usize, 0usize);
+        let (mut md_lo, mut md_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut md_moved = 0usize;
+        for i in 0..rw * rh {
+            if f32::from_bits(gb3.depth[i].load(Relaxed)) >= far {
+                continue; // sky: the pack zeroes sig there by construction
+            }
+            hits += 1;
+            let armed = &arms[0].1[i * 72 + SIG..][..16];
+            let off = &arms[1].1[i * 72 + SIG..][..16];
+            if armed.iter().any(|b| *b != 0) {
+                live += 1;
+            }
+            if off.iter().any(|b| *b != 0) {
+                leaked += 1;
+            }
+            let w = u32::from_le_bytes(armed[12..16].try_into().unwrap());
+            let md = vk::tracer::half_from_bits((w >> 16) as u16);
+            md_lo = md_lo.min(md);
+            md_hi = md_hi.max(md);
+            if md != 1.0 {
+                md_moved += 1;
+            }
+        }
+        eprintln!(
+            "check-vk: V14 sig capture invariance: accum-diff {acc_diff} | sig live {live}/{hits} \
+             | sig leaked (disarmed) {leaked} | m_d [{md_lo:.4}, {md_hi:.4}] moved {md_moved} px"
+        );
+        if acc_diff != 0 {
+            eprintln!(
+                "check-vk: FAIL V14 arming the sig lanes moved {acc_diff} accum bytes — the \
+                 capture is supposed to be assignment-only"
+            );
+            ok = false;
+        }
+        if leaked != 0 {
+            eprintln!("check-vk: FAIL V14 {leaked} px carry sig bytes with the lanes DISARMED");
+            ok = false;
+        }
+        if hits > 0 && live != hits {
+            eprintln!(
+                "check-vk: FAIL V14 only {live} of {hits} hit px carry sig — the pack's lanes \
+                 are what the bridge reads, so a partial capture is a partial denoise"
+            );
+            ok = false;
+        }
+        if hits > 0 && !(md_lo > 0.0 && md_hi <= 1.0) {
+            eprintln!("check-vk: FAIL V14 m_d outside (0, 1]");
+            ok = false;
+        }
+        // THE INERT NOTE, D3D12's N6b verbatim in intent — and here it fires on
+        // every committed gate pose, which is worth stating rather than hoping
+        // a reader infers it. `m_d` is `sk = 1 − 0.157·sheen` blended toward
+        // `sk·dcav`, only the `fabric` class sets sheen at all (matclass.rs's
+        // `tela`/`carpet`/`individual` vocabulary), and `dcav` needs the detail
+        // field's window OPEN, i.e. a magnified surface. The procedural scene
+        // has neither, and san-miguel's nine fabric materials are its
+        // tablecloths and chair fabric — present in the scene, absent from the
+        // fitted overview every `--check-vk` run uses.
+        //
+        // The pose that DOES exercise it is this tree's own documented
+        // glassware close-up, `--cam 0.71,1.55,0.45,0.71,1.25,-0.35` on
+        // san-miguel-low-poly, where this arm reads m_d [0.7700, 1.0000]. Note
+        // the rest of the suite is known-red there for reasons that predate
+        // this stage (`mv_selftest` median 3.156 against a 0.17 limit, plus the
+        // candidate-loop divergences a nearly-all-glass view amplifies), so
+        // that is a READ-THE-LOG configuration, not a passing one — the same
+        // caveat `--dxr-sbt 3` already carries for the identical pose.
+        if hits > 0 && md_moved == 0 {
+            eprintln!(
+                "check-vk: V14 NOTE — m_d is exactly 1.0 on every hit pixel, so the remodulation \
+                 is INERT at this pose and this arm proves it harmless, not correct (the \
+                 glassware close-up is what moves it — see the source)"
+            );
+        }
+        Ok(())
+    })();
+    if let Err(e) = run {
+        eprintln!("check-vk: FAIL V14 {e}");
+        ok = false;
+    }
     ok
 }
 
@@ -17496,9 +17818,6 @@ fn run_check_vk_replay(
 }
 
 fn run_check_nrd(opts: &Opts) -> i32 {
-    // Only N1 reads it (the DLL path); N0 below is pure.
-    #[cfg(not(windows))]
-    let _ = opts;
     let mut ok = true;
 
     // N0 — DLL-free math twins.
@@ -17518,20 +17837,29 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         println!("check-nrd: N9-CPU remodulation identity OK");
     }
 
-    // N1 — the DLL contract. Windows-only for now, and SAID rather than
-    // silently skipped: NRD's D3D12 artifact is `NRD.dll` with DXIL
-    // embedded, which has no Linux equivalent (the portable NRD build
-    // carries SPIRV — see `SpirvBindingOffsets` in nrd.rs — and is a
-    // Vulkan-backend concern). N0 above is the DLL-free half and runs on
-    // every platform, so the packing math is still gated here.
-    #[cfg(not(windows))]
-    println!(
-        "check-nrd: SKIP N1 (the NRD.dll instance/dispatch contract is \
-         D3D12-only; N0's math twins ran)"
-    );
-
-    #[cfg(windows)]
+    // N1 — the library contract, on every platform since the Linux installer
+    // arm landed. Windows loads `NRD.dll` with DXIL embedded, Linux
+    // `libNRD.so` with SPIR-V; the seven entry points, the structs and the
+    // version gate are identical, so this block is platform-free and the two
+    // places that are not (`nrd::LIB_FILE`, `PipelineDesc::shader`) carry the
+    // difference.
     {
+        // THE ABSENT/TOLD SPLIT, and it is a behaviour change on Windows too.
+        // Until now ANY `Nrd::new` error SKIPped, so a library built without
+        // the encoding pins — the exact drift the gate inside `Nrd::new`
+        // exists to catch — exited 0 having gated nothing. Absent is an
+        // environment fact and still SKIPs; present-but-REFUSED is a FAIL.
+        // One rule, both platforms — and the hole would be much wider here,
+        // where the artifact is built locally by a script anyone can mis-flag.
+        let lib_path = std::path::Path::new(&opts.nrd_path).join(nrd::LIB_FILE);
+        if !lib_path.exists() {
+            println!(
+                "check-nrd: SKIP N1 ({} not found); run `{}`",
+                lib_path.display(),
+                nrd::INSTALLER
+            );
+            return if ok { 0 } else { 1 };
+        }
         let denoisers = [nrd::DenoiserDesc {
             identifier: 0,
             denoiser: nrd::DENOISER_REBLUR_DIFFUSE_SPECULAR,
@@ -17539,18 +17867,57 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         let mut inst = match nrd::Nrd::new(&opts.nrd_path, &denoisers) {
             Ok(i) => i,
             Err(e) => {
-                // A missing/drifted DLL must not fail a bare-checkout gate run —
-                // but say exactly how to get one.
-                println!(
-                    "check-nrd: SKIP N1 (NRD.dll unavailable: {e}); run install-prerequisites.bat nrd"
-                );
-                return if ok { 0 } else { 1 };
+                eprintln!("check-nrd: FAIL N1 {e}");
+                return 1;
             }
         };
         println!(
-            "check-nrd: N1 NRD v{}.{}.{} loaded (encodings pinned 2/1)",
-            inst.version.0, inst.version.1, inst.version.2
+            "check-nrd: N1 {} v{}.{}.{} loaded from {} (encodings pinned 2/1)",
+            nrd::LIB_FILE,
+            inst.version.0,
+            inst.version.1,
+            inst.version.2,
+            opts.nrd_path
         );
+
+        // The SPIR-V register shifts. Read, printed FIELD BY NAME, and pinned
+        // — on BOTH platforms, because `g_NrdLibraryDesc` is a constexpr whose
+        // offsets reach it as compile definitions regardless of which shader
+        // arm was embedded, so a Windows DLL reports the same four. That makes
+        // the Windows gate protect a value only the Vulkan backend consumes.
+        //
+        // Naming each field in the line is the point: NRD's CMakeLists sets
+        // them in the order (S=0, B=2, U=3, T=20) and `Wrapper.cpp` REORDERS
+        // them into the struct, so bare integers here would read as agreeing
+        // with the build system while meaning something else entirely.
+        {
+            let o = inst.spirv_offsets;
+            let p = nrd::PIN_SPIRV_BINDING_OFFSETS;
+            println!(
+                "check-nrd: N1 spirv binding offsets sampler {} texture {} cbuffer {} storage {} \
+                 (pinned {}/{}/{}/{})",
+                o.sampler_offset,
+                o.texture_offset,
+                o.constant_buffer_offset,
+                o.storage_texture_and_buffer_offset,
+                p.sampler_offset,
+                p.texture_offset,
+                p.constant_buffer_offset,
+                p.storage_texture_and_buffer_offset,
+            );
+            if o.sampler_offset != p.sampler_offset
+                || o.texture_offset != p.texture_offset
+                || o.constant_buffer_offset != p.constant_buffer_offset
+                || o.storage_texture_and_buffer_offset != p.storage_texture_and_buffer_offset
+            {
+                eprintln!(
+                    "check-nrd: FAIL N1 spirv binding offsets != pinned — a descriptor layout \
+                     built from these would bind every resource at the wrong register"
+                );
+                ok = false;
+            }
+        }
+
         {
             let d = inst.instance_desc();
             let mut n1_ok = d.pipelines_num > 0
@@ -17558,27 +17925,191 @@ fn run_check_nrd(opts: &Opts) -> i32 {
                 && d.transient_pool_size > 0
                 && d.constant_buffer_max_data_size > 0
                 && d.samplers_num == 2;
-            // The install script builds DXIL-only — every pipeline must carry a
-            // DXIL blob or the GPU host has nothing to create PSOs from.
+            // Every pipeline must carry THIS platform's blob, or its host has
+            // nothing to create pipelines from. `shader()` is the one
+            // selector; the recorder uses the same one, so a green count here
+            // is a count of what would actually be loaded.
             let pipes = unsafe { std::slice::from_raw_parts(d.pipelines, d.pipelines_num as usize) };
-            let dxil_missing = pipes
+            let missing = pipes.iter().filter(|p| !p.shader().is_present()).count();
+            // Non-null-and-nonzero passes on garbage: assert the container
+            // magic so the bytes are the FORMAT they are claimed to be.
+            let bad_magic = pipes
                 .iter()
-                .filter(|p| p.compute_shader_dxil.bytecode.is_null() || p.compute_shader_dxil.size == 0)
+                .filter(|p| p.shader().is_present() && p.shader().magic() != Some(nrd::SHADER_MAGIC))
                 .count();
-            if dxil_missing > 0 {
+            // SPIR-V consumability, and the two halves are NOT the same claim.
+            // `vkCreateShaderModule` takes `*const u32` with `codeSize` a
+            // multiple of 4, so:
+            //   * a size that is not a whole number of words is MALFORMED —
+            //     SPIR-V is defined as a word stream, so this is a real defect
+            //     and fails;
+            //   * an ADDRESS that is not 4-byte aligned is perfectly legal —
+            //     NRD packs its blobs back to back in a data section and
+            //     promises nothing about their placement. It is a FINDING, not
+            //     a fault, and the finding is precisely what the Vulkan
+            //     recorder needs to know: it must copy into a `Vec<u32>`
+            //     rather than casting the pointer, which is what
+            //     `Spirv::compile` already returns everywhere else in src/vk/.
+            // Measuring it here is the whole reason this gate precedes the
+            // recorder instead of shipping with it.
+            let short_words =
+                pipes.iter().filter(|p| p.shader().is_present() && p.shader().size % 4 != 0).count();
+            let unaligned = pipes
+                .iter()
+                .filter(|p| {
+                    p.shader().is_present() && !(p.shader().bytecode as usize).is_multiple_of(4)
+                })
+                .count();
+            let blob_bytes: u64 = pipes.iter().map(|p| p.shader().size).sum();
+            if missing > 0 || bad_magic > 0 || short_words > 0 {
                 n1_ok = false;
             }
             println!(
-                "check-nrd: N1 pipelines {} (dxil-missing {dxil_missing}) | pool perm {} trans {} | \
+                "check-nrd: N1 pipelines {} ({}-missing {missing}, bad-magic {bad_magic}, \
+                 non-word-size {short_words}, {blob_bytes} B total) | pool perm {} trans {} | \
                  cb-max {} B | samplers {}",
                 d.pipelines_num,
+                nrd::SHADER_KIND,
                 d.permanent_pool_size,
                 d.transient_pool_size,
                 d.constant_buffer_max_data_size,
                 d.samplers_num
             );
+            if unaligned > 0 {
+                println!(
+                    "check-nrd: N1 NOTE — {unaligned} of {} blobs sit at a non-4-byte-aligned \
+                     address. Legal (NRD packs them back to back and promises no alignment) but \
+                     load-bearing for the Vulkan recorder: vkCreateShaderModule takes *const u32, \
+                     so the blobs must be COPIED into a Vec<u32>, never cast in place",
+                    d.pipelines_num
+                );
+            }
+
+            // The entry point every VkPipelineShaderStageCreateInfo needs, and
+            // that nothing reads today. Assert what is READ, print it, never
+            // hardcode the string.
+            let entry = if d.shader_entry_point.is_null() {
+                None
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(d.shader_entry_point) }.to_str().ok()
+            };
+            match entry {
+                Some(e) if !e.is_empty() => {
+                    println!(
+                        "check-nrd: N1 entry point {e:?} | spaces: resources {} cb+samplers {}",
+                        d.resources_space_index, d.constant_buffer_and_samplers_space_index
+                    );
+                }
+                _ => {
+                    eprintln!("check-nrd: FAIL N1 shader_entry_point is null/empty/non-UTF8");
+                    n1_ok = false;
+                }
+            }
+
+            // THE DESCRIPTOR LAYOUT IS REALISABLE — the assertion that only
+            // exists because a Vulkan recorder is coming, and the direct
+            // answer to "prove the foreign contract before a foreign-DECLARED
+            // layout is in flight". Build the binding windows that recorder
+            // will use, entirely from read values, and require them disjoint.
+            // With v4.17.3's numbers this reads samplers {0,1}, cbuffer {2},
+            // UAVs from 3, SRVs from 20 — which is what makes TREG=20 a
+            // hand-packed binding map rather than a magic number. Non-vacuous:
+            // it fires the moment a denoiser wants more than 17 storage
+            // images, or more than two samplers.
+            {
+                let o = inst.spirv_offsets;
+                let pool = d.descriptor_pool_desc;
+                let srv = (
+                    d.resources_base_register_index + o.texture_offset,
+                    pool.per_set_textures_max_num,
+                );
+                let uav = (
+                    d.resources_base_register_index + o.storage_texture_and_buffer_offset,
+                    pool.per_set_storage_textures_max_num,
+                );
+                let smp = (d.samplers_base_register_index + o.sampler_offset, d.samplers_num);
+                let cbv = (d.constant_buffer_register_index + o.constant_buffer_offset, 1);
+                let overlaps = |a: (u32, u32), b: (u32, u32)| {
+                    a.0 < b.0.saturating_add(b.1) && b.0 < a.0.saturating_add(a.1)
+                };
+                let same_space =
+                    d.resources_space_index == d.constant_buffer_and_samplers_space_index;
+                let mut clash = Vec::new();
+                if overlaps(srv, uav) {
+                    clash.push("SRV/UAV");
+                }
+                if overlaps(smp, cbv) {
+                    clash.push("sampler/cbuffer");
+                }
+                if same_space
+                    && (overlaps(srv, smp)
+                        || overlaps(srv, cbv)
+                        || overlaps(uav, smp)
+                        || overlaps(uav, cbv))
+                {
+                    clash.push("resources/cb+samplers (one space)");
+                }
+                println!(
+                    "check-nrd: N1 binding windows — samplers [{}, {}) cbuffer [{}, {}) \
+                     uav [{}, {}) srv [{}, {})",
+                    smp.0,
+                    smp.0 + smp.1,
+                    cbv.0,
+                    cbv.0 + cbv.1,
+                    uav.0,
+                    uav.0 + uav.1,
+                    srv.0,
+                    srv.0 + srv.1
+                );
+                if !clash.is_empty() {
+                    eprintln!(
+                        "check-nrd: FAIL N1 binding windows overlap ({}) — the descriptor \
+                         layout a recorder builds from these cannot be realised",
+                        clash.join(", ")
+                    );
+                    n1_ok = false;
+                }
+
+                // Pool coherence: a pipeline needing more than the per-set
+                // maximum means the one layout sized to those maxima is wrong
+                // for it.
+                let (mut max_tex, mut max_uav) = (0u32, 0u32);
+                for p in pipes {
+                    let (mut t, mut u) = (0u32, 0u32);
+                    let rr = unsafe {
+                        std::slice::from_raw_parts(p.resource_ranges, p.resource_ranges_num as usize)
+                    };
+                    for r in rr {
+                        if r.descriptor_type == nrd::DESC_TEXTURE {
+                            t += r.descriptors_num;
+                        } else {
+                            u += r.descriptors_num;
+                        }
+                    }
+                    max_tex = max_tex.max(t);
+                    max_uav = max_uav.max(u);
+                }
+                println!(
+                    "check-nrd: N1 pool — per-set tex {} (max over pipelines {max_tex}) storage {} \
+                     (max {max_uav}) | totals {}/{} | sets {}",
+                    pool.per_set_textures_max_num,
+                    pool.per_set_storage_textures_max_num,
+                    pool.total_textures_num,
+                    pool.total_storage_textures_num,
+                    pool.sets_max_num
+                );
+                if max_tex > pool.per_set_textures_max_num
+                    || max_uav > pool.per_set_storage_textures_max_num
+                    || pool.sets_max_num == 0
+                    || pool.total_textures_num < pool.per_set_textures_max_num
+                {
+                    eprintln!("check-nrd: FAIL N1 descriptor pool cannot cover its own pipelines");
+                    n1_ok = false;
+                }
+            }
+
             if !n1_ok {
-                eprintln!("check-nrd: FAIL N1 instance contract (see the counter line)");
+                eprintln!("check-nrd: FAIL N1 instance contract (see the counter lines)");
                 ok = false;
             }
         }

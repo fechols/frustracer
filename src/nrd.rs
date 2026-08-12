@@ -5,12 +5,20 @@
 //!
 //! FOOTPRINT POLICY (the xess.rs/OIDN shape): nothing links NRD and NO NRD
 //! header or shader is committed — the NVIDIA RTX SDKs license forbids source
-//! redistribution, which is also why `install-prerequisites.bat nrd` BUILDS
-//! the pinned tag locally instead of downloading a binary (NVIDIA publishes
-//! none). `NRD.dll` is `LoadLibraryExW`'d at runtime from `--nrd-path`
-//! (default `SDKs\NRD\bin`, env `FRUSTRACER_NRD_PATH`); a missing DLL is a
-//! loud shed, never an error, and every `--check*` except the DLL half of
-//! `--check-nrd` stays DLL-free.
+//! redistribution, which is also why the install scripts BUILD the pinned tag
+//! locally instead of downloading a binary (NVIDIA publishes none). The
+//! library is loaded at runtime from `--nrd-path` (default `SDKs/NRD/bin`,
+//! env `FRUSTRACER_NRD_PATH`); a missing library is a loud shed, never an
+//! error, and every `--check*` except the library half of `--check-nrd` stays
+//! DLL-free.
+//!
+//! TWO ARTIFACTS, ONE API. Windows loads `NRD.dll` with DXIL embedded, for
+//! D3D12; Linux loads `libNRD.so` with SPIR-V embedded, for the Vulkan
+//! backend — the SAME seven `extern "C"` entry points, the same structs, the
+//! same version gate. `LIB_FILE` is the one place the two names differ and
+//! `loader::imp` the one place the two `dlopen`s do; everything else in this
+//! file is platform-free, `oracle` and `remod` included (they are what
+//! `--check-nrd`'s DLL-free N0 gate scores on every platform).
 //!
 //! TRANSCRIPTION CONTRACT: every `#[repr(C)]` struct, enum value, and default
 //! below is transcribed from NRD **v4.17.3** `Include/{NRD.h, NRDDescs.h,
@@ -18,9 +26,13 @@
 //! Regenerate against the pinned tag as a whole, never hand-edit piecemeal
 //! (the nppd.rs `OrtApi` discipline). The `PIN_*` size asserts carry the
 //! MSVC-x64 `sizeof`/`offsetof` ground truth measured by compiling a sizer
-//! against the pinned headers (2026-08-08); `NRD_API` is `extern "C"`
-//! dllexport in the default shared build, so the seven entry points resolve
-//! unmangled. C++ references in the signatures are ABI pointers on x64.
+//! against the pinned headers (2026-08-08) — and because that `const _` block
+//! is UNCONDITIONAL, the fact that this file compiles on Linux is itself the
+//! proof that the Itanium C++ ABI lays these POD structs out identically.
+//! `NRD_API` is `extern "C"` dllexport in the default shared build (and
+//! `__attribute__((visibility("default")))` in the ELF one), so the seven
+//! entry points resolve unmangled on both. C++ references in the signatures
+//! are ABI pointers on x64.
 //! `Nrd::new` additionally gates `GetLibraryDesc` at runtime — version 4.17
 //! AND normalEncoding == 2 (R10G10B10A2 oct) AND roughnessEncoding == 1
 //! (linear), the build contract the install script's cmake flags fix — so a
@@ -38,9 +50,67 @@
 
 use std::ffi::c_void;
 
-/// The pinned NRD version — must match `install-prerequisites.bat`'s NRD_TAG.
+/// The pinned NRD version — must match `install-prerequisites.{bat,sh}`'s
+/// NRD_TAG.
 pub const PIN_MAJOR: u8 = 4;
 pub const PIN_MINOR: u8 = 17;
+
+/// The library file `--nrd-path` is expected to hold, per platform. ONE
+/// source of truth: the loader, the `--nrd-perf` probe in main's lever block
+/// and `--check-nrd`'s absent/told split all join it onto `--nrd-path`, so
+/// they cannot disagree about what "the artifact is missing" means.
+///
+/// macOS is spelled even though no installer arm produces it and no backend
+/// consumes it — a constant that names the platform's real convention is not
+/// a lie, whereas one that omitted the arm would read as "unreachable here"
+/// long after that stopped being true.
+pub const LIB_FILE: &str = if cfg!(windows) {
+    "NRD.dll"
+} else if cfg!(target_os = "macos") {
+    "libNRD.dylib"
+} else {
+    "libNRD.so"
+};
+
+/// The command that builds `LIB_FILE` on this platform. Every advice string
+/// reads this rather than spelling one installer, because the two scripts
+/// build DIFFERENT artifacts and naming the wrong one sends a reader to a
+/// machine they do not have.
+pub const INSTALLER: &str = if cfg!(windows) {
+    "install-prerequisites.bat nrd"
+} else {
+    "./install-prerequisites.sh nrd"
+};
+
+/// The shader blob this platform's artifact carries — for gate messages, so
+/// "0 missing" names what was counted. See `PipelineDesc::shader`.
+pub const SHADER_KIND: &str = if cfg!(windows) { "dxil" } else { "spirv" };
+
+/// NRD's SPIR-V register shifts, as `GetLibraryDesc` reports them.
+///
+/// PLATFORM-NEUTRAL, which is why this is not `cfg`'d: `g_NrdLibraryDesc` is a
+/// `constexpr` initialised unconditionally and `SPIRV_*_OFFSET` reach it as
+/// compile definitions regardless of `NRD_EMBEDS_SPIRV_SHADERS`, so a
+/// Windows-built `NRD.dll` reports the same four values a SPIRV build does.
+/// One pin, both platforms — and the Windows gate thereby protects a value the
+/// Vulkan backend depends on.
+///
+/// THE TRAP THIS PINS, and it is why the field order matters more than the
+/// numbers: NRD's CMakeLists hardcodes `SPIRV_SREG_OFFSET 0`, `BREG 2`,
+/// `UREG 3`, `TREG 20` as plain `set()`s (no `-D` can move them — a cache
+/// entry is shadowed by a later normal variable), and `Source/Wrapper.cpp`
+/// then REORDERS them into the struct as
+/// `{sampler, texture, constantBuffer, storageTextureAndBuffer}`. So the CMake
+/// order is (0, 2, 3, 20) and the struct order is (0, 20, 2, 3). These
+/// constants are written in STRUCT order, which is the order a descriptor
+/// layout gets built in; a recorder that read the CMake order would bind every
+/// resource at the wrong register and nothing but this pin would say so.
+pub const PIN_SPIRV_BINDING_OFFSETS: SpirvBindingOffsets = SpirvBindingOffsets {
+    sampler_offset: 0,
+    texture_offset: 20,
+    constant_buffer_offset: 2,
+    storage_texture_and_buffer_offset: 3,
+};
 
 // ---------------------------------------------------------------------------
 // Enums (values transcribed from NRDDescs.h / NRDSettings.h; carried as raw
@@ -224,6 +294,47 @@ pub struct PipelineDesc {
     pub resource_ranges_num: u32,
     pub has_constant_data: u8,
     pub shader_identifier: [u8; 256],
+}
+
+impl ComputeShaderDesc {
+    /// A blob is present iff it has both an address and a length. NRD zeroes
+    /// the arms its build did not embed.
+    pub fn is_present(&self) -> bool {
+        !self.bytecode.is_null() && self.size > 0
+    }
+
+    /// The blob's container magic, or `None` if it is shorter than one word.
+    /// Non-null-and-nonzero passes on garbage; this is what says the bytes are
+    /// the FORMAT they are claimed to be.
+    pub fn magic(&self) -> Option<u32> {
+        (self.is_present() && self.size >= 4)
+            .then(|| unsafe { std::ptr::read_unaligned(self.bytecode as *const u32) })
+    }
+}
+
+/// The container magic `shader()`'s blob must carry — SPIR-V's `0x07230203`
+/// header word, or the `DXBC` FourCC that wraps DXIL too (bytes `44 58 42 43`,
+/// which a little-endian word read returns as `0x43425844`).
+pub const SHADER_MAGIC: u32 = if cfg!(windows) { 0x4342_5844 } else { 0x0723_0203 };
+
+impl PipelineDesc {
+    /// The bytecode THIS platform's artifact carries — one selector, shared by
+    /// the `--check-nrd` gate and (later) the Vulkan recorder, so neither can
+    /// score a blob the other would not have loaded.
+    ///
+    /// The install scripts build DXIL on Windows and SPIRV everywhere else,
+    /// and off `WIN32` that is not even a choice: NRD's own
+    /// `cmake_dependent_option` forces DXIL and DXBC OFF.
+    pub fn shader(&self) -> &ComputeShaderDesc {
+        #[cfg(windows)]
+        {
+            &self.compute_shader_dxil
+        }
+        #[cfg(not(windows))]
+        {
+            &self.compute_shader_spirv
+        }
+    }
 }
 
 #[repr(C)]
@@ -691,21 +802,25 @@ const _: () = {
 // Loader (the xess.rs shape: LoadLibraryExW + GetProcAddress fn table).
 // ---------------------------------------------------------------------------
 
-// The DLL half is Windows-only: NRD ships `NRD.dll` with DXIL embedded for
-// D3D12. `oracle` below is the portable twin and stays compiled everywhere —
-// it is what --check-nrd's DLL-free N0 gate scores, and it must not evaporate
-// off Windows just because the loader cannot. (A Vulkan NRD build is a
-// different artifact, carrying SPIRV; see SpirvBindingOffsets above.)
-#[cfg(windows)]
+// TWO LOADERS, ONE EVERYTHING ELSE. `Api`'s seven signatures, the `resolve!`
+// macro, `load()`, the version/encoding gate and every wrapper below exist
+// exactly once; only three items split by platform (`imp::Lib`, `imp::open`,
+// `imp::sym`). That matters because the gate inside `Nrd::new` is the drift
+// check the whole transcription rests on, and a second copy of it would be a
+// second thing to keep in step.
+//
+// The seven `extern "system"` signatures are correct on BOTH platforms and it
+// would be a mistake to "fix" them to `extern "C"` for the Unix arm: NRD's
+// `NRD_CALL` is `__stdcall` only under `_WIN32` and empty otherwise, and
+// Rust's `extern "system"` IS `extern "C"` on every target except 32-bit
+// Windows. One declaration, both ABIs, by construction.
 mod loader {
     use super::*;
-    use windows::core::{PCSTR, PCWSTR};
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::System::LibraryLoader::{
-        GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
-    };
+    use std::path::Path;
 
-    /// The resolved NRD entry points (extern "C" ⇒ undecorated x64 exports).
+    /// The resolved NRD entry points (extern "C" ⇒ undecorated exports; a
+    /// Linux build additionally sets `-fvisibility=hidden` plus an explicit
+    /// default-visibility attribute, so these seven and nothing else).
     pub(super) struct Api {
         pub create_instance:
             unsafe extern "system" fn(*const InstanceCreationDesc, *mut *mut Instance) -> u32,
@@ -723,63 +838,137 @@ mod loader {
             *mut *const DispatchDesc,
             *mut u32,
         ) -> u32,
+        /// LAST, AND THAT IS LOAD-BEARING: declaration order is drop order,
+        /// and the seven pointers above point INTO this image. On Unix the
+        /// handle `dlclose`s when it drops; on Windows `HMODULE` has no `Drop`
+        /// and the module is never freed (the xess.rs/OIDN policy).
+        _lib: imp::Lib,
     }
 
-    fn load_dll(dir: &str, name: &str) -> Result<HMODULE, String> {
-        let path = format!("{dir}\\{name}");
-        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) }
-            .map_err(|e| format!("failed to load {path}: {e}"))
+    #[cfg(windows)]
+    mod imp {
+        use std::path::Path;
+        use windows::core::{PCSTR, PCWSTR};
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::System::LibraryLoader::{
+            GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
+        };
+
+        pub(super) type Lib = HMODULE;
+
+        pub(super) fn open(path: &Path) -> Result<Lib, String> {
+            // Absolute path: ALTERED_SEARCH_PATH only helps absolute paths,
+            // and the `\\?\` prefix canonicalize adds is not something the
+            // loader accepts.
+            let abs = std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+            let wide: Vec<u16> = abs.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) }
+                .map_err(|e| format!("failed to load {abs}: {e}"))
+        }
+
+        pub(super) fn sym(lib: &Lib, name: &[u8]) -> Option<*mut std::ffi::c_void> {
+            unsafe { GetProcAddress(*lib, PCSTR(name.as_ptr())) }
+                .map(|f| f as usize as *mut std::ffi::c_void)
+        }
+    }
+
+    #[cfg(unix)]
+    mod imp {
+        use std::path::Path;
+
+        pub(super) type Lib = libloading::Library;
+
+        pub(super) fn open(path: &Path) -> Result<Lib, String> {
+            // SAFETY: `dlopen` runs the library's initializers, which is
+            // arbitrary code. NRD's are the C++ runtime's own; the same
+            // argument vk/spirv.rs makes for libdxcompiler.so.
+            unsafe { libloading::Library::new(path) }
+                .map_err(|e| format!("failed to load {}: {e}", path.display()))
+        }
+
+        pub(super) fn sym(lib: &Lib, name: &[u8]) -> Option<*mut std::ffi::c_void> {
+            // Deref the `Symbol` to a plain pointer so its borrow of `lib`
+            // ends here — that is what lets `load()` move the handle into
+            // `Api` afterwards (vk/spirv.rs's `let create = *create;`).
+            unsafe { lib.get::<*mut std::ffi::c_void>(name) }.ok().map(|s| *s)
+        }
     }
 
     macro_rules! resolve {
-        ($h:expr, $name:literal) => {{
-            let sym = unsafe { GetProcAddress($h, PCSTR(concat!($name, "\0").as_ptr())) }
-                .ok_or_else(|| format!("NRD.dll: missing export {}", $name))?;
+        ($lib:expr, $name:literal) => {{
+            let sym = imp::sym(&$lib, concat!($name, "\0").as_bytes())
+                .ok_or_else(|| format!("{}: missing export {}", LIB_FILE, $name))?;
             #[allow(clippy::missing_transmute_annotations)]
             let f = unsafe { std::mem::transmute(sym) };
             f
         }};
     }
 
-    pub(super) fn load(dll_dir: &str) -> Result<Api, String> {
-        // Absolute path: ALTERED_SEARCH_PATH only helps absolute paths.
-        let dir = std::fs::canonicalize(dll_dir)
-            .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
-            .unwrap_or_else(|_| dll_dir.to_string());
-        let h = load_dll(&dir, "NRD.dll")?;
-        // The HMODULE is never freed (the SL/OIDN policy — fn pointers must
-        // stay valid for the process lifetime).
+    pub(super) fn load(dir: &str) -> Result<Api, String> {
+        let path = Path::new(dir).join(LIB_FILE);
+        // PROBE BEFORE OPENING, for two reasons. It is what gives
+        // --check-nrd's absent/told split its discriminator (absent is an
+        // environment fact and SKIPs; present-but-refused is a FAIL). And on
+        // Unix it closes a real hole: `dlopen` on a name carrying no path
+        // separator falls back to the SYSTEM search path, so `--nrd-path ""`
+        // would load something else rather than fail.
+        if !path.exists() {
+            return Err(format!("{} not found — run {INSTALLER}", path.display()));
+        }
+        let lib = imp::open(&path)?;
+        // Bind all seven BEFORE constructing, so on Unix every borrow of
+        // `lib` has ended by the time it moves into the struct.
+        let create_instance = resolve!(lib, "CreateInstance");
+        let destroy_instance = resolve!(lib, "DestroyInstance");
+        let get_library_desc = resolve!(lib, "GetLibraryDesc");
+        let get_instance_desc = resolve!(lib, "GetInstanceDesc");
+        let set_common_settings = resolve!(lib, "SetCommonSettings");
+        let set_denoiser_settings = resolve!(lib, "SetDenoiserSettings");
+        let get_compute_dispatches = resolve!(lib, "GetComputeDispatches");
         Ok(Api {
-            create_instance: resolve!(h, "CreateInstance"),
-            destroy_instance: resolve!(h, "DestroyInstance"),
-            get_library_desc: resolve!(h, "GetLibraryDesc"),
-            get_instance_desc: resolve!(h, "GetInstanceDesc"),
-            set_common_settings: resolve!(h, "SetCommonSettings"),
-            set_denoiser_settings: resolve!(h, "SetDenoiserSettings"),
-            get_compute_dispatches: resolve!(h, "GetComputeDispatches"),
+            create_instance,
+            destroy_instance,
+            get_library_desc,
+            get_instance_desc,
+            set_common_settings,
+            set_denoiser_settings,
+            get_compute_dispatches,
+            _lib: lib,
         })
     }
 }
 
-/// A live NRD instance over a runtime-loaded NRD.dll.
-#[cfg(windows)]
+/// A live NRD instance over a runtime-loaded NRD library.
+///
+/// `Nrd`'s OWN field order is deliberately NOT load-bearing, and the reason is
+/// worth stating so nobody cargo-cults one: `Drop::drop`'s BODY runs before
+/// any field drops, so `destroy_instance` is always called while the library
+/// is still mapped. What matters is that the handle lives inside `Api` inside
+/// `Nrd` at all — that is what makes the borrow checker enforce that
+/// `&InstanceDesc` and `&[DispatchDesc]`, both borrowed from library-owned
+/// memory and tied to `&self`, cannot outlive the mapping.
 pub struct Nrd {
     api: loader::Api,
     instance: *mut Instance,
     pub version: (u8, u8, u8),
+    /// NRD's SPIR-V register shifts, captured at load from the same
+    /// `LibraryDesc` the version gate read. Reported by `--check-nrd` N1 and
+    /// consumed by the Vulkan recorder, which builds its descriptor layout
+    /// from THIS value rather than from a literal.
+    pub spirv_offsets: SpirvBindingOffsets,
 }
 
-#[cfg(windows)]
 impl Nrd {
-    /// Load NRD.dll from `dll_dir`, gate the version/encoding pins, and
+    /// Load the NRD library from `dir`, gate the version/encoding pins, and
     /// create an instance over `denoisers`. Every failure is a `String` the
     /// caller sheds loudly with — never a panic.
     pub fn new(dll_dir: &str, denoisers: &[DenoiserDesc]) -> Result<Self, String> {
         let api = loader::load(dll_dir)?;
         let lib = unsafe { (api.get_library_desc)() };
         if lib.is_null() {
-            return Err("NRD.dll: GetLibraryDesc returned null".into());
+            return Err(format!("{LIB_FILE}: GetLibraryDesc returned null"));
         }
         let lib = unsafe { &*lib };
         // The drift gate: the transcribed structs and the bridge kernels'
@@ -787,8 +976,8 @@ impl Nrd {
         // encodings the install script's cmake flags fixed.
         if lib.version_major != PIN_MAJOR || lib.version_minor != PIN_MINOR {
             return Err(format!(
-                "NRD.dll v{}.{}.{} != pinned {PIN_MAJOR}.{PIN_MINOR} — rebuild via \
-                 install-prerequisites.bat nrd (or /force after a repo update)",
+                "{LIB_FILE} v{}.{}.{} != pinned {PIN_MAJOR}.{PIN_MINOR} — rebuild via \
+                 `{INSTALLER}` (force a rebuild after a repo update)",
                 lib.version_major, lib.version_minor, lib.version_build
             ));
         }
@@ -796,13 +985,20 @@ impl Nrd {
             || lib.roughness_encoding != ROUGHNESS_ENCODING_LINEAR
         {
             return Err(format!(
-                "NRD.dll encodings (normal {}, roughness {}) != pinned (2, 1) — the DLL was \
-                 built without the install script's cmake pins; rebuild via \
-                 install-prerequisites.bat nrd /force",
+                "{LIB_FILE} encodings (normal {}, roughness {}) != pinned (2, 1) — the library \
+                 was built without the install script's cmake pins; force a rebuild via \
+                 `{INSTALLER}`",
                 lib.normal_encoding, lib.roughness_encoding
             ));
         }
         let version = (lib.version_major, lib.version_minor, lib.version_build);
+        // Captured, deliberately NOT gated. The version/encoding pins above
+        // exist because a mismatch silently corrupts packing math with no
+        // other symptom; the binding offsets are consumed by a recorder that
+        // does not exist yet, so refusing a session over a value it never
+        // reads would be a degrade with no upside. The pin lives in
+        // --check-nrd's N1, which is what keeps this honest.
+        let spirv_offsets = lib.spirv_binding_offsets;
         let creation = InstanceCreationDesc {
             allocation_callbacks: AllocationCallbacks {
                 allocate: None,
@@ -818,7 +1014,7 @@ impl Nrd {
         if r != RESULT_SUCCESS || instance.is_null() {
             return Err(format!("NRD CreateInstance failed (result {r})"));
         }
-        Ok(Self { api, instance, version })
+        Ok(Self { api, instance, version, spirv_offsets })
     }
 
     /// The instance's resource/pipeline requirements. Valid for the
@@ -877,7 +1073,6 @@ impl Nrd {
     }
 }
 
-#[cfg(windows)]
 impl Drop for Nrd {
     fn drop(&mut self) {
         if !self.instance.is_null() {
