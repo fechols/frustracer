@@ -12,10 +12,21 @@
 /// ShaderMake and MathLib as URL zips, and putting the network inside every
 /// `cargo build` is not a trade worth making.
 ///
-/// The artifact half is Windows-only today because the artifact itself is —
-/// a Linux build emits libNRD.so carrying SPIR-V, which is right for a Vulkan
-/// backend and unloadable by the D3D12 sessions this tree currently renders
-/// with. When the Vulkan backend lands, add its arm here beside the DLL.
+/// The artifact is per TARGET: `NRD.dll` carrying DXIL for D3D12, `libNRD.so`
+/// carrying SPIR-V for the Vulkan backend. Both arms are hard requirements —
+/// the Linux one since the installer learned to build it — and both are keyed
+/// on `CARGO_CFG_TARGET_OS`, never `cfg!(windows)`, which describes the HOST
+/// (the defect `build_ffx_fsr3` documents below; `require_nrd` had it too, and
+/// only accidentally: it made cross-compiling to Windows skip the DLL check).
+///
+/// BUT THE ARTIFACT HALF FIRES ONLY ON A NATIVE BUILD, and that is a statement
+/// rather than an escape. The panic exists to stop a SESSION rendering
+/// undenoised without saying so; `cargo check --target x86_64-pc-windows-msvc`
+/// — what `tools/win-cross-check.sh` runs on a Linux box to type-check the
+/// `#[cfg(windows)]` half of this tree — produces no session and cannot
+/// produce an `NRD.dll` either. Keying the artifact on the target WITHOUT this
+/// guard would turn today's accidental pass into a hard panic and take the one
+/// tool that covers the Windows half every commit. Cross-builds get a warning.
 fn require_nrd() {
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=SDKs/NRD-src/CMakeLists.txt");
@@ -26,18 +37,46 @@ fn require_nrd() {
              default denoiser and is required to build.\n"
         );
     }
-    #[cfg(windows)]
-    {
-        println!("cargo:rerun-if-changed=SDKs/NRD/bin/NRD.dll");
-        if !manifest.join("SDKs/NRD/bin/NRD.dll").exists() {
-            panic!(
-                "\n\nNRD.dll is missing: SDKs\\NRD\\bin\\NRD.dll has not been built.\n    \
-                 install-prerequisites.bat nrd\n\nNeeds CMake (3.22...3.30) + VS 2022 C++ \
-                 tools; NVIDIA ships no prebuilt binaries, so it compiles locally from the \
-                 submodule.\n"
-            );
-        }
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // `HOST`/`TARGET` are triples cargo always sets for a build script.
+    let native = std::env::var("HOST").ok() == std::env::var("TARGET").ok();
+    let (rel, installer, deps) = match target_os.as_str() {
+        "windows" => (
+            "SDKs/NRD/bin/NRD.dll",
+            "install-prerequisites.bat nrd",
+            "CMake (3.22...3.30) + VS 2022 C++ tools",
+        ),
+        "linux" => (
+            "SDKs/NRD/bin/libNRD.so",
+            "./install-prerequisites.sh nrd",
+            "CMake + a C++17 compiler",
+        ),
+        // macOS and anything else: no NRD consumer exists there (NRD emits
+        // DXBC/DXIL/SPIR-V and has no Metal output at all), so requiring an
+        // artifact nothing loads would be a gate with no subject.
+        _ => return,
+    };
+    println!("cargo:rerun-if-changed={rel}");
+    if manifest.join(rel).exists() {
+        return;
     }
+    if !native {
+        println!(
+            "cargo:warning={rel} is missing, and this is a cross-build ({} -> {}) — the \
+             artifact check stands down, so this checks types only and produces nothing \
+             runnable. Build it with `{installer}` on the target platform.",
+            std::env::var("HOST").unwrap_or_default(),
+            std::env::var("TARGET").unwrap_or_default(),
+        );
+        return;
+    }
+    panic!(
+        "\n\nThe NRD library is missing: {rel} has not been built.\n    {installer}\n\n\
+         Needs {deps}; NVIDIA ships no prebuilt binaries, so it compiles locally from the \
+         submodule. NRD is the default denoiser, so a tree that cannot produce it is a tree \
+         whose default session silently runs undenoised.\n"
+    );
 }
 
 /// The FidelityFX SDK 1.1.4 core — the backend-neutral half of FSR3 for the

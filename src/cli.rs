@@ -126,14 +126,17 @@ pub struct Opts {
     /// --nppd conflict fatal vs a loud disarm, and what gates the
     /// "not armed" session notes (a default shouldn't nag DLSS sessions).
     pub nrd_explicit: bool,
-    /// Directory holding NRD.dll (install-prerequisites.bat nrd builds it).
+    /// Directory holding the NRD library — `NRD.dll` on Windows (DXIL, for
+    /// D3D12), `libNRD.so` on Linux (SPIR-V, for the Vulkan backend). The
+    /// filename is `nrd::LIB_FILE`; this is the ONE path default two platforms
+    /// consume, which is why it is the only one spelled with forward slashes.
     pub nrd_path: String,
-    /// Load the REBLUR_PERFORMANCE_MODE build of NRD.dll (`<nrd_path>\perf`,
-    /// the install script's second cmake tree) — cheaper ReBLUR internals
-    /// (6-tap Poisson, frame rotators, no Catmull-Rom history), same dispatch
-    /// count, lower quality. Perf mode is a COMPILE-TIME NRD option (no
-    /// ReblurSettings field exists for it in 4.17.3), hence a second DLL.
-    /// A missing perf DLL falls back to the standard one with a loud line.
+    /// Load the REBLUR_PERFORMANCE_MODE build (`<nrd_path>/perf`, the install
+    /// script's second cmake tree) — cheaper ReBLUR internals (6-tap Poisson,
+    /// frame rotators, no Catmull-Rom history), same dispatch count, lower
+    /// quality. Perf mode is a COMPILE-TIME NRD option (no ReblurSettings
+    /// field exists for it in 4.17.3), hence a second library. A missing perf
+    /// build falls back to the standard one with a loud line.
     pub nrd_perf: bool,
     /// Runtime ReblurSettings overrides (--nrd-max-stabilized-frames,
     /// --nrd-prepass-radius, --nrd-no-anti-firefly, --nrd-max-accum-frames,
@@ -867,9 +870,12 @@ pub fn defaults() -> Opts {
         // silently fail to exist.
         nrd: true,
         nrd_explicit: false,
-        nrd_path: std::env::var("FRUSTRACER_NRD_PATH").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\NRD\bin").to_string()
-        }),
+        // FORWARD SLASHES, unlike its four siblings below, and deliberately:
+        // this is the one SDK path TWO platforms consume, and Windows path
+        // APIs accept `/` while Linux does not accept `\`. The siblings stay
+        // backslashed because nothing off Windows reads them.
+        nrd_path: std::env::var("FRUSTRACER_NRD_PATH")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/SDKs/NRD/bin").to_string()),
         nrd_perf: false,
         nrd_tune: Default::default(),
         nrd_common: Default::default(),
@@ -2544,13 +2550,20 @@ pub fn usage() {
                 eprintln!("                is a git submodule and the BUILD REQUIRES it, so unlike every other");
                 eprintln!("                vendor level it cannot silently fail to exist. Arming surface: GPU");
                 eprintln!("                tracers x XeSS/FSR3 (DLSS-RR/FSR4-RR never arm it); excl. --nppd");
-                eprintln!("                (explicit pair exits 2); missing SDKs\\NRD\\bin\\NRD.dll sheds loudly —");
-                eprintln!("                install-prerequisites.bat nrd builds it");
+                eprintln!("                (explicit pair exits 2); a missing library sheds loudly —");
+                eprintln!("                `{}` builds it", crate::nrd::INSTALLER);
                 eprintln!("  --no-nrd      the default, spelled explicitly");
-                eprintln!("  --nrd-path    NRD.dll directory (default: SDKs\\NRD\\bin)");
-                eprintln!("  --nrd-perf    load the REBLUR_PERFORMANCE_MODE build (<nrd-path>\\perf\\NRD.dll —");
-                eprintln!("                install-prerequisites.bat nrd builds both): cheaper ReBLUR internals,");
-                eprintln!("                lower quality; missing perf DLL = loud line + the standard DLL");
+                eprintln!(
+                    "  --nrd-path    directory holding {} (default: SDKs/NRD/bin). Windows loads the",
+                    crate::nrd::LIB_FILE
+                );
+                eprintln!("                DXIL build for D3D12, Linux the SPIR-V one for the Vulkan backend");
+                eprintln!(
+                    "  --nrd-perf    load the REBLUR_PERFORMANCE_MODE build (<nrd-path>/perf/{} —",
+                    crate::nrd::LIB_FILE
+                );
+                eprintln!("                the installer builds both): cheaper ReBLUR internals, lower quality;");
+                eprintln!("                missing perf build = loud line + the standard one");
                 eprintln!("                (--no-nrd-perf spells the default)");
                 eprintln!("  --nrd-max-stabilized-frames N  ReBLUR tuning (unset = library default 63): 0 drops");
                 eprintln!("                the TemporalStabilization pass outright — the dispatch-level lever");

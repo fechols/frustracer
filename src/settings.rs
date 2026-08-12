@@ -1521,7 +1521,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("oidn_path", "OIDN DLL dir", "Advanced", Restart, Text, acc_str!(advanced.oidn_path)),
             item!("nppd_path", "ONNX Runtime DLL dir", "Advanced", Restart, Text, acc_str!(advanced.nppd_path)),
             item!("nppd_model", "NPPD model path", "Advanced", Restart, Text, acc_str!(advanced.nppd_model)),
-            item!("nrd_path", "NRD DLL dir", "Advanced", Restart, Text, acc_str!(advanced.nrd_path)),
+            item!("nrd_path", "NRD library dir", "Advanced", Restart, Text, acc_str!(advanced.nrd_path)),
             item!("xess_path", "XeSS DLL dir", "Advanced", Restart, Text, acc_str!(advanced.xess_path)),
             item!("ffx_path", "FidelityFX DLL dir", "Advanced", Restart, Text, acc_str!(advanced.ffx_path)),
             item!("fg_path", "FG provider DLL dir", "Advanced", Restart, Text, acc_str!(advanced.fg_path)),

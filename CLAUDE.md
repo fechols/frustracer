@@ -1663,12 +1663,46 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # the object-code-only grant is never engaged). build.rs's
                                       # require_nrd() hard-FAILS — not the DLSS block's
                                       # cargo:warning degrade — on a missing submodule (all
-                                      # platforms) or a missing SDKs\NRD\bin\NRD.dll (Windows;
-                                      # add the libNRD.so arm when the Vulkan backend lands, the
-                                      # SPIR-V artifact being right for it and unloadable by
-                                      # D3D12). Rationale: NRD is the DEFAULT denoiser, so a tree
-                                      # that cannot produce it is a tree whose default session
-                                      # silently runs undenoised. Consequences, all deliberate:
+                                      # platforms) or a missing ARTIFACT. Rationale: NRD is the
+                                      # DEFAULT denoiser, so a tree that cannot produce it is a
+                                      # tree whose default session silently runs undenoised.
+                                      # TWO ARTIFACTS SINCE 2026-08-11 (the Vulkan port's B4b-i),
+                                      # and the owed arm this comment used to promise is PAID:
+                                      # SDKs\NRD\bin\NRD.dll carrying DXIL for D3D12, and
+                                      # SDKs/NRD/bin/libNRD.so carrying SPIR-V for the Vulkan
+                                      # backend, both from the same submodule at the same tag with
+                                      # the same encoding pins — only the shader arm differs, and
+                                      # off WIN32 that is not even a choice (NRD's own
+                                      # cmake_dependent_option forces DXIL/DXBC OFF, and
+                                      # NRD_EMBEDS_SPIRV_SHADERS already defaults ON everywhere).
+                                      # `install-prerequisites.sh nrd` builds BOTH Linux arms
+                                      # (standard + perf) in ~18 s; the DLL half still is not
+                                      # producible off Windows and the blocker is dxil.dll, the
+                                      # Windows-only DXIL SIGNER, not CMake or MSVC.
+                                      # THE CHECK IS KEYED ON THE TARGET, NOT THE HOST — the
+                                      # `cfg!(windows)`-describes-the-HOST defect build_ffx_fsr3
+                                      # documents, which require_nrd had too and only
+                                      # accidentally: it made cross-compiling to Windows skip the
+                                      # DLL check. BUT THE ARTIFACT HALF FIRES ONLY ON A NATIVE
+                                      # BUILD (`HOST == TARGET`), and that is a statement rather
+                                      # than an escape: the panic exists to stop a SESSION
+                                      # rendering undenoised, and `cargo check --target
+                                      # x86_64-pc-windows-msvc` — what tools/win-cross-check.sh
+                                      # runs on a Linux box to type-check the cfg(windows) half of
+                                      # this tree — produces no session and cannot produce an
+                                      # NRD.dll either. Target-keying WITHOUT that guard turns
+                                      # today's accidental pass into a hard panic and takes the one
+                                      # tool covering the Windows half every commit; cross-builds
+                                      # get a cargo:warning naming the target's artifact and its
+                                      # installer (verified: the Linux->Windows cross-check prints
+                                      # the NRD.dll line and still exits 0). Consequence of the
+                                      # hard fail, accepted rather than discovered: a bare Linux
+                                      # clone must run the installer — network plus a CMake build —
+                                      # before `cargo build` works at all, CPU-tracer-only users
+                                      # included, so do_nrd's missing-cmake degrade is an
+                                      # UNCONDITIONAL fail (a named-only skip would leave a tree
+                                      # that no longer compiles; the two move together).
+                                      # Consequences, all deliberate:
                                       # .gitignore needs the `!/SDKs/NRD-src` negation (the
                                       # blanket /SDKs/* otherwise makes `git submodule add`
                                       # refuse — and NO trailing slash, which only matches an
@@ -2528,8 +2562,68 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # in FRD first, behind its own bit, with
                                       # NRD carrying it clear.
                                       # Gates: --check-nrd (N0
-                                      # DLL-free math twins + N1 instance/dispatch contract,
-                                      # absent-DLL = loud skip exit 0); --check-gpu N2
+                                      # DLL-free math twins + N1 instance/dispatch contract).
+                                      # N1 RUNS ON EVERY PLATFORM since 2026-08-11 (B4b-i) — it
+                                      # was Windows-only, printing a SKIP line here — and its
+                                      # absent/told split changed WITH that, on BOTH platforms:
+                                      # a MISSING artifact still SKIPs at exit 0 (an environment
+                                      # fact), but a PRESENT one the version/encoding gate REFUSES
+                                      # is now a FAIL. Until then any Nrd::new error SKIPped, so a
+                                      # library built without the cmake encoding pins — the exact
+                                      # drift that gate exists to catch — exited 0 having gated
+                                      # nothing, and the hole is far wider on Linux where the
+                                      # artifact is built locally by a script anyone can mis-flag
+                                      # (TOOTH FIRED: a -DNRD_NORMAL_ENCODING=0 build reads
+                                      # "encodings (normal 0, roughness 1) != pinned (2, 1)" and
+                                      # exits 1). MEASURED on Linux, and these are the numbers
+                                      # B4b-ii's recorder is designed against: 14 pipelines / 31
+                                      # dispatches / pool perm 13 trans 8 / cb-max 864 B /
+                                      # samplers 2 / entry point "main" / spaces resources 0,
+                                      # cb+samplers 1.
+                                      # N1'S NEW ASSERTIONS, all read from the library, no
+                                      # literals but the pins: (a) spirv_binding_offsets, PRINTED
+                                      # FIELD BY NAME and pinned at {sampler 0, texture 20,
+                                      # cbuffer 2, storage 3} — a field NOTHING in this tree had
+                                      # ever read, and a prerequisite INPUT to the Vulkan
+                                      # recorder's descriptor layout. UN-cfg'd deliberately:
+                                      # g_NrdLibraryDesc is constexpr and the offsets reach it as
+                                      # compile definitions regardless of which shader arm was
+                                      # embedded, so a Windows DLL reports the same four and the
+                                      # Windows gate thereby protects a value only Vulkan
+                                      # consumes. THE TRAP it pins: NRD's CMakeLists sets them as
+                                      # (S=0, B=2, U=3, T=20) plain set()s no -D can move, and
+                                      # Source/Wrapper.cpp REORDERS them into the struct as
+                                      # {sampler, texture, constantBuffer, storageTextureAndBuffer}
+                                      # — so a recorder reading the CMake order binds every
+                                      # resource at the wrong register (TOOTH FIRED: pinning
+                                      # 0/2/3/20 fails). Naming each field in the line is what
+                                      # makes that visible instead of four bare integers.
+                                      # (b) every pipeline carries THIS platform's blob, through
+                                      # ONE selector (PipelineDesc::shader) the recorder shares,
+                                      # plus its container MAGIC — non-null-and-nonzero passes on
+                                      # garbage. (c) THE DESCRIPTOR LAYOUT IS REALISABLE: the
+                                      # binding windows a recorder would build, computed from read
+                                      # values and required DISJOINT — measured samplers [0,2),
+                                      # cbuffer [2,3), uav [3,10), srv [20,38), which is what makes
+                                      # TREG=20 a hand-packed binding map rather than a magic
+                                      # number, and it is non-vacuous (it fires the moment a
+                                      # denoiser wants >17 storage images or >2 samplers; TOOTH
+                                      # FIRED by swapping one offset). (d) pool coherence against
+                                      # each pipeline's own resource_ranges. (e) the summed blob
+                                      # bytes — the FIRST thing that can tell the perf artifact
+                                      # from the standard one at gate time (LibraryDesc carries no
+                                      # perf bit, which is why the --nrd-perf pick must be loud):
+                                      # measured 523132 B standard vs 452988 B perf.
+                                      # THE FINDING, and the reason this gate precedes the recorder
+                                      # rather than shipping with it: 9 of 14 SPIR-V blobs sit at a
+                                      # NON-4-BYTE-ALIGNED address. That is legal — NRD packs them
+                                      # back to back and promises nothing — but vkCreateShaderModule
+                                      # takes *const u32, so B4b-ii must COPY each blob into a
+                                      # Vec<u32> and must never cast the pointer in place. Reported
+                                      # as a NOTE, not a failure; the half that IS a defect (a size
+                                      # that is not a whole number of words — SPIR-V is a word
+                                      # stream) fails, and reads 0.
+                                      # --check-gpu N2
                                       # (pack-vs-oracle, 0 bad px), N3 (passthrough byte-equal),
                                       # N4 (real ReBLUR: Laplacian −70%, energy +0.6%, temporal
                                       # 8× shrink, RESTART departs — N4 RESTORES frame B's
@@ -5856,8 +5950,8 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # san-miguel-low-poly.obj arms ALPHA_CUTOUT/TRANS_SHADOW, which
                                       # the procedural scene cannot reach) — and the summary reports
                                       # ASSEMBLED BYTES because the unit and module COUNTS cannot tell
-                                      # two scenes apart: both give 47/78. Measured 7747408 B procedural
-                                      # vs 7748552 B san-miguel, with FR_ABL=noalpha,notrans returning
+                                      # two scenes apart: both give 47/78. Measured 7797887 B procedural
+                                      # vs 7799031 B san-miguel, with FR_ABL=noalpha,notrans returning
                                       # it EXACTLY to the procedural count — the three-way proof the
                                       # keying reaches. (Refreshed 2026-08-11, TWICE in one day, and
                                       # the second time is the evidence for the caveat: the ABSOLUTE

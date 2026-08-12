@@ -574,14 +574,22 @@ fn main() {
     // LibraryDesc carries no perf bit, which is why the pick must be loud —
     // the version gate cannot tell the two DLLs apart after the fact.
     if opts.nrd_perf {
-        let perf_dir = format!("{}\\perf", opts.nrd_path);
-        if std::path::Path::new(&format!("{perf_dir}\\NRD.dll")).exists() {
-            eprintln!("nrd: performance-mode DLL selected ({perf_dir})");
-            opts.nrd_path = perf_dir;
+        // Ungated by platform, and correct on both since the Linux installer
+        // arm landed: `nrd::LIB_FILE` names the artifact and `Path::join` the
+        // separator, so this resolves a real `perf/libNRD.so` here exactly as
+        // it resolves `perf\NRD.dll` there. Gating it off on Linux would be
+        // the silent degrade the conventions forbid — the lever is real the
+        // moment the installer stages the second arm.
+        let perf_dir = std::path::Path::new(&opts.nrd_path).join("perf");
+        if perf_dir.join(nrd::LIB_FILE).exists() {
+            eprintln!("nrd: performance-mode library selected ({})", perf_dir.display());
+            opts.nrd_path = perf_dir.to_string_lossy().into_owned();
         } else {
             eprintln!(
-                "nrd: --nrd-perf requested but {perf_dir}\\NRD.dll not found — using the \
-                 standard DLL (run install-prerequisites.bat nrd to build both)"
+                "nrd: --nrd-perf requested but {} not found — using the standard library \
+                 (run `{}` to build both)",
+                perf_dir.join(nrd::LIB_FILE).display(),
+                nrd::INSTALLER
             );
         }
     }
@@ -17810,9 +17818,6 @@ fn run_check_vk_replay(
 }
 
 fn run_check_nrd(opts: &Opts) -> i32 {
-    // Only N1 reads it (the DLL path); N0 below is pure.
-    #[cfg(not(windows))]
-    let _ = opts;
     let mut ok = true;
 
     // N0 — DLL-free math twins.
@@ -17832,20 +17837,29 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         println!("check-nrd: N9-CPU remodulation identity OK");
     }
 
-    // N1 — the DLL contract. Windows-only for now, and SAID rather than
-    // silently skipped: NRD's D3D12 artifact is `NRD.dll` with DXIL
-    // embedded, which has no Linux equivalent (the portable NRD build
-    // carries SPIRV — see `SpirvBindingOffsets` in nrd.rs — and is a
-    // Vulkan-backend concern). N0 above is the DLL-free half and runs on
-    // every platform, so the packing math is still gated here.
-    #[cfg(not(windows))]
-    println!(
-        "check-nrd: SKIP N1 (the NRD.dll instance/dispatch contract is \
-         D3D12-only; N0's math twins ran)"
-    );
-
-    #[cfg(windows)]
+    // N1 — the library contract, on every platform since the Linux installer
+    // arm landed. Windows loads `NRD.dll` with DXIL embedded, Linux
+    // `libNRD.so` with SPIR-V; the seven entry points, the structs and the
+    // version gate are identical, so this block is platform-free and the two
+    // places that are not (`nrd::LIB_FILE`, `PipelineDesc::shader`) carry the
+    // difference.
     {
+        // THE ABSENT/TOLD SPLIT, and it is a behaviour change on Windows too.
+        // Until now ANY `Nrd::new` error SKIPped, so a library built without
+        // the encoding pins — the exact drift the gate inside `Nrd::new`
+        // exists to catch — exited 0 having gated nothing. Absent is an
+        // environment fact and still SKIPs; present-but-REFUSED is a FAIL.
+        // One rule, both platforms — and the hole would be much wider here,
+        // where the artifact is built locally by a script anyone can mis-flag.
+        let lib_path = std::path::Path::new(&opts.nrd_path).join(nrd::LIB_FILE);
+        if !lib_path.exists() {
+            println!(
+                "check-nrd: SKIP N1 ({} not found); run `{}`",
+                lib_path.display(),
+                nrd::INSTALLER
+            );
+            return if ok { 0 } else { 1 };
+        }
         let denoisers = [nrd::DenoiserDesc {
             identifier: 0,
             denoiser: nrd::DENOISER_REBLUR_DIFFUSE_SPECULAR,
@@ -17853,18 +17867,57 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         let mut inst = match nrd::Nrd::new(&opts.nrd_path, &denoisers) {
             Ok(i) => i,
             Err(e) => {
-                // A missing/drifted DLL must not fail a bare-checkout gate run —
-                // but say exactly how to get one.
-                println!(
-                    "check-nrd: SKIP N1 (NRD.dll unavailable: {e}); run install-prerequisites.bat nrd"
-                );
-                return if ok { 0 } else { 1 };
+                eprintln!("check-nrd: FAIL N1 {e}");
+                return 1;
             }
         };
         println!(
-            "check-nrd: N1 NRD v{}.{}.{} loaded (encodings pinned 2/1)",
-            inst.version.0, inst.version.1, inst.version.2
+            "check-nrd: N1 {} v{}.{}.{} loaded from {} (encodings pinned 2/1)",
+            nrd::LIB_FILE,
+            inst.version.0,
+            inst.version.1,
+            inst.version.2,
+            opts.nrd_path
         );
+
+        // The SPIR-V register shifts. Read, printed FIELD BY NAME, and pinned
+        // — on BOTH platforms, because `g_NrdLibraryDesc` is a constexpr whose
+        // offsets reach it as compile definitions regardless of which shader
+        // arm was embedded, so a Windows DLL reports the same four. That makes
+        // the Windows gate protect a value only the Vulkan backend consumes.
+        //
+        // Naming each field in the line is the point: NRD's CMakeLists sets
+        // them in the order (S=0, B=2, U=3, T=20) and `Wrapper.cpp` REORDERS
+        // them into the struct, so bare integers here would read as agreeing
+        // with the build system while meaning something else entirely.
+        {
+            let o = inst.spirv_offsets;
+            let p = nrd::PIN_SPIRV_BINDING_OFFSETS;
+            println!(
+                "check-nrd: N1 spirv binding offsets sampler {} texture {} cbuffer {} storage {} \
+                 (pinned {}/{}/{}/{})",
+                o.sampler_offset,
+                o.texture_offset,
+                o.constant_buffer_offset,
+                o.storage_texture_and_buffer_offset,
+                p.sampler_offset,
+                p.texture_offset,
+                p.constant_buffer_offset,
+                p.storage_texture_and_buffer_offset,
+            );
+            if o.sampler_offset != p.sampler_offset
+                || o.texture_offset != p.texture_offset
+                || o.constant_buffer_offset != p.constant_buffer_offset
+                || o.storage_texture_and_buffer_offset != p.storage_texture_and_buffer_offset
+            {
+                eprintln!(
+                    "check-nrd: FAIL N1 spirv binding offsets != pinned — a descriptor layout \
+                     built from these would bind every resource at the wrong register"
+                );
+                ok = false;
+            }
+        }
+
         {
             let d = inst.instance_desc();
             let mut n1_ok = d.pipelines_num > 0
@@ -17872,27 +17925,191 @@ fn run_check_nrd(opts: &Opts) -> i32 {
                 && d.transient_pool_size > 0
                 && d.constant_buffer_max_data_size > 0
                 && d.samplers_num == 2;
-            // The install script builds DXIL-only — every pipeline must carry a
-            // DXIL blob or the GPU host has nothing to create PSOs from.
+            // Every pipeline must carry THIS platform's blob, or its host has
+            // nothing to create pipelines from. `shader()` is the one
+            // selector; the recorder uses the same one, so a green count here
+            // is a count of what would actually be loaded.
             let pipes = unsafe { std::slice::from_raw_parts(d.pipelines, d.pipelines_num as usize) };
-            let dxil_missing = pipes
+            let missing = pipes.iter().filter(|p| !p.shader().is_present()).count();
+            // Non-null-and-nonzero passes on garbage: assert the container
+            // magic so the bytes are the FORMAT they are claimed to be.
+            let bad_magic = pipes
                 .iter()
-                .filter(|p| p.compute_shader_dxil.bytecode.is_null() || p.compute_shader_dxil.size == 0)
+                .filter(|p| p.shader().is_present() && p.shader().magic() != Some(nrd::SHADER_MAGIC))
                 .count();
-            if dxil_missing > 0 {
+            // SPIR-V consumability, and the two halves are NOT the same claim.
+            // `vkCreateShaderModule` takes `*const u32` with `codeSize` a
+            // multiple of 4, so:
+            //   * a size that is not a whole number of words is MALFORMED —
+            //     SPIR-V is defined as a word stream, so this is a real defect
+            //     and fails;
+            //   * an ADDRESS that is not 4-byte aligned is perfectly legal —
+            //     NRD packs its blobs back to back in a data section and
+            //     promises nothing about their placement. It is a FINDING, not
+            //     a fault, and the finding is precisely what the Vulkan
+            //     recorder needs to know: it must copy into a `Vec<u32>`
+            //     rather than casting the pointer, which is what
+            //     `Spirv::compile` already returns everywhere else in src/vk/.
+            // Measuring it here is the whole reason this gate precedes the
+            // recorder instead of shipping with it.
+            let short_words =
+                pipes.iter().filter(|p| p.shader().is_present() && p.shader().size % 4 != 0).count();
+            let unaligned = pipes
+                .iter()
+                .filter(|p| {
+                    p.shader().is_present() && !(p.shader().bytecode as usize).is_multiple_of(4)
+                })
+                .count();
+            let blob_bytes: u64 = pipes.iter().map(|p| p.shader().size).sum();
+            if missing > 0 || bad_magic > 0 || short_words > 0 {
                 n1_ok = false;
             }
             println!(
-                "check-nrd: N1 pipelines {} (dxil-missing {dxil_missing}) | pool perm {} trans {} | \
+                "check-nrd: N1 pipelines {} ({}-missing {missing}, bad-magic {bad_magic}, \
+                 non-word-size {short_words}, {blob_bytes} B total) | pool perm {} trans {} | \
                  cb-max {} B | samplers {}",
                 d.pipelines_num,
+                nrd::SHADER_KIND,
                 d.permanent_pool_size,
                 d.transient_pool_size,
                 d.constant_buffer_max_data_size,
                 d.samplers_num
             );
+            if unaligned > 0 {
+                println!(
+                    "check-nrd: N1 NOTE — {unaligned} of {} blobs sit at a non-4-byte-aligned \
+                     address. Legal (NRD packs them back to back and promises no alignment) but \
+                     load-bearing for the Vulkan recorder: vkCreateShaderModule takes *const u32, \
+                     so the blobs must be COPIED into a Vec<u32>, never cast in place",
+                    d.pipelines_num
+                );
+            }
+
+            // The entry point every VkPipelineShaderStageCreateInfo needs, and
+            // that nothing reads today. Assert what is READ, print it, never
+            // hardcode the string.
+            let entry = if d.shader_entry_point.is_null() {
+                None
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(d.shader_entry_point) }.to_str().ok()
+            };
+            match entry {
+                Some(e) if !e.is_empty() => {
+                    println!(
+                        "check-nrd: N1 entry point {e:?} | spaces: resources {} cb+samplers {}",
+                        d.resources_space_index, d.constant_buffer_and_samplers_space_index
+                    );
+                }
+                _ => {
+                    eprintln!("check-nrd: FAIL N1 shader_entry_point is null/empty/non-UTF8");
+                    n1_ok = false;
+                }
+            }
+
+            // THE DESCRIPTOR LAYOUT IS REALISABLE — the assertion that only
+            // exists because a Vulkan recorder is coming, and the direct
+            // answer to "prove the foreign contract before a foreign-DECLARED
+            // layout is in flight". Build the binding windows that recorder
+            // will use, entirely from read values, and require them disjoint.
+            // With v4.17.3's numbers this reads samplers {0,1}, cbuffer {2},
+            // UAVs from 3, SRVs from 20 — which is what makes TREG=20 a
+            // hand-packed binding map rather than a magic number. Non-vacuous:
+            // it fires the moment a denoiser wants more than 17 storage
+            // images, or more than two samplers.
+            {
+                let o = inst.spirv_offsets;
+                let pool = d.descriptor_pool_desc;
+                let srv = (
+                    d.resources_base_register_index + o.texture_offset,
+                    pool.per_set_textures_max_num,
+                );
+                let uav = (
+                    d.resources_base_register_index + o.storage_texture_and_buffer_offset,
+                    pool.per_set_storage_textures_max_num,
+                );
+                let smp = (d.samplers_base_register_index + o.sampler_offset, d.samplers_num);
+                let cbv = (d.constant_buffer_register_index + o.constant_buffer_offset, 1);
+                let overlaps = |a: (u32, u32), b: (u32, u32)| {
+                    a.0 < b.0.saturating_add(b.1) && b.0 < a.0.saturating_add(a.1)
+                };
+                let same_space =
+                    d.resources_space_index == d.constant_buffer_and_samplers_space_index;
+                let mut clash = Vec::new();
+                if overlaps(srv, uav) {
+                    clash.push("SRV/UAV");
+                }
+                if overlaps(smp, cbv) {
+                    clash.push("sampler/cbuffer");
+                }
+                if same_space
+                    && (overlaps(srv, smp)
+                        || overlaps(srv, cbv)
+                        || overlaps(uav, smp)
+                        || overlaps(uav, cbv))
+                {
+                    clash.push("resources/cb+samplers (one space)");
+                }
+                println!(
+                    "check-nrd: N1 binding windows — samplers [{}, {}) cbuffer [{}, {}) \
+                     uav [{}, {}) srv [{}, {})",
+                    smp.0,
+                    smp.0 + smp.1,
+                    cbv.0,
+                    cbv.0 + cbv.1,
+                    uav.0,
+                    uav.0 + uav.1,
+                    srv.0,
+                    srv.0 + srv.1
+                );
+                if !clash.is_empty() {
+                    eprintln!(
+                        "check-nrd: FAIL N1 binding windows overlap ({}) — the descriptor \
+                         layout a recorder builds from these cannot be realised",
+                        clash.join(", ")
+                    );
+                    n1_ok = false;
+                }
+
+                // Pool coherence: a pipeline needing more than the per-set
+                // maximum means the one layout sized to those maxima is wrong
+                // for it.
+                let (mut max_tex, mut max_uav) = (0u32, 0u32);
+                for p in pipes {
+                    let (mut t, mut u) = (0u32, 0u32);
+                    let rr = unsafe {
+                        std::slice::from_raw_parts(p.resource_ranges, p.resource_ranges_num as usize)
+                    };
+                    for r in rr {
+                        if r.descriptor_type == nrd::DESC_TEXTURE {
+                            t += r.descriptors_num;
+                        } else {
+                            u += r.descriptors_num;
+                        }
+                    }
+                    max_tex = max_tex.max(t);
+                    max_uav = max_uav.max(u);
+                }
+                println!(
+                    "check-nrd: N1 pool — per-set tex {} (max over pipelines {max_tex}) storage {} \
+                     (max {max_uav}) | totals {}/{} | sets {}",
+                    pool.per_set_textures_max_num,
+                    pool.per_set_storage_textures_max_num,
+                    pool.total_textures_num,
+                    pool.total_storage_textures_num,
+                    pool.sets_max_num
+                );
+                if max_tex > pool.per_set_textures_max_num
+                    || max_uav > pool.per_set_storage_textures_max_num
+                    || pool.sets_max_num == 0
+                    || pool.total_textures_num < pool.per_set_textures_max_num
+                {
+                    eprintln!("check-nrd: FAIL N1 descriptor pool cannot cover its own pipelines");
+                    n1_ok = false;
+                }
+            }
+
             if !n1_ok {
-                eprintln!("check-nrd: FAIL N1 instance contract (see the counter line)");
+                eprintln!("check-nrd: FAIL N1 instance contract (see the counter lines)");
                 ok = false;
             }
         }
