@@ -22727,13 +22727,41 @@ fn run_cinematic(
         _ => Vec::new(),
     };
 
-    let arm = if opts.gpu {
-        "gpu"
-    } else if opts.dxr {
-        "dxr"
-    } else {
-        "cpu"
+    // ONE predicate for the label and the dispatch below. They used to be
+    // derived separately and had drifted: `opts.dxr` defaults to true, so a
+    // bare `--cinematic` off Windows announced `[dxr]` and then rendered every
+    // frame on the CPU.
+    let pick = cinematic::pick_arm(opts.gpu, opts.dxr, opts.mode_explicit);
+    let arm = match pick {
+        cinematic::ArmPick::Cpu => "cpu",
+        #[cfg(windows)]
+        cinematic::ArmPick::Gpu => {
+            if opts.gpu {
+                "gpu"
+            } else {
+                "dxr"
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        cinematic::ArmPick::Gpu => "vk",
+        #[cfg(target_os = "macos")]
+        cinematic::ArmPick::Gpu => "cpu",
     };
+    // Beside the label rather than at the dispatch, so `--cinematic-dry-run`
+    // — whose whole job is to make the decision observable without rendering —
+    // explains the one case where the label is not what was asked for. A
+    // SUBSTITUTION, not a refusal: this backend has exactly one GPU arm, so
+    // there is nothing to be told about, and the `--fsr4` exit-2 doctrine is
+    // about being told something impossible rather than about a default.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if pick == cinematic::ArmPick::Gpu
+        && cinematic::asked_for_dxr(opts.gpu, opts.dxr, opts.mode_explicit)
+    {
+        eprintln!(
+            "cinematic: --dxr names a DispatchRays pipeline, which the Vulkan backend does not \
+             have — using the Vulkan wavefront tracer"
+        );
+    }
     eprintln!(
         "cinematic: {} shot(s) [{arm}] | out {} | fps {} | tod {} | pid {}",
         shots.len(),
@@ -22808,10 +22836,23 @@ fn run_cinematic(
     }
 
     #[cfg(windows)]
-    if opts.gpu || opts.dxr {
+    if pick == cinematic::ArmPick::Gpu {
         match run_cinematic_gpu(scene, bvh, world, &shots, &attractors, cine, opts) {
             Ok(code) => return code,
             Err(e) => eprintln!("cinematic: GPU arm unavailable ({e}) — falling back to the CPU tracer"),
+        }
+    }
+    // The Vulkan arm, in the SAME shape as the Windows one: unreachable-if-not
+    // picked, and an `Err` falls through to the CPU tracer with one line. So
+    // the degrade chain reads identically on both platforms and the CPU arm is
+    // still the floor everywhere.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if pick == cinematic::ArmPick::Gpu {
+        match run_cinematic_vk(scene, bvh, &shots, &attractors, cine, opts) {
+            Ok(code) => return code,
+            Err(e) => {
+                eprintln!("cinematic: Vulkan arm unavailable ({e}) — falling back to the CPU tracer")
+            }
         }
     }
     run_cinematic_cpu(scene, bvh, &shots, &attractors, cine, opts)
@@ -23085,6 +23126,436 @@ fn run_cinematic_cpu(
         cine_encode(&dir, shot, cine);
     }
     0
+}
+
+/// THE VULKAN ARM — the first thing on this backend that produces a picture.
+///
+/// Sixteen `--check-vk` stages have scored the Vulkan tracer and every one of
+/// them ends in a number; nobody has ever looked at its output. This is the
+/// mode that makes that possible without a window, and it needs no swapchain,
+/// no surface, no graphics pipeline and no new dependency, because the whole
+/// presentation path below `cine_write_frame` is already portable and already
+/// runs here for the CPU arm.
+///
+/// It carries the D3D12 arm's shape with the parts that have no peer here
+/// dropped rather than emulated: ONE upscaler (FSR3 — see the vendor survey;
+/// XeSS ships no Linux library and DLSS has no Vulkan NGX at all), ONE denoiser
+/// (NRD, which is the compiled default), no dual-GPU, no HUD.
+///
+/// TWO ARMS PER SHOT, exactly as on D3D12:
+///   * RECONSTRUCTION — every sub-frame is a fresh jittered frame the temporal
+///     model integrates, and the frame written is FFX's reconstructed output.
+///   * ACCUMULATION — the fallback, and the arm a GI shot always takes, because
+///     the hemisphere integrator is a still-frame accumulation contract.
+///
+/// THE TRACER IS CACHED BY RESOLUTION and not rebuilt per shot: constructing
+/// one compiles the whole kernel corpus through DXC, which is ~20 s, and the
+/// `islands` preset is seven shots at one resolution.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_cinematic_vk(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    shots: &[cinematic::Shot],
+    attractors: &[world::TodAttractor],
+    cine: &cinematic::CineOpts,
+    opts: &Opts,
+) -> Result<i32, String> {
+    let hg = vk::headless::VkHeadless::new(false).map_err(|e| e.to_string())?;
+    if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU {
+        // A software ICD renders this correctly and uselessly slowly, and FFX
+        // declines to create a context on one at all. Say so and let the CPU
+        // tracer — which is genuinely faster here — take it.
+        return Err(format!("{} is a software device", hg.vk.info.name));
+    }
+    let sp = vk::spirv::Spirv::load(&vk::spirv::default_dir())?;
+    let vs = vk::scene::VkScene::new(&hg, scene, bvh)?;
+    let vt = vk::textures::VkTextures::new(&hg, &sp, scene, opts.bc7)?;
+
+    // WHAT THIS BACKEND CANNOT DO, each said once and loudly rather than
+    // discovered in the output. `--fsr4` is the exception that stays fatal:
+    // it is a REQUIREMENT rather than a preference, which is the whole point
+    // of the flag.
+    if opts.fsr4_required {
+        return Err(
+            "--fsr4 requires the FSR4 Ray Regeneration provider, which is a D3D12 DLL — this \
+             backend upscales with FSR 3.1 only. Drop the flag, or use --fsr3"
+                .into(),
+        );
+    }
+    if opts.chain.dlss || opts.chain.fsr4 || opts.chain.xess {
+        eprintln!(
+            "cinematic: DLSS / FSR4-RR / XeSS have no Linux artifact — falling through the chain \
+             to FSR 3.1"
+        );
+    }
+    if opts.dual_gpu.is_some() {
+        eprintln!("cinematic: --dual-gpu is D3D12-only — capturing on one device");
+    }
+    if opts.frd {
+        eprintln!("cinematic: --frd is D3D12-only — the capture denoises with NRD, or --no-nrd");
+    }
+    if scene.sway.is_some() {
+        // The animated TLAS ring has no Vulkan peer, so the rest pose is what
+        // traces. A leaf that never moves is a picture of nothing with no
+        // error, which is worse than a missing feature — so name it.
+        eprintln!(
+            "cinematic: foliage sway has no Vulkan arm — leaves render at their REST POSE (the \
+             `foliage` preset has nothing to show on this backend; use --cpu for it)"
+        );
+    }
+
+    // The upscaler, if the chain wants one AND it is compiled in. The
+    // accumulation arm is the fallback and is never an error.
+    let want_up = opts.chain != upchain::UpChain::NONE && vk::fsr3::built();
+    if opts.chain != upchain::UpChain::NONE && !vk::fsr3::built() {
+        eprintln!(
+            "cinematic: FidelityFX was not compiled in (./install-prerequisites.sh fsr3src) — \
+             accumulation fallback"
+        );
+    }
+    let want_dn = want_up && opts.nrd;
+
+    let mut built: Option<((usize, usize), CineVk)> = None;
+    let mut code = 0;
+
+    for shot in shots {
+        let (rw, rh) = shot.res;
+        let dir = cine_prepare_dir(cine, shot)?;
+        let q = cine_quality(shot);
+        // A GI shot integrates the hemisphere, which is a still-frame
+        // accumulation contract — so it takes the accumulation arm whatever the
+        // chain says. D3D12 does the same, for the same reason.
+        let recon = want_up && !shot.gi;
+
+        if built.as_ref().map(|(r, _)| *r) != Some((rw, rh)) {
+            if let Some((_, old)) = built.take() {
+                old.destroy(&hg);
+            }
+            built = Some((
+                (rw, rh),
+                CineVk::build(&hg, &sp, scene, &vs, &vt, bvh, rw, rh, recon, want_dn, opts)?,
+            ));
+        }
+        let cv = &mut built.as_mut().unwrap().1;
+
+        let frames = shot.kind.frames();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let mut present = vec![0u32; rw * rh];
+        let mut prev_hour: Option<f32> = None;
+        let t_shot = Instant::now();
+
+        for f in 0..frames {
+            let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
+            cv.tg.refresh_sky(scene);
+            let hdr = cv.output_frame(&hg, scene, shot, &fs, f, rw, rh, q, opts)?;
+
+            if shot.overlay {
+                let ib = hg.read_buffer(&cv.tg.info, rw * rh * 4)?;
+                for (dst, c) in info.iter().zip(ib.chunks_exact(4)) {
+                    dst.store(u32::from_le_bytes(c.try_into().unwrap()), Relaxed);
+                }
+            }
+            cine_write_frame(
+                &dir, shot, cine, f, &hdr, &info, &mut present, &fs, rw, rh, "VK",
+            );
+            cine_progress(shot, f, frames, t_shot, fs.hour);
+        }
+        cine_finish(&dir, shot, t_shot);
+        cine_encode(&dir, shot, cine);
+        code = 0;
+    }
+
+    if let Some((_, b)) = built.take() {
+        b.destroy(&hg);
+    }
+    vs.destroy(&hg);
+    vt.destroy(&hg);
+    Ok(code)
+}
+
+/// One resolution's worth of Vulkan capture state.
+///
+/// A struct rather than D3D12's positional tuple for a reason this backend has
+/// and that one does not: `VkTracer`, `Fsr3` and `VkNrd` have `destroy(&hg)`
+/// and NO `Drop`, so a forgotten teardown leaks device memory across a
+/// seven-shot preset. One `destroy` in reverse construction order makes that
+/// structural instead of remembered.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct CineVk {
+    tg: vk::tracer::VkTracer,
+    up: Option<vk::fsr3::Fsr3>,
+    dn: Option<vk::nrd::VkNrd>,
+    /// Free-running across the WHOLE shot, so the Halton phase never restarts.
+    seq: u32,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl CineVk {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        hg: &vk::headless::VkHeadless,
+        sp: &vk::spirv::Spirv,
+        scene: &scene::Scene,
+        vs: &vk::scene::VkScene,
+        vt: &vk::textures::VkTextures,
+        bvh: &bvh::Bvh,
+        rw: usize,
+        rh: usize,
+        recon: bool,
+        want_dn: bool,
+        opts: &Opts,
+    ) -> Result<CineVk, String> {
+        let tg = vk::tracer::VkTracer::new(
+            hg,
+            sp,
+            scene,
+            vs,
+            vt,
+            bvh,
+            rw as u32,
+            rh as u32,
+            vk::tracer::TracerOpts {
+                gbuf_full: recon,
+                feed: recon,
+                nrd: recon && want_dn,
+            },
+        )?;
+        // The upscaler runs at 1:1 — `--cinematic` is DLAA-shaped by design
+        // (`run_cinematic_gpu` captures at 100% render scale), so the temporal
+        // model is an antialiaser and integrator rather than a magnifier.
+        let up = if recon {
+            match vk::fsr3::Fsr3::new(
+                hg,
+                (rw as u32, rh as u32),
+                (rw as u32, rh as u32),
+                vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("cinematic: FSR3 unavailable ({e}) — accumulation fallback");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let dn = match (&up, want_dn) {
+            (Some(_), true) => match tg.nrd_plane_handles() {
+                Some(planes) => {
+                    match vk::nrd::VkNrd::new(hg, &opts.nrd_path, rw as u32, rh as u32, &planes) {
+                        Ok(e) => {
+                            eprintln!(
+                                "nrd: armed — cinematic pre-upscale denoising at {rw}x{rh} ({})",
+                                opts.nrd_path
+                            );
+                            Some(e)
+                        }
+                        Err(e) => {
+                            eprintln!("nrd: unavailable ({e}) — the capture upscales undenoised");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(f) = &up {
+            tg.wire_feed(hg, f.feed_views());
+        }
+        if dn.is_some() {
+            tg.wire_nrd(hg);
+        }
+        Ok(CineVk { tg, up, dn, seq: 0 })
+    }
+
+    /// Render ONE output frame and return it as a linear f32 RGB image.
+    #[allow(clippy::too_many_arguments)]
+    fn output_frame(
+        &mut self,
+        hg: &vk::headless::VkHeadless,
+        scene: &scene::Scene,
+        shot: &cinematic::Shot,
+        fs: &CineFrame,
+        f: u32,
+        rw: usize,
+        rh: usize,
+        q: Quality,
+        opts: &Opts,
+    ) -> Result<Vec<f32>, String> {
+        let basis = fs.cam.basis(rw, rh);
+        let (near, far) = dlss::near_far(scene.diag);
+        let samples = shot.samples.max(1);
+
+        let Some(up) = self.up.as_ref() else {
+            return self.accumulate(hg, scene, fs, &basis, samples, q, opts);
+        };
+
+        // OUTPUT FRAME 0 GETS A WARM-UP, and it is not optional: `seq`
+        // free-runs while `reset` fires once per shot, so frame 0 would be
+        // reconstructed from under half a jitter phase AND sampled on a biased
+        // lattice — a discontinuity that, in a looping clip, shows once per lap.
+        // Self-limiting: a 256-sample still is already several phases, so the
+        // extra count is 0 there. Deliberately NOT applied to the accumulation
+        // arm, whose frame 0 is statistically identical to any other.
+        let warm = if f == 0 { dlss::JITTER_PHASE.saturating_sub(samples) } else { 0 };
+
+        let mut out = Vec::new();
+        for k in 0..warm + samples {
+            let emit = k >= warm;
+            let jit = dlss::jitter_for(self.seq);
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: self.seq,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some(jit),
+                prev_cam: Some(basis),
+                q,
+                verify: false,
+                spp: opts.spp,
+                probe_sample: 0,
+                clouds: fs.clouds,
+                fireflies: fs.fireflies,
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            let dp = vk::fsr3::Dispatch {
+                jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
+                mv_scale: fsr::UPSCALE_MV_SIGN,
+                near_far: (near, far),
+                fov_y: fs.cam.fov_y,
+                dt_ms: gfx::denoise::NOMINAL_DT_MS,
+                reset: self.seq == 0,
+            };
+            self.tg.render_wavefront(hg, &p, true)?;
+
+            match self.dn.as_mut() {
+                // THE COMPOSED FRAME (B5a): pack -> ReBLUR -> recompose -> FFX,
+                // and NO feed dispatch — the folded pack wrote the guides and
+                // the recompose wrote the colour.
+                Some(eng) => {
+                    let mats = dlss::cam_matrices(&fs.cam, rw, rh, near, far);
+                    let (pw, ph) = eng.prev_size();
+                    let cs = gfx::denoise::common_settings(
+                        &mats,
+                        &mats,
+                        jit,
+                        dlss::jitter_for(self.seq.saturating_sub(1)),
+                        rw as u32,
+                        rh as u32,
+                        pw,
+                        ph,
+                        far,
+                        gfx::denoise::NOMINAL_DT_MS,
+                        self.seq,
+                        self.seq == 0,
+                        false,
+                    );
+                    let rs = gfx::denoise::reblur_settings();
+                    let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+                    up.frame_fed(
+                        hg,
+                        |d, cmd| {
+                            unsafe {
+                                r1 = self.tg.record_nrd_pack(d, cmd);
+                                r2 = eng.record(d, cmd, &cs, &rs);
+                                r3 = self.tg.record_nrd_out(d, cmd);
+                            }
+                            r2.clone()
+                        },
+                        dp,
+                    )?;
+                    r1?;
+                    r2?;
+                    r3?;
+                }
+                None => {
+                    let mut rf = Ok(());
+                    up.frame_fed(
+                        hg,
+                        |d, cmd| {
+                            rf = unsafe { self.tg.record_feed(d, cmd) };
+                            rf.clone()
+                        },
+                        dp,
+                    )?;
+                    rf?;
+                }
+            }
+            self.seq += 1;
+            if emit && k + 1 == warm + samples {
+                out = up.read_output(hg)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The accumulation arm: N sub-frames at ONE pose into `accum`, averaged.
+    ///
+    /// Structure REPLAY across sub-frames 1..N-1 is a pure win and is why high
+    /// sample counts are affordable — the terminal quadtree is a function of
+    /// (scene, BVH, basis, rw, rh) only, and the pose is bit-equal across a
+    /// shot's sub-frames BY CONSTRUCTION (one `basis`, computed once). This
+    /// backend asks the CALLER to prove that bit-equality rather than keeping a
+    /// `last_struct` cache, and "the same variable, reused" is the narrowest
+    /// possible proof of it.
+    fn accumulate(
+        &self,
+        hg: &vk::headless::VkHeadless,
+        scene: &scene::Scene,
+        fs: &CineFrame,
+        basis: &camera::CamBasis,
+        samples: u32,
+        q: Quality,
+        opts: &Opts,
+    ) -> Result<Vec<f32>, String> {
+        let _ = scene;
+        for k in 0..samples {
+            let p = gfx::frame::FrameParams {
+                cam: *basis,
+                frame: k,
+                accumulate: true,
+                // Sub-frame 0 is the pixel CENTRE, 1.. are jittered — the
+                // codebase's accumulation convention.
+                jitter: k > 0,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp: opts.spp,
+                probe_sample: 0,
+                clouds: fs.clouds,
+                fireflies: fs.fireflies,
+                sway_time: None,
+                sway_prev_time: None,
+                replay: k > 0 && opts.replay,
+            };
+            if k > 0 && opts.replay {
+                self.tg.render_wavefront_replay(hg, &p, k == 0)?;
+            } else {
+                self.tg.render_wavefront(hg, &p, k == 0)?;
+            }
+        }
+        let px = self.tg.rw as usize * self.tg.rh as usize;
+        let bytes = hg.read_buffer(&self.tg.accum, px * 3 * 4)?;
+        let inv = 1.0 / samples as f32;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()) * inv)
+            .collect())
+    }
+
+    fn destroy(self, hg: &vk::headless::VkHeadless) {
+        if let Some(d) = self.dn {
+            d.destroy(hg);
+        }
+        if let Some(u) = self.up {
+            u.destroy(hg);
+        }
+        self.tg.destroy(hg);
+    }
 }
 
 /// Write one output frame's files from the averaged LINEAR image.

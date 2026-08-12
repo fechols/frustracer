@@ -258,8 +258,27 @@ except the vendor upscaler):
 ```bash
 ./install-prerequisites.sh dxc spirv
 cargo run --release -- --check-spirv   # the whole shader corpus -> SPIR-V, validated
-cargo run --release -- --check-vk      # device, tracer, hemi tiers, replay, BC7, FSR3
+cargo run --release -- --check-vk      # device, tracer, hemi tiers, replay, BC7, FSR3, NRD
 ```
+
+There is no window on Linux yet, but there is a picture: `--cinematic` has a
+Vulkan arm, so the GPU tracer renders stills and camera-spline sequences
+straight to PNG (and to PQ/EXR under `--cinematic-hdr`, and to video through the
+ffmpeg lines it prints). NRD denoises and FSR 3.1 reconstructs each frame; GI
+shots take the accumulation path, which is the one thing a live session could
+never do anyway.
+
+```bash
+cargo run --release -- --cinematic hero --gpu          # a still, Vulkan-traced
+cargo run --release -- --cinematic orbit --gpu         # a sequence + the ffmpeg commands
+cargo run --release -- --cinematic hero --gpu --cinematic-gi   # moving camera WITH bounce GI
+```
+
+Every arm hands the same linear image to the same tone curve, so the Vulkan and
+CPU captures agree on level to a fraction of a step — but they are not
+bit-identical and cannot be, being different tracers with different
+reconstruction. Foliage sway has no Vulkan arm yet and renders at the rest pose,
+which the run says out loud.
 
 `FR_VK_DEVICE=<index|name>` picks the adapter, `FR_VK_MAP=1` prints the derived
 register map, and `FR_VK_VALIDATION=0` opts out of the validation layer (which

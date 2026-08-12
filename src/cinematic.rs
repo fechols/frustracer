@@ -1228,11 +1228,98 @@ pub fn composite_premul(present: &mut [u32], hud: &[[u8; 4]], w: usize, h: usize
 }
 
 // ---------------------------------------------------------------------------
+// Which tracer renders the capture
+// ---------------------------------------------------------------------------
+
+/// The capture's render arm — the CPU frustum tracer, or THIS PLATFORM's
+/// GPU-resident one (D3D12's wavefront/DXR on Windows, Vulkan's wavefront on
+/// Linux).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArmPick {
+    Cpu,
+    Gpu,
+}
+
+/// Pick the arm from the mode flags, and NOTHING else.
+///
+/// THIS EXISTS BECAUSE THE LABEL AND THE DISPATCH HAD DRIFTED APART. The header
+/// line derived its arm from `opts.gpu`/`opts.dxr` on every platform while the
+/// dispatch sat behind `#[cfg(windows)]`, and `opts.dxr` DEFAULTS TO TRUE — so
+/// a bare `--cinematic` on Linux announced `[dxr]`, fell past the Windows-only
+/// block, and rendered every frame on the CPU while labelling it `"CPU"`. Three
+/// bools in, an enum out, one call site: that is what makes the two agree by
+/// construction rather than by care, and it is why this is pure data in
+/// `cinematic.rs` rather than an `if` in `main`.
+///
+/// `--dxr` is NOT a refusal on a backend that has no DispatchRays pipeline —
+/// there is exactly one GPU arm there, so picking it is a substitution, and the
+/// caller says so. That matches the mode's own policy (take the best available
+/// arm and degrade loudly) and the precedent already in `run_cinematic_gpu`,
+/// which switches a GI or overlay shot off DXR with one line rather than
+/// failing. It also matters that `--dxr` is a DEFAULT value: making the default
+/// fatal would be the opposite of the `--fsr4` doctrine, which is about being
+/// TOLD something impossible.
+pub fn pick_arm(gpu: bool, dxr: bool, _mode_explicit: bool) -> ArmPick {
+    if gpu || dxr {
+        ArmPick::Gpu
+    } else {
+        ArmPick::Cpu
+    }
+}
+
+/// True when the user TYPED `--dxr` rather than inheriting its default — which
+/// is what a backend with no DXR pipeline reports on, and nothing else.
+/// `--cpu` clears both flags and `--gpu` clears `dxr`, so this is exactly "the
+/// request was for the DispatchRays pipeline".
+pub fn asked_for_dxr(gpu: bool, dxr: bool, mode_explicit: bool) -> bool {
+    dxr && mode_explicit && !gpu
+}
+
+// ---------------------------------------------------------------------------
 // Gates
 // ---------------------------------------------------------------------------
 
 /// Closed-form gates, run by `--check`. Pure — no rng, no GPU, no DLLs.
 pub fn self_test() -> Result<(), String> {
+    // The arm pick. Three bools in, an enum out — and the reason it is gated at
+    // all is that the header LABEL and the DISPATCH must not be able to
+    // disagree again: `opts.dxr` defaults to true, so before this existed a
+    // bare `--cinematic` on a backend with no DXR pipeline announced `[dxr]`
+    // and rendered on the CPU. The table is the same on every platform, which
+    // is the property that makes one command line mean one thing everywhere.
+    {
+        let cases: [(bool, bool, bool, ArmPick); 6] = [
+            // gpu,   dxr,   explicit, expected
+            (false, false, true, ArmPick::Cpu),  // --cpu
+            (true, false, true, ArmPick::Gpu),   // --gpu
+            (false, true, false, ArmPick::Gpu),  // bare: dxr's default
+            (false, true, true, ArmPick::Gpu),   // --dxr, typed
+            (true, true, true, ArmPick::Gpu),    // belt and braces
+            (false, false, false, ArmPick::Cpu), // no mode at all
+        ];
+        for (g, d, e, want) in cases {
+            let got = pick_arm(g, d, e);
+            if got != want {
+                return Err(format!(
+                    "pick_arm(gpu {g}, dxr {d}, explicit {e}) = {got:?}, expected {want:?}"
+                ));
+            }
+        }
+        // `asked_for_dxr` must separate a TYPED --dxr from its own default,
+        // because that is the only thing a backend without the pipeline should
+        // report on. A predicate that fired on the default would put a degrade
+        // line on every bare run.
+        if asked_for_dxr(false, true, false) {
+            return Err("asked_for_dxr fired on --dxr's DEFAULT, which every bare run has".into());
+        }
+        if !asked_for_dxr(false, true, true) {
+            return Err("asked_for_dxr missed a typed --dxr".into());
+        }
+        if asked_for_dxr(true, true, true) {
+            return Err("asked_for_dxr fired when --gpu also named an arm".into());
+        }
+    }
+
     // ISLAND_FRAMING is keyed by island NAME, and a key that matches nothing
     // fails SILENTLY into the bounding-sphere rule — which is the exact bug the
     // table exists to fix, so a rename would quietly restore roof photos of

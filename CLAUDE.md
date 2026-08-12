@@ -8345,7 +8345,91 @@ cargo run --release -- --cinematic tour --cinematic-res 3840x2160 --cinematic-fp
                                       # not a gate — and it is exclusive with --spin/--check*,
                                       # which keep their own scenes so no must-fire gate moves).
                                       # The only path that can render a moving camera WITH hemi GI,
-                                      # because every output frame is a static accumulating pose
+                                      # because every output frame is a static accumulating pose.
+                                      # THREE ARMS, ONE PER BACKEND (B5b, 2026-08-12 — the Vulkan
+                                      # one is what finally makes this backend produce a PICTURE;
+                                      # sixteen --check-vk stages had scored it and every one ends
+                                      # in a number). It needs no window, no swapchain, no surface
+                                      # and no new dependency, because everything below
+                                      # `cine_write_frame` was already portable and already ran
+                                      # here for the CPU arm — which is also the doctrine it
+                                      # inherits: every arm hands a LINEAR f32 image to the one
+                                      # `resolve_hdr -> ToneParams::SDR -> save_png` path, so the
+                                      # arms cannot drift onto different tone curves. MEASURED at
+                                      # 480x270x8: Vulkan mean level 138.5 vs the CPU arm's 139.0
+                                      # — the shared curve; bit-identity was never available
+                                      # (different tracer, different reconstruction, different rng),
+                                      # so "the same curve by construction" is the honest claim.
+                                      # THE ARM PICK IS PURE DATA (`cinematic::pick_arm`), and it
+                                      # exists because the LABEL and the DISPATCH had drifted:
+                                      # `opts.dxr` DEFAULTS TO TRUE and the label was derived on
+                                      # every platform while the dispatch sat behind
+                                      # `#[cfg(windows)]`, so a bare `--cinematic` off Windows
+                                      # announced `[dxr]`, fell past the block, and rendered every
+                                      # frame on the CPU labelling it "CPU". Three bools in, an
+                                      # enum out, ONE call site; gated in `cinematic::self_test`,
+                                      # so the table is pinned on a box with no GPU. `--gpu` is the
+                                      # right spelling for the Vulkan arm and no `--vk` flag exists
+                                      # — the flag names an ARM (the GPU-resident wavefront tracer)
+                                      # and Vulkan implements exactly that, so one command line
+                                      # means one thing on both OSes. `--dxr` there is a
+                                      # SUBSTITUTION with one loud line, not an exit 2: there is
+                                      # exactly one GPU arm to pick, and the --fsr4 doctrine is
+                                      # about being TOLD something impossible rather than about a
+                                      # default. The line prints beside the LABEL so
+                                      # `--cinematic-dry-run` explains itself.
+                                      # TWO ARMS PER SHOT, mirroring D3D12: RECONSTRUCTION (FSR3 at
+                                      # 1:1 — DLAA-shaped, the temporal model as antialiaser and
+                                      # integrator — fed the COMPOSED frame when NRD is armed, so
+                                      # pack -> ReBLUR -> recompose -> FFX with NO feed dispatch)
+                                      # and ACCUMULATION (the fallback, and what a GI shot always
+                                      # takes, because the hemisphere integrator is a still-frame
+                                      # accumulation contract). The sub-frame contract is copied
+                                      # verbatim: free-running `seq` so the Halton phase never
+                                      # restarts, `reset` only at seq 0, and the OUTPUT-FRAME-0
+                                      # WARM-UP of `JITTER_PHASE - samples` emitting passes —
+                                      # without which frame 0 is reconstructed from under half a
+                                      # phase AND sampled on a biased lattice, a discontinuity that
+                                      # shows once per lap in a looping clip. Self-limiting (a
+                                      # 256-sample still is already several phases) and
+                                      # deliberately NOT on the accumulation arm. Replay covers
+                                      # sub-frames 1..N-1 there: this backend asks the CALLER to
+                                      # prove the bit-equality rather than keeping a `last_struct`
+                                      # cache, and "one `basis`, computed once per output frame and
+                                      # reused" is the narrowest possible proof of it.
+                                      # THE TRACER IS CACHED BY RESOLUTION, not rebuilt per shot —
+                                      # constructing one compiles the corpus through DXC (~20 s)
+                                      # and the `islands` preset is seven shots at one res — and
+                                      # `CineVk::destroy` is a struct rather than D3D12's
+                                      # positional tuple for a reason only this backend has:
+                                      # `VkTracer`/`Fsr3`/`VkNrd` have `destroy(&hg)` and NO `Drop`,
+                                      # so a forgotten teardown leaks device memory across a
+                                      # seven-shot preset.
+                                      # WORKS ON DAY ONE: stills, sequences, GI, overlay (the
+                                      # `info` plane exists, so the quadtree overlay draws real
+                                      # subdivision), --cinematic-hdr's PQ/EXR, --cinematic-encode,
+                                      # exposure/res/samples/frames/fps/island/out/dry-run, TOD
+                                      # attractors, BC7, --spp, --replay, --sw-rays. LOUD DEGRADES,
+                                      # each with its reason: DLSS/FSR4-RR/XeSS have no Linux
+                                      # artifact (the chain falls through to FSR 3.1); --fsr4 is
+                                      # the one that stays FATAL, being a requirement rather than a
+                                      # preference; --dual-gpu and --frd are D3D12-only; the HUD is
+                                      # (`slint` is cfg(windows)); and FOLIAGE SWAY has no animated
+                                      # TLAS on this backend, so leaves render at their REST POSE —
+                                      # named explicitly because the `foliage` preset's whole
+                                      # subject is the wind, and N identical PNGs with no error is
+                                      # worse than a missing feature.
+                                      # MEASURED (RADV, procedural, 480x270): the denoised capture
+                                      # carries 40% less high-frequency content than `--no-nrd` at
+                                      # 2 samples/frame — the composed frame doing real work in the
+                                      # media path, not only in V16.
+                                      # WHAT IS NOT ASSERTABLE, and the plan says so rather than
+                                      # manufacturing a gate: whether the picture is GOOD.
+                                      # `--check-vk` writes no files and is a pure function of the
+                                      # command line; this mode's product IS a file. What gates is
+                                      # the arm-pick table (in --check, GPU-free) and V16's
+                                      # composed frame; the rest is a human look, and this arm is
+                                      # what finally makes that look possible on Linux
 cargo run --release -- --no-settings  # ignore frustracer-settings.json for this run (the pause
                                       # menu's saved settings — loaded as DEFAULTS the CLI flags
                                       # override; auto-saved on every menu edit; headless
