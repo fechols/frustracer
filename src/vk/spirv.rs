@@ -335,7 +335,17 @@ pub struct Spirv {
     _lib: libloading::Library,
 }
 
-/// Where `install-prerequisites.sh dxc` puts the Linux drop, overridable with
+/// The host-native DXC library's filename, which is a fact about the TARGET
+/// and not about the host: a Linux drop is `libdxcompiler.so`, a macOS build
+/// `libdxcompiler.dylib`. One const, read by both the path join and the advice
+/// text, so a message can never name a file the loader did not try.
+pub const LIB_NAME: &str = if cfg!(target_os = "macos") {
+    "libdxcompiler.dylib"
+} else {
+    "libdxcompiler.so"
+};
+
+/// Where the host-native drop lives, overridable with
 /// `FRUSTRACER_DXC_SPIRV_PATH`.
 ///
 /// Deliberately NOT `--dxc-path`/`FRUSTRACER_DXC_PATH`, which names the
@@ -344,24 +354,46 @@ pub struct Spirv {
 /// are two artifacts in two directories and one path variable cannot name
 /// both — pointing the D3D12 lever at a `.so` would be the kind of quiet
 /// mis-wiring that surfaces as "SPIR-V is unavailable" on a tree that has it.
+///
+/// TWO DIRECTORIES, ONE PIN, because the two arms are ACQUIRED differently and
+/// the pin is what makes that safe. Linux has an upstream tarball at `DXC_TAG`;
+/// macOS has nothing published at all (`DXC_TAG` ships a Windows zip, a Linux
+/// x86_64 tarball and a PDB zip — no macOS build, no arm64 build of anything),
+/// so the drop there is a SOURCE BUILD at the same tag. A community binary
+/// would not be from the tag, and the invariant this module's header states —
+/// the two backends compile identical concatenated source, so a front-end
+/// difference is invisible to every gate — is exactly what that would break.
 pub fn default_dir() -> String {
-    std::env::var("FRUSTRACER_DXC_SPIRV_PATH")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/SDKs/dxc-linux/lib").to_string())
+    std::env::var("FRUSTRACER_DXC_SPIRV_PATH").unwrap_or_else(|_| {
+        let sub = if cfg!(target_os = "macos") { "dxc-macos" } else { "dxc-linux" };
+        format!("{}/SDKs/{sub}/lib", env!("CARGO_MANIFEST_DIR"))
+    })
 }
 
 impl Spirv {
-    /// Load `libdxcompiler.so` from `dir` and create the compiler. A missing
-    /// drop is a normal condition (the SDK tree is gitignored) — the error
-    /// names the fix, the same way the DXIL loader's does.
+    /// Load `LIB_NAME` from `dir` and create the compiler. A missing drop is a
+    /// normal condition (the SDK tree is gitignored) — the error names the fix,
+    /// the same way the DXIL loader's does.
     pub fn load(dir: &str) -> Result<Self> {
-        let path = std::path::Path::new(dir).join("libdxcompiler.so");
-        let advice = format!(
-            "The Vulkan backend needs the DirectX Shader Compiler's Linux build.\n\
-             Run `./install-prerequisites.sh dxc` (it fetches the Linux tarball and\n\
-             the Windows zip from the SAME release tag), or point\n\
-             FRUSTRACER_DXC_SPIRV_PATH at a directory holding libdxcompiler.so\n\
-             (NOT FRUSTRACER_DXC_PATH — that one names the Windows drop)."
-        );
+        let path = std::path::Path::new(dir).join(LIB_NAME);
+        let advice = if cfg!(target_os = "macos") {
+            format!(
+                "The Vulkan backend needs the DirectX Shader Compiler, and upstream\n\
+                 publishes no macOS build at the pinned tag — so it is built from\n\
+                 SOURCE at that tag. Run `./install-prerequisites.sh dxc`, which does\n\
+                 the whole build (needs cmake + ninja + git and Xcode's clang; ~10 min\n\
+                 on an M1), or point FRUSTRACER_DXC_SPIRV_PATH at a directory holding\n\
+                 {LIB_NAME} (NOT FRUSTRACER_DXC_PATH — that one names the Windows drop)."
+            )
+        } else {
+            format!(
+                "The Vulkan backend needs the DirectX Shader Compiler's Linux build.\n\
+                 Run `./install-prerequisites.sh dxc` (it fetches the Linux tarball and\n\
+                 the Windows zip from the SAME release tag), or point\n\
+                 FRUSTRACER_DXC_SPIRV_PATH at a directory holding {LIB_NAME}\n\
+                 (NOT FRUSTRACER_DXC_PATH — that one names the Windows drop)."
+            )
+        };
         // SAFETY: loading a shared object runs its initializers. This one is a
         // compiler with no global side effects of interest.
         let lib = unsafe { libloading::Library::new(&path) }

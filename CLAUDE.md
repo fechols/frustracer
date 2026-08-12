@@ -5986,18 +5986,42 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # release tag, so the compiler emitting DXIL and the one emitting
                                       # SPIR-V cannot drift to different HLSL front ends) + SDKs/
                                       # spirv-tools (install-prerequisites.sh spirv). ON macOS THE DXC
-                                      # HALF DOES NOT EXIST and the pin is why, not effort: DXC_TAG
+                                      # HALF IS A SOURCE BUILD, and the pin is why, not effort: DXC_TAG
                                       # publishes a Windows zip, a linux x86_64 tarball and a PDB zip —
                                       # no macOS build, no arm64 build of anything — so a community
                                       # binary would not be from the tag, breaking the same-front-end
                                       # invariant above, which is exactly the drift no gate can see. The
                                       # route that keeps it is a source build at DXC_TAG (the shape
-                                      # `nrd` already uses); the installer says so and stands the half
-                                      # down rather than substituting. spirv DOES have a macOS prebuilt,
+                                      # `nrd` already uses), and `install-prerequisites.sh dxc` now DOES
+                                      # that on macOS (do_dxc_macos) instead of standing the half down:
+                                      # clone at the tag, cmake+ninja, install to SDKs/dxc-macos/{bin,lib}
+                                      # — ~10 min on an M1, and the binary carries
+                                      # LC_RPATH=@executable_path/../lib so it finds its dylib with
+                                      # nothing added to the environment, exactly as the Linux drop's
+                                      # DT_RPATH does. THREE BUILD FLAGS, each a measured workaround, all
+                                      # of them compiler/CMake levers rather than patches to the fork (a
+                                      # patch would silently un-apply on the next fetch AND would break
+                                      # what the pin means): -DCMAKE_POLICY_VERSION_MINIMUM=3.5, because
+                                      # DXC is an old LLVM fork and CMake 4 removed compatibility with
+                                      # cmake_minimum_required(VERSION <3.5); -DCMAKE_CXX_FLAGS=
+                                      # -Wno-invalid-specialization, because llvm/ADT/StringRef.h
+                                      # specializes std::is_nothrow_constructible and Xcode 26's libc++
+                                      # marks that entity __no_specializations__, which clang now
+                                      # diagnoses as an ERROR (three lines in one header, 15 errors, the
+                                      # whole build); and -DLLVM_PARALLEL_LINK_JOBS=1, because LLVM link
+                                      # steps are the memory-hungry part and 8 GB Apple silicon is a real
+                                      # configuration. spirv DOES have a macOS prebuilt,
                                       # x86_64-only, so it runs under Rosetta on Apple silicon and the
-                                      # installer checks that it EXECUTES rather than assuming. So
-                                      # --check-spirv/--check-vk SKIP on macOS today, which is the
-                                      # bare-checkout degrade and not a failure. Either missing =
+                                      # installer checks that it EXECUTES rather than assuming.
+                                      # MEASURED on macOS 26.5 / M1 the first time the corpus went
+                                      # through a macOS DXC (2026-08-12): 47 units -> 78 modules, 78
+                                      # validated, 0 failed — the SAME counts Linux records — with
+                                      # assembled bytes 7797887 procedural and 7799031 san-miguel, i.e.
+                                      # BOTH absolutes matching the recorded Linux figures and the
+                                      # load-bearing +1144 B delta reproduced exactly. The corpus
+                                      # assembly is platform-independent, confirmed rather than assumed.
+                                      # --check-vk still SKIPs on macOS (no Vulkan loader). Either
+                                      # missing =
                                       # loud SKIP + exit 0, the bare-checkout degrade; the path lever is
                                       # FRUSTRACER_DXC_SPIRV_PATH and NOT FRUSTRACER_DXC_PATH, which
                                       # names the Windows drop (two artifacts, two directories — one
@@ -8281,6 +8305,174 @@ cargo run --release -- --check-fsr3   # FSR3 UPSCALING ON METAL, gated (macOS; s
                                       # can score — a mirrored jitter or MV sign reads as doubled
                                       # wobble or a directional smear, and both move the numbers
                                       # by about as much as being right does
+cargo run --release -- --check-metalfx# MetalFX TEMPORAL UPSCALING, gated (macOS; src/mtl/mfx.rs +
+                                      # src/mtl/planes.rs — the Metal port's B3, 2026-08-12). Apple's
+                                      # `MTLFXTemporalScaler` over the SAME CPU-rendered G-buffer
+                                      # --check-fsr3 feeds FidelityFX, headless and scored. No Metal
+                                      # tracer, no presentation stage — the B2 scope, unchanged.
+                                      # A SEPARATE GATE rather than a stage of --check-fsr3, on the
+                                      # one-gate-per-SDK convention (--check-oidn/-xess/-nrd): the skip
+                                      # stories are unrelated (device support and a macOS floor here;
+                                      # the FidelityFX SDK source plus a build-time transpile there),
+                                      # and a flag named after FidelityFX that also ran Apple's
+                                      # upscaler would mislead every later reader. Note --check-vk's
+                                      # V11 is the OTHER precedent and points the same way: one gate
+                                      # per backend there, one per SDK here, and in both cases the
+                                      # thing that decides is what a reader would expect the flag to
+                                      # cover.
+                                      # IT COSTS ALMOST NOTHING NEXT TO THE FSR3 ARM, and the asymmetry
+                                      # is structural. FidelityFX ships ffx_vk and ffx_dx12 and nothing
+                                      # else, so Metal needed a hand-written FfxInterface (~1350 lines
+                                      # of non-ARC ObjC++ this tree OWNS, with no upstream) plus a
+                                      # build-time SPIR-V -> MSL transpile of 80 permutations. MetalFX
+                                      # is a system framework: no shim, no metallib table, no SDK
+                                      # fetch. So this arm WORKS ON A BARE CLONE and carries no cfg
+                                      # beyond macOS, where mtl::fsr3 is gated on ffx_fsr3_metal.
+                                      # THE POINT IS NOT A SECOND UPSCALER, IT IS AN INSTRUMENT. B2's
+                                      # own risk record says real depth and real jitter were the
+                                      # untested path (the reference it was ported from upscaled VIDEO:
+                                      # flat depth, zero jitter, hardcoded camera) and that a single
+                                      # arm's teeth "catch gross wiring, not polarity — that needs the
+                                      # dump images". Two independent consumers of byte-identical
+                                      # inputs can do what one cannot: correlate.
+                                      # THE CONVENTIONS, and which are DERIVED. (a) MOTION VECTORS,
+                                      # derived: Apple documents motionVectorScaleX at 1.0 as "the
+                                      # motion vectors for an object that moves down and to the right
+                                      # in the colorTexture by 10 pixels would be (-10,-10)"; GBufs::
+                                      # mvec stores prev_px - cur_px y-down, and such an object has
+                                      # prev - cur = (-10,-10). Exact match, so the scale is the bare
+                                      # fsr::UPSCALE_MV_SIGN — the same value both FSR3 arms pass.
+                                      # (b) DEPTH, derived: fsr::stage_depth writes reversed-Z with sky
+                                      # at exactly 0.0, so setDepthReversed(true), the twin of FSR3's
+                                      # FLAG_DEPTH_INVERTED. (c) JITTER, NOT documented by Apple — and
+                                      # MEASURED here rather than left a coin flip, which is the
+                                      # headline result. mtl::mfx::JITTER_SIGN started seeded at FFX's
+                                      # value on the reasoning that both take "the subpixel jitter
+                                      # offset applied to the camera" in pixels; X3's cross-check then
+                                      # SETTLED it: mirroring this arm alone drops the FSR3 correlation
+                                      # 0.655 -> 0.479 and fails the gate, so +1 is the measurement.
+                                      # FR_MFX_JITTER=raw|neg is the lever (the FR_VK_FSR3_JITTER
+                                      # shape).
+                                      # THE ONE HARD API CONSTRAINT, and it reshaped the harness:
+                                      # MTLFXTemporalScaler.h:222 says of outputTexture "You are
+                                      # responsible for providing a texture with a private storageMode"
+                                      # — the one texture in this tree the CPU may not touch. So
+                                      # Mtl::texture GAINED a storage-mode parameter (it hardcoded
+                                      # Shared), and Mtl gained blit-based read_private/clear_private,
+                                      # because getBytes and replaceRegion are both illegal there.
+                                      # KEEPING THE CLEAR mattered more than it looks: it is what
+                                      # separates "the scaler wrote nothing" from "the scaler wrote a
+                                      # dark image" in the readback, and dropping it on the grounds
+                                      # that replaceRegion no longer applies would have made X3's
+                                      # non-zero assertion silently untestable — the highest-value
+                                      # vacuity available in this gate, arriving as a side effect of a
+                                      # mechanical fix.
+                                      # TWO SETTINGS ARE DETERMINISM PRECONDITIONS, not preferences.
+                                      # requiresSynchronousInitialization(true): Apple's default is
+                                      # FALSE, which returns a scaler immediately and "compile[s] a
+                                      # faster upscaler in the BACKGROUND" — and the gate builds
+                                      # several scalers and compares pairs, so a compile landing
+                                      # between two runs would be comparing two implementations and
+                                      # calling the difference residue. (Apple says quality is
+                                      # "consistent" across the two, which is a quality claim, not a
+                                      # bit-identity one, and this gate asserts bit-identity.) Cost is
+                                      # real and reported per run: X2's FIRST scaler measures 266-627 ms
+                                      # (cold — it carries one-time framework init), after which X3's
+                                      # four build in ~720 ms total, i.e. ~180 ms each.
+                                      # And autoExposureEnabled(FALSE) plus a 1x1 R16Float
+                                      # exposure texture holding 1.0 — DELIBERATELY UNLIKE the Metal
+                                      # FSR3 arm, which sets FLAG_AUTO_EXPOSURE: auto-exposure has
+                                      # MetalFX compute a per-frame gain that multiplies the input
+                                      # colour with nothing documenting it being un-applied on output,
+                                      # which would make X3's energy assertion a measurement of Apple's
+                                      # heuristic rather than of our wiring — and the temptation on
+                                      # failure would be to widen the one bound that catches
+                                      # colour-space mistakes.
+                                      # DETERMINISM IS STRICTER HERE THAN FOR FSR3, and that is a
+                                      # measurement, not an assumption inherited from the sibling. The
+                                      # claim was written STRICT (both regimes exactly reproducible)
+                                      # precisely because MetalFX's history is internal and opaque, so
+                                      # no cause was available in advance to justify FSR3's two-regime
+                                      # split — and it HELD: reset-only 0 channels AND accumulating 0
+                                      # channels, across fresh scalers, unchanged under
+                                      # MTL_SHADER_VALIDATION=1. FSR3 needs its split because
+                                      # FidelityFX declares internal resources UNINITIALIZED; nothing
+                                      # of the kind surfaces here. The comparison is an INTEGER ULP
+                                      # distance over the f16 bit patterns (read_output_bits), not a
+                                      # relative bound on widened floats: an ULP distance cannot be
+                                      # answered by moving a threshold, and --check-fsr3's own comment
+                                      # already records "EXACTLY ONE f16 ULP" while its code asserts a
+                                      # tunable 1%.
+                                      # THE CROSS-CHECK (X3, compiled only where FSR3 is also built).
+                                      # Both arms render from mtl::planes::Trio — ONE allocation and
+                                      # ONE staging site, which is what makes "identical inputs"
+                                      # structural rather than two call sites agreeing — and the gate
+                                      # correlates their deviations from a common bilinear reference.
+                                      # THE OBVIOUS FORMULATION IS UNSOUND AND WAS MEASURED TO BE, so
+                                      # do not re-derive it: the tempting d(mfx,fsr3) < d(mfx,bilinear)
+                                      # ("two reconstructions must resemble each other more than either
+                                      # resembles a resampler") is implied by nothing. Bilinear is the
+                                      # SMOOTH image; both arms deviate by ADDING detail, and where
+                                      # those deviations are not identical they add rather than cancel,
+                                      # so the mutual distance can legitimately EXCEED each arm's
+                                      # distance from the smooth reference — approaching sqrt(2) times
+                                      # it for independent deviations. Measured: mutual 2.999e-2
+                                      # against 2.752e-2, ratio 1.09, i.e. strongly correlated AND the
+                                      # inequality false. The correlation is what that 1.09 actually
+                                      # says.
+                                      # MEASURED (M1, macOS 26.5, procedural scene, 321x181 -> 642x362):
+                                      # energy 0.988x, history 1.140e-2, vs-bilinear 2.752e-2, FSR3
+                                      # correlation 0.655, probes jitter 2.882e-2 / depth 3.938e-3 /
+                                      # motion 1.671e-2, scale range 1.00x..3.00x, required usage
+                                      # color/depth/motion 0x1 and output 0x7 (all inside the harness's
+                                      # 0x7). MFX_BILINEAR_MIN is 4.5e-3 — this arm's OWN measurement
+                                      # divided by six, never FSR3's 5e-3 inherited, since that number
+                                      # describes FidelityFX's reconstruction on this scene and not
+                                      # Apple's.
+                                      # MFX_FSR3_CORR_MIN IS NOT MIDWAY, and the asymmetry is chosen:
+                                      # 0.5 sits 0.024 above the MIRRORED reading and 0.155 below the
+                                      # correct one, buying margin against false failures at the cost
+                                      # of margin against a blunt tooth — the right direction for a
+                                      # gate, since a flaky red costs every future run while a tooth
+                                      # that stops biting costs only the case it was aimed at. The
+                                      # consequence to know: a scene or driver that moves the MIRRORED
+                                      # reading up 5% silently stops this discriminating, and the
+                                      # symptom is a GREEN run, not a noisy one — re-measure both arms
+                                      # (FR_MFX_JITTER=neg) before trusting it on new content.
+                                      # WHAT IT STILL CANNOT SCORE, said rather than implied: the depth
+                                      # POLARITY. Flattening the depth plane moves the output whichever
+                                      # way setDepthReversed points, so that probe fires either way —
+                                      # the same class the jitter sign was in before the cross-check,
+                                      # and the reason FR_MFX_DUMP=1 exists.
+                                      # KNOWN-ACCEPTS. The macOS floor rises to 13.0 for the WHOLE
+                                      # binary: objc2-metal-fx carries an unconditional #[link(name =
+                                      # "MetalFX", kind = "framework")], so MetalFX.framework is an
+                                      # LC_LOAD_DYLIB of every macOS build including bare checkouts
+                                      # that never run this gate, and on an older macOS the process
+                                      # does not launch AT ALL (not a graceful skip). Accepted — and
+                                      # note the related claim this repaired: build.rs said scoping the
+                                      # Metal/Foundation links to want_metal meant "a bare checkout
+                                      # still links nothing", which was FALSE (objc2-metal and objc2
+                                      # carry their own #[link] attributes; both frameworks were always
+                                      # in the load commands). Fixed-size allocation, not the FSR3
+                                      # arm's allocate-at-max-and-sub-rect: MetalFX validates textures
+                                      # against its descriptor's dimensions and its dynamic-resolution
+                                      # equivalent is descriptor-level (inputContentPropertiesEnabled
+                                      # plus a device scale range), i.e. a different mechanism, and an
+                                      # untested dynamic-res path inside a gate that exists to prove
+                                      # the static one is scope creep. Enabling MTLFXTemporalScaler
+                                      # additively pulls objc2-metal/MTL4Compiler and MTLFence into the
+                                      # graph, so Cargo.toml's deliberately-short one-feature-per-header
+                                      # list is no longer the whole truth (said there).
+                                      # Touch src/mtl/mfx.rs / planes.rs / device.rs's texture storage
+                                      # or blit helpers / run_check_metalfx -> run --check-metalfx,
+                                      # then AGAIN under MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 (the
+                                      # storage-mode class is invisible otherwise and the gate says so
+                                      # on an unvalidated run), then --check-fsr3 (planes::Trio is
+                                      # shared, so its U4 numbers are the before/after fingerprint —
+                                      # energy/history/vs-bilinear must not move), --check-fsr, --check,
+                                      # and cargo test. FR_MFX_JITTER=neg must FAIL the cross-check;
+                                      # if it stops failing, the tooth has gone blunt.
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)
 cargo run --release -- --prefer-intel # pick that vendor's adapter for the D3D12 device (also
                                       # --prefer-nvidia / --prefer-amd; default NVIDIA, or AMD under

@@ -1433,6 +1433,13 @@ impl VkTracer {
     /// day moves per OUTPUT frame (the world's attractors, or an authored
     /// keyframe hour), and `cine_frame_state` mutates the scene's lighting
     /// without touching anything the per-frame `with_frame` rebuilds.
+    ///
+    /// That caller — `run_cinematic_vk` — is
+    /// `cfg(all(unix, not(target_os = "macos")))`, so on macOS this module
+    /// compiles (it is unix) with nothing calling this. The allow says so
+    /// rather than letting a real dead-code warning accumulate beside it;
+    /// `src/vk/fsr3.rs` marks its own cfg-orphaned items the same way.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn refresh_sky(&mut self, scene: &Scene) {
         self.cb_base.refresh_sky_rows(scene, self.rw, self.rh);
     }

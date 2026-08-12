@@ -208,6 +208,38 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLPixelFormat",
     "MTLTypes",
 ] }
+# MetalFX (src/mtl/mfx.rs) — Apple's temporal upscaler, a second consumer of the
+# same G-buffer `mtl::fsr3` feeds FidelityFX. No shim, no shader transpile, no
+# SDK fetch: a system framework, so this arm works on a bare clone.
+#
+# TWO CONSEQUENCES WORTH KNOWING BEFORE EDITING EITHER LIST.
+#
+# (1) It raises the macOS RUNTIME FLOOR of the whole binary to 13.0.
+# `objc2-metal-fx` carries an unconditional
+# `#[link(name = "MetalFX", kind = "framework")]`, and MTLFXTemporalScaler is
+# API_AVAILABLE(macos(13.0)) — so MetalFX.framework becomes an LC_LOAD_DYLIB of
+# every macOS build, including bare checkouts that will never run the gate. On
+# an older macOS the process does not launch AT ALL; it is not a graceful skip.
+# Accepted deliberately (macOS 13 shipped in 2022 and this tree already needs
+# Xcode-26-era tooling to generate the FSR3 metallibs), and stated in README's
+# OS row rather than only here. The alternative — an optional cargo feature —
+# was rejected because it would make a gate's availability depend on build
+# flags rather than on the command line.
+#
+# (2) It WIDENS the deliberately-short objc2-metal list above, invisibly.
+# `MTLFXTemporalScaler.h` imports Metal/MTL4Compiler.h and uses id<MTLFence>, so
+# the crate feature additively enables `objc2-metal/MTL4Compiler` and
+# `objc2-metal/MTLFence` for the whole graph. Those two are therefore in the
+# build without appearing in the list above — which is why this comment exists,
+# and why "the list is deliberately SHORT" is no longer the whole truth.
+#
+# `std` is NOT implied by the effect feature (the crate has `std = ["alloc"]`),
+# so it must be named explicitly under `default-features = false`. MTL4* — the
+# Metal 4 command-buffer variants — are deliberately absent.
+objc2-metal-fx = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLFXTemporalScaler",
+] }
 
 [build-dependencies]
 cc = "1"

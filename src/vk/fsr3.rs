@@ -587,34 +587,54 @@ impl Fsr3 {
     /// between our recompose and FFX's read, it asks whether FFX consumed OUR
     /// plane or something it had cached. A gate that only compares two
     /// plausible pictures cannot tell those apart.
-    #[cfg(ffx_fsr3_vk)]
+    ///
+    /// THE CFG IS INSIDE THE BODY, not on the item, and that is the pattern the
+    /// rest of this impl already uses (`frame_fed`, `frame`). Gating the ITEM
+    /// makes the method vanish on a build without `ffx_fsr3_vk` while its caller
+    /// — `compose_probe`, which is `cfg(unix)` — remains, and macOS is unix with
+    /// `want_vk` false BY CONSTRUCTION (build.rs: `want_vk` requires Linux). So
+    /// an item-level gate here does not degrade the feature, it fails to
+    /// COMPILE on every Mac; keeping the signature unconditional is what makes
+    /// `cfg(unix)` callers legal everywhere and leaves the degrade at run time
+    /// where the rest of this file puts it.
     pub fn clear_color_in_place(&self, d: &ash::Device, cmd: vk::CommandBuffer) {
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
-        unsafe {
-            d.cmd_clear_color_image(
-                cmd,
-                self.color.img,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue { float32: [0.0; 4] },
-                &[range],
-            );
-            // TRANSFER -> COMPUTE: the clear must land before FFX's first read.
-            // Deterministic by construction; omitting it would make the probe a
-            // race, which is a strictly worse tooth than a wrong answer.
-            d.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)],
-                &[],
-                &[],
-            );
+        #[cfg(not(ffx_fsr3_vk))]
+        {
+            // The probe is a no-op rather than an error: its caller compares a
+            // cleared run against a control, and on a build with no FFX there is
+            // no dispatch for either to reach.
+            let _ = (d, cmd);
+        }
+        #[cfg(ffx_fsr3_vk)]
+        {
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            unsafe {
+                d.cmd_clear_color_image(
+                    cmd,
+                    self.color.img,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue { float32: [0.0; 4] },
+                    &[range],
+                );
+                // TRANSFER -> COMPUTE: the clear must land before FFX's first
+                // read. Deterministic by construction; omitting it would make
+                // the probe a race, which is a strictly worse tooth than a
+                // wrong answer.
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+                    &[],
+                    &[],
+                );
+            }
         }
     }
 
