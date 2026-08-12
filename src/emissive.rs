@@ -50,6 +50,26 @@
 //! double-counts, and `hemi.rs` / `hemi_leaf.hlsl` / both GI reference
 //! estimators are untouched by construction.
 //!
+//! # The light model is ISOTROPIC, and the header below says "disc"
+//!
+//! MEASURED 2026-08-11 (`derive_parts`' directionality report, R =
+//! |Σw·n|/Σw over each cluster's emissive triangles):
+//!
+//!     scene            min     mean    max    panel-like (R >= 0.6)
+//!     DamagedHelmet    0.820   0.986   1.000   32 of 32
+//!     bistro Exterior  0.139   0.620   1.000   18 of 32
+//!
+//! So real emissive content is strongly ORIENTED — the helmet's visor almost
+//! perfectly so, bistro genuinely mixed (4 clusters under R = 0.2 really are
+//! bulb-like, and for those the isotropic model is CORRECT). What ships today
+//! evaluates `C/(d²+rc²)` — documented below as the ON-AXIS value of a
+//! Lambertian disc — in EVERY direction, so a one-sided panel lights points
+//! behind it exactly as brightly as points in front. Shadow rays hide much of
+//! that (a wall behind a sconce occludes); what survives is over-lighting to
+//! the side and edge-on, where a real `cos θ` emitter has fallen to nothing.
+//! `Cluster::resultant` is the number that decides whether an emission lobe is
+//! worth carrying, and on this content it says yes.
+//!
 //! # The light model (disc, not point)
 //!
 //! Each cluster is a Lambertian disc of radius `rc` with radiance·area sum
@@ -231,6 +251,12 @@ pub struct EmissiveLight {
     /// body), capped at `(EL_RMAX_K · content_diag)²` — the floor wins when
     /// a giant low-budget cluster puts them in conflict.
     pub r_infl2: f32,
+    /// The emission lobe's axis: the power-weighted mean emitter normal,
+    /// UNNORMALIZED, so `|axis|` is the mean resultant length R (row c xyz).
+    pub axis: [f32; 3],
+    /// R again, explicitly (row c w) — carried so neither shader needs a
+    /// normalize or a sqrt, and so `R == 0` is a cheap branch.
+    pub r_dir: f32,
 }
 
 /// The scene's derived light set — pure data, the fireflies' `count == 0`
@@ -246,16 +272,59 @@ impl EmissiveLights {
     pub fn off() -> EmissiveLights {
         EmissiveLights {
             count: 0,
-            lights: [EmissiveLight { pos: [0.0; 3], rc2: 0.0, color: [0.0; 3], r_infl2: 0.0 };
-                MAX_EMISSIVE_LIGHTS],
+            lights: [EmissiveLight {
+                pos: [0.0; 3],
+                rc2: 0.0,
+                color: [0.0; 3],
+                r_infl2: 0.0,
+                axis: [0.0; 3],
+                r_dir: 0.0,
+            }; MAX_EMISSIVE_LIGHTS],
         }
     }
+}
+
+/// The emission lobe at a receiver lying in direction `w_lr` FROM the light
+/// (unit). Attenuation-only:
+///
+/// ```text
+///     f = 1 - R + saturate(dot(v, w_lr)),   v = R·n_c,  R = |v| in [0,1]
+/// ```
+///
+/// R = 0 returns exactly 1.0 through a BRANCH — never a computed `* 1.0` — so
+/// an isotropic cluster, and every scene whose emitters cancel, shades on the
+/// pre-lobe instruction stream bitwise. R = 1 is `saturate(cos)`: the true
+/// Lambertian shape, exactly 0 at 90 deg and behind.
+///
+/// BOUNDED ABOVE BY 1, and that is the load-bearing property rather than an
+/// accident of taste: `saturate(dot(v, w)) <= |v| = R`, so `f <= 1` always.
+/// The whole `r_infl2` derivation is a closed-form solve of the ISOTROPIC
+/// falloff against `EL_MIN_E`, and `cull_tile` is EXACT — not conservative —
+/// because the window is exactly 0 at `r_infl`, which is what lets the CPU and
+/// GPU cull independently with no bit-parity contract. A profile that could
+/// exceed 1 would carry a light past `EL_MIN_E` outside its own influence
+/// sphere and put both of those back in play. Energy is therefore
+/// REDISTRIBUTED downward rather than conserved (`EL_BOOST` is the artistic
+/// constant that absorbs the level); the sphere-mean-1 variant
+/// `1 + R·(4·saturate(cos) - 1)` is the physically complete form and needs
+/// `r_infl` re-derived from the profile maximum first.
+#[inline(always)]
+pub fn lobe(l: &EmissiveLight, w_lr: Vec3A) -> f32 {
+    if l.r_dir <= 0.0 {
+        return 1.0;
+    }
+    1.0 - l.r_dir + Vec3A::from(l.axis).dot(w_lr).clamp(0.0, 1.0)
 }
 
 /// Windowed disc irradiance (over π — the Lambert convention) arriving at
 /// distance² `d2` from light `l`, RGB. Exactly ZERO at and past the
 /// influence radius (the window's zero is exact in fp: `d2 == r2 ⇒ x == 0`).
 /// Term-for-term mirrored in shade.hlsli's emissive block.
+///
+/// DIRECTION-FREE by construction: this is the ON-AXIS value, and `lobe` is
+/// the factor that attenuates it off-axis. Keeping the two apart is what
+/// leaves `r_infl2` — a closed-form solve of THIS function against
+/// `EL_MIN_E` — and `cull_tile`'s exactness untouched by the lobe.
 #[inline(always)]
 pub fn irradiance(l: &EmissiveLight, d2: f32) -> Vec3A {
     if d2 >= l.r_infl2 {
@@ -380,6 +449,11 @@ struct TriRec {
     power: Vec3A,
     mn: Vec3A,
     mx: Vec3A,
+    /// Unit geometric normal. FREE: the first pass already builds the cross
+    /// product and throws its direction away to keep `.length()`, so this is
+    /// one divide by a scalar we had. Consumed only by the cluster's `nacc`
+    /// below — nothing shades with it yet.
+    normal: Vec3A,
 }
 
 /// One seed/merged cluster during derivation.
@@ -393,6 +467,12 @@ struct Cluster {
     mn: Vec3A,
     mx: Vec3A,
     alive: bool,
+    /// Σ w·n — the power-weighted mean normal, UNNORMALIZED so its length
+    /// carries the spread (see `resultant`). Accumulated with the same `w` as
+    /// `cacc`, and linear like it, so the merge stays associative,
+    /// index-ordered and byte-deterministic. MEASUREMENT ONLY today: nothing
+    /// reads it outside the derivation report.
+    nacc: Vec3A,
 }
 
 impl Cluster {
@@ -402,17 +482,32 @@ impl Cluster {
         self.wsum += o.wsum;
         self.mn = self.mn.min(o.mn);
         self.mx = self.mx.max(o.mx);
+        self.nacc += o.nacc;
     }
     fn centroid(&self) -> Vec3A {
         self.cacc / self.wsum.max(1e-30)
+    }
+    /// MEAN RESULTANT LENGTH, |Σ w·n| / Σ w, in [0, 1] — the directional
+    /// spread of the cluster's emitters, and the number that decides whether
+    /// an emission lobe is worth having at all.
+    ///
+    ///   R -> 0  the normals cancel: a bulb, a tube, a box of panels facing
+    ///           every way. The shipped ISOTROPIC model is CORRECT here, and a
+    ///           cosine lobe would have to disarm itself to match it.
+    ///   R -> 1  they agree: a flat panel or a strip. The shipped model lights
+    ///           its own back hemisphere as brightly as its front, which is
+    ///           the error a lobe would remove.
+    fn resultant(&self) -> f32 {
+        (self.nacc.length() / self.wsum.max(1e-30)).min(1.0)
     }
 }
 
 /// Derive the scene's clustered lights. Serial, index-ordered,
 /// byte-deterministic. Called from `scene::finalize_scalars`.
 pub fn derive(scene: &Scene, budget: u32) -> EmissiveLights {
-    derive_parts(
+    let out = derive_parts(
         &scene.positions,
+        &scene.normals,
         &scene.indices,
         &scene.tri_mat,
         &scene.materials,
@@ -423,7 +518,9 @@ pub fn derive(scene: &Scene, budget: u32) -> EmissiveLights {
         scene.eps,
         budget,
         cluster_mode(),
-    )
+    );
+    report_directionality(&out);
+    out
 }
 
 /// The `--el-cluster som` arm: a power-weighted BATCH SOM refinement of the
@@ -488,6 +585,7 @@ fn som_refine(recs: &[TriRec], clusters: &mut Vec<Cluster>) {
             mn: Vec3A::splat(f32::INFINITY),
             mx: Vec3A::splat(f32::NEG_INFINITY),
             alive: true,
+            nacc: Vec3A::ZERO,
         })
         .collect();
     for r in recs {
@@ -499,6 +597,7 @@ fn som_refine(recs: &[TriRec], clusters: &mut Vec<Cluster>) {
         c.wsum += w;
         c.mn = c.mn.min(r.mn);
         c.mx = c.mx.max(r.mx);
+        c.nacc += r.normal * w;
     }
     rebuilt.retain(|c| c.wsum > 0.0);
     *clusters = rebuilt;
@@ -509,6 +608,7 @@ fn som_refine(recs: &[TriRec], clusters: &mut Vec<Cluster>) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn derive_parts(
     positions: &[Vec3A],
+    normals: &[Vec3A],
     indices: &[[u32; 3]],
     tri_mat: &[u32],
     materials: &[Material],
@@ -542,9 +642,46 @@ pub(crate) fn derive_parts(
         }
         let (a, b, c) =
             (positions[idx[0] as usize], positions[idx[1] as usize], positions[idx[2] as usize]);
-        let area = 0.5 * (b - a).cross(c - a).length();
+        let cr = (b - a).cross(c - a);
+        let area = 0.5 * cr.length();
         if area <= 0.0 {
             continue;
+        }
+        // Unit normal for free — `cr.length()` is `2*area`, already computed
+        // — but ORIENTED against the authored vertex normals, not left to
+        // winding alone.
+        //
+        // Winding is the only orientation the cross product carries, and this
+        // renderer does not otherwise trust it: `surface_point` keeps an
+        // unconditional face flip precisely for "a mesh whose winding
+        // disagrees with its authored vertex normals (a modeling error the
+        // loader preserves whenever the OBJ ships a full normal array)". That
+        // was harmless while the normal was discarded a line later. It is not
+        // harmless now: the lobe points where this vector points, so a
+        // reversed-winding panel would go `f = 1 - R ~ 0` on the side it is
+        // meant to light — and SILENTLY, because every other emissive path is
+        // two-sided (the display add has no facing test, moller_trumbore is
+        // two-sided, and the fb.gi gather picks emitters up from either
+        // side), so the panel would still glow on screen and still light the
+        // room under GI while its NEE pool vanished. Removing light where it
+        // belongs is a worse failure than the isotropic over-lighting this
+        // replaces, and high R cannot detect it: R says the winding is
+        // CONSISTENT across the cluster, never that it points outward.
+        //
+        // The authored normals are the same tie-breaker `surface_point` uses.
+        // Sum the three (one direction per face, robust to a single bad
+        // vertex) and flip when they disagree. A scene with no normal array,
+        // or a face whose authored normals cancel, keeps winding verbatim —
+        // coarser, never wrong, and bitwise the pre-fix behaviour.
+        let mut normal = cr / (2.0 * area);
+        if !normals.is_empty() {
+            let na = normals[idx[0] as usize] + normals[idx[1] as usize] + normals[idx[2] as usize];
+            // `> 0` (not `>= 0`) leaves an exactly-perpendicular or
+            // fully-cancelling authored set on the winding arm, and rejects
+            // NaN by falling through.
+            if na.length_squared() > 0.0 && normal.dot(na) < 0.0 {
+                normal = -normal;
+            }
         }
         let l = tri_radiance(&materials[tri_mat[t] as usize], textures, texcoords, *idx, positions.len());
         let power = l * area;
@@ -556,6 +693,7 @@ pub(crate) fn derive_parts(
             power,
             mn: a.min(b).min(c),
             mx: a.max(b).max(c),
+            normal,
         });
     }
     if recs.is_empty() {
@@ -586,12 +724,14 @@ pub(crate) fn derive_parts(
                 mn: Vec3A::splat(f32::INFINITY),
                 mx: Vec3A::splat(f32::NEG_INFINITY),
                 alive: true,
+                nacc: Vec3A::ZERO,
             });
             e.power += r.power;
             e.cacc += r.centroid * w;
             e.wsum += w;
             e.mn = e.mn.min(r.mn);
             e.mx = e.mx.max(r.mx);
+            e.nacc += r.normal * w;
         }
         if cells.len() <= EL_MAX_CELLS {
             break cells;
@@ -657,15 +797,63 @@ pub(crate) fn derive_parts(
         // lights is the user's own budget choice.
         let lo = 4.0 * rc2;
         let r_infl2 = (lum(cp) / EL_MIN_E - rc2).clamp(lo, r_cap2.max(lo));
+        // The emission lobe: v = R·n_c, i.e. the power-weighted mean normal
+        // scaled to carry its own spread. `wsum` is positive for every
+        // surviving cluster (`lum(power) > 0` is the record admission test and
+        // the som rebuild retains on `wsum > 0`), but the guard keeps a
+        // degenerate cluster isotropic rather than NaN.
+        let r_dir = c.resultant();
+        let v = if r_dir > 0.0 { c.nacc / c.wsum.max(1e-30) } else { Vec3A::ZERO };
         out.lights[out.count as usize] = EmissiveLight {
             pos: [cen.x, cen.y, cen.z],
             rc2,
             color: [cp.x, cp.y, cp.z],
             r_infl2,
+            axis: [v.x, v.y, v.z],
+            r_dir,
         };
         out.count += 1;
     }
+
     out
+}
+
+/// THE DIRECTIONALITY REPORT — the loud derivation line that says how much the
+/// emission lobe is doing on THIS scene. R near 0 means the cluster's normals
+/// cancel (a bulb, a tube, a box of panels facing out) and the lobe is inert;
+/// R near 1 means a panel, where an isotropic source would have lit points
+/// behind it exactly as brightly as points in front. It is the tuning signal
+/// for `EL_BOOST`, which absorbs the level the attenuation-only profile gives
+/// up (the EL_BOOST loud-line / FR_AEXP_GUARD_TRACE histogram precedents).
+///
+/// Read off the FINISHED rows rather than the clusters, so it reports exactly
+/// the `r_dir` the shaders will consume — and lives at the ONE production call
+/// site rather than inside `derive_parts`, which `self_test` calls a dozen
+/// times over 2-triangle synthetic scenes (an unconditional print there put
+/// eleven lines of noise in every `--check`, and interleaved one per island
+/// across the concurrent world fan-out).
+fn report_directionality(out: &EmissiveLights) {
+    if out.count == 0 {
+        return;
+    }
+    let rs: Vec<f32> = out.lights[..out.count as usize].iter().map(|l| l.r_dir).collect();
+    let n = rs.len() as f32;
+    let mean = rs.iter().sum::<f32>() / n;
+    let lo = rs.iter().cloned().fold(f32::INFINITY, f32::min);
+    let hi = rs.iter().cloned().fold(0.0f32, f32::max);
+    // Five buckets over [0,1]; the top two are where the lobe bites.
+    let mut hist = [0u32; 5];
+    for &r in &rs {
+        hist[((r * 5.0) as usize).min(4)] += 1;
+    }
+    eprintln!(
+        "emissive: cluster directionality R = |Σw·n|/Σw — min {lo:.3} mean {mean:.3} \
+         max {hi:.3} | histogram [0,.2) {} [.2,.4) {} [.4,.6) {} [.6,.8) {} [.8,1] {} \
+         | {} of {} clusters are panel-like (R >= 0.6)",
+        hist[0], hist[1], hist[2], hist[3], hist[4],
+        hist[3] + hist[4],
+        rs.len()
+    );
 }
 
 /// Closed-form gates on everything the consumers lean on. Pure, DLL-free,
@@ -714,12 +902,12 @@ pub fn self_test() -> Result<(), String> {
         let (mut pos, mut idx, mut tm) = (Vec::new(), Vec::new(), Vec::new());
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::ZERO, 0);
         let mats = [mat_dark()];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
+        let el = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
         if el.count != 0 {
             return Err(format!("emissive-free scene derived {} lights", el.count));
         }
         let mats2 = [mat_emit(Vec3A::ONE)];
-        let el2 = derive_parts(&pos, &idx, &tm, &mats2, &[], &[], cmin, cmax, eps, 0, ClusterMode::Grid);
+        let el2 = derive_parts(&pos, &[], &idx, &tm, &mats2, &[], &[], cmin, cmax, eps, 0, ClusterMode::Grid);
         if el2.count != 0 {
             return Err("zero budget did not derive count 0".into());
         }
@@ -735,8 +923,8 @@ pub fn self_test() -> Result<(), String> {
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(-8.0, 1.0, 0.0), 0);
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(8.0, 1.0, 0.0), 1);
         let mats = [mat_emit(Vec3A::new(4.0, 2.0, 1.0)), mat_emit(Vec3A::splat(6.0))];
-        let a = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
-        let b = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
+        let a = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
+        let b = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
         if a != b {
             return Err("derive is not deterministic".into());
         }
@@ -777,7 +965,7 @@ pub fn self_test() -> Result<(), String> {
             push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(x, 1.0, z), 0);
         }
         let mats = [mat_emit(Vec3A::splat(2.0))];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Grid);
+        let el = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Grid);
         if el.count != 16 {
             return Err(format!("budget 16 derived {} lights", el.count));
         }
@@ -797,7 +985,7 @@ pub fn self_test() -> Result<(), String> {
         // half the content box, where the 4·rc2 floor exceeds the r_cap2
         // cap — the arm that PANICKED as a bare `clamp` (min > max; measured
         // live on bistro --emissive-lights 1). The floor must win.
-        let el1 = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 1, ClusterMode::Grid);
+        let el1 = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 1, ClusterMode::Grid);
         if el1.count != 1 {
             return Err(format!("budget 1 derived {} lights", el1.count));
         }
@@ -814,6 +1002,8 @@ pub fn self_test() -> Result<(), String> {
             rc2: 0.01,
             color: [3.0, 2.0, 1.0],
             r_infl2: 25.0,
+            axis: [0.0; 3],
+            r_dir: 0.0,
         };
         if irradiance(&l, l.r_infl2) != Vec3A::ZERO || irradiance(&l, l.r_infl2 * 2.0) != Vec3A::ZERO
         {
@@ -852,7 +1042,7 @@ pub fn self_test() -> Result<(), String> {
         m.emissive_tex = 0;
         let mats = [m];
         let texs = [tex];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &texs, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
+        let el = derive_parts(&pos, &[], &idx, &tm, &mats, &texs, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
         if el.count != 1 {
             return Err(format!("mapped emitter derived {} lights", el.count));
         }
@@ -865,7 +1055,7 @@ pub fn self_test() -> Result<(), String> {
             image::RgbaImage::from_raw(2, 2, vec![0u8, 0, 0, 255].repeat(4)).unwrap(),
         );
         let texs_b = [Texture::from_image(black, true)];
-        let el_b = derive_parts(&pos, &idx, &tm, &mats, &texs_b, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
+        let el_b = derive_parts(&pos, &[], &idx, &tm, &mats, &texs_b, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
         if el_b.count != 0 {
             return Err("black emissive map still derived a light".into());
         }
@@ -875,7 +1065,7 @@ pub fn self_test() -> Result<(), String> {
         let mut m0 = mat_emit(Vec3A::ZERO);
         m0.emissive_tex = 0;
         let mats0 = [m0];
-        let el_0 = derive_parts(&pos, &idx, &tm, &mats0, &texs, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
+        let el_0 = derive_parts(&pos, &[], &idx, &tm, &mats0, &texs, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
         if el_0.count != 0 {
             return Err("Ke-zero mapped material derived a light (display renders it black)".into());
         }
@@ -886,7 +1076,7 @@ pub fn self_test() -> Result<(), String> {
         let (mut pos, mut idx, mut tm) = (Vec::new(), Vec::new(), Vec::new());
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::ZERO, 0);
         let mats = [mat_emit(Vec3A::ONE)];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 999, ClusterMode::Grid);
+        let el = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 999, ClusterMode::Grid);
         if el.count != 1 {
             return Err("over-cap budget mishandled".into());
         }
@@ -913,6 +1103,8 @@ pub fn self_test() -> Result<(), String> {
             rc2: 1e-4,
             color: [1.0, 1.0, 1.0],
             r_infl2,
+            axis: [0.0; 3],
+            r_dir: 0.0,
         };
         let mut el = EmissiveLights::off();
         // 0: on-axis in front — KEPT. 1: far off-axis — plane-culled.
@@ -1013,8 +1205,8 @@ pub fn self_test() -> Result<(), String> {
             push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(x, 1.0, z), 0);
         }
         let mats = [mat_emit(Vec3A::splat(2.0))];
-        let a = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Som);
-        let b = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Som);
+        let a = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Som);
+        let b = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Som);
         if a != b {
             return Err("som derive is not deterministic".into());
         }
@@ -1039,9 +1231,184 @@ pub fn self_test() -> Result<(), String> {
         // Anti-vacuity: the refinement must actually MOVE something on this
         // geometry, or the gate proves only that the arm compiled — the
         // grid centroids are not Lloyd-stationary here by construction.
-        let g = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Grid);
+        let g = derive_parts(&pos, &[], &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Grid);
         if a == g {
             return Err("som arm returned the grid clustering bitwise — the refinement never ran".into());
+        }
+    }
+
+    // Gate 9: THE EMISSION LOBE. `lobe` is pure, so this is closed form.
+    {
+        let mk = |axis: Vec3A, r: f32| EmissiveLight {
+            pos: [0.0, 0.0, 0.0],
+            rc2: 1.0,
+            color: [1.0, 1.0, 1.0],
+            r_infl2: 100.0,
+            axis: [axis.x, axis.y, axis.z],
+            r_dir: r,
+        };
+        let n = Vec3A::Y;
+
+        // (a) R = 0 is EXACTLY 1.0 in every direction — the structural off
+        // arm, and it must be bit-exact rather than close (an isotropic
+        // cluster has to shade on the pre-lobe instruction stream).
+        let iso = mk(Vec3A::ZERO, 0.0);
+        for i in 0..64 {
+            let a = i as f32 * 2.399_963;
+            let z = 1.0 - 2.0 * (i as f32 + 0.5) / 64.0;
+            let rr = (1.0 - z * z).max(0.0).sqrt();
+            let w = Vec3A::new(rr * a.cos(), z, rr * a.sin());
+            if lobe(&iso, w).to_bits() != 1.0f32.to_bits() {
+                return Err(format!("lobe: R=0 is not exactly 1.0 at {w:?}"));
+            }
+        }
+
+        // (b) THE BOUND THE CULL RESTS ON: f in [0, 1] for every R and every
+        // direction. If f could exceed 1 a light would reach past r_infl and
+        // `cull_tile`'s exactness argument — and r_infl2's own derivation —
+        // would both be invalid.
+        for ri in 0..=10 {
+            let r = ri as f32 / 10.0;
+            let l = mk(n * r, r);
+            for i in 0..256 {
+                let a = i as f32 * 2.399_963;
+                let z = 1.0 - 2.0 * (i as f32 + 0.5) / 256.0;
+                let rr = (1.0 - z * z).max(0.0).sqrt();
+                let w = Vec3A::new(rr * a.cos(), z, rr * a.sin());
+                let f = lobe(&l, w);
+                if !(0.0..=1.0).contains(&f) {
+                    return Err(format!("lobe: f = {f} outside [0,1] at R={r}, w={w:?}"));
+                }
+            }
+        }
+
+        // (c) R = 1 is the true Lambertian shape: exactly saturate(cos), so
+        // exactly 0 at 90 deg and everywhere behind.
+        let pan = mk(n, 1.0);
+        if lobe(&pan, n) != 1.0 {
+            return Err("lobe: R=1 on-axis is not 1.0".into());
+        }
+        if lobe(&pan, -n) != 0.0 || lobe(&pan, Vec3A::X) != 0.0 {
+            return Err("lobe: R=1 must be exactly 0 at 90 deg and behind".into());
+        }
+        for i in 0..32 {
+            let t = (i as f32 + 0.5) / 32.0 * std::f32::consts::FRAC_PI_2;
+            let w = (n * t.cos() + Vec3A::X * t.sin()).normalize();
+            if (lobe(&pan, w) - t.cos()).abs() > 2e-6 {
+                return Err(format!("lobe: R=1 is not saturate(cos) at {t} rad"));
+            }
+        }
+
+        // (d) Monotone in the angle, and the on-axis value is the maximum —
+        // an emitter may not be brighter off its own axis.
+        let mid = mk(n * 0.5, 0.5);
+        let mut prev = lobe(&mid, n);
+        if (prev - 1.0).abs() > 1e-6 {
+            return Err("lobe: on-axis is not 1.0 at R=0.5".into());
+        }
+        for i in 1..=64 {
+            let t = i as f32 / 64.0 * std::f32::consts::PI;
+            let w = (n * t.cos() + Vec3A::X * t.sin()).normalize();
+            let f = lobe(&mid, w);
+            if f > prev + 1e-6 {
+                return Err(format!("lobe: not monotone in angle at {t} rad ({prev} -> {f})"));
+            }
+            prev = f;
+        }
+        // ...and the back hemisphere sits exactly at the floor 1 - R.
+        if (lobe(&mid, -n) - 0.5).abs() > 1e-6 {
+            return Err("lobe: back hemisphere is not the 1-R floor".into());
+        }
+
+        // (e) The DERIVATION end of it, with teeth both ways: a flat panel
+        // must come out panel-like and a closed box must come out isotropic,
+        // because "R self-disarms on a bulb" is the whole safety argument.
+        let quad = |o: Vec3A, u: Vec3A, v: Vec3A| -> (Vec<Vec3A>, Vec<[u32; 3]>) {
+            (vec![o, o + u, o + u + v, o + v], vec![[0, 1, 2], [0, 2, 3]])
+        };
+        let (qp, qi) = quad(Vec3A::ZERO, Vec3A::X, Vec3A::Z);
+        let mats = vec![Material { emissive: Vec3A::splat(5.0), ..mat_dark() }];
+        let tm = vec![0u32; qi.len()];
+        let flat = derive_parts(
+            &qp, &[], &qi, &tm, &mats, &[], &[], Vec3A::splat(-2.0), Vec3A::splat(2.0), 1e-3, 4,
+            ClusterMode::Grid,
+        );
+        if flat.count == 0 || flat.lights[0].r_dir < 0.99 {
+            return Err(format!(
+                "lobe: a flat emissive quad must read panel-like, got R = {}",
+                flat.lights.first().map(|l| l.r_dir).unwrap_or(-1.0)
+            ));
+        }
+        // (f) THE WINDING ARM, which is what the axis would otherwise be
+        // trusting blind. This same quad's winding normal is -Y (u x v =
+        // X x Z), so authoring its vertex normals as +Y is exactly the
+        // disagreement `surface_point` documents in real OBJ content: the
+        // panel faces +Y and the index order says otherwise. The lobe must
+        // follow the AUTHORED normals.
+        //
+        // Teeth both ways, because either half alone passes vacuously: with
+        // the normal array the axis must land on +Y (the rule fires — before
+        // the fix this arm reads -1.0), and WITHOUT it the same geometry must
+        // land on -Y (the probe really is contradictory, so the first arm is
+        // measuring the fix and not a quad that already agreed).
+        let fnorm = vec![Vec3A::Y; qp.len()];
+        let ftm = vec![0u32; qi.len()];
+        let flip = derive_parts(
+            &qp, &fnorm, &qi, &ftm, &mats, &[], &[], Vec3A::splat(-2.0), Vec3A::splat(2.0), 1e-3,
+            4, ClusterMode::Grid,
+        );
+        if flip.count == 0 || Vec3A::from(flip.lights[0].axis).dot(Vec3A::Y) < 0.99 {
+            return Err(format!(
+                "lobe: winding disagreeing with the authored normals must follow the \
+                 AUTHORED ones, got axis {:?}",
+                flip.lights.first().map(|l| l.axis).unwrap_or([0.0; 3])
+            ));
+        }
+        if flat.count == 0 || Vec3A::from(flat.lights[0].axis).dot(Vec3A::Y) > -0.99 {
+            return Err(format!(
+                "lobe: the winding probe is not contradictory (anti-vacuity) — the same \
+                 quad with no normal array read axis {:?}, want -Y",
+                flat.lights.first().map(|l| l.axis).unwrap_or([0.0; 3])
+            ));
+        }
+
+        // A closed box: six faces, outward normals cancelling exactly. This is
+        // the bulb case, and it must disarm the lobe rather than merely soften
+        // it — one grid cell, so the merge sees all six.
+        let mut bp: Vec<Vec3A> = Vec::new();
+        let mut bi: Vec<[u32; 3]> = Vec::new();
+        for (o, u, v) in [
+            (Vec3A::new(0.0, 0.0, 0.0), Vec3A::X, Vec3A::Z),
+            (Vec3A::new(0.0, 1.0, 0.0), Vec3A::Z, Vec3A::X),
+            (Vec3A::new(0.0, 0.0, 0.0), Vec3A::Z, Vec3A::Y),
+            (Vec3A::new(1.0, 0.0, 0.0), Vec3A::Y, Vec3A::Z),
+            (Vec3A::new(0.0, 0.0, 0.0), Vec3A::Y, Vec3A::X),
+            (Vec3A::new(0.0, 0.0, 1.0), Vec3A::X, Vec3A::Y),
+        ] {
+            let b = bp.len() as u32;
+            let (p4, i2) = quad(o, u, v);
+            bp.extend(p4);
+            for t in i2 {
+                bi.push([t[0] + b, t[1] + b, t[2] + b]);
+            }
+        }
+        let btm = vec![0u32; bi.len()];
+        let boxy = derive_parts(
+            &bp, &[], &bi, &btm, &mats, &[], &[], Vec3A::splat(-2.0), Vec3A::splat(3.0), 1e-3, 1,
+            ClusterMode::Grid,
+        );
+        if boxy.count != 1 {
+            return Err(format!("lobe: box probe made {} clusters, want 1", boxy.count));
+        }
+        if boxy.lights[0].r_dir > 0.05 {
+            return Err(format!(
+                "lobe: a closed box must disarm the lobe (R = {}, want ~0) — the bulb case",
+                boxy.lights[0].r_dir
+            ));
+        }
+        // ...and being isotropic, its lobe must be the exact 1.0 off arm.
+        if lobe(&boxy.lights[0], Vec3A::Y).to_bits() != 1.0f32.to_bits() {
+            return Err("lobe: the box cluster is not on the exact-1.0 isotropic arm".into());
         }
     }
 

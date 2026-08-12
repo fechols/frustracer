@@ -6,13 +6,34 @@
 //! irradiance, zero rays), and the sharp sun disc stays an explicit,
 //! cone-sampled, shadow-rayed light. See `shade::sky_dome` / `shade::sun_disc`.
 //!
-//! Order 2 is not a compromise — it is exact enough to be uninteresting.
-//! Irradiance is a convolution of radiance with a clamped-cosine kernel, whose
-//! own spectrum collapses above l = 2 (Ramamoorthi & Hanrahan 2001): for ANY
-//! sky, 9 coefficients carry >99% of the energy a Lambertian surface can see.
+//! Order 2 is close to free and nearly exact, for the reason Ramamoorthi &
+//! Hanrahan 2001 give: irradiance is a convolution of radiance with a
+//! clamped-cosine kernel whose own spectrum collapses above l = 2, so 9
+//! coefficients carry essentially everything a Lambertian surface can see.
 //! What SH CANNOT do is the sun — a peaked source needs bands up to
 //! l ≈ 180°/θ, rings under truncation, and (fatally) cannot be shadow-rayed.
 //! That is why the sun is not in here.
+//!
+//! MEASURED, ON THE SKY WE ACTUALLY SHIP (`sky::self_test` G6b, 2026-08-11),
+//! because this header used to say "exact enough to be uninteresting" and that
+//! is a claim about the NOON sky only:
+//!
+//!     sun     per-channel mean / worst    vs the scene's ambient scale
+//!     noon          1.17% / 4.36%                   0.9%
+//!     low           5.12% / 32.03%                  3.0%
+//!     night         0.68% / 3.19%                   0.8%
+//!
+//! The residual is genuine truncation — a 64x sweep of BOTH the reference and
+//! `PROJ_SAMPLES` moves those figures in the 4th decimal — and it is dominated
+//! by the l = 4 band the cosine kernel does NOT annihilate (Â4/Â0 = 1/24 ≈
+//! 4.2%, which is the noon worst almost exactly). The low-sun row is the one
+//! to know about, and its cause is NOT the aureole: the worst probe faces
+//! straight DOWN, so what order 2 cannot follow is the horizon step and its
+//! `sky::GROUND_ALBEDO` bounce — the Gibbs case the blend band softens but does
+//! not eliminate (hence `irradiance`'s clamp). Bounded at ~3% of the scene's
+//! own ambient scale, which is why it reads correctly; if that ever needs
+//! fixing the answer is more BANDS (or pulling the ground bounce out
+//! analytically, the way the sun was pulled out), not a different basis.
 //!
 //! Convention (load-bearing — `hemi.rs`'s doc comment states the same one):
 //! `irradiance()` returns cosine-weighted incoming radiance **divided by π**,
@@ -182,10 +203,16 @@ pub fn self_test() -> Result<(), String> {
         }
     }
 
-    // G3: accuracy vs ground truth. A cosine-weighted quadrature of a real
-    // directional sky, compared against the 9-coefficient closed form. This is
-    // the claim the whole design rests on — order 2 is enough for diffuse.
-    // Ramamoorthi's own bound is ~1% worst case for arbitrary skies.
+    // G3: accuracy vs ground truth. A cosine-weighted quadrature of a directional
+    // sky, compared against the 9-coefficient closed form. Ramamoorthi's own
+    // bound is ~1% worst case for arbitrary skies.
+    //
+    // THE INTEGRAND HERE IS A STAND-IN, and knowing that is the point: it is a
+    // pure l=1 ramp with no Mie aureole and no horizon step, so it measures the
+    // MACHINERY (basis, projection, closed form) on an easy field and lands at
+    // ~0.03% / ~0.19%. It is NOT the accuracy of the shipping sky, which is
+    // 30-100x worse and is measured by `sky::self_test` G6b — see this module's
+    // header for the table. Do not quote G3's numbers as "the SH error".
     let dome = |d: Vec3A| -> Vec3A {
         // A stand-in with the same shape as the real dome: a bright horizon
         // fading to a darker zenith, i.e. a strong l=1 term.
@@ -229,13 +256,26 @@ pub fn self_test() -> Result<(), String> {
 
 /// Brute-force cosine-weighted irradiance / π — the ground truth G3 scores
 /// against. Deliberately the dumbest possible integrator.
-fn reference_irradiance(f: impl Fn(Vec3A) -> Vec3A, n: Vec3A) -> Vec3A {
-    const M: usize = 200_000;
+pub(crate) fn reference_irradiance(f: impl Fn(Vec3A) -> Vec3A, n: Vec3A) -> Vec3A {
+    reference_irradiance_n(f, n, 200_000)
+}
+
+/// `reference_irradiance` with the sample count exposed. It is a deterministic
+/// Fibonacci quadrature over a smooth integrand, NOT Monte Carlo, so it
+/// converges fast and a caller integrating something far dearer than G3's lerp
+/// (`sky::dome`, with its exp/pow per sample) can afford fewer points without
+/// approaching the 1% limits it is scored against. Never lower the LIMITS to
+/// compensate.
+pub(crate) fn reference_irradiance_n(
+    f: impl Fn(Vec3A) -> Vec3A,
+    n: Vec3A,
+    m: usize,
+) -> Vec3A {
     let mut sum = Vec3A::ZERO;
     let ga = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
-    for i in 0..M {
+    for i in 0..m {
         let fi = i as f32;
-        let z = 1.0 - 2.0 * (fi + 0.5) / M as f32;
+        let z = 1.0 - 2.0 * (fi + 0.5) / m as f32;
         let r = (1.0 - z * z).max(0.0).sqrt();
         let phi = ga * fi;
         let d = Vec3A::new(r * phi.cos(), r * phi.sin(), z);
@@ -245,12 +285,12 @@ fn reference_irradiance(f: impl Fn(Vec3A) -> Vec3A, n: Vec3A) -> Vec3A {
         }
     }
     // Σ L·cos · (4π/M) is the irradiance E; /π is the renderer convention.
-    sum * (4.0 / M as f32)
+    sum * (4.0 / m as f32)
 }
 
 /// A fixed spread of normals — axis-aligned, and a few obliques that exercise
 /// every cross term in the l=2 band.
-fn probe_normals() -> Vec<Vec3A> {
+pub(crate) fn probe_normals() -> Vec<Vec3A> {
     let mut v = vec![
         Vec3A::Y,
         Vec3A::NEG_Y,

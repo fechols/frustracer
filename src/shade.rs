@@ -1387,7 +1387,11 @@ pub fn shade(
             if ndl <= 0.0 {
                 continue;
             }
-            let e = crate::emissive::irradiance(l, d2);
+            // The emission lobe: `wi` points from the shading point TO the
+            // light, so the direction FROM the light to the receiver is -wi.
+            // Bounded by 1, so this can only ever REMOVE light — no in-range
+            // test, no influence radius and no tile cull is perturbed.
+            let e = crate::emissive::irradiance(l, d2) * crate::emissive::lobe(l, -wi);
             if e == Vec3A::ZERO {
                 continue;
             }

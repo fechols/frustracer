@@ -830,6 +830,133 @@ pub fn self_test() -> Result<(), String> {
         return Err(format!("sky ambient is not blue-dominant: {e_up:?}"));
     }
 
+    // G6b: SH ACCURACY ON THE REAL SKY — the gate the "order 2 is enough for
+    // diffuse" claim was missing.
+    //
+    // G6 above only bands the ambient's MAGNITUDE, and sh.rs's own G3 scores the
+    // closed form against brute force on a hand-written linear-in-y STAND-IN: a
+    // strong l=1 field with no Mie aureole in it. So nothing anywhere compared
+    // order-2 SH irradiance against ground truth for the sky we actually ship —
+    // which is precisely where the claim could hide a defect, because `dome`'s
+    // forward Henyey-Geenstein lobe (MIE_G = 0.76, ~30x isotropic at the peak
+    // and ~4x down over 20 deg) is genuinely l >= 3 content, and it is the only
+    // sharp feature the dome has.
+    //
+    // The closure is `gather` — VERBATIM what `scene::refresh_sky_sh` projects,
+    // so this scores the shipping projection and not a parallel description of
+    // it. Three suns, because the dome's shape is a function of the sun: high
+    // (aureole near the zenith), low (aureole down in the thick horizon path,
+    // where the 1/λ⁴ reddening is strongest and the l=1 band is largest), and
+    // night (the moonlit floor plus `star_glow` — the one arm whose integrand
+    // is not `dome` alone).
+    //
+    // REF_M is below sh.rs's own 200k because `dome` costs exps and pows per
+    // sample where G3's lerp costs nothing. That is affordable ONLY because the
+    // reference is a deterministic Fibonacci quadrature over a smooth integrand
+    // rather than Monte Carlo, so it is already far under the limits it scores
+    // against. Never lower the LIMITS to buy time here.
+    // TWO METRICS, because one of them lies. `rel` is G3's own per-channel
+    // relative error, kept for comparability with sh.rs — but its denominator
+    // COLLAPSES exactly where the value stops mattering, and the worst probe in
+    // every case below is n = (0,-1,0), a downward normal whose irradiance is
+    // the dim ground-bounce term. (The same shape as fsr.rs's residual gate,
+    // which is absolute for the same reason.) So the bound that carries the
+    // PHYSICAL claim is `scene_rel`: the luma error normalized by the BRIGHTEST
+    // probe, i.e. "how wrong is the ambient, against the scale of the ambient".
+    //
+    // MEASURED (2026-08-11), and these are stable to 4 decimals under a 64x
+    // sweep of both the reference AND the projection sample counts:
+    //
+    //     sun    per-channel mean / worst    scene_rel    sun peak/mean
+    //     noon         1.17% / 4.36%           1.1%           6.6x
+    //     low          5.12% / 32.03%          3.0%          19.4x
+    //     night        0.68% / 3.19%           0.9%           4.6x
+    //
+    // THE LOW SUN IS THE INTERESTING ROW, and the cause is NOT the aureole:
+    // the worst probe faces straight down, so what order 2 cannot follow is the
+    // HORIZON STEP and its GROUND_ALBEDO bounce — the Gibbs case the blend band
+    // exists to soften, and evidently does not fully contain. Its absolute size
+    // stays ~3% of the scene's ambient scale, which is why the ambient still
+    // looks right; but "exact enough to be uninteresting" is a claim about the
+    // NOON sky, and sh.rs's header now says so.
+    const REF_M: usize = 65_536;
+    const LUM: Vec3A = Vec3A::new(0.2126, 0.7152, 0.0722);
+    // The physical bound, one number for every sun: 6% against ~3% measured.
+    const SCENE_REL_LIMIT: f32 = 0.06;
+    let probes = crate::sh::probe_normals();
+    // Per-case drift ceilings on the per-channel metric — ~1.4x the measured
+    // values above. These are DRIFT catches, not physical claims (the 45% reads
+    // absurd precisely because that metric is the one that lies); retuning the
+    // dome legitimately moves them, exactly as it moves G6's DOME_SCALE band.
+    for &(label, sd, scale, night, mean_lim, worst_lim) in &[
+        ("noon ", Vec3A::new(6.0, 10.0, 4.0), 1.0f32, 0.0f32, 0.017f32, 0.062f32),
+        ("low  ", Vec3A::new(10.0, 0.6, 2.0), 1.0, 0.0, 0.072, 0.45),
+        ("night", Vec3A::new(-3.0, 6.0, -2.0), MOON_DOME_FRAC, 1.0, 0.010, 0.045),
+    ] {
+        let sd = sd.normalize();
+        let f = |d: Vec3A| gather(d, sd, scale, night);
+        let sh_r = crate::sh::Sh9::project(f);
+
+        // ANTI-VACUITY, and the half that matters: a pass proves nothing if the
+        // sharp feature never entered the integral. The DC coefficient IS the
+        // sphere-mean radiance (c[0]·Y00), so peak-over-mean at the sun costs
+        // nothing extra and asserts directly that what we projected is peaked
+        // rather than near-uniform. A flattened Mie term would collapse it.
+        let mean = sh_r.c[0] * 0.282_095;
+        let peak = f(sd);
+        let ratio = peak.dot(LUM) / mean.dot(LUM).max(1e-20);
+        if !(ratio > 2.0) {
+            return Err(format!(
+                "G6b/{label}: sky is not peaked at the sun (peak/mean {ratio:.2}, want > 2) \
+                 — the aureole is missing, so this gate is scoring a near-uniform sky"
+            ));
+        }
+
+        // Two passes only because `scene_rel` needs the brightest probe first.
+        let vals: Vec<(Vec3A, Vec3A)> = probes
+            .iter()
+            .map(|&n| (crate::sh::reference_irradiance_n(f, n, REF_M), sh_r.irradiance(n)))
+            .collect();
+        let ref_max = vals.iter().fold(0.0f32, |a, (w, _)| a.max(w.dot(LUM)));
+        if !(ref_max > 0.0) {
+            return Err(format!("G6b/{label}: reference irradiance is zero everywhere"));
+        }
+        let mut worst: f32 = 0.0;
+        let mut sum_rel = 0.0;
+        let mut scene_rel: f32 = 0.0;
+        for (want, got) in &vals {
+            worst = worst.max(((*got - *want) / *want).abs().max_element());
+            sum_rel += ((*got - *want) / *want).abs().max_element();
+            scene_rel = scene_rel.max((*got - *want).abs().dot(LUM) / ref_max);
+        }
+        let mean_rel = sum_rel / vals.len() as f32;
+        if scene_rel > SCENE_REL_LIMIT {
+            return Err(format!(
+                "G6b/{label}: order-2 SH mis-states the ambient by {:.2}% of the scene's own \
+                 ambient scale (limit {:.0}%) — the representation, not the metric",
+                scene_rel * 100.0,
+                SCENE_REL_LIMIT * 100.0
+            ));
+        }
+        if mean_rel > mean_lim || worst > worst_lim {
+            return Err(format!(
+                "G6b/{label}: per-channel drift: mean {:.3}% (ceiling {:.1}%), worst {:.3}% \
+                 (ceiling {:.1}%) — the dome's shape moved; re-measure and re-record",
+                mean_rel * 100.0,
+                mean_lim * 100.0,
+                worst * 100.0,
+                worst_lim * 100.0
+            ));
+        }
+        eprintln!(
+            "sky self-test: G6b {label} order-2 vs REAL sky — scene {:.2}%, per-channel mean \
+             {:.3}% worst {:.3}%, sun peak/mean {ratio:.1}x",
+            scene_rel * 100.0,
+            mean_rel * 100.0,
+            worst * 100.0
+        );
+    }
+
     // G7: the star field's DAY bit-identity. `star_glow` must be exactly ZERO
     // and `gather` must return `dome` BITWISE — both are branches on `night`,
     // so an untouched day session is unchanged by construction. If this ever

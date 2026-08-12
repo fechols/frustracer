@@ -18,7 +18,7 @@
 //!   consume the modules we produce, so the version is a floor, not a
 //!   preference.
 //! * **`scalarBlockLayout`.** `-fvk-use-dx-layout` is what lets ONE Rust
-//!   packer serve both backends (`gfx::frame::FrameCb`'s 4608 bytes stay
+//!   packer serve both backends (`gfx::frame::FrameCb`'s 5616 bytes stay
 //!   byte-compatible instead of needing a std140 twin), and the price is that
 //!   DX packing rules must be legal — a `uint3` at 12-byte stride is a scalar
 //!   layout, not std430's 16. So this is REQUIRED, never preferred: a device

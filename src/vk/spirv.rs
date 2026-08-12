@@ -26,7 +26,7 @@
 //!   error, not a silent downgrade, but naming the real floor keeps the
 //!   failure legible.
 //! * `-fvk-use-dx-layout` — the reason ONE Rust packer serves both backends.
-//!   `gfx::frame::FrameCb` is 4608 bytes of D3D12 constant-buffer layout;
+//!   `gfx::frame::FrameCb` is 5616 bytes of D3D12 constant-buffer layout;
 //!   this makes Vulkan read it with the same rules instead of std140/std430,
 //!   so the byte-identical-CB claim holds by construction rather than by a
 //!   second packer that must be kept in sync. The price is a device feature —
