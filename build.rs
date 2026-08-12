@@ -219,6 +219,17 @@ fn build_ffx_fsr3() {
         println!("cargo:rustc-link-lib=dylib=vulkan");
         println!("cargo:rerun-if-changed=shim/ffx_fsr3_vk.cpp");
         println!("cargo:rerun-if-changed=shim/ffx_fsr3_vk.h");
+
+        // ONE CFG PER ARTIFACT. `ffx_fsr3_src` says the backend-NEUTRAL units
+        // built; it does NOT say `ffx_vk.cpp` and our shim did, and on macOS
+        // they provably did not — `want_vk` requires Linux, because that
+        // platform takes the Metal `FfxInterface` instead. `src/vk/fsr3.rs`
+        // declared its `frshim_fsr3vk_*` externs under the broader cfg, so any
+        // box with the FFX SDK source and no `want_vk` — every Mac — failed to
+        // LINK with three undefined symbols, while build.rs's own warning
+        // promised the arm had "stood down". The Linux-without-headers case was
+        // fine only by accident: its early `return` also skips `ffx_fsr3_src`.
+        println!("cargo:rustc-cfg=ffx_fsr3_vk");
     }
 
     println!("cargo:rustc-cfg=ffx_fsr3_src");
@@ -651,6 +662,11 @@ fn main() {
     // this condition when it exists; today the cfg gates only the transpiled
     // shader table.) Declared everywhere for the same reason as the line above.
     println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_metal)");
+    // The Vulkan arm of the same feature: set when `ffx_vk.cpp` and
+    // shim/ffx_fsr3_vk.cpp actually compiled, which needs the distro's
+    // vulkan-headers and is Linux-only. Distinct from `ffx_fsr3_src` because
+    // the neutral units build on macOS too — see the note at the cfg's site.
+    println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_vk)");
     #[cfg(windows)]
     {
         // FidelityFX FFI shim: the ffx-api structs (pNext chains,

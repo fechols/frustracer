@@ -1227,9 +1227,12 @@ fn main() {
             // "nothing to run here" for a gate that was asked for exits 0 on a
             // run that gated nothing.
             eprintln!(
-                "--check-fsr3 is macOS-only today (the FidelityFX 1.1.x Metal arm). The \
-                 Vulkan arm joins behind this same flag — the subject is the upscaler, not \
-                 the backend. The pure half of the same math runs everywhere in --check-fsr."
+                "--check-fsr3 gates the FidelityFX 1.1.x upscaler on METAL, so it is \
+                 macOS-only. The VULKAN arm of the same SDK is --check-vk's V11 (stock \
+                 ffx_vk on a device that suite already opens); this one exists separately \
+                 because Metal needs a hand-written FfxInterface, which is a different \
+                 subject. The pure half of the shared staging math runs everywhere in \
+                 --check-fsr."
             );
             std::process::exit(2);
         }

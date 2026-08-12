@@ -743,10 +743,18 @@ pub struct Cli {
     pub check_nppd: bool,
     pub nppd_dump: bool,
     pub check_nrd: bool,
-    /// `--check-fsr3`: the FidelityFX 1.1.x upscaler arm — the metallib table,
-    /// a real device, a real FSR3 context, and one scored upscale of a
-    /// CPU-rendered G-buffer. macOS today (Metal); the Vulkan arm joins behind
-    /// the same flag, since the subject is the UPSCALER, not the backend.
+    /// `--check-fsr3`: the FidelityFX 1.1.x upscaler on METAL — the transpiled
+    /// metallib table, a real device, a real FSR3 context, and one scored
+    /// upscale of a CPU-rendered G-buffer.
+    ///
+    /// Metal-only, and that is now a decision rather than a placeholder: the
+    /// VULKAN arm of the same SDK lives in `--check-vk` (stage V11), because
+    /// there it rides the stock `ffx_vk` backend on a device that suite already
+    /// opens, while Metal has no backend at all until `shim/ffx_metal.mm`
+    /// supplies a hand-written `FfxInterface` — a different subject with a
+    /// different failure surface. An earlier draft of this comment promised the
+    /// Vulkan arm would join this flag; it did not, and one gate per BACKEND is
+    /// the arrangement that shipped.
     pub check_fsr3: bool,
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
@@ -2600,9 +2608,10 @@ pub fn usage() {
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
                 eprintln!("  --check-fsr   headless: FSR signal-split/encoding/MV contract self-test (no GPU or DLL)");
-                eprintln!("  --check-fsr3  headless (macOS): the FidelityFX 1.1.x upscaler arm — the transpiled");
+                eprintln!("  --check-fsr3  headless (macOS): FidelityFX 1.1.x upscaling on METAL — the transpiled");
                 eprintln!("                metallib table, a real Metal device, an FSR3 context, and one scored");
-                eprintln!("                upscale of a CPU-rendered G-buffer. Needs the SDK source");
+                eprintln!("                upscale of a CPU-rendered G-buffer. (The VULKAN arm of the same SDK is");
+                eprintln!("                --check-vk's V11.) Needs the SDK source");
                 eprintln!("                (./install-prerequisites.sh fsr3src) plus spirv-cross + Xcode at build");
                 eprintln!("                time; without them the pure half still runs and the rest SKIPs");
                 eprintln!("  --fsr         force-start the upscaler chain at FSR4 + Ray Regeneration (K toggles;");

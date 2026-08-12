@@ -27,7 +27,7 @@ use super::headless::VkHeadless;
 
 // The C ABI from shim/ffx_fsr3_vk.h. Declared only where the SDK was actually
 // compiled in — `built()` is the Rust-visible half of the same `cfg`.
-#[cfg(ffx_fsr3_src)]
+#[cfg(ffx_fsr3_vk)]
 unsafe extern "C" {
     fn frshim_fsr3vk_create(
         physical_device: *mut c_void,
@@ -78,10 +78,21 @@ pub const DEPTH_INFINITE: u32 = 1 << 2;
 pub const AUTO_EXPOSURE: u32 = 1 << 3;
 
 /// Was the SDK's Vulkan backend compiled into this binary? A false here is an
-/// environment fact (`./install-prerequisites.sh fsr3src`), never a failure —
-/// the gate SKIPs on it, the way every absent-SDK path in this tree does.
+/// environment fact (`./install-prerequisites.sh fsr3src`, plus the distro's
+/// vulkan-headers), never a failure — the gate SKIPs on it, the way every
+/// absent-SDK path in this tree does.
+///
+/// KEYED ON `ffx_fsr3_vk`, NOT `ffx_fsr3_src`, and the difference is a link
+/// error rather than a nicety: build.rs compiles `ffx_vk.cpp` + our shim only
+/// when `want_vk` (Linux AND <vulkan/vulkan.h> present), while `ffx_fsr3_src`
+/// says merely that the backend-NEUTRAL units built. On macOS the two diverge
+/// by construction — that platform takes the Metal `FfxInterface` instead — so
+/// declaring the `frshim_fsr3vk_*` externs under the broader cfg left them
+/// undefined at link time on every Mac carrying the SDK source. One cfg per
+/// artifact, the same rule `ffx_fsr3_metal` follows for the transpiled
+/// metallibs.
 pub const fn built() -> bool {
-    cfg!(ffx_fsr3_src)
+    cfg!(ffx_fsr3_vk)
 }
 
 /// Everything one FFX dispatch needs that is not a resource.
@@ -92,6 +103,11 @@ pub const fn built() -> bool {
 /// quality difference between the two feed routes, which is exactly the
 /// comparison V13 makes, so it would corrupt its own instrument.
 #[derive(Clone, Copy)]
+// Only the `ffx_fsr3_vk` build calls into this; on macOS the whole arm
+// compiles out (the Metal `FfxInterface` stands in), so the allow is
+// scoped to exactly that platform rather than blanketed — a dead-code
+// warning is signal in this tree and must keep firing on Linux.
+#[cfg_attr(not(ffx_fsr3_vk), allow(dead_code))]
 pub struct Dispatch {
     /// The renderer's own sample offset, through `fsr::JITTER_SIGN` (or the
     /// `FR_VK_FSR3_JITTER` lever) — the one convention the two FidelityFX
@@ -131,6 +147,11 @@ struct Img {
     bpp: u64,
 }
 
+// Only the `ffx_fsr3_vk` build calls into this; on macOS the whole arm
+// compiles out (the Metal `FfxInterface` stands in), so the allow is
+// scoped to exactly that platform rather than blanketed — a dead-code
+// warning is signal in this tree and must keep firing on Linux.
+#[cfg_attr(not(ffx_fsr3_vk), allow(dead_code))]
 impl Img {
     fn new(vkd: &Vk, w: u32, h: u32, fmt: vk::Format, bpp: u64) -> Result<Img, String> {
         let d = &vkd.device;
@@ -250,6 +271,11 @@ fn transition(
 }
 
 /// The FSR3 upscaler over a Vulkan device.
+// Only the `ffx_fsr3_vk` build calls into this; on macOS the whole arm
+// compiles out (the Metal `FfxInterface` stands in), so the allow is
+// scoped to exactly that platform rather than blanketed — a dead-code
+// warning is signal in this tree and must keep firing on Linux.
+#[cfg_attr(not(ffx_fsr3_vk), allow(dead_code))]
 pub struct Fsr3 {
     handle: *mut c_void,
     render: (u32, u32),
@@ -282,12 +308,12 @@ impl Fsr3 {
         upscale: (u32, u32),
         flags: u32,
     ) -> Result<Fsr3, String> {
-        #[cfg(not(ffx_fsr3_src))]
+        #[cfg(not(ffx_fsr3_vk))]
         {
             let _ = (hg, render, upscale, flags);
             return Err("FSR3 was not compiled into this binary".into());
         }
-        #[cfg(ffx_fsr3_src)]
+        #[cfg(ffx_fsr3_vk)]
         {
             let vkd = &hg.vk;
             let (rw, rh) = render;
@@ -397,12 +423,12 @@ impl Fsr3 {
         motion: &[u16],
         dp: Dispatch,
     ) -> Result<(), String> {
-        #[cfg(not(ffx_fsr3_src))]
+        #[cfg(not(ffx_fsr3_vk))]
         {
             let _ = (hg, color, depth, motion, dp);
             Err("FSR3 was not compiled into this binary".into())
         }
-        #[cfg(ffx_fsr3_src)]
+        #[cfg(ffx_fsr3_vk)]
         {
             let vkd = &hg.vk;
             let (rw, rh) = self.render;
@@ -494,12 +520,12 @@ impl Fsr3 {
     where
         F: FnOnce(&ash::Device, vk::CommandBuffer) -> Result<(), String>,
     {
-        #[cfg(not(ffx_fsr3_src))]
+        #[cfg(not(ffx_fsr3_vk))]
         {
             let _ = (hg, feed, dp);
             Err("FSR3 was not compiled into this binary".into())
         }
-        #[cfg(ffx_fsr3_src)]
+        #[cfg(ffx_fsr3_vk)]
         {
             let rc = std::cell::Cell::new(0i32);
             let ferr: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
@@ -540,7 +566,7 @@ impl Fsr3 {
 
     /// The FFX dispatch itself — the tail both arms end in, so neither can
     /// drift from the other in the descriptor a quality comparison rests on.
-    #[cfg(ffx_fsr3_src)]
+    #[cfg(ffx_fsr3_vk)]
     fn record_ffx(&self, cmd: vk::CommandBuffer, dp: &Dispatch) -> i32 {
         let (rw, rh) = self.render;
         let (near, far) = dp.near_far;
@@ -727,7 +753,7 @@ impl Fsr3 {
         unsafe {
             let _ = vkd.device.device_wait_idle();
         }
-        #[cfg(ffx_fsr3_src)]
+        #[cfg(ffx_fsr3_vk)]
         unsafe {
             frshim_fsr3vk_destroy(self.handle);
         }
@@ -748,10 +774,20 @@ impl Fsr3 {
     }
 }
 
+// Only the `ffx_fsr3_vk` build calls into this; on macOS the whole arm
+// compiles out (the Metal `FfxInterface` stands in), so the allow is
+// scoped to exactly that platform rather than blanketed — a dead-code
+// warning is signal in this tree and must keep firing on Linux.
+#[cfg_attr(not(ffx_fsr3_vk), allow(dead_code))]
 fn bytemuck_u16(v: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+// Only the `ffx_fsr3_vk` build calls into this; on macOS the whole arm
+// compiles out (the Metal `FfxInterface` stands in), so the allow is
+// scoped to exactly that platform rather than blanketed — a dead-code
+// warning is signal in this tree and must keep firing on Linux.
+#[cfg_attr(not(ffx_fsr3_vk), allow(dead_code))]
 fn bytemuck_f32(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
