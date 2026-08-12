@@ -2468,9 +2468,10 @@ pub fn usage() {
                 eprintln!("                chs = mode-1 closest-hit tickets, the hit-stage packing view)");
                 eprintln!("  --cinematic [p]  MEDIA MODE: render stills / camera-spline video sequences");
                 eprintln!("                headlessly. Presets: hero (default, one still) | islands |");
-                eprintln!("                tour (the island lap, dawn -> moonlit night) | orbit | hud |");
+                eprintln!("                tour (the island lap, dawn -> moonlit night) | orbit |");
+                eprintln!("                foliage (a locked-off clip of the wind) | hud |");
                 eprintln!("                list. Anything else is read as a JSON shot list. Writes a PNG");
-                eprintln!("                sequence + manifest.json and PRINTS the ffmpeg commands");
+                eprintln!("                sequence and PRINTS the ffmpeg commands to encode it");
                 eprintln!("                (--cinematic-encode runs them). Loads the world by default.");
                 eprintln!("                The GPU arms capture through the upscaler chain BY DEFAULT:");
                 eprintln!("                DLSS-RR -> FSR4-RR -> XeSS -> FSR3 probed at 100% render scale");

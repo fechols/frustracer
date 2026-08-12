@@ -285,8 +285,12 @@ camera.
 
 ![A lap of the archipelago](docs/media/tour.webp)
 
-*A lap of the world, sunrise to moonlit night. Rendered with `--cinematic`;
-the full 4K60 version is on the [releases page](../../releases).*
+*A lap of the world, sunrise to moonlit night. Every frame is lit by the
+always-on real-time bounce — this is the one clip on the page that is **not**
+a hemisphere-GI capture, so the light filling the arcades and streets is the
+same single cosine bounce per pixel a live session gets. Rendered with
+`--cinematic`; the full 4K60 version is on the
+[releases page](../../releases).*
 
 ---
 
@@ -466,24 +470,35 @@ see it too. All three tracers animate. `--no-foliage-sway` pins the rest pose;
 </tr>
 </table>
 
-![The quadtree overlay](docs/media/ab/overlay.webp)
+<table>
+<tr>
+<td><img src="docs/media/ab/overlay-off.webp" alt="The frame as rendered"><br><sub>the frame, as rendered</sub></td>
+<td><img src="docs/media/ab/overlay-on.webp" alt="The same frame with the quadtree overlay"><br><sub><b>O</b> — the same frame, tinted by how each tile resolved</sub></td>
+</tr>
+</table>
 
-*The **O** overlay, tinting each pixel by how its tile resolved. The blue band
-is sky **proven empty and traced with zero rays**; the warm region is where
-tiles reached the leaf level and fired real rays. Shot on the procedural scene
+*The same pose twice, one keypress apart. The **O** overlay tints each pixel by
+how its tile resolved: the blue band is sky **proven empty and traced with zero
+rays**, and the warm region is where tiles reached the leaf level and fired real
+ones. Side by side, the algorithm's product is legible — every blue pixel on the
+right is a pixel the left one did not pay for. Shot on the procedural scene
 (`--no-world`) on purpose: the world's islands all stand on one enormous ground
 quad whose bounding box reaches nearly every frustum, so almost nothing is
 provable as empty until deep in the tree and the overlay flattens to a single
-tint. Sparse geometry against open sky is where the algorithm's product is
-visible. (It needs the quadtree, so it runs on the CPU or `--gpu` arm —
-`--dxr` traces from the TLAS root and has no subdivision to show.)*
+tint. Sparse geometry against open sky is where the product is visible. (It needs
+the quadtree, so it runs on the CPU or `--gpu` arm — `--dxr` traces from the TLAS
+root and has no subdivision to show, which is also why both frames above pin
+`--gpu`: without it, only the overlay run would switch tracers.)*
 
 ---
 
 ## THE CAMERA CREW — `--cinematic`
 
 Every image on this page was rendered by the program itself, headlessly and
-deterministically — these are the exact commands, so you can check:
+deterministically — these are the exact commands, so you can check. (The one
+exception is the Arc hybrid-vs-DXR pairs further down, which are screen
+captures of a live window, because the title bar's fps receipt is not in any
+render target.)
 
 ```
 cargo run --release -- --cinematic list                    # the shot catalogue
@@ -513,15 +528,30 @@ cargo run --release -- --cinematic hero --cinematic-island rungholt --cinematic-
 cargo run --release -- --cinematic hud --cinematic-island bistro --cinematic-gi \
                         --cinematic-res 1280x720 [--cinematic-hud settings:Renderer]
 
-# the quadtree overlay, on the procedural scene
-cargo run --release -- --cinematic hero --no-world --cinematic-overlay \
+# the quadtree overlay pair, on the procedural scene. --gpu is pinned on BOTH
+# arms deliberately: under the default --dxr, --cinematic-overlay alone
+# promotes that ONE run to the wavefront tracer (DXR builds no quadtree to
+# draw), so the pair would differ by tracer as well as by overlay
+cargo run --release -- --cinematic hero --no-world --gpu [--cinematic-overlay] \
                         --cinematic-res 1600x900 --cinematic-samples 96
 ```
 
+Those write PNG. The two hops that turn them into what this page actually
+serves live in `tools/media-encode.py` — stills to **lossless** WebP, and the
+letterboxed frame-decimated variant of the lap clip, which is *not* the encode
+the program prints:
+
+```
+python3 tools/media-encode.py still \
+    capture-islands/island-02-sponza-0830/island-02-sponza-0830.png \
+    docs/media/islands/02-sponza.webp
+python3 tools/media-encode.py tour capture-tour/tour/frames docs/media/tour.webp
+```
+
 `--cinematic` renders stills and camera-spline sequences (closed-loop
-Catmull-Rom, so a lap loops seamlessly), writes a numbered PNG sequence plus a
-manifest, and prints the exact `ffmpeg` commands to encode it — HDR10 HEVC for
-the release, an animated WebP for a README. `--cinematic-hdr` adds 16-bit
+Catmull-Rom, so a lap loops seamlessly), writes a numbered PNG sequence, and
+prints the exact `ffmpeg` commands to encode it — HDR10 HEVC for the release,
+an animated WebP for a README. `--cinematic-hdr` adds 16-bit
 PQ/Rec.2020 frames, a linear OpenEXR master, and a properly tagged HDR AVIF.
 
 The framing for the seven isles is **authored**, not fitted, and the reason is
@@ -1263,36 +1293,53 @@ the findings came from. These are the Arc-specific ones, with the numbers
 attached. Some are properties of the hardware, some of the *driver*, and some
 of the *tooling* — the distinction matters, so each one says which it is.
 
-**The wavefront default, measured end-to-end.** A July 2026 whole-session
+**The wavefront default, measured end-to-end.** An August 2026 whole-session
 pass on THE WORLD read the compute-wavefront hybrid against the DXR pipeline
 at four islands, each parked at its own attractor time-of-day and measured in
-both render modes: 1920×1080 window, XeSS wired at native (100%) scale,
-1 spp, vsync off. The figures are the title bar's **rendered** frame rate —
-the XeSS-FG ×2 presented surplus is excluded:
+both render modes *in one process*, so nothing but the tracer differs: SPACE
+switches arms in place. 1920×1080 window, XeSS wired at native (100%) scale,
+1 spp, vsync and frame generation off, and everything the shipping Intel
+session arms — real-time GI on, ReBLUR (NRD) denoising on. The figures are
+the title bar's **rendered** frame rate:
 
 | B70, THE WORLD, rendered FPS | wavefront hybrid | DXR |
 |---|---:|---:|
-| Sponza, 09:01 | 101 | 57 |
-| San Miguel, 15:17 | 107 | 63 |
-| Bistro, 17:16 | 76 | 50 |
-| Rungholt, 11:01 | 131 | 81 |
-| **average** | **103.75** | **62.75** |
+| Sponza, 08:30 | 42 | 32 |
+| San Miguel, 15:30 | 42 | 27 |
+| Bistro, 17:30 | 45 | 37 |
+| Rungholt, 11:00 | 89 | 57 |
+| **average** | **54.50** | **38.25** |
 
-That is the hybrid **1.5–1.8× faster at every island, ~65% on average** — and
-it holds **moving or parked**. A per-pass `--gpu-timing` A/B at the world
-boot pose (same protocol: `--prefer-intel --no-vsync --no-settings --no-fg`,
-steady-state windows, both arms tracing the *same* chunked TLAS and paying
-the same ~1.4 ms foliage-sway refit) reproduces the band at the GPU level:
-frame span 3.30 vs 5.36 ms parked (1.62×), and 3.4–3.5 vs the same 5.36
-under a live strafe (~1.5×). The wavefront barely notices motion because the
-level ladder costs only ~0.2 ms at the shipping leaf frontier and structure
-replay deletes even that on parked frames, while `dxr-rays` re-traces every
-pixel from the TLAS root each frame at 3.13 ms against the wavefront's
-1.15 ms leaf+sky. (A July 22 re-measure had mode-1 DXR slightly ahead on
-producing frames; the leaf-frontier and pack-split optimizations that landed
-July 24 were wavefront-side and retired that result.) The margin is that
-structure compounded with the *hardware* balance — Arc's RT throughput is
-weak relative to its shader cores, so rays not traced are worth more there.
+That is the hybrid **1.2–1.6× faster at every island, ~42% on average**. The
+per-pass `--gpu-timing` breakdown from the same runs says where it comes from,
+and it is worth reading rather than the end-to-end column alone:
+
+| B70, GPU ms (steady-state window) | wavefront | DXR |
+|---|---:|---:|
+| Sponza — tracer / frame span | 17.27 / 23.68 | 26.60 / 31.64 |
+| San Miguel — tracer / frame span | 17.20 / 23.35 | 31.85 / 36.66 |
+| Bistro — tracer / frame span | 16.28 / 21.90 | 22.57 / 26.81 |
+| Rungholt — tracer / frame span | 5.76 / 10.99 | 13.39 / 17.20 |
+
+**On the tracer alone the margin is wider — 1.39× to 2.33×** — and the
+end-to-end figure is smaller than that because ReBLUR and XeSS add a
+**fixed 3.8–5.0 ms tail that both arms pay identically** (`nrd-pack` +
+`nrd` + `nrd-out` + `xess-eval`, agreeing to within 0.03 ms on every
+pair). Denoising a 1-spp path-traced frame is now a real share of the
+budget, so a faster tracer buys proportionally less of the whole frame than
+it used to: this same comparison read 1.5–1.8× end-to-end in July, before
+GI and the denoiser landed, on a tracer that was doing less work per pixel.
+The tracer verdict did not weaken — the frame grew around it.
+
+The mechanism is unchanged: `dxr-rays` re-traces every pixel from the TLAS
+root each frame (11.96–30.41 ms) against the wavefront's leaf+sky, which
+traces nothing for tiles it has proven empty, and on a parked frame structure
+replay deletes the level ladder outright. That ladder is only ~0.2 ms at the
+shipping leaf frontier, so motion cannot plausibly reverse a 5–13 ms gap even
+though these particular numbers are parked. Both arms trace the *same* chunked
+TLAS and pay the same ~1.4 ms foliage-sway refit. Underneath it is the
+*hardware* balance — Arc's RT throughput is weak relative to its shader
+cores, so rays not traced are worth more there.
 Note the baseline: this is against the DXR *pipeline*, most of whose margin
 is Arc running the same traversal far better as a compute kernel — for what
 the quadtree itself contributes over a bare compute baseline (much less),
@@ -1306,26 +1353,30 @@ invert — on other GPUs.** On an RTX 4090 the same comparison prefers DXR
 (see the `--dxr-inline` table above), which is exactly why the render-mode
 default is vendor-keyed rather than universal.
 
-The two tracers produce the same image from the same pose; only the frame
-rate differs. Hybrid on the left, DXR on the right, rendered fps in each
-title bar:
+The two tracers render the same world from the same pose; only the frame rate
+differs. These are untouched lossless captures of the live window, so the
+title bar carries its own receipt — and because they are two moments of a
+running session rather than one frame rendered twice, the leaves are caught
+mid-sway at different instants. That is the only place the pairs disagree: at
+Bistro, the frame's tree canopy and hedges differ while the sky matches to
+**0.0%** of pixels. Hybrid on the left, DXR on the right:
 
 <table>
 <tr>
-<td><img src="docs/media/ab/b70-sponza-hybrid.webp" alt="Sponza, wavefront hybrid, 101 fps"><br><sub>Sponza — hybrid, <b>101 fps</b></sub></td>
-<td><img src="docs/media/ab/b70-sponza-dxr.webp" alt="Sponza, DXR, 57 fps"><br><sub>Sponza — DXR, 57 fps</sub></td>
+<td><img src="docs/media/ab/b70-sponza-hybrid.webp" alt="Sponza, wavefront hybrid, 42 fps"><br><sub>Sponza — hybrid, <b>42 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-sponza-dxr.webp" alt="Sponza, DXR, 32 fps"><br><sub>Sponza — DXR, 32 fps</sub></td>
 </tr>
 <tr>
-<td><img src="docs/media/ab/b70-san-miguel-hybrid.webp" alt="San Miguel, wavefront hybrid, 107 fps"><br><sub>San Miguel — hybrid, <b>107 fps</b></sub></td>
-<td><img src="docs/media/ab/b70-san-miguel-dxr.webp" alt="San Miguel, DXR, 63 fps"><br><sub>San Miguel — DXR, 63 fps</sub></td>
+<td><img src="docs/media/ab/b70-san-miguel-hybrid.webp" alt="San Miguel, wavefront hybrid, 42 fps"><br><sub>San Miguel — hybrid, <b>42 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-san-miguel-dxr.webp" alt="San Miguel, DXR, 27 fps"><br><sub>San Miguel — DXR, 27 fps</sub></td>
 </tr>
 <tr>
-<td><img src="docs/media/ab/b70-bistro-hybrid.webp" alt="Bistro, wavefront hybrid, 76 fps"><br><sub>Bistro — hybrid, <b>76 fps</b></sub></td>
-<td><img src="docs/media/ab/b70-bistro-dxr.webp" alt="Bistro, DXR, 50 fps"><br><sub>Bistro — DXR, 50 fps</sub></td>
+<td><img src="docs/media/ab/b70-bistro-hybrid.webp" alt="Bistro, wavefront hybrid, 45 fps"><br><sub>Bistro — hybrid, <b>45 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-bistro-dxr.webp" alt="Bistro, DXR, 37 fps"><br><sub>Bistro — DXR, 37 fps</sub></td>
 </tr>
 <tr>
-<td><img src="docs/media/ab/b70-rungholt-hybrid.webp" alt="Rungholt, wavefront hybrid, 131 fps"><br><sub>Rungholt — hybrid, <b>131 fps</b></sub></td>
-<td><img src="docs/media/ab/b70-rungholt-dxr.webp" alt="Rungholt, DXR, 81 fps"><br><sub>Rungholt — DXR, 81 fps</sub></td>
+<td><img src="docs/media/ab/b70-rungholt-hybrid.webp" alt="Rungholt, wavefront hybrid, 89 fps"><br><sub>Rungholt — hybrid, <b>89 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-rungholt-dxr.webp" alt="Rungholt, DXR, 57 fps"><br><sub>Rungholt — DXR, 57 fps</sub></td>
 </tr>
 </table>
 
@@ -1521,14 +1572,16 @@ useful work was **tiles proven empty tracing no rays at all**. The valuable
 product is the shared empty-space proof (and, for custom traversal, the
 inherited node frontier), not physical ray length.
 
-**How this squares with the ~65% B70 world result above — the baseline is
+**How this squares with the ~42% B70 world result above — the baseline is
 the whole difference.** This section measures the quadtree against the
 *plain compute reference* — the same RayQuery traversal in a bare compute
 kernel, the cheapest arm that exists — and on THE WORLD that comparison
 comes out the same way as here: at the boot pose the hybrid's trace costs
 1.15 ms replayed / ~1.4 ms producing against the reference's 1.28, a ±10%
-wash. The ~65% headline is measured against the **DXR pipeline**, and an
-August 2026 same-day sweep decomposed the gap: the *identical* full-screen
+wash. The ~42% headline is measured against the **DXR pipeline**, and an
+August 2026 same-day sweep decomposed the gap (the millisecond figures below
+are from that sweep's build, *before* real-time GI and the denoiser landed —
+read them as ratios, not against the frame times tabulated above): the *identical* full-screen
 traversal costs 1.28 ms as a compute kernel, 2.59 ms as a mode-2
 `DispatchRays` raygen, and 3.13 ms through the shipping mode-1 pipeline —
 i.e. on Arc, with the world's fat alpha-cutout shaders, the DXR execution
