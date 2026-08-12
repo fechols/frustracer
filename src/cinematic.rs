@@ -1390,6 +1390,92 @@ pub fn asked_for_dxr(gpu: bool, dxr: bool, mode_explicit: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The capture's per-sub-frame temporal state
+// ---------------------------------------------------------------------------
+
+/// What one sub-frame must know about the one before it.
+///
+/// `prev_basis` is what the G-buffer pack reprojects FROM (`FrameParams::
+/// prev_cam`) and what NRD's `prev_mats` is built from; `replay` is whether the
+/// terminal quadtree the previous producing frame left behind still describes
+/// this view.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Step {
+    pub prev_basis: crate::camera::CamBasis,
+    pub prev_cam: Camera,
+    pub prev_jitter: (f32, f32),
+    pub reset: bool,
+    pub replay: bool,
+}
+
+/// The capture arm's memory of the previous SUB-frame.
+///
+/// PER SUB-FRAME, NOT PER OUTPUT FRAME, and that is what makes it correct at
+/// both seams: within an output frame the pose is identical, so `prev == cur`
+/// is the right answer AND the quadtree can be replayed; at an output-frame
+/// boundary the pose has moved, so `prev` is the previous frame's pose and the
+/// structure must be re-traced.
+///
+/// `replay` is DERIVED — the basis bit-equals the previous producing frame's,
+/// which is the precondition `render_wavefront_replay` states in its own doc —
+/// rather than inferred from a sub-frame index. That is the difference between
+/// a fact and a heuristic: a warm-up pass that does not advance, a shot whose
+/// pose happens to repeat, or a caller that reorders its loop cannot desync it,
+/// and the same machine therefore serves the reconstruction and accumulation
+/// arms instead of the two disagreeing about when replay is legal.
+///
+/// ONE PER SHOT. A new shot is a hard cut, so its first sub-frame must reset
+/// every temporal history, and `Default`'s `None` IS that state. That is why
+/// the capture loop constructs one per shot rather than carrying a
+/// free-running index: D3D12's arm declares its `seq` INSIDE the per-shot loop
+/// and says "reset fires once per shot", and hoisting the Vulkan equivalent
+/// into a RESOLUTION-CACHED struct is precisely what made the `islands` preset
+/// (seven shots at one resolution) carry shot 1's FSR3 and NRD history across
+/// six hard cuts.
+#[derive(Default)]
+pub struct Temporal {
+    prev: Option<(crate::camera::CamBasis, Camera, (f32, f32))>,
+}
+
+impl Temporal {
+    /// What this sub-frame should be told. Pure — call it as often as you like.
+    pub fn step(&self, basis: &crate::camera::CamBasis, cam: &Camera, jitter: (f32, f32)) -> Step {
+        match &self.prev {
+            // The shot's first sub-frame: there is no history to reproject
+            // from, so reproject from ITSELF — zero motion, which is the
+            // honest answer rather than a convenient one — and tell the
+            // engines to reset. `nrd_frame_step`'s `nrd_prev.unwrap_or(mats)`
+            // is the same rule on the other backend, and it is the ONLY place
+            // "prev == current" is correct on a moving shot.
+            None => Step {
+                prev_basis: *basis,
+                prev_cam: *cam,
+                prev_jitter: jitter,
+                reset: true,
+                replay: false,
+            },
+            Some((pb, pc, pj)) => Step {
+                prev_basis: *pb,
+                prev_cam: *pc,
+                prev_jitter: *pj,
+                reset: false,
+                replay: pb == basis,
+            },
+        }
+    }
+
+    /// Remember this sub-frame — ON SUCCESS ONLY.
+    ///
+    /// The split from `step` is `nrd_frame_step`'s error rule: a frame that
+    /// failed must not advance the history, or the next one reprojects from a
+    /// pose nothing was ever rendered at and replays a structure that was
+    /// never produced.
+    pub fn advance(&mut self, basis: crate::camera::CamBasis, cam: Camera, jitter: (f32, f32)) {
+        self.prev = Some((basis, cam, jitter));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gates
 // ---------------------------------------------------------------------------
 
@@ -1431,6 +1517,90 @@ pub fn self_test() -> Result<(), String> {
         }
         if asked_for_dxr(true, true, true) {
             return Err("asked_for_dxr fired when --gpu also named an arm".into());
+        }
+    }
+
+    // THE CAPTURE'S TEMPORAL STATE, and this gate exists because a defect
+    // shipped: the reconstruction arm passed its OWN basis as the previous one
+    // on every sub-frame, so a moving shot's motion vectors were zero and NRD
+    // accumulated a whole tour while being told the camera had not moved.
+    //
+    // Nothing in the type system can catch that — `common_settings` takes two
+    // equally-typed `&CamMatrices` and `common_settings(&mats, &mats, ..)`
+    // compiles cleanly — and BOTH device gates that exercise the denoiser
+    // (V15, V16) render one pose repeatedly, where passing the same value twice
+    // is the CORRECT answer. So they share the exact call shape that was wrong
+    // in the capture arm and could never have flagged it. The state machine is
+    // what gets gated instead: here, on every platform, GPU-free.
+    {
+        let a = Camera::look_at(Vec3A::new(0.0, 0.0, 5.0), Vec3A::ZERO, 1.0);
+        let b = Camera::look_at(Vec3A::new(3.0, 1.0, 5.0), Vec3A::ZERO, 1.0);
+        let (ba, bb) = (a.basis(64, 48), b.basis(64, 48));
+        if ba == bb {
+            return Err("temporal: the two probe poses share a basis — the table is vacuous".into());
+        }
+        let j = |k: u32| (k as f32 * 0.125, k as f32 * -0.0625);
+
+        // Three sub-frames at pose A, then two at pose B — an output-frame
+        // boundary in the middle, which is the seam the defect lived on.
+        let mut t = Temporal::default();
+        let want: [(bool, bool, bool); 5] = [
+            // reset, replay, prev-is-A
+            (true, false, true),   // shot's first sub-frame: reset, prev == self
+            (false, true, true),   // same pose: replay is legal
+            (false, true, true),   // still the same pose
+            (false, false, true),  // pose MOVED: prev is A, and no replay
+            (false, true, false),  // settled at B
+        ];
+        for (i, (want_reset, want_replay, want_prev_a)) in want.into_iter().enumerate() {
+            let (cam, basis) = if i < 3 { (a, ba) } else { (b, bb) };
+            let s = t.step(&basis, &cam, j(i as u32));
+            if s.reset != want_reset {
+                return Err(format!(
+                    "temporal step {i}: reset {}, expected {want_reset}",
+                    s.reset
+                ));
+            }
+            if s.replay != want_replay {
+                return Err(format!(
+                    "temporal step {i}: replay {}, expected {want_replay} — replay must mean \
+                     'the basis bit-equals the previous PRODUCING frame's', which is the \
+                     precondition render_wavefront_replay states",
+                    s.replay
+                ));
+            }
+            if (s.prev_basis == ba) != want_prev_a {
+                return Err(format!(
+                    "temporal step {i}: prev basis is {}, expected {}",
+                    if s.prev_basis == ba { "A" } else { "B" },
+                    if want_prev_a { "A" } else { "B" }
+                ));
+            }
+            // TEETH FOR THE SHIPPED DEFECT: after the first sub-frame, prev
+            // must never be THIS sub-frame's own pose+jitter. That is exactly
+            // what `prev_cam: Some(basis)` and `common_settings(&mats, &mats)`
+            // did, and it is what zeroed the motion vectors.
+            if i > 0 && s.prev_jitter == j(i as u32) {
+                return Err(format!(
+                    "temporal step {i}: prev jitter equals this sub-frame's own — the arm is \
+                     reprojecting from itself, which is the defect this gate exists for"
+                ));
+            }
+            t.advance(basis, cam, j(i as u32));
+        }
+
+        // A FAILED frame must not advance the history — `nrd_frame_step`'s
+        // rule, and the reason `step` and `advance` are separate calls rather
+        // than one. Step without advancing, twice: the answer must not move.
+        let mut t = Temporal::default();
+        t.advance(ba, a, j(0));
+        let s1 = t.step(&bb, &b, j(1));
+        let s2 = t.step(&bb, &b, j(1));
+        if s1 != s2 {
+            return Err("temporal: `step` is not pure — a frame that failed would advance".into());
+        }
+        if s1.prev_basis != ba {
+            return Err("temporal: an un-advanced failure lost the last GOOD pose".into());
         }
     }
 

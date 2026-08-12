@@ -306,11 +306,11 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     // class record — the recursive dispatch is the SBT arithmetic, not code.
     if ((p.prim & 0x80000000u) != 0u) {
         PrimSurf psr;
-        float3 w3, o3, n3;
+        float3 w3, o3, n3, t3;
         p.color = shade_split(WorldRayOrigin(), WorldRayDirection(), h, p.rng,
                               shadow_samples, ao_samples, reflections != 0u, false,
                               p.sp.y, pixel_cone, true, true,
-                              uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, psr,
+                              uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, t3, psr,
                               asuint(p.sp.x));
         p.t = h.t;
         return;

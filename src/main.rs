@@ -726,9 +726,42 @@ fn main() {
         eprintln!("detail-untex-scale: untextured detail ×{}", opts.detail_untex_scale);
     }
     scene::set_amb_bump(opts.amb_bump);
-    shade::set_rtgi(opts.rtgi);
-    if !opts.rtgi {
+    shade::set_rtgi_bounces(opts.rtgi_bounces);
+    // FR_RTGI_NOWEIGHT=1 — the naive-coin-flip repro arm (loud on departure,
+    // the FR_ABL idiom). Biased by construction; it exists so the bias is
+    // reproducible on demand and so the unbiasedness gate has teeth.
+    if std::env::var("FR_RTGI_NOWEIGHT").as_deref() == Ok("1") {
+        shade::set_rtgi_rr_noweight(true);
+        eprintln!(
+            "FR_RTGI_NOWEIGHT=1 — rouletted gathers taken UNWEIGHTED (biased: \
+             the naive coin flip, delivering only p of the correction)"
+        );
+    }
+    // Only a DEPARTURE prints, the lever-line convention — so a flagless
+    // session's stderr says nothing about GI. Compared against the ONE const
+    // rather than a literal of its own: a lever line that announces the
+    // default (or goes quiet on a departure) is the exact silent half-landing
+    // `shade::DEFAULT_BOUNCES` exists to prevent.
+    if opts.rtgi_bounces <= 0.0 {
         eprintln!("rtgi: OFF — flat SH×AO ambient (the pre-RTGI renderer)");
+    } else if opts.rtgi_bounces != shade::DEFAULT_BOUNCES {
+        let det = opts.rtgi_bounces.floor();
+        let pr = opts.rtgi_bounces - det;
+        if pr > 0.0 {
+            eprintln!(
+                "rtgi: {} bounces — {det} deterministic + a {:.0}% rouletted gather \
+                 over the SH×AO tail (unbiased for {})",
+                opts.rtgi_bounces,
+                pr * 100.0,
+                det + 1.0
+            );
+        } else {
+            eprintln!(
+                "rtgi: {} deterministic bounce{}",
+                opts.rtgi_bounces,
+                if opts.rtgi_bounces == 1.0 { "" } else { "s" }
+            );
+        }
     }
     autoexp::set_enabled(opts.autoexp);
     // DEFAULT ON — only a DEPARTURE prints, the lever-line convention.
@@ -2350,12 +2383,28 @@ fn run_check_dxr(
     let mut sum_c = [0.0f64; 3];
     let mut sum_g = [0.0f64; 3];
     let mut sum_abs = 0.0f64;
+    // NON-FINITE and NEGATIVE are DIFFERENT failures and were being counted as
+    // one, which meant neither was precisely asserted. A NaN or Inf is always a
+    // defect. A negative sample is not: the GI ladder's stochastic rungs
+    // estimate the ambient as `tail + (G - tail)/p`, an UNBIASED estimator of a
+    // non-negative quantity, and an unbiased estimator of a non-negative
+    // quantity may legitimately sample below zero — here exactly when
+    // `G < tail*(1 - p)`, so the frequency climbs as p falls. MEASURED on this
+    // scene, of 1.44M samples: 131 at p = 0.25, 12 at 0.5, 2 at 0.75, while the
+    // radiance mean stays flat at 0.044-0.053% — i.e. the image is right and
+    // the tail is real. Clamping them away would remove the negative tail and
+    // BIAS the mean, which is the one thing the ladder must not do (its own
+    // `rtgi-rr` gate would catch it), so the samples stand and the bound is on
+    // HOW MANY rather than on whether.
     let mut nonfinite = 0usize;
+    let mut negative = 0usize;
     for i in 0..px * 3 {
         let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
         let g = gpu_acc[i] * inv;
-        if !g.is_finite() || g < 0.0 {
+        if !g.is_finite() {
             nonfinite += 1;
+        } else if g < 0.0 {
+            negative += 1;
         }
         sum_c[i % 3] += c as f64;
         sum_g[i % 3] += g as f64;
@@ -2367,12 +2416,25 @@ fn run_check_dxr(
         mean_rel = mean_rel.max(rel);
     }
     eprintln!(
-        "check-dxr: radiance A/B over {AB_FRAMES} frames: per-channel mean rel diff {:.3}% | mean abs px diff {:.4} | non-finite {nonfinite}",
+        "check-dxr: radiance A/B over {AB_FRAMES} frames: per-channel mean rel diff {:.3}% | mean abs px diff {:.4} | non-finite {nonfinite} | negative {negative}",
         mean_rel * 100.0,
         sum_abs / (px * 3) as f64
     );
     if nonfinite > 0 {
-        eprintln!("check-dxr: FAIL non-finite or negative HDR samples");
+        eprintln!("check-dxr: FAIL non-finite HDR samples");
+        ok = false;
+    }
+    // A stochastic rung may sample negative (see above); no other configuration
+    // may, and even an armed one only in the tail — 0.1% of samples is two
+    // orders above the worst measured and still catches a sign error, which
+    // would flip a large POPULATION rather than a fringe.
+    let neg_ok = crate::gfx::frame::rtgi_corr_p(shade::rtgi_bounces()) > 0.0
+        && negative <= px * 3 / 1000;
+    if negative > 0 && !neg_ok {
+        eprintln!(
+            "check-dxr: FAIL {negative} negative HDR samples — legitimate only in a \
+             stochastic GI rung's tail (--rtgi-bounces with a fractional part)"
+        );
         ok = false;
     }
     if mean_rel > 0.02 {
@@ -2512,7 +2574,7 @@ fn run_check_dxr(
         let (near, far) = dlss::near_far(scene.diag);
         // rtgi pinned OFF — the --check-gpu twin's composition-gate rule
         // (prim.ao == 0 under RTGI would vacuate the AO must-fires).
-        let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+        let uq = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
         let dxr_gbuf_frame = |hg: &mut gpu::trace::HeadlessGpu,
                               dg2: &gpu::dxr::DxrGpu,
                               basis: camera::CamBasis,
@@ -5709,16 +5771,35 @@ fn run_check_gpu(
     // must count exactly 0 (the define is omitted, so a nonzero count means
     // the bump escaped its guard). Same --cam caveat class: a pose with no
     // hit pixel would trip the must-fire.
-    let rtgi_rays = ctrs[gpu::trace::CTR_RTGI_RAYS as usize];
-    if shade::rtgi_enabled() {
-        eprintln!("check-gpu: rtgi bounce rays: {rtgi_rays}");
-        if rtgi_rays == 0 {
-            eprintln!("check-gpu: FAIL rtgi armed but the wavefront frame traced 0 bounce rays");
+    //
+    // Scored as the LADDER'S RUNG SIGNATURE, the pair (level-0, level-1):
+    // rungs 0.5 and 1 agree about level 0 and differ in nothing a level-0-only
+    // gate can see, so the single-counter form would have read them as the same
+    // session. The zero arms are the teeth — each rung's blocks are COMPILE
+    // defines, so a count on a rung that omits them means a define escaped its
+    // guard and reached a unit it should not have.
+    let rtgi_n = shade::rtgi_bounces();
+    let rtgi_l0 = ctrs[gpu::trace::CTR_RTGI_RAYS as usize];
+    let rtgi_l1 = ctrs[gpu::trace::CTR_RTGI_RAYS2 as usize];
+    eprintln!(
+        "check-gpu: rtgi gathers at --rtgi-bounces {rtgi_n}: level-0 {rtgi_l0} + level-1 {rtgi_l1}"
+    );
+    for (live, got, what) in
+        [(rtgi_n > 0.0, rtgi_l0, "level-0"), (rtgi_n > 1.0, rtgi_l1, "level-1")]
+    {
+        if live && got == 0 {
+            eprintln!(
+                "check-gpu: FAIL rung {rtgi_n} traced 0 {what} gathers \
+                 (the wavefront frame runs fb OFF, so that rung must fire)"
+            );
+            ok = false;
+        } else if !live && got != 0 {
+            eprintln!(
+                "check-gpu: FAIL {got} {what} gathers at --rtgi-bounces {rtgi_n} \
+                 (that rung's block must be compiled out)"
+            );
             ok = false;
         }
-    } else if rtgi_rays != 0 {
-        eprintln!("check-gpu: FAIL {rtgi_rays} rtgi bounce rays under --no-rtgi (RTGI must be compiled out)");
-        ok = false;
     }
     // Opaque-continuation anti-vacuity and reuse accounting. These counters
     // fire once per CONSUMED non-root LeafRec, not once per ray; the ray total
@@ -7621,7 +7702,7 @@ fn run_check_gpu(
         // gate's anti-vacuity and as "no live AO term" to the composite's.
         // The runtime flag derives from p.q, so this is per-pass, no global.
         // Armed coverage lives in the wavefront soundness/rtgi gates above.
-        let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+        let uq = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
         // One fresh 1-spp wavefront frame at the upscaler contract
         // (accumulate off, frame-uniform zero jitter), pack read back into a
         // CPU GBufs so the CPU gate consumes it unmodified. Returns the pack
@@ -9810,7 +9891,7 @@ fn run_check_gpu(
                             // the whole `ao * amb` term drops out of D_in, and
                             // what remains is exactly what shade captured.
                             if crate::shade::rtgi_enabled() {
-                                let q9 = Quality { rtgi: true, ..Quality::upscaler_1spp() };
+                                let q9 = Quality { rtgi_bounces: 1.0, ..Quality::upscaler_1spp() };
                                 let p9 = gpu::trace::FrameParams {
                                     sway_prev_time: None,
                                     cam: basis_b,
@@ -12089,7 +12170,7 @@ fn run_check_gpu(
                 // other two). Stands down under --no-rtgi: the shade block
                 // the flag gates never compiled.
                 if crate::shade::rtgi_enabled() {
-                    let gq = Quality { rtgi: true, ..Quality::upscaler_1spp() };
+                    let gq = Quality { rtgi_bounces: 1.0, ..Quality::upscaler_1spp() };
                     let pg = gpu::trace::FrameParams {
                         sway_prev_time: None,
                         cam: basis_b,
@@ -14121,7 +14202,13 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         let jobs: Vec<(String, String)> = match shape {
             Shape::Lib(t) => vec![(String::new(), t.clone())],
             Shape::Gfx => {
-                vec![("vsmain".into(), "vs_6_0".into()), ("psmain".into(), "ps_6_0".into())]
+                // The names come from `gfx::shaders`, which is where the
+                // Vulkan display stage reads them too — so this gate and its
+                // consumer cannot drift onto different entry points.
+                vec![
+                    (sh::GFX_VS.to_string(), "vs_6_0".into()),
+                    (sh::GFX_PS.to_string(), "ps_6_0".into()),
+                ]
             }
             Shape::Compute(t) => {
                 let e = compute_entries(src);
@@ -14366,6 +14453,16 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V18: the display stage — the first thing here that DRAWS. ----
+    //
+    // Top level for V11's reason, one better: it owns its pipelines, its
+    // images and its descriptor set, and it needs neither a scene nor a
+    // tracer. That is also what makes it reachable on a device with no surface
+    // support at all, and therefore in CI on llvmpipe.
+    if !run_check_vk_display(&hg, &sp) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
@@ -14385,6 +14482,355 @@ fn run_check_vk(
 
     println!("CHECK-VK {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// V18 — the display stage: `tonemap.hlsl` and `blit.hlsl` DRAWN, and scored.
+///
+/// `--check-gpu`'s M12 transplanted, with ZERO new tolerances: the same ramp,
+/// the same three wires at the same limits, the same f16-rounded oracle, the
+/// same relative-above-1.0 metric. What it proves here is one step further
+/// than it proves there, because the whole graphics path underneath it is new:
+/// a `VkPipelineRenderingCreateInfo` pipeline, a derived layout carrying a
+/// sampler and a uniform buffer, a colour attachment with a real layout
+/// lifecycle, and a fullscreen triangle whose winding is the opposite of the
+/// one D3D12 rasterizes.
+///
+/// TWO ARMS M12 DOES NOT HAVE, and the first is the reason this gate is not
+/// simply M12 with the formats renamed.
+///
+/// **THE BLIT EXACT-IDENTITY ARM IS MANDATORY**, because M12's ramp is
+/// geometric and therefore SMOOTH: neighbouring texels differ by 0.88% in
+/// radiance, which the tone curve compresses further. MEASURED, over the
+/// geometric span (indices 2..n, i.e. excluding the two special leading
+/// entries) for a ONE-PIXEL horizontal shift: worst per-channel error 2.02e-3,
+/// against an `sdr` tolerance of 3.92e-3 — **invisible, and not marginally so;
+/// ALL 2045 ramp texels are individually within tolerance of their own
+/// neighbour.** The 10-bit wires do catch it, at 2.02e-3 against 1.08e-3, but
+/// by under 2x and only because their quantum is smaller — not by design, and
+/// not with room to spare.
+///
+/// So the ramp is a curve gate that happens to be weak evidence about the pixel
+/// MAPPING, and a wrong `SV_Position` convention, a half-texel offset or a
+/// transposed row length is exactly the class it is weak about. D3D12 does not
+/// have this hole because its rasterizer was known-good for years before M12
+/// was written; this backend had never rasterized anything. `blit.hlsl` is
+/// twelve lines of `src.Load(int3(pos.xy, 0)).rgb` with alpha forced to 1, so
+/// over a per-pixel pattern it is an EXACT byte identity with no tolerance to
+/// hide in — and a spatial slip of one pixel breaks it at essentially every
+/// texel rather than at none of them.
+///
+/// The pattern is `k/255` per channel with `k` a hash of (pixel, channel), and
+/// the round trip is exact by construction rather than by luck: f16 carries 11
+/// significant bits, so the worst error in representing `k/255` is ~1.2e-1 of a
+/// UNORM8 step — an eighth of the rounding boundary — and the pixel shader does
+/// no arithmetic at all. Per CHANNEL rather than per pixel so a swizzle is
+/// caught too, which the ramp's own per-channel tint cannot do (it is monotone
+/// in all three).
+///
+/// **ALPHA IS A FREE COVERAGE WITNESS.** Both pixel shaders write 1.0
+/// unconditionally and the M12 oracle compares RGB only, so "alpha is at
+/// maximum everywhere" answers a question no colour comparison can: did the
+/// draw cover this pixel at all. It costs nothing — the bytes are already read
+/// back — and it is what separates "the tone curve is wrong" from "the triangle
+/// missed", which a black frame reports identically.
+///
+/// The per-stage validation delta is V16's pattern: the first thing in this
+/// backend to create a graphics pipeline should name itself rather than
+/// surfacing in the suite-wide sweep as an unattributed count.
+#[cfg(unix)]
+fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use ash::vk as avk;
+    use vk::display;
+
+    // Both are FACTS recorded at device open rather than assumptions, and both
+    // are read here rather than discovered at `vkCmdDraw`: 1.3 mandates dynamic
+    // rendering so the first is universally true on this floor, and the queue
+    // family is PREFERRED-not-required to carry GRAPHICS, so the second is the
+    // one that can genuinely fail. A compute-only queue makes a draw illegal,
+    // which is an environment fact and therefore a SKIP.
+    if !hg.vk.info.dynamic_rendering {
+        println!(
+            "check-vk: SKIP V18 (no dynamicRendering — a graphics pipeline with a null \
+             renderPass needs it ENABLED, not merely supported)"
+        );
+        return true;
+    }
+    if !hg.vk.info.graphics_queue {
+        println!(
+            "check-vk: SKIP V18 (the chosen queue family is compute-only — vkCmdDraw on it \
+             is illegal, so this stage has nowhere to run)"
+        );
+        return true;
+    }
+
+    let ve0 = vk::device::validation_errors();
+    let mut ok = true;
+
+    // ---- M12's fixture, verbatim. ----
+    const TW: u32 = 64;
+    const TH: u32 = 32;
+    const RAMP_LO: f32 = 1e-3;
+    const RAMP_HI: f32 = 6.0e4;
+    let n = (TW * TH) as usize;
+    let span = (n - 3) as f32;
+    let radiance = |i: usize| -> f32 {
+        match i {
+            0 => 0.0,
+            1 => 1.0, // exactly the HDR knee: must be reproduced, not rolled off
+            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+        }
+    };
+    // Anti-vacuity, M12's own: the claim is that the ramp spans the sun-disc
+    // range, so assert it gets there rather than trusting the arithmetic.
+    let top = radiance(n - 1);
+    if !(top >= 4.4e4 && top <= 65504.0) {
+        eprintln!("check-vk: FAIL V18 ramp tops out at {top:.0} — must span the sun-disc range");
+        ok = false;
+    }
+    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
+
+    // The blit arm's pattern: a per-(pixel, channel) byte, spread by a cheap
+    // integer mix so neighbours are uncorrelated — a shifted image must not be
+    // able to look like an unshifted one.
+    let pat_byte = |i: usize, c: usize| -> u8 {
+        let mut h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(c as u32 * 40_503);
+        h ^= h >> 15;
+        h = h.wrapping_mul(2_246_822_519);
+        h ^= h >> 13;
+        (h & 0xff) as u8
+    };
+    let pattern: Vec<f32> =
+        (0..n * 3).map(|k| f32::from(pat_byte(k / 3, k % 3)) / 255.0).collect();
+
+    let vkd = &hg.vk;
+    let src = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        avk::Format::R16G16B16A16_SFLOAT,
+        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V18 source image: {e}");
+            return false;
+        }
+    };
+
+    // The three wires. Two DISTINCT formats, so two pipeline sets — the
+    // attachment format is baked into the pipeline by dynamic rendering, and
+    // sdr10/hdr10 differ only in `ToneParams`, which is a cbuffer value.
+    //
+    // Vulkan's `A2B10G10R10_UNORM_PACK32` is D3D12's `R10G10B10A2_UNORM`: R in
+    // the low ten bits, A in the top two. The names suggest the opposite order
+    // and the memory layout agrees — which is what lets M12's unpacking cross
+    // over unchanged.
+    let wires: [(&str, avk::Format, tone::ToneParams, f32); 3] = [
+        ("sdr", avk::Format::B8G8R8A8_UNORM, tone::ToneParams::SDR, 1.0 / 255.0 + 1e-6),
+        (
+            "sdr10",
+            avk::Format::A2B10G10R10_UNORM_PACK32,
+            tone::ToneParams::SDR,
+            1.0 / 1023.0 + 1e-4,
+        ),
+        (
+            "hdr10",
+            avk::Format::A2B10G10R10_UNORM_PACK32,
+            tone::ToneParams::hdr10(200.0, 1000.0),
+            // ~2 ten-bit LSBs + DXC pow/exp slop through the ST 2084 pair.
+            // Never widen past 5e-3 without investigating — a wiring or
+            // constant error moves this by tens of percent.
+            2.5e-3,
+        ),
+    ];
+
+    // Build one `Passes` per distinct format and keep them; rebuilding per wire
+    // would triple the DXC cost for nothing.
+    let mut built: Vec<(avk::Format, display::Passes)> = Vec::new();
+    let get = |fmt: avk::Format, built: &mut Vec<(avk::Format, display::Passes)>| -> bool {
+        if built.iter().any(|(f, _)| *f == fmt) {
+            return true;
+        }
+        match display::Passes::new(hg, sp, fmt) {
+            Ok(p) => {
+                p.bind_source(vkd, src.view);
+                built.push((fmt, p));
+                true
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V18 display passes ({fmt:?}): {e}");
+                false
+            }
+        }
+    };
+    for (_, fmt, _, _) in wires {
+        if !get(fmt, &mut built) {
+            src.destroy(vkd);
+            for (_, p) in &built {
+                p.destroy(vkd);
+            }
+            return false;
+        }
+    }
+
+    // One render + readback, shared by every arm below.
+    let run = |passes: &display::Passes,
+               fmt: avk::Format,
+               tonemap: bool,
+               p: display::Params|
+     -> Result<Vec<u8>, String> {
+        let dst = display::Image::new(
+            vkd,
+            TW,
+            TH,
+            fmt,
+            avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        let r = (|| -> Result<Vec<u8>, String> {
+            passes.set_params(vkd, p)?;
+            hg.run(|d, cmd| passes.record(d, cmd, &dst, tonemap))?;
+            display::read_target(hg, &dst, 4)
+        })();
+        dst.destroy(vkd);
+        r
+    };
+
+    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
+        eprintln!("check-vk: FAIL V18 ramp upload: {e}");
+        ok = false;
+    }
+
+    for (label, fmt, tp, tol) in wires {
+        let passes = &built.iter().find(|(f, _)| *f == fmt).unwrap().1;
+        // Bloom OFF, exactly as M12 passes it: the glare arm is a cbuffer-
+        // uniform branch, so a zero strength makes the t1 tap structurally
+        // dead and the gate scores the curve alone.
+        let params = display::Params::new(tp, 1.0, (0.0, 0.0, 0.0));
+        let got = match run(passes, fmt, true, params) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V18 render ({label}): {e}");
+                ok = false;
+                continue;
+            }
+        };
+        let mut worst = 0.0f32;
+        let mut worst_at = 0.0f32;
+        let mut alpha_bad = 0usize;
+        for i in 0..n {
+            let px = &got[i * 4..i * 4 + 4];
+            // Feed the oracle what the SHADER reads: the source is a real
+            // RGBA16F texture, so the f32 ramp is f16-rounded on the way in.
+            // Comparing against the exact f32 would charge the port for the
+            // wire's rounding — a step of 32 radiance at the top of this ramp.
+            let q = |v: f32| half::f16::from_f32(v).to_f32();
+            let c = glam::Vec3A::new(q(ramp[i * 3]), q(ramp[i * 3 + 1]), q(ramp[i * 3 + 2]));
+            let want = tone::map(c, tp);
+            // `passes.fmt` rather than the loop's `fmt`: they are equal by
+            // construction, and decoding with the one the PIPELINE was built
+            // for is what keeps that a fact rather than an assumption.
+            let have = display::decode(px, passes.fmt);
+            for ch in 0..3 {
+                let w = want[ch];
+                let d = (have[ch] - w).abs() / (1.0f32).max(w.abs());
+                if d > worst {
+                    worst = d;
+                    worst_at = radiance(i);
+                }
+            }
+            if display::decode_alpha(px, passes.fmt) < 1.0 {
+                alpha_bad += 1;
+            }
+        }
+        if worst > tol {
+            eprintln!(
+                "check-vk: FAIL V18 tonemap PS ({label}) vs tone::map — \
+                 worst {worst:.2e} > {tol:.2e} at radiance {worst_at:.3}"
+            );
+            ok = false;
+        } else if alpha_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V18 tonemap PS ({label}) — {alpha_bad}/{n} px with alpha below \
+                 maximum: the draw did not cover them"
+            );
+            ok = false;
+        } else {
+            println!("check-vk: V18 tonemap PS ({label}) == tone::map (worst {worst:.2e})");
+        }
+    }
+
+    // ---- The blit exact-identity arm. ----
+    if let Err(e) = display::upload_rgba16f(hg, &src, &pattern) {
+        eprintln!("check-vk: FAIL V18 pattern upload: {e}");
+        ok = false;
+    }
+    let bfmt = avk::Format::B8G8R8A8_UNORM;
+    // 8-bit ONLY, and that is a precision argument rather than a shortcut: a
+    // UNORM8 step is ~8x the worst f16 representation error for these values,
+    // so the round trip is exact with room to spare, while at ten bits the two
+    // are the same size and an exact bar would be measuring f16 rather than the
+    // rasterizer. The mapping this arm tests is format-independent.
+    let passes = &built.iter().find(|(f, _)| *f == bfmt).unwrap().1;
+    match run(passes, bfmt, false, display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0)))
+    {
+        Ok(got) => {
+            let mut bad = 0usize;
+            let mut first: Option<(usize, [u8; 3], [u8; 3])> = None;
+            let mut alpha_bad = 0usize;
+            for i in 0..n {
+                let px = &got[i * 4..i * 4 + 4];
+                // B8G8R8A8 in memory: B, G, R, A.
+                let have = [px[2], px[1], px[0]];
+                let want = [pat_byte(i, 0), pat_byte(i, 1), pat_byte(i, 2)];
+                if have != want {
+                    bad += 1;
+                    if first.is_none() {
+                        first = Some((i, want, have));
+                    }
+                }
+                if px[3] != 255 {
+                    alpha_bad += 1;
+                }
+            }
+            if bad > 0 {
+                let (i, w, h) = first.unwrap();
+                eprintln!(
+                    "check-vk: FAIL V18 blit identity — {bad}/{n} texels differ; first at \
+                     ({}, {}) want {w:?} got {h:?}. A smooth ramp cannot see this: it is the \
+                     pixel MAPPING, not the curve.",
+                    i as u32 % TW,
+                    i as u32 / TW
+                );
+                ok = false;
+            } else if alpha_bad > 0 {
+                eprintln!(
+                    "check-vk: FAIL V18 blit identity — {alpha_bad}/{n} px with alpha != 255"
+                );
+                ok = false;
+            } else {
+                println!(
+                    "check-vk: V18 blit identity EXACT over {n} texels x 3 ch (the pixel \
+                     mapping, which the tonemap ramp is too smooth to score)"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V18 blit render: {e}");
+            ok = false;
+        }
+    }
+
+    for (_, p) in &built {
+        p.destroy(vkd);
+    }
+    src.destroy(vkd);
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!("check-vk: FAIL V18 {ve} validation error(s) in the display stage");
+        ok = false;
+    }
+    ok
 }
 
 /// V10 — the BC7 encoder, scored through the hardware decoder.
@@ -14514,7 +14960,7 @@ fn run_check_vk_fsr3(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -15870,9 +16316,9 @@ fn run_check_vk_gbuf(
     // Odd dims, `--check-gpu` M7's own.
     let (pw, ph) = (533usize, 400usize);
     let (near, far) = dlss::near_far(scene.diag);
-    // `rtgi: false` for M7's reason: under RTGI `prim.ao` is 0 everywhere,
+    // `rtgi_bounces: 0.0` for M7's reason: under RTGI `prim.ao` is 0 everywhere,
     // which vacuates the AO-bearing lanes a later feed gate will want.
-    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+    let q = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
 
     let tg = match vk::tracer::VkTracer::new(
         hg,
@@ -16100,9 +16546,9 @@ fn run_check_vk_feed(
     let (rw, rh) = (ow / 2, oh / 2);
     const FRAMES: u32 = 8;
     let (near, far) = dlss::near_far(scene.diag);
-    // `rtgi: false` for V12's reason (M7's): under RTGI `prim.ao` is 0
+    // `rtgi_bounces: 0.0` for V12's reason (M7's): under RTGI `prim.ao` is 0
     // everywhere, which vacuates lanes a feed gate wants.
-    let q = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+    let q = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
 
     let tg = match vk::tracer::VkTracer::new(
         hg,
@@ -16133,6 +16579,21 @@ fn run_check_vk_feed(
             return false;
         }
     };
+
+    // Hoisted above the FFX contexts (it is a pure function of `cam0` and the
+    // render size) so V17 below can use it.
+    let basis = cam0.basis(rw, rh);
+
+    // ---- V17: structure replay WITH THE PACK ARMED. ----
+    // BEFORE the FFX contexts, deliberately. This arm needs only the tracer,
+    // and everything after context creation is unreachable on a software ICD,
+    // where V11/V13 SKIP outright — so placing it here is what gives the one
+    // pure-tracer gate in this function the same llvmpipe coverage V6/V7/V8/V9
+    // have, i.e. what keeps it gateable in CI without a GPU.
+    if !run_check_vk_replay_pack(hg, &tg, scene, &basis, q, rw, rh) {
+        tg.destroy(hg);
+        return false;
+    }
 
     // Two FFX contexts, one per route, stepped in lockstep on one frame
     // sequence. Separate rather than one context run twice because FSR3 is
@@ -16185,7 +16646,6 @@ fn run_check_vk_feed(
         return false;
     }
 
-    let basis = cam0.basis(rw, rh);
     let mut ok = true;
 
     let run = (|| -> Result<(), String> {
@@ -16379,6 +16839,122 @@ fn run_check_vk_feed(
     cpu.destroy(hg);
     tg.destroy(hg);
     ok
+}
+
+/// V17 — STRUCTURE REPLAY WITH THE PACK ARMED.
+///
+/// V9 proves a replayed frame is bit-identical to a produced one, but its
+/// tracer is built `TracerOpts::default()`, i.e. `gbuf_full: false` — so there
+/// the pack is not merely unchecked, it is not ALLOCATED (`VkTracer::new`
+/// collapses it to a one-element dummy). And V13/V14/V15/V16 all run on a
+/// pack-armed tracer that never replays. So "replay with the pack armed" was
+/// exercised by no gate in either direction.
+///
+/// That stopped being academic when the capture arm started doing exactly it:
+/// `CineVk::output_frame` replays every sub-frame after the first, on a tracer
+/// carrying the pack, the feed planes and NRD's. This is the gate that licenses
+/// it.
+///
+/// The claim is V9's, one configuration further out. The terminal structure is
+/// a pure function of (scene, BVH, basis, rw, rh) while spp/jitter/frame ride
+/// the cbuffer; the PACK is written by the leaf and sky passes, which a replay
+/// re-dispatches. So a replayed frame must reproduce a produced one BYTE for
+/// byte in `accum` and in both halves of the pack — and the ladder must
+/// provably not have run.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_check_vk_replay_pack(
+    hg: &vk::headless::VkHeadless,
+    tg: &vk::tracer::VkTracer,
+    scene: &scene::Scene,
+    basis: &camera::CamBasis,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+) -> bool {
+    use gfx::shaders as gs;
+    let px = rw * rh;
+    // The capture arm's own frame shape: a fresh 1-spp upscaler frame, not
+    // V9's accumulating one — this gate is about the configuration that
+    // actually ships, and `accumulate` changes which store the leaf takes.
+    let mk = |replay: bool| gfx::frame::FrameParams {
+        cam: *basis,
+        frame: 7,
+        accumulate: false,
+        jitter: false,
+        frame_jitter: Some(dlss::jitter_for(7)),
+        prev_cam: Some(*basis),
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay,
+    };
+    let grab = |tag: &str| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u32>), String> {
+        Ok((
+            hg.read_buffer(&tg.accum, px * 3 * 4).map_err(|e| format!("{tag} accum: {e}"))?,
+            hg.read_buffer(&tg.gbuf, px * gfx::frame::GBUF_STRIDE as usize)
+                .map_err(|e| format!("{tag} gbuf: {e}"))?,
+            hg.read_buffer(&tg.gbuf_ext, px * gfx::frame::GBUF_EXT_STRIDE as usize)
+                .map_err(|e| format!("{tag} gbuf_ext: {e}"))?,
+            tg.read_counters(hg).map_err(|e| format!("{tag} counters: {e}"))?,
+        ))
+    };
+
+    let r = (|| -> Result<(), String> {
+        tg.render_wavefront(hg, &mk(false), true).map_err(|e| format!("produce: {e}"))?;
+        let (a0, g0, e0, c0) = grab("produce")?;
+        tg.render_wavefront_replay(hg, &mk(true), true).map_err(|e| format!("replay: {e}"))?;
+        let (a1, g1, e1, c1) = grab("replay")?;
+
+        // ANTI-VACUITY FIRST, because every assertion below is satisfied by two
+        // buffers that were never written: an all-zero pack compares clean.
+        let nz = g0.iter().filter(|b| **b != 0).count();
+        if nz == 0 {
+            return Err("the produced pack is entirely zero — the comparison is vacuous".into());
+        }
+        let c = |v: &[u32], i: u32| v.get(i as usize).copied().unwrap_or(0);
+        if c(&c0, gs::CTR_SPLIT) == 0 {
+            return Err("the producing frame ran no ladder — nothing was replayed".into());
+        }
+        // The ladder must provably NOT have run on the replay: a "replay" that
+        // quietly re-traced everything is bit-identical by construction, which
+        // is V9's own anti-vacuity argument.
+        for (name, i) in [
+            ("split", gs::CTR_SPLIT),
+            ("tile-a", gs::CTR_TILE_A),
+            ("tile-b", gs::CTR_TILE_B),
+        ] {
+            if c(&c1, i) != 0 {
+                return Err(format!("replay ran the ladder ({name} {})", c(&c1, i)));
+            }
+        }
+        for (name, p, r) in
+            [("accum", &a0, &a1), ("gbuf", &g0, &g1), ("gbuf-ext", &e0, &e1)]
+        {
+            let d = p.iter().zip(r.iter()).filter(|(x, y)| x != y).count();
+            if d != 0 || p.len() != r.len() {
+                return Err(format!("{name}: {d} of {} bytes differ under replay", p.len()));
+            }
+        }
+        println!(
+            "check-vk: V17 replay with the pack armed {rw}x{rh}: accum/gbuf/gbuf-ext byte-diff 0 \
+             | pack non-zero {nz} B | ladder produce split {} -> replay 0",
+            c(&c0, gs::CTR_SPLIT)
+        );
+        Ok(())
+    })();
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V17 {e}");
+            false
+        }
+    }
 }
 
 /// V16 — THE COMPOSED FRAME: trace -> pack -> ReBLUR -> recompose -> FSR3.
@@ -16910,6 +17486,23 @@ fn run_check_vk_nrd(
             "check-vk: SKIP V15 ({} not found); run `{}`",
             lib.display(),
             nrd::INSTALLER
+        );
+        return true;
+    }
+    // THE SKIP THE CODE ALREADY PROMISED AND DID NOT IMPLEMENT. Four of
+    // ReBLUR's fourteen kernels declare `ComputeDerivativeGroupQuadsKHR`, so
+    // `vk/device.rs` enables `VK_KHR_compute_shader_derivatives`
+    // when present — and its own comment there, plus CLAUDE.md, both stated
+    // that V15 skips on a device without it. Nothing did: the only skip was
+    // the missing-library one above, so this gate would have dispatched
+    // modules whose declared capability is unavailable, which the same
+    // comment calls "undefined and — as measured — silent". An environment
+    // fact, so SKIP at exit 0, matching the absent/told split.
+    if !hg.vk.info.compute_derivatives {
+        println!(
+            "check-vk: SKIP V15 (no VK_KHR_compute_shader_derivatives — four ReBLUR kernels \
+             declare ComputeDerivativeGroupQuads and dispatching them with the feature off is \
+             undefined)"
         );
         return true;
     }
@@ -17975,7 +18568,10 @@ fn run_check_vk_wavefront(
         scene.any_height && bvh::height_on(),
         ctr(gs::CTR_HEIGHT_REJ),
     );
-    arm(&mut ok, "rtgi bounce rays", shade::rtgi_enabled(), ctr(gs::CTR_RTGI_RAYS));
+    // The ladder's rung signature, both halves (see --check-gpu's twin).
+    let rtgi_n = shade::rtgi_bounces();
+    arm(&mut ok, "rtgi level-0 gathers", rtgi_n > 0.0, ctr(gs::CTR_RTGI_RAYS));
+    arm(&mut ok, "rtgi level-1 gathers", rtgi_n > 1.0, ctr(gs::CTR_RTGI_RAYS2));
 
     // ---- the continuation frontier, under `--sw-rays` ----
     //
@@ -19715,7 +20311,7 @@ fn fsr3_upscale_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -20477,7 +21073,7 @@ fn metalfx_upscale_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -20973,7 +21569,7 @@ fn metalfx_denoise_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -21318,7 +21914,7 @@ fn metalfx_interp_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -21574,7 +22170,7 @@ fn fsr_frame_check(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -22364,7 +22960,7 @@ fn mv_check_at(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -22834,7 +23430,7 @@ fn run_check_xess(
             ao_samples: 2,
             reflections: true,
             fb: shade::FrustumBounce::OFF,
-            rtgi: false,
+            rtgi_bounces: 0.0,
             emissive_display: true,
         };
         // Accumulate several jittered frames per side: two single 1-spp
@@ -23091,7 +23687,7 @@ fn run_check_nppd(
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
-        rtgi: false,
+        rtgi_bounces: 0.0,
         emissive_display: true,
     };
     let stats = Stats::default();
@@ -24974,7 +25570,15 @@ fn run_cinematic_vk(
     }
     let want_dn = want_up && opts.nrd;
 
-    let mut built: Option<((usize, usize), CineVk)> = None;
+    // KEYED ON `recon` AS WELL AS THE RESOLUTION. The pack, the feed and the
+    // NRD planes are BUILD-time `TracerOpts`, so a key of size alone freezes
+    // the first shot's answer for every later shot at that size: a GI shot
+    // following a non-GI one would reuse an upscaler-armed tracer and take the
+    // reconstruction arm, which is exactly what "a GI shot always accumulates"
+    // forbids. D3D12 gets away with a size-only key because it decides per shot
+    // at the frame loop; here the decision is baked into the build, so it
+    // belongs in the key.
+    let mut built: Option<((usize, usize, bool), CineVk)> = None;
     let mut code = 0;
 
     for shot in shots {
@@ -24986,16 +25590,20 @@ fn run_cinematic_vk(
         // chain says. D3D12 does the same, for the same reason.
         let recon = want_up && !shot.gi;
 
-        if built.as_ref().map(|(r, _)| *r) != Some((rw, rh)) {
+        let key = (rw, rh, recon);
+        if built.as_ref().map(|(k, _)| *k) != Some(key) {
             if let Some((_, old)) = built.take() {
                 old.destroy(&hg);
             }
             built = Some((
-                (rw, rh),
+                key,
                 CineVk::build(&hg, &sp, scene, &vs, &vt, bvh, rw, rh, recon, want_dn, opts)?,
             ));
         }
         let cv = &mut built.as_mut().unwrap().1;
+        // A shot boundary is a HARD CUT, and the expensive half above is cached
+        // across it — so the per-shot temporal state has to be dropped by hand.
+        cv.begin_shot();
 
         let frames = shot.kind.frames();
         let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
@@ -25044,8 +25652,18 @@ struct CineVk {
     tg: vk::tracer::VkTracer,
     up: Option<vk::fsr3::Fsr3>,
     dn: Option<vk::nrd::VkNrd>,
-    /// Free-running across the WHOLE shot, so the Halton phase never restarts.
+    /// Free-running across ONE shot, so the Halton phase never restarts inside
+    /// it — and reset BY `begin_shot` at every shot boundary, because a new
+    /// shot is a hard cut. This struct is cached by resolution across shots
+    /// (the `islands` preset is seven at one res), so a `seq` that only ever
+    /// incremented gave the whole RUN a single `reset` and carried shot 1's
+    /// history into all six that followed. D3D12 declares its `seq` inside the
+    /// per-shot loop for exactly this reason.
     seq: u32,
+    /// The previous SUB-frame's pose — what the pack reprojects from, what
+    /// NRD's `prev_mats` is built from, and what decides whether the terminal
+    /// quadtree can be replayed. One per shot; see `cinematic::Temporal`.
+    temporal: cinematic::Temporal,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -25125,7 +25743,25 @@ impl CineVk {
         if dn.is_some() {
             tg.wire_nrd(hg);
         }
-        Ok(CineVk { tg, up, dn, seq: 0 })
+        Ok(CineVk {
+            tg,
+            up,
+            dn,
+            seq: 0,
+            temporal: cinematic::Temporal::default(),
+        })
+    }
+
+    /// A shot boundary is a HARD CUT: drop every temporal history.
+    ///
+    /// This is a method rather than a fresh `CineVk` because the expensive half
+    /// (the tracer's kernels, the FFX context, the NRD instance) is cached
+    /// across shots at one resolution and must survive — only the per-shot
+    /// state resets. Forgetting it is what let the `islands` preset reconstruct
+    /// shot 2's first frames out of shot 1's island.
+    fn begin_shot(&mut self) {
+        self.seq = 0;
+        self.temporal = cinematic::Temporal::default();
     }
 
     /// Render ONE output frame and return it as a linear f32 RGB image.
@@ -25163,13 +25799,22 @@ impl CineVk {
         for k in 0..warm + samples {
             let emit = k >= warm;
             let jit = dlss::jitter_for(self.seq);
+            // What the PREVIOUS sub-frame was, which is a different question
+            // from what this one is — and the question this arm used to answer
+            // with `basis` itself, zeroing every motion vector on a moving shot
+            // and telling NRD the camera had not moved for the whole tour.
+            // Inside an output frame the pose really is unchanged, so `st`
+            // reports prev == cur AND licenses a replay; at an output-frame
+            // boundary it reports the frame before and refuses one.
+            let st = self.temporal.step(&basis, &fs.cam, jit);
+            let replay = st.replay && opts.replay;
             let p = gfx::frame::FrameParams {
                 cam: basis,
                 frame: self.seq,
                 accumulate: false,
                 jitter: false,
                 frame_jitter: Some(jit),
-                prev_cam: Some(basis),
+                prev_cam: Some(st.prev_basis),
                 q,
                 verify: false,
                 spp: opts.spp,
@@ -25178,7 +25823,7 @@ impl CineVk {
                 fireflies: fs.fireflies,
                 sway_time: None,
                 sway_prev_time: None,
-                replay: false,
+                replay,
             };
             let dp = vk::fsr3::Dispatch {
                 jitter: (jit.0 * fsr::JITTER_SIGN, jit.1 * fsr::JITTER_SIGN),
@@ -25186,9 +25831,19 @@ impl CineVk {
                 near_far: (near, far),
                 fov_y: fs.cam.fov_y,
                 dt_ms: gfx::denoise::NOMINAL_DT_MS,
-                reset: self.seq == 0,
+                reset: st.reset,
             };
-            self.tg.render_wavefront(hg, &p, true)?;
+            // Structure replay across a shot's sub-frames is why high sample
+            // counts are affordable — the terminal quadtree is a function of
+            // (scene, BVH, basis, rw, rh) and the pose is bit-equal here, so a
+            // 256-sample still ran the whole ladder 256 times for one answer.
+            // The accumulation arm three functions down has always done this;
+            // the arm that produces the shipped pictures did not.
+            if replay {
+                self.tg.render_wavefront_replay(hg, &p, true)?;
+            } else {
+                self.tg.render_wavefront(hg, &p, true)?;
+            }
 
             match self.dn.as_mut() {
                 // THE COMPOSED FRAME (B5a): pack -> ReBLUR -> recompose -> FFX,
@@ -25196,12 +25851,19 @@ impl CineVk {
                 // the recompose wrote the colour.
                 Some(eng) => {
                     let mats = dlss::cam_matrices(&fs.cam, rw, rh, near, far);
+                    // The PREVIOUS sub-frame's matrices, which is the whole
+                    // point: `common_settings` takes two equally-typed
+                    // `&CamMatrices` and `(&mats, &mats)` compiles cleanly, so
+                    // the compiler cannot tell a reprojection from an identity.
+                    // It is only correct where the pose provably did not move
+                    // — which is true of V15/V16 and was not true here.
+                    let prev_mats = dlss::cam_matrices(&st.prev_cam, rw, rh, near, far);
                     let (pw, ph) = eng.prev_size();
                     let cs = gfx::denoise::common_settings(
                         &mats,
-                        &mats,
+                        &prev_mats,
                         jit,
-                        dlss::jitter_for(self.seq.saturating_sub(1)),
+                        st.prev_jitter,
                         rw as u32,
                         rh as u32,
                         pw,
@@ -25209,7 +25871,7 @@ impl CineVk {
                         far,
                         gfx::denoise::NOMINAL_DT_MS,
                         self.seq,
-                        self.seq == 0,
+                        st.reset,
                         false,
                     );
                     let rs = gfx::denoise::reblur_settings();
@@ -25243,7 +25905,12 @@ impl CineVk {
                     rf?;
                 }
             }
+            // ADVANCE ONLY HERE, past every `?` above: a sub-frame that failed
+            // must not become the pose the next one reprojects from, nor the
+            // structure it replays. `nrd_frame_step`'s rule, and the reason
+            // `Temporal` splits `step` from `advance`.
             self.seq += 1;
+            self.temporal.advance(basis, fs.cam, jit);
             if emit && k + 1 == warm + samples {
                 out = up.read_output(hg)?;
             }
@@ -26127,7 +26794,7 @@ fn run_cinematic_gpu(
                             upscaler_defaults(
                                 &mut o,
                                 matches!(u.name, "xess" | "fsr3").then_some(u.name),
-                                dn_slot.is_some() && opts.rtgi,
+                                dn_slot.is_some() && opts.rtgi_bounces > 0.0,
                             );
                             emissive::set_enabled(o.emissive_lights);
                         }
@@ -26447,7 +27114,7 @@ fn run_cinematic_gpu(
                                                 jit,
                                                 reset,
                                                 sun_cur,
-                                                p.q.rtgi && primv.nrd_sig(),
+                                                p.q.rtgi_bounces > 0.0 && primv.nrd_sig(),
                                                 &|| match &*armv {
                                                     CineArm::Wave(tg) => tg.record_nrd_pack(l, 0),
                                                     CineArm::Dxr(dg) => dg.record_nrd_pack(l, 0),
@@ -26783,6 +27450,10 @@ fn cine_composite_hud(
                                 spp: 1,
                                 preset: 2,
                                 hud: true,
+                                // A Live row reads its value from HERE, and
+                                // Default is 0 ("off") — the shot must show
+                                // the real shipping default, not a lie.
+                                move_ease: camera::MOVE_EASE_S,
                                 ..Default::default()
                             };
                             // Headless capture renders Settings::default() —
@@ -26922,7 +27593,7 @@ fn run_frd_lab(
     });
     // rtgi pinned OFF (the F4 harness rule): the streak is specular, and the
     // sampled-AO tier keeps the dd fold's inputs live.
-    let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+    let uq = Quality { rtgi_bounces: 0.0, ..Quality::upscaler_1spp() };
     let (near, far) = dlss::near_far(scene.diag);
     let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -29351,6 +30022,23 @@ fn run_check(
         }
     };
 
+    // Keyboard flight ease — the flycam integrator's pure half. The arm that
+    // matters is EXACT REST: the ramp must reach a bitwise zero on key
+    // release, or the integrator's idle early-out never re-arms and an idle
+    // session re-writes cam.pos forever, silently defeating plain
+    // accumulation / structure replay / every upscaler history. Lives in
+    // camera.rs precisely so it gates off Windows too (flycam is cfg'd).
+    let camera_ok = match camera::self_test() {
+        Ok(()) => {
+            eprintln!("camera self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("camera self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // QA-socket reply encoding (the pure half of --qa — the ok/error level
     // semantics and one-line framing a scripted driver's contract rests on).
     let qa_ok = match qa::self_test() {
@@ -29401,8 +30089,14 @@ fn run_check(
             false
         }
     };
+    // A gate that reports green without running is worse than a missing one,
+    // because a suite reading PASSED is taken to have covered it. `dual_ok`
+    // below prints its SKIP; these two were silently `true`.
     #[cfg(not(windows))]
-    let quin_ok = true;
+    let quin_ok = {
+        eprintln!("quin self-test: SKIP (D3D12-hosted; pending its own move to gfx::)");
+        true
+    };
 
     // Raw-NGX DLSS-G guide self-test — the two conversions the --fg
     // evaluate feeds the FG snippet: clip depth must be the exact z-mapping
@@ -29421,8 +30115,15 @@ fn run_check(
             false
         }
     };
+    // Same shape as `quin_ok` above, and the same reason: ~64% of
+    // ngxfg_guides.rs is D3D12-free `glam` math and a pure self_test, so this
+    // is a `gfx::guides` candidate rather than a permanent skip — but until it
+    // moves, say so instead of reporting a gate that never ran.
     #[cfg(not(windows))]
-    let ngxfg_guides_ok = true;
+    let ngxfg_guides_ok = {
+        eprintln!("ngxfg-guides self-test: SKIP (D3D12-hosted; pending its own move to gfx::)");
+        true
+    };
 
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
@@ -30494,27 +31195,42 @@ fn run_check(
         }
     };
 
-    // REAL-TIME GI liveness (the alpha-rej/el-cull shape), snapshotted before
-    // the first stats.clear() like el-cull above: an armed session's verify
-    // phases must have traced bounce rays (every hybrid pass with fb OFF
-    // bounces at each hit pixel — a hitless --cam pose is the documented
-    // caveat class), and --no-rtgi must count exactly 0 (the arm is
-    // Quality-gated, so a stray ray means a constructor stopped reading the
-    // lever).
+    // REAL-TIME GI liveness across THE LADDER (the alpha-rej/el-cull shape),
+    // snapshotted before the first stats.clear() like el-cull above.
+    //
+    // The PAIR (level-0 gathers, level-1-and-deeper gathers) is the rung
+    // SIGNATURE, and asserting both halves is what stops a rung passing by
+    // accident: rungs 0.5 and 1 agree about level 0 and differ in nothing a
+    // level-0-only gate can see, so the old single-counter form would have read
+    // them as the same session.
+    //
+    //     rung 0        -> (0, 0)
+    //     rungs 0.5, 1  -> (>0, 0)
+    //     rungs 1.5, 2  -> (>0, >0)
+    //
+    // Every hybrid pass with fb OFF gathers at each hit pixel, so an armed
+    // session's verify phases must fire; a hitless --cam pose is the documented
+    // caveat class. The zero arms are the teeth: the tier is Quality-gated, so
+    // a stray ray means a constructor stopped reading the lever, and a level-1
+    // ray below rung 1.5 means a gather started recursing on its own.
     let rtgi_ok = {
-        let rays = stats.rtgi_rays.load(Relaxed);
-        if shade::rtgi_enabled() {
-            eprintln!("check: rtgi bounce rays {rays}");
-            if rays == 0 {
-                eprintln!("check: FAIL rtgi armed but the verify phases traced 0 bounce rays");
+        let n = shade::rtgi_bounces();
+        let l0 = stats.rtgi_rays.load(Relaxed);
+        let l1 = stats.rtgi_rays2.load(Relaxed);
+        eprintln!("check: rtgi gathers at --rtgi-bounces {n}: level-0 {l0} + level-1 {l1}");
+        let mut rok = true;
+        let mut want = |live: bool, got: u64, what: &str| {
+            if live && got == 0 {
+                eprintln!("check: FAIL rung {n} traced 0 {what} gathers (that rung is dead code)");
+                rok = false;
+            } else if !live && got != 0 {
+                eprintln!("check: FAIL {got} {what} gathers at --rtgi-bounces {n}");
+                rok = false;
             }
-            rays > 0
-        } else if rays != 0 {
-            eprintln!("check: FAIL {rays} rtgi bounce rays under --no-rtgi");
-            false
-        } else {
-            true
-        }
+        };
+        want(n > 0.0, l0, "level-0");
+        want(n > 1.0, l1, "level-1");
+        rok
     };
 
     // RTGI estimator/wiring A/B (structural — default scene). The unpaired
@@ -30528,7 +31244,7 @@ fn run_check(
     // fb.gi accumulation of the same view. Both estimate the same integral
     // through the same BOUNCE_Q policy and everything OUTSIDE the ambient
     // tier is identical by construction (same q otherwise; both arms drop
-    // emissive NEE; recursion shades rtgi: false either way), so the trimmed
+    // emissive NEE; recursion shades rtgi_bounces: 0.0 either way), so the trimmed
     // per-pixel relative-luminance means differ only by estimator noise —
     // while a kd double-fold (≈−15%), a π factor (+200%), or a disc-carrying
     // miss (firefly-scale) blow the bounds. Trim per the unpaired-A/B
@@ -30536,10 +31252,10 @@ fn run_check(
     // so the gate keeps its teeth under a `--no-rtgi --check` (the CPU arm
     // is Quality-gated, not lever-gated — the amb-bump save/restore pattern
     // without the global).
-    let rtgi_ab_ok = if structural {
-        const RTGI_AB_FRAMES: u32 = 32;
-        const GI_AB_FRAMES: u32 = 4;
-        let render_mean = |bq: Quality, n: u32| -> Vec<f32> {
+    // Shared by the two RTGI gates below: an n-frame accumulation of one
+    // Quality, returned as the per-channel mean. ONE frame loop, so neither
+    // gate can be measuring its own harness.
+    let render_mean = |bq: Quality, n: u32| -> Vec<f32> {
             for f in 0..n {
                 let ctx = FrameCtx {
                     sway_mv: None,
@@ -30577,26 +31293,21 @@ fn run_check(
                 };
                 render::render_frame(&ctx, true);
             }
-            // accum holds the n-frame SUM (frame 0 stores, later frames add).
-            (0..rw * rh * 3)
-                .map(|i| f32::from_bits(accum[i].load(Relaxed)) / n as f32)
-                .collect()
-        };
-        let mut bq_rtgi = q;
-        bq_rtgi.fb = shade::FrustumBounce::OFF;
-        bq_rtgi.rtgi = true;
-        let mut bq_gi = q;
-        bq_gi.fb = shade::FrustumBounce { ao: false, gi: true, depth: q.fb.depth };
-        bq_gi.rtgi = false;
-        let img_rtgi = render_mean(bq_rtgi, RTGI_AB_FRAMES);
-        let img_gi = render_mean(bq_gi, GI_AB_FRAMES);
+        // accum holds the n-frame SUM (frame 0 stores, later frames add).
+        (0..rw * rh * 3)
+            .map(|i| f32::from_bits(accum[i].load(Relaxed)) / n as f32)
+            .collect()
+    };
+    // The trimmed per-pixel relative-luminance statistic both RTGI gates score
+    // on (the unpaired-A/B firefly discipline -- the canopy lesson).
+    let rel_stats = |img: &[f32], reference: &[f32]| -> (f64, f64, f64, f64) {
         let lum = |b: &[f32], i: usize| {
             0.2126 * b[i * 3] + 0.7152 * b[i * 3 + 1] + 0.0722 * b[i * 3 + 2]
         };
         let mut rels: Vec<f64> = (0..rw * rh)
             .map(|i| {
-                let lg = lum(&img_gi, i);
-                ((lum(&img_rtgi, i) - lg) / lg.max(0.05)) as f64
+                let lg = lum(reference, i);
+                ((lum(img, i) - lg) / lg.max(0.05)) as f64
             })
             .collect();
         // total_cmp: a NaN rel must FAIL (it sorts past +inf into the kept
@@ -30606,18 +31317,131 @@ fn run_check(
         let kept = &rels[cut..rels.len() - cut];
         let mean_signed = kept.iter().sum::<f64>() / kept.len() as f64;
         let mean_abs = kept.iter().map(|r| r.abs()).sum::<f64>() / kept.len() as f64;
+        (mean_abs, mean_signed, rels[0], rels[rels.len() - 1])
+    };
+
+    let rtgi_ab_ok = if structural {
+        const RTGI_AB_FRAMES: u32 = 32;
+        const GI_AB_FRAMES: u32 = 4;
+        let mut bq_rtgi = q;
+        bq_rtgi.fb = shade::FrustumBounce::OFF;
+        bq_rtgi.rtgi_bounces = 1.0;
+        let mut bq_gi = q;
+        bq_gi.fb = shade::FrustumBounce { ao: false, gi: true, depth: q.fb.depth };
+        bq_gi.rtgi_bounces = 0.0;
+        let img_rtgi = render_mean(bq_rtgi, RTGI_AB_FRAMES);
+        let img_gi = render_mean(bq_gi, GI_AB_FRAMES);
+        let (mean_abs, mean_signed, worst_lo, worst_hi) = rel_stats(&img_rtgi, &img_gi);
         eprintln!(
             "check: rtgi-vs-hemi-gi A/B ({RTGI_AB_FRAMES}f vs {GI_AB_FRAMES}f): \
              trimmed mean rel {mean_abs:.4} signed {mean_signed:+.4} \
-             (raw worst {:+.2}/{:+.2})",
-            rels[0],
-            rels[rels.len() - 1]
+             (raw worst {worst_lo:+.2}/{worst_hi:+.2})"
         );
         let ok = mean_abs < 0.08 && mean_signed.abs() < 0.02;
         if !ok {
             eprintln!("check: FAIL rtgi ambient disagrees with the hemi GI tier");
         }
         ok
+    } else {
+        true
+    };
+
+    // THE UNBIASEDNESS GATE — the ladder's own correctness property, and the
+    // only thing in the suite that can see whether the roulette's 1/p weight
+    // is RIGHT rather than merely present.
+    //
+    // It is SELF-ORACLING, which is what makes it strong: a stochastic rung
+    // estimates EXACTLY the deterministic rung above it (the roulette's
+    // expectation is the gather it rouletttes, and both arms compute that
+    // gather through the same `shade::rtgi_gather`), so the oracle is another
+    // SHIPPING setting rather than a synthetic reference that could drift away
+    // from the thing it is meant to score.
+    //
+    //     mean(0.5) -> mean(1)     the correction at level 0
+    //     mean(1.5) -> mean(2)     the correction at level 1
+    //
+    // BOTH arms, because the correction runs at two different depths and the
+    // level-1 failure modes are invisible at level 0: the emissive-display
+    // double count (`gather_q`'s inherited flag) can only happen where `el` has
+    // already been dropped, and a budget that failed to decrement can only show
+    // where there is a budget left to spend.
+    //
+    // TEETH: `FR_RTGI_NOWEIGHT`'s naive coin flip — take the gather outright
+    // instead of the 1/p-weighted delta — delivers only p of the correction and
+    // MUST blow both bounds. Without that arm, a roulette that never fired
+    // would pass by agreeing with the tail it never departed from, which is the
+    // exact shape of "the flag reached the pack but changed nothing".
+    let rtgi_rr_ok = if structural {
+        // The stochastic arms carry the roulette's own variance on top of the
+        // 1-spp gather noise both arms share, so they get the longer run; the
+        // deterministic oracle converges faster.
+        const RR_FRAMES: u32 = 96;
+        const DET_FRAMES: u32 = 32;
+        // THE SIGNED MEAN IS THE VERDICT, and picking it over the absolute one
+        // is the whole difference between a gate that works and one that
+        // reports confidently on noise. Both arms are 1-spp estimates, so
+        // `mean_abs` is dominated by per-pixel VARIANCE (~1-1.5% here) and the
+        // bias being hunted is the same size — MEASURED, the absolute statistic
+        // reads 0.0149 unbiased against 0.0248 biased and cannot separate them,
+        // while the signed statistic reads +0.0004 against -0.0194 and
+        // separates them by fifty times. Bias cancels nothing in a signed mean
+        // and everything in an absolute one; this is the `--spp` gate's own
+        // lesson ("a systematic bias is invisible to the max/hot half") from the
+        // other side.
+        //
+        // MEASURED (deterministic — `render::primary_seed` is a pure function
+        // of pixel/frame/sample, so these repeat exactly): weighted +0.0004 on
+        // BOTH arms; naive -0.0194 at level 0 and -0.0056 at level 1, the
+        // smaller figure because a second bounce is a smaller share of the
+        // image than a first. The bound sits 6x above the honest reading and
+        // 2.2x below the weaker teeth. Never widen it to pass — a wider bound
+        // stops the naive arm failing, which is the one thing this gate is for.
+        const RR_SIGNED: f64 = 0.0025;
+        // The absolute statistic is kept as a LOOSE sanity bound only: it
+        // catches a catastrophic divergence (a rung rendering something else
+        // entirely) and is deliberately not the verdict.
+        const RR_ABS: f64 = 0.05;
+        let arm = |budget: f32, n: u32| -> Vec<f32> {
+            let mut bq = q;
+            bq.fb = shade::FrustumBounce::OFF;
+            bq.rtgi_bounces = budget;
+            render_mean(bq, n)
+        };
+        let was_naive = shade::rtgi_rr_noweight();
+        let mut rrok = true;
+        for (lo, hi) in [(0.5f32, 1.0f32), (1.5, 2.0)] {
+            let det = arm(hi, DET_FRAMES);
+            shade::set_rtgi_rr_noweight(false);
+            let (ma, ms, wlo, whi) = rel_stats(&arm(lo, RR_FRAMES), &det);
+            // The teeth, same pose and same frame count — only the weight
+            // differs, so the verdict is attributable to the weight alone.
+            shade::set_rtgi_rr_noweight(true);
+            let (na, ns, _, _) = rel_stats(&arm(lo, RR_FRAMES), &det);
+            shade::set_rtgi_rr_noweight(was_naive);
+            eprintln!(
+                "check: rtgi-rr unbiasedness {lo} vs {hi} ({RR_FRAMES}f vs {DET_FRAMES}f): \
+                 trimmed mean rel {ma:.4} signed {ms:+.4} (raw worst {wlo:+.2}/{whi:+.2}) \
+                 | naive-coin-flip arm {na:.4} signed {ns:+.4}"
+            );
+            if !(ms.abs() < RR_SIGNED && ma < RR_ABS) {
+                eprintln!(
+                    "check: FAIL rung {lo} does not estimate rung {hi} \
+                     (signed {ms:+.4} vs {RR_SIGNED}) — the roulette weight is wrong"
+                );
+                rrok = false;
+            }
+            // The teeth, scored on the SAME statistic as the verdict: a biased
+            // estimator must be one this gate would have rejected.
+            if ns.abs() < RR_SIGNED {
+                eprintln!(
+                    "check: FAIL the naive coin flip at rung {lo} would have PASSED \
+                     (signed {ns:+.4}) — the gate cannot tell a biased estimator \
+                     from an unbiased one, so it proves nothing"
+                );
+                rrok = false;
+            }
+        }
+        rrok
     } else {
         true
     };
@@ -31661,7 +32485,7 @@ fn run_check(
             ao_samples: 1,
             reflections: true,
             fb: shade::FrustumBounce::OFF,
-            rtgi: shade::rtgi_enabled(),
+            rtgi_bounces: shade::rtgi_bounces(),
             emissive_display: true,
         };
         for (label, bq, cuts_opt) in [
@@ -31874,6 +32698,7 @@ fn run_check(
         ("el-cull", el_cull_ok),
         ("rtgi", rtgi_ok),
         ("rtgi-ab", rtgi_ab_ok),
+        ("rtgi-rr", rtgi_rr_ok),
         ("tod", tod_ok),
         ("light-gain", light_gain_ok),
         ("light-gain-ab", light_gain_ab_ok),
@@ -31899,6 +32724,7 @@ fn run_check(
         ("upchain", upchain_ok),
         ("settings", settings_ok),
         ("cli", cli_ok),
+        ("camera", camera_ok),
         ("qa", qa_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
@@ -32521,7 +33347,7 @@ fn run_window(
         // (the 2026-08-10 narrowing — dn_kind is post-conflict-resolution
         // truth here, and the fold additionally needs the RTGI arm).
         // wired()'s Quin/Rr/Fsr4/Plain arms all fall to None — see the fn.
-        let dn_fold = dn_kind(&o).is_some() && o.rtgi;
+        let dn_fold = dn_kind(&o).is_some() && o.rtgi_bounces > 0.0;
         upscaler_defaults(
             &mut o,
             match gpu.wired() {
@@ -32721,6 +33547,7 @@ fn run_window(
         opts.tod.unwrap_or_else(scene::default_tod),
         scene.diag,
         attractors,
+        opts.move_ease,
     );
     // Audio lives here beside the FlyCam for the same reason: a resize
     // re-enters session(), and the loops must keep playing through the
@@ -34309,6 +35136,7 @@ fn session(
                 fireflies: fireflies::enabled(),
                 fireflies_count: fireflies::count(),
                 emissive_lights: emissive::enabled(),
+                move_ease: fly.move_ease(),
             };
             if hd.menu_open() && menu_rows_stale {
                 menu_rows_stale = false;
@@ -34365,6 +35193,11 @@ fn session(
                                 settings::MenuFx::CycleSpp => edges.cycle_spp = true,
                                 settings::MenuFx::Quality(n) => edges.quality = Some(n),
                                 settings::MenuFx::SetTod(t) => fly.set_tod(t),
+                                settings::MenuFx::MoveEase(s) => {
+                                    // Input response, not shading or
+                                    // visibility — no reset of any kind.
+                                    fly.set_move_ease(s);
+                                }
                                 settings::MenuFx::ToggleBloom => {
                                     // Display-stage — deliberately NO reset
                                     // (the --no-bloom bit-identity argument).
@@ -36529,7 +37362,7 @@ fn session(
                 ao_samples: 1,
                 reflections: true,
                 fb: shade::FrustumBounce::OFF,
-                rtgi: shade::rtgi_enabled(),
+                rtgi_bounces: shade::rtgi_bounces(),
                 emissive_display: true,
             }
         } else if moved && !use_budget {

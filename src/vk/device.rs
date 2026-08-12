@@ -330,6 +330,33 @@ pub struct DeviceInfo {
     /// advertising the extension while reporting `computeDerivativeGroupQuads`
     /// false would be malformed (the feature is the extension's only content).
     pub compute_derivatives: bool,
+
+    /// `VkPhysicalDeviceVulkan13Features::dynamicRendering`.
+    ///
+    /// Vulkan 1.3 MANDATES it and 1.3 is our floor (`REQ_API`), so this is
+    /// universally true in practice — but it is a FEATURE, and a feature that
+    /// is supported and not ENABLED is one `vkCreateGraphicsPipelines` rejects
+    /// when `renderPass` is NULL. Recorded and enabled-when-present rather
+    /// than assumed, and deliberately NOT in the `reject` chain: refusing a
+    /// device over it would turn a currently-usable one into a SKIP for a
+    /// feature only the display stage reads.
+    pub dynamic_rendering: bool,
+
+    /// `VK_KHR_swapchain` is present on this device.
+    ///
+    /// Presence only — the display stage's own concern, and never a
+    /// requirement: every gate but the present one runs without a surface at
+    /// all, which is the property that keeps this backend testable headlessly.
+    pub swapchain: bool,
+
+    /// The CHOSEN queue family carries GRAPHICS as well as COMPUTE.
+    ///
+    /// `open_device` PREFERS such a family and falls back to compute-only, and
+    /// until now nothing recorded which it got — so a `vkCmdDraw` on a
+    /// compute-only queue would have been illegal with no way to see it
+    /// coming. A fact about the device that was opened, like every other field
+    /// here.
+    pub graphics_queue: bool,
 }
 
 impl DeviceInfo {
@@ -566,7 +593,7 @@ impl Vk {
             eprintln!("vk: FR_VK_DEVICE={} (device pick forced)", force.as_deref().unwrap());
         }
         let idx = pick(&cands, force.as_deref())?;
-        let (info, _) = probed.swap_remove(idx);
+        let (mut info, _) = probed.swap_remove(idx);
         let phys = phys_all[idx];
 
         // Queue family: prefer graphics+compute (one family that can also
@@ -582,6 +609,11 @@ impl Vk {
             .or_else(|| fams.iter().position(|f| has(f, vk::QueueFlags::COMPUTE)))
             .ok_or_else(|| format!("{}: no compute queue family", info.name))?
             as u32;
+        // WHICH family we got, recorded rather than assumed: the fallback arm
+        // above is compute-only, and `vkCmdDraw` on such a queue is illegal.
+        // The display stage reads this to SKIP loudly instead of submitting
+        // something the layer may or may not be installed to catch.
+        info.graphics_queue = has(&fams[qfam as usize], vk::QueueFlags::GRAPHICS);
 
         let prio = [1.0f32];
         let qci = [vk::DeviceQueueCreateInfo::default()
@@ -601,6 +633,17 @@ impl Vk {
             .shader_sampled_image_array_non_uniform_indexing(true)
             .descriptor_binding_partially_bound(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+        // DYNAMIC RENDERING, for the display stage: `vkCreateGraphicsPipelines`
+        // with `renderPass = NULL` requires it ENABLED, not merely supported,
+        // and 1.3 (our floor) mandates it — so this is universally true here
+        // and costs nothing. Enabled-when-present rather than required for the
+        // reason the `reject` chain stays short: a device that somehow lacked
+        // it would still run every compute gate, and refusing it outright
+        // would trade a working headless backend for a feature only the
+        // present path reads. Inert for compute either way.
+        if info.dynamic_rendering {
+            f13 = f13.dynamic_rendering(true);
+        }
         if info.subgroup_size_control {
             f13 = f13.subgroup_size_control(true).compute_full_subgroups(true);
         }
@@ -811,6 +854,11 @@ impl Vk {
                 .required_subgroup_size_stages
                 .contains(vk::ShaderStageFlags::COMPUTE),
             max_workgroup_subgroups: sg.max_compute_workgroup_subgroups,
+            dynamic_rendering: f13.dynamic_rendering == vk::TRUE,
+            swapchain: has_ext(ash::khr::swapchain::NAME),
+            // Filled by `open_device`, which is where the family is chosen;
+            // `probe` describes the physical device and has not picked one.
+            graphics_queue: false,
             ray_query: has_ext(ash::khr::ray_query::NAME),
             accel_struct: has_ext(ash::khr::acceleration_structure::NAME),
             rt_pipeline: has_ext(ash::khr::ray_tracing_pipeline::NAME),
@@ -995,8 +1043,16 @@ impl Vk {
             (false, true, _) => "accel-struct only",
             _ => "no ray tracing",
         };
+        // What the display stage needs, reported as a FACT on the same line as
+        // everything else — a device that cannot draw should say so once at
+        // open rather than at the first `vkCmdDraw`.
+        let disp = match (i.dynamic_rendering && i.graphics_queue, i.swapchain) {
+            (true, true) => "display-capable",
+            (true, false) => "draw, no swapchain",
+            (false, _) => "no draw",
+        };
         format!(
-            "vk: {} ({} {}, {}) — Vulkan {}.{}.{}, subgroup {} [{}..{}]{}, {}",
+            "vk: {} ({} {}, {}) — Vulkan {}.{}.{}, subgroup {} [{}..{}]{}, {}, {disp}",
             i.name,
             i.vendor_str(),
             i.kind_str(),

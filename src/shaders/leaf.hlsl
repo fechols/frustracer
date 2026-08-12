@@ -168,10 +168,10 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 // the surface point to the hemisphere wavefront. One point per
                 // PIXEL, never per sample (cap_hemi_pt is rw*rh, and the CPU
                 // pins spp to 1 on fb frames anyway).
-                float3 o_h, n_h;
+                float3 o_h, n_h, t_h;
                 c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
                                 reflections != 0u, true, 0.0, pixel_cone, true, true,
-                                el_mask, aw, o_h, n_h, ps);
+                                el_mask, aw, o_h, n_h, t_h, ps);
                 // Wave-aggregated: this fires once per HIT PIXEL, ~2M times to
                 // a single address at 1080p, from a 256-thread group. The
                 // reservation is hoisted out of the `if (prim)` so the whole

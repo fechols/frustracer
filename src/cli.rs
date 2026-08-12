@@ -556,13 +556,27 @@ pub struct Opts {
     /// under sky light). Runtime shading lever — the depth-tint class; a
     /// no-op on flat-shaded geometry (n_s == n_g).
     pub amb_bump: bool,
-    /// `--no-rtgi` clears (`shade::set_rtgi`): real-time GI OFF — the ambient
-    /// tier goes back to flat `SH sky irradiance × AO`, bit-identical to the
-    /// pre-RTGI renderer (the GPU compiles the bounce block out). DEFAULT ON:
-    /// one cosine-sampled bounce ray per pixel per frame replaces the ambient
-    /// term, shaded at the hemi BOUNCE_Q policy, integrated by the temporal
-    /// denoisers / accumulation. Still-frame hemi tiers (H) take precedence.
-    pub rtgi: bool,
+    /// `--rtgi-bounces N` (`shade::set_rtgi_bounces`): the GI ladder, as a
+    /// BOUNCE BUDGET. DEFAULT `shade::DEFAULT_BOUNCES` = 2.0 — TWO real
+    /// bounces, the user's feel-test call, at a measured cost that const
+    /// records. `1` is one cosine-sampled gather per pixel per frame replacing
+    /// the ambient term, shaded at the hemi BOUNCE_Q policy and integrated by
+    /// the temporal denoisers / accumulation — the renderer this field used to
+    /// spell as a bool, and the lever for a session that wants the time back.
+    ///
+    /// The five canonical rungs are 0 | 0.5 | 1 | 1.5 | 2. `0` is the flat
+    /// `SH sky irradiance × AO` ambient, bit-identical to the pre-RTGI
+    /// renderer (and what `--no-rtgi` spells); `2` is two real bounces. A
+    /// HALF rung buys the rung above at a fraction of its ray cost: the SH×AO
+    /// tail is kept as a control variate and a real gather is rouletted over
+    /// it at that probability, which is unbiased for the rung above rather
+    /// than an average of the two (see shade.rs's ambient tier).
+    ///
+    /// Any value in [0, 2] parses — the continuum costs nothing (the
+    /// implementation reads floor and fract, never a table) and it is what
+    /// lets a feel-test find a probability the five rungs do not name.
+    /// Still-frame hemi tiers (H) take precedence at every rung.
+    pub rtgi_bounces: f32,
     /// `--no-auto-exposure` clears (`autoexp::set_enabled`): a display-stage
     /// controller eases a clamped EV toward what the presented frame's mean
     /// log2-luminance asks for (src/autoexp.rs) — enclosures open up,
@@ -583,6 +597,19 @@ pub struct Opts {
     /// the screen through the session controller's `set_exposure`, which
     /// headless paths never tick.
     pub exposure_bias: f32,
+    /// `--move-ease S` (seconds, 0.0..=1.0, default `camera::MOVE_EASE_S` =
+    /// 0.18): ease-in/ease-out on KEYBOARD flight, integrated in the 500 Hz
+    /// flycam thread with the measured dt so the inertia is wall-clock exact
+    /// at any frame rate. 0 (`--no-move-ease`) is the pre-ease hard step,
+    /// bitwise — the integrator branches around the eased arm entirely.
+    /// The analog stick / triggers / QA `drive` are NOT affected: deflection
+    /// is already the throttle there.
+    ///
+    /// Not a process global — it rides `FlyCam::spawn` (and the pause menu's
+    /// Live row), like `normal_strength` rides `SceneRequest` — so it is
+    /// deliberately absent from `lever_snapshot`. Interactive-only by
+    /// construction: headless paths never build a `FlyCam`.
+    pub move_ease: f32,
     /// `--no-autoexp-spike-guard` clears (`autoexp::set_guard`): withhold the
     /// aperture's BOOST from pixels that are outliers against their own
     /// surround, so brightening a dark scene does not also amplify its
@@ -994,9 +1021,10 @@ pub fn defaults() -> Opts {
         detail_ao_strength: 0.125,
         detail_untex_scale: 1.0,
         amb_bump: true,
-        rtgi: true,
+        rtgi_bounces: crate::shade::DEFAULT_BOUNCES,
         autoexp: true,
         exposure_bias: 0.0,
+        move_ease: crate::camera::MOVE_EASE_S,
         autoexp_guard: true,
         autoexp_guard_strength: 1.0,
         autoexp_mode: crate::autoexp::Mode::Lights,
@@ -1477,9 +1505,30 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--no-amb-bump" => opts.amb_bump = false,
             // --no-rtgi: real-time GI off — the ambient tier reverts to flat
             // SH×AO (bit-identical pre-RTGI arm; the GPU kernels compile the
-            // bounce block out). --rtgi spells the default (later flags win).
-            "--no-rtgi" => opts.rtgi = false,
-            "--rtgi" => opts.rtgi = true,
+            // bounce block out). --rtgi spells the default. Both are aliases
+            // for a point on the --rtgi-bounces ladder, so all three arms
+            // compose under one later-flags-win rule.
+            "--no-rtgi" => opts.rtgi_bounces = 0.0,
+            "--rtgi" => opts.rtgi_bounces = 1.0,
+            // --rtgi-bounces N: the ladder itself. Out of range EXITS rather
+            // than clamping — a quality lever that silently clamps reports the
+            // wrong arm in an A/B, which is the whole failure the loud-lever
+            // rule exists to prevent. NaN falls out of the range test too.
+            "--rtgi-bounces" => {
+                let v = args.next().unwrap_or_default();
+                let n: f32 = v
+                    .parse()
+                    .ok()
+                    .filter(|n: &f32| (0.0..=2.0).contains(n))
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--rtgi-bounces needs a bounce budget in 0..=2 \
+                             (the rungs are 0, 0.5, 1, 1.5, 2), got {v:?}"
+                        );
+                        std::process::exit(2);
+                    });
+                opts.rtgi_bounces = n;
+            }
             // --auto-exposure ARMS the display-stage aperture controller
             // (DEFAULT OFF — RTGI lights enclosures for real, so the
             // aperture holds at a fixed 1.0, plus any --exposure-bias).
@@ -1500,6 +1549,22 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     });
                 opts.exposure_bias = ev;
             }
+            // Keyboard flight ease. Interactive-only (headless never builds a
+            // FlyCam), so it reaches no gate and needs no lever line.
+            "--move-ease" => {
+                let s: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&s: &f32| s.is_finite() && (0.0..=1.0).contains(&s))
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--move-ease needs a value in seconds, 0.0..=1.0 (0 = the hard-step arm)"
+                        );
+                        std::process::exit(2);
+                    });
+                opts.move_ease = s;
+            }
+            "--no-move-ease" => opts.move_ease = 0.0,
             // The spike guard rides the aperture: it only ever WITHHOLDS the
             // boost, never adds one, so it is inert whenever the controller is
             // not boosting. Display-stage — no gate contact.
@@ -2813,10 +2878,19 @@ pub fn usage() {
                 eprintln!("                irradiance response to the shading normal's deviation (normal");
                 eprintln!("                maps + detail bump read flat under sky light again; a no-op on");
                 eprintln!("                flat-shaded geometry)");
-                eprintln!("  --no-rtgi     real-time GI off: the ambient tier reverts to flat SH-sky x AO");
-                eprintln!("                (the pre-RTGI renderer bit-exactly). Default ON: one cosine bounce");
-                eprintln!("                ray per pixel per frame IS the ambient — real one-bounce GI the");
-                eprintln!("                temporal denoisers/accumulation integrate (--rtgi spells the default)");
+                eprintln!("  --rtgi-bounces N  the GI ladder, as a BOUNCE BUDGET. Rungs 0 | 0.5 | 1 | 1.5 | 2");
+                eprintln!("                (any N in 0..=2 parses; DEFAULT 2 = two real bounces. It costs: 1 -> 2");
+                eprintln!("                is +11% CPU frame and +28-37% of the GPU leaf region, so --rtgi-bounces 1");
+                eprintln!("                — one gather as the ambient term — is the lever for the time back).");
+                eprintln!("                A HALF rung buys the rung above at a fraction of its rays:");
+                eprintln!("                the SH-sky x AO tail is kept as a control variate and a real gather");
+                eprintln!("                is rouletted over it at that probability, which is UNBIASED for the");
+                eprintln!("                rung above rather than an average of the two — so the temporal");
+                eprintln!("                denoisers converge it to the upper rung's image. Scale it per GPU");
+                eprintln!("                and resolution; 1.5 is the interesting one on a heavy scene");
+                eprintln!("  --no-rtgi     real-time GI off — an alias for --rtgi-bounces 0: the ambient tier");
+                eprintln!("                reverts to flat SH-sky x AO (the pre-RTGI renderer bit-exactly).");
+                eprintln!("                --rtgi spells rung 1; all three compose, later flags winning");
                 eprintln!("  --no-auto-exposure  kill the display-stage aperture controller: exposure holds at");
                 eprintln!("                exactly 1.0 plus any --exposure-bias (the pre-feature look). Default ON:");
                 eprintln!("                exposure eases toward mid-grey, clamped to +-2 EV, so enclosures open up");
@@ -2824,6 +2898,11 @@ pub fn usage() {
                 eprintln!("  --auto-exposure  the default, spelled explicitly (later flags win)");
                 eprintln!("  --exposure-bias EV  manual aperture offset in stops (-8..=8, default 0; composes");
                 eprintln!("                with auto-exposure and still applies with it off — the manual lever)");
+                eprintln!("  --move-ease S  ease-in/ease-out on KEYBOARD flight, seconds (0.0..=1.0, default 0.18).");
+                eprintln!("                Integrated in the 500 Hz flycam thread with the measured dt, so the");
+                eprintln!("                inertia is wall-clock exact at any frame rate; a direction change slews");
+                eprintln!("                (W->S passes through a stop). The analog stick is untouched — deflection");
+                eprintln!("                is already its throttle. --no-move-ease is the hard-step A/B arm");
                 eprintln!("  --no-autoexp-spike-guard  let the aperture boost NOISE SPIKES along with the scene.");
                 eprintln!("                Default ON: a pixel far brighter than its own surround is exempted from");
                 eprintln!("                the boost and presented at its unboosted brightness, so brightening a");
@@ -2969,7 +3048,7 @@ fn lever_snapshot() -> String {
         scene::detail_ao_strength(),
         scene::detail_untex_scale(),
         scene::amb_bump(),
-        crate::shade::rtgi_enabled(),
+        crate::shade::rtgi_bounces(),
         crate::autoexp::enabled(),
         crate::autoexp::bias(),
         crate::autoexp::guard(),
@@ -3036,6 +3115,8 @@ pub fn self_test() -> Result<(), String> {
         "0.25",
         "--no-amb-bump",
         "--no-rtgi",
+        "--rtgi-bounces",
+        "1.5",
         "--no-auto-exposure",
         "--no-autoexp-spike-guard",
         "--autoexp-spike-strength",
@@ -3044,6 +3125,8 @@ pub fn self_test() -> Result<(), String> {
         "tonemap",
         "--exposure-bias",
         "1.5",
+        "--move-ease",
+        "0.4",
         "--no-water",
         "--no-coincident-cull",
         "--heightfield",
@@ -3142,10 +3225,11 @@ pub fn self_test() -> Result<(), String> {
         ("detail_ao_strength", o.detail_ao_strength == 0.5),
         ("detail_untex_scale", o.detail_untex_scale == 0.25),
         ("amb_bump", !o.amb_bump),
-        ("rtgi", !o.rtgi),
+        ("rtgi_bounces", o.rtgi_bounces == 1.5),
         // Default ON: "moved" means KILLED (the argv passes --no-auto-exposure).
         ("autoexp", !o.autoexp),
         ("exposure_bias", o.exposure_bias == 1.5),
+        ("move_ease", o.move_ease == 0.4),
         // Also default ON, so "moved" is again KILLED. The strength is pinned
         // to its own distinct value: sharing 1.0 with the default would let a
         // parser that never wrote it pass.
@@ -3248,6 +3332,69 @@ pub fn self_test() -> Result<(), String> {
     if parse_argv(&["--no-aniso", "--aniso", "8"]).opts.aniso != 8 {
         return Err("--no-aniso --aniso 8 must land on 8".into());
     }
+    // ---- the RTGI ladder ---------------------------------------------------
+    // The default is the rung this renderer shipped with, and it is what makes
+    // a flagless session byte-identical to the pre-ladder build. A drift here
+    // would move every golden without moving a single gate.
+    // The shipping rung, from its ONE const — this only checks that `defaults`
+    // reads it rather than carrying a literal of its own, since a second
+    // literal is exactly how the four sites drifted apart before.
+    if defaults().rtgi_bounces != crate::shade::DEFAULT_BOUNCES {
+        return Err(format!(
+            "cli::defaults' rtgi-bounces is {}, shade::DEFAULT_BOUNCES is {}",
+            defaults().rtgi_bounces,
+            crate::shade::DEFAULT_BOUNCES
+        ));
+    }
+    for (argv, want) in [
+        (vec![], crate::shade::DEFAULT_BOUNCES),
+        (vec!["--no-rtgi"], 0.0),
+        (vec!["--rtgi"], 1.0),
+        (vec!["--rtgi-bounces", "0"], 0.0),
+        (vec!["--rtgi-bounces", "0.5"], 0.5),
+        (vec!["--rtgi-bounces", "1"], 1.0),
+        (vec!["--rtgi-bounces", "1.5"], 1.5),
+        (vec!["--rtgi-bounces", "2"], 2.0),
+        // The three spellings are one ladder, so later flags win ACROSS them —
+        // an alias that could not be overridden by the numeric form (or vice
+        // versa) would be a second lever wearing the first one's name.
+        (vec!["--rtgi-bounces", "2", "--no-rtgi"], 0.0),
+        (vec!["--no-rtgi", "--rtgi-bounces", "1.5"], 1.5),
+        (vec!["--rtgi-bounces", "0.5", "--rtgi"], 1.0),
+    ] {
+        let got = parse_argv(&argv).opts.rtgi_bounces;
+        if got != want {
+            return Err(format!("{argv:?} resolved rtgi-bounces {got}, want {want}"));
+        }
+    }
+    // The settings row's default must agree with the CLI's, for the
+    // autoexp_mode tripwire's reason: a flip that moved cli.rs and shade.rs but
+    // forgot settings.rs leaves a settings FILE silently re-selecting another
+    // rung on every launch that has one.
+    let rrow = crate::settings::menu_items()
+        .iter()
+        .find(|i| i.id == "rtgi_bounces")
+        .ok_or("settings.rs has no rtgi_bounces row")?;
+    match rrow.control {
+        crate::settings::Control::Cycle { options, default_ix } => {
+            if options.get(default_ix).copied() != Some(defaults().rtgi_bounces.to_string().as_str())
+            {
+                return Err(format!(
+                    "settings.rs's rtgi_bounces default is {:?}, cli.rs's is {}",
+                    options.get(default_ix),
+                    defaults().rtgi_bounces
+                ));
+            }
+            // Every rung the menu offers must be a rung the parser accepts.
+            for o in options {
+                let got = parse_argv(&["--rtgi-bounces", o]).opts.rtgi_bounces;
+                if got.to_string() != *o {
+                    return Err(format!("settings rung {o:?} parsed as {got}"));
+                }
+            }
+        }
+        _ => return Err("rtgi_bounces' menu row is no longer a Cycle".into()),
+    }
     if parse_argv(&["--dual-gpu", "3", "--no-dual-gpu"]).opts.dual_gpu.is_some() {
         return Err("--dual-gpu 3 --no-dual-gpu must disarm".into());
     }
@@ -3298,6 +3445,20 @@ pub fn self_test() -> Result<(), String> {
     }
     if parse_argv(&["--aniso", "8", "--no-aniso"]).opts.aniso != 1 {
         return Err("--aniso 8 --no-aniso must land on 1".into());
+    }
+    // The keyboard flight ease. Its default is DUPLICATED in camera.rs's
+    // MOVE_EASE_S and settings.rs's menu-row `StepF { default }` — this pin is
+    // what stops the three drifting apart.
+    if parse_argv(&[]).opts.move_ease != crate::camera::MOVE_EASE_S {
+        return Err("move_ease must default to camera::MOVE_EASE_S".into());
+    }
+    if parse_argv(&["--no-move-ease"]).opts.move_ease != 0.0 {
+        return Err("--no-move-ease must be exactly 0.0 (the hard-step arm is a BRANCH)".into());
+    }
+    if parse_argv(&["--no-move-ease", "--move-ease", "0.3"]).opts.move_ease != 0.3
+        || parse_argv(&["--move-ease", "0.3", "--no-move-ease"]).opts.move_ease != 0.0
+    {
+        return Err("--move-ease / --no-move-ease must be last-wins in both orders".into());
     }
     if parse_argv(&["--no-cloud-shadow", "--cloud-shadow", "32"]).opts.cloud_shadow != 32 {
         return Err("--no-cloud-shadow --cloud-shadow 32 must land on 32".into());

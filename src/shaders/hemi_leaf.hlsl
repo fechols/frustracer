@@ -79,7 +79,7 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     } else {
         HitInfo h;
         if (trace_closest(pt.o, d, tc, FLT_MAX, h)) {
-            float3 w3, o3, n3;
+            float3 w3, o3, n3, t3;
             PrimSurf ps_unused; // bounce rays never capture (secondary-ray rule)
             // Bounce cone: octant-scale spread (shade.rs::HEMI_CONE_SPREAD
             // — the CPU hemi leaf shades with the same value), and ISOTROPIC
@@ -98,7 +98,7 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             // emissive transport under GI).
             float3 l = shade_split(pt.o, d, h, rng, 1u, 1u, false, false,
                                    0.0, HEMI_CONE_SPREAD, false, false,
-                                   uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, ps_unused);
+                                   uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, t3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {
             // GATHER, not the full sky: a GI leaf ray landing in the sun disc

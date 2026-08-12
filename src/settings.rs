@@ -278,10 +278,12 @@ opt_fields! {
         pub detail_untex_scale: f32,
         /// --no-amb-bump inverse (restart)
         pub amb_bump: bool,
-        /// --no-rtgi inverse (restart: the GPU bounce block is a compile
-        /// define, so a live enable in a session built without it would
-        /// silently diverge CPU vs GPU)
-        pub rtgi: bool,
+        /// --rtgi-bounces N, as the ladder's own vocabulary (restart: both
+        /// GPU blocks are compile defines, so a live change in a session built
+        /// without them would silently diverge CPU vs GPU). Renamed from the
+        /// `rtgi` bool it replaced, so an older file's key is simply unknown
+        /// and ignored — deliberately unmigrated, the hdr10 precedent.
+        pub rtgi_bounces: String,
         /// --no-water inverse (restart: keys the scene cache)
         pub water: bool,
         /// --no-foliage-sway inverse (restart: read at scene load / SceneGpu
@@ -380,6 +382,14 @@ opt_fields! {
         pub dxr_inline: u32,
         /// --fsr4's REQUIRED semantics for a "fsr4" chain force
         pub fsr4_required: bool,
+        /// `--move-ease S` (seconds, 0.0..=1.0): keyboard flight ease-in /
+        /// ease-out, integrated in the 500 Hz flycam thread. 0 = the hard-step
+        /// arm. Live tier — the row talks to `FlyCam::set_move_ease`, the
+        /// `set_tod` precedent. The default is DUPLICATED in
+        /// camera::MOVE_EASE_S, cli::defaults() and the menu row's
+        /// `StepF { default }` — flip all three in lockstep (cli::self_test
+        /// pins the first two, settings::self_test the third).
+        pub move_ease: f32,
         pub gpu_debug: bool,
         pub pix_markers: bool,
         pub gpu_timing: bool,
@@ -1070,6 +1080,13 @@ fn apply_with(
     if let Some(v) = a.fsr4_required {
         opts.fsr4_required = v;
     }
+    if let Some(s) = a.move_ease {
+        if s.is_finite() && (0.0..=1.0).contains(&s) {
+            opts.move_ease = s;
+        } else {
+            warn("advanced.move_ease", &s.to_string());
+        }
+    }
     if let Some(v) = a.gpu_debug {
         opts.gpu_debug = v;
     }
@@ -1191,8 +1208,11 @@ fn apply_with(
     if let Some(v) = e.amb_bump {
         opts.amb_bump = v;
     }
-    if let Some(v) = e.rtgi {
-        opts.rtgi = v;
+    if let Some(v) = e.rtgi_bounces.as_deref() {
+        match v.parse::<f32>() {
+            Ok(n) if (0.0..=2.0).contains(&n) => opts.rtgi_bounces = n,
+            _ => warn("effects.rtgi_bounces", v),
+        }
     }
     if let Some(v) = e.water {
         opts.water = v;
@@ -1469,7 +1489,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("detail_ao_strength", "detail AO strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.125, default: 0.125 }, acc_f32!(effects.detail_ao_strength)),
             item!("detail_untex_scale", "detail on untextured (scale)", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 1.0 }, acc_f32!(effects.detail_untex_scale)),
             item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
-            item!("rtgi", "real-time GI (1 bounce/frame)", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.rtgi)),
+            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, Cycle { options: &["0", "0.5", "1", "1.5", "2"], default_ix: 4 }, acc_str!(effects.rtgi_bounces)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
             item!("foliage_sway", "foliage sway", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.foliage_sway)),
             item!("foliage_amp", "foliage sway amplitude", "Effects", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 1.0 }, acc_f32!(effects.foliage_amp)),
@@ -1477,6 +1497,10 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("world", "world mode (flagless boot)", "Scene", Restart, Toggle { default: true }, acc_bool!(scene.world)),
             item!("scene_path", "scene path", "Scene", Restart, Text, acc_str!(scene.scene_path)),
             // ── Advanced
+            // Live: the row writes straight through to the flycam thread's
+            // shared ease (the `tod` row's own shape). Not a shading or
+            // visibility change, so no frame/history reset.
+            item!("move_ease", "keyboard flight ease (s)", "Advanced", Live, StepF { min: 0.0, max: 1.0, step: 0.02, default: crate::camera::MOVE_EASE_S }, acc_f32!(advanced.move_ease)),
             item!("bvh_builder", "BVH builder", "Advanced", Restart, Cycle { options: &["sah", "lbvh", "ploc", "som"], default_ix: 0 }, acc_str!(advanced.bvh_builder)),
             item!("bvh_ctrav", "BVH SAH traversal cost", "Advanced", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 3.0 }, acc_f32!(advanced.bvh_ctrav)),
             item!("bvh_maxleaf", "BVH max leaf tris", "Advanced", Restart, StepU { min: 2, max: 32, step: 2, default: 8 }, acc_u32!(advanced.bvh_maxleaf)),
@@ -1566,6 +1590,8 @@ pub struct LiveView {
     pub fireflies: bool,
     pub fireflies_count: u32,
     pub emissive_lights: bool,
+    /// Keyboard flight ease in seconds (the flycam's live value).
+    pub move_ease: f32,
 }
 
 /// What a Live-tier adjust does to the session — main.rs maps these onto the
@@ -1598,6 +1624,8 @@ pub enum MenuFx {
     ExposureBias(f32),
     ToggleAutoExpGuard,
     AutoExpGuardStrength(f32),
+    /// Keyboard flight ease, seconds — `FlyCam::set_move_ease`.
+    MoveEase(f32),
     ToggleClouds,
     ToggleFireflies,
     FirefliesCount(u32),
@@ -1634,6 +1662,13 @@ pub fn menu_value(item: &MenuItem, s: &Settings, live: &LiveView) -> String {
             "exposure_bias" => format!("{:+.1} EV", live.exposure_bias),
             "autoexp_spike_guard" => onoff(live.autoexp_guard),
             "autoexp_spike_strength" => format!("{:.1}", live.autoexp_guard_strength),
+            "move_ease" => {
+                if live.move_ease > 0.0 {
+                    format!("{:.2} s", live.move_ease)
+                } else {
+                    "off".into()
+                }
+            }
             "autoexp_mode" => live.autoexp_mode.to_string(),
             "clouds" => onoff(live.clouds),
             "fireflies" => onoff(live.fireflies),
@@ -1805,6 +1840,7 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "bloom" => |o: &Opts| onoff(o.bloom),
         "autoexp" => |o: &Opts| onoff(o.autoexp),
         "exposure_bias" => |o: &Opts| o.exposure_bias.to_string(),
+        "move_ease" => |o: &Opts| o.move_ease.to_string(),
         "autoexp_spike_guard" => |o: &Opts| onoff(o.autoexp_guard),
         "autoexp_spike_strength" => |o: &Opts| o.autoexp_guard_strength.to_string(),
         "autoexp_mode" => |o: &Opts| o.autoexp_mode.as_str().to_string(),
@@ -1831,7 +1867,7 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "detail_ao_strength" => |o: &Opts| o.detail_ao_strength.to_string(),
         "detail_untex_scale" => |o: &Opts| o.detail_untex_scale.to_string(),
         "amb_bump" => |o: &Opts| onoff(o.amb_bump),
-        "rtgi" => |o: &Opts| onoff(o.rtgi),
+        "rtgi_bounces" => |o: &Opts| o.rtgi_bounces.to_string(),
         "water" => |o: &Opts| onoff(o.water),
         "foliage_sway" => |o: &Opts| onoff(o.foliage_sway),
         "foliage_amp" => |o: &Opts| o.foliage_amp.to_string(),
@@ -2009,6 +2045,18 @@ pub fn menu_adjust(item: &MenuItem, dir: i32, s: &mut Settings, live: &LiveView)
                 }
                 (item.set)(s, &format!("{v}"));
                 MenuFx::ExposureBias(v)
+            }
+            "move_ease" => {
+                let (min, max, step) = match &item.control {
+                    Control::StepF { min, max, step, .. } => (*min, *max, *step),
+                    _ => (0.0, 1.0, 0.02),
+                };
+                let v = (live.move_ease + dir as f32 * step).clamp(min, max);
+                if v == live.move_ease {
+                    return MenuFx::None;
+                }
+                (item.set)(s, &format!("{v}"));
+                MenuFx::MoveEase(v)
             }
             "autoexp_spike_guard" => {
                 (item.set)(s, &onoff(!live.autoexp_guard));
@@ -2323,6 +2371,38 @@ pub fn self_test() -> Result<(), String> {
         };
         if !ok {
             return Err(format!("menu id '{}' offers an option its consumer rejects", it.id));
+        }
+    }
+    // The keyboard flight ease's default is TRIPLICATED (camera::MOVE_EASE_S,
+    // cli::defaults(), and this row's `StepF { default }`) — cli::self_test
+    // pins the first two against each other, this pins the third. Without it a
+    // flip that forgot the menu would leave the row displaying, and a settings
+    // FILE re-selecting, the wrong value on every launch that has one. Its
+    // range must also agree with the CLI's own filter and `apply_with`'s.
+    {
+        let it = item_by_id("move_ease").ok_or("menu item 'move_ease' missing")?;
+        match it.control {
+            Control::StepF { min, max, default, .. } => {
+                if default != crate::camera::MOVE_EASE_S {
+                    return Err(format!(
+                        "move_ease row default {default} != camera::MOVE_EASE_S {}",
+                        crate::camera::MOVE_EASE_S
+                    ));
+                }
+                if min != 0.0 || max != 1.0 {
+                    return Err(format!(
+                        "move_ease row range {min}..={max} != the CLI's 0.0..=1.0"
+                    ));
+                }
+            }
+            _ => return Err("move_ease must be a StepF row".into()),
+        }
+        // ...and a file value outside that range must be warn-ignored, not
+        // silently handed to the flycam.
+        let mut s = Settings::default();
+        s.advanced.move_ease = Some(2.5);
+        if !invalid_fields(&s).iter().any(|f| f == "move_ease") {
+            return Err("an out-of-range advanced.move_ease must be reported invalid".into());
         }
     }
     // A restart Toggle round-trips through its accessors: adjust flips from

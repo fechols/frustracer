@@ -104,22 +104,27 @@ pub const CTR_FRONTIER_ENTRIES: u32 = 23;
 /// (the qsky rect-area sum), so `cs_seed_replay` preserves it with
 /// CTR_LEAF/CTR_SKY/CTR_CUT.
 pub const CTR_SKY_PX: u32 = 24;
-/// Real-time-GI bounce rays (shade_full's RTGI block; wavefront leaf units
-/// only — the reference kernel and the DXR library carry no counters). The
-/// `--check-gpu` must-fire on armed sessions, exactly 0 under `--no-rtgi`.
+/// LEVEL-0 GI gather rays (shade_full's RTGI block, and at rung 0.5 its
+/// rouletted correction; wavefront leaf units only — the reference kernel and
+/// the DXR library carry no counters). The `--check-gpu` must-fire on armed
+/// sessions, exactly 0 at `--rtgi-bounces 0`.
 pub const CTR_RTGI_RAYS: u32 = 25;
-pub const CTR_COUNT: u32 = 26;
+/// LEVEL-1 GI gather rays (the correction at rungs 1.5 and 2). The PAIR is the
+/// ladder's rung signature, and the reason the level-0 counter alone will not
+/// do: rungs 0.5 and 1 differ in nothing it can see.
+pub const CTR_RTGI_RAYS2: u32 = 26;
+pub const CTR_COUNT: u32 = 27;
 // WIDTH_PROBE slots (FR_WIDTH=1 — `width_defs`): each kernel reports its
 // COMPILED wave width (WaveGetLaneCount()). DELIBERATELY >= CTR_COUNT: every
 // zero loop runs `i < CTR_COUNT` and every gate readback reads CTR_COUNT*4
 // bytes, so these slots are never zeroed and never gated by construction.
 // LOCKSTEP with ctr.hlsli's block AND the counters buffer size (CTR_TOTAL*4).
-pub const CTR_W_LEAF: u32 = 26;
-pub const CTR_W_SKY: u32 = 27;
-pub const CTR_W_LEVEL: u32 = 28;
-pub const CTR_W_HEMI: u32 = 29;
-pub const CTR_W_REFERENCE: u32 = 30;
-pub const CTR_TOTAL: u32 = 31;
+pub const CTR_W_LEAF: u32 = 27;
+pub const CTR_W_SKY: u32 = 28;
+pub const CTR_W_LEVEL: u32 = 29;
+pub const CTR_W_HEMI: u32 = 30;
+pub const CTR_W_REFERENCE: u32 = 31;
+pub const CTR_TOTAL: u32 = 32;
 const _: () = assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL == CTR_W_REFERENCE + 1);
 
 /// queues.hlsli::LeafRec's stride — the qleaf allocation and main.rs's
@@ -822,6 +827,24 @@ pub const HUD_HLSL: &str = include_str!("../shaders/hud.hlsl");
 pub const BLOOM_HLSL: &str = include_str!("../shaders/bloom.hlsl");
 pub const AUTOEXP_HLSL: &str = include_str!("../shaders/autoexp.hlsl");
 
+/// The entry-point names every fullscreen pair above spells, in ONE place.
+///
+/// All four display shaders (`blit`, `tonemap`, `waveviz`, `hud`) use this
+/// pair, and three separate places compile them: `gpu/tonemap.rs` at
+/// `vs_5_0`/`ps_5_0` through fxc, `--check-spirv` at `vs_6_0`/`ps_6_0` through
+/// DXC, and the Vulkan display stage, which consumes what the second emits.
+/// That is the shape which quietly acquires a typo — a wrong entry name is a
+/// compile error NOWHERE, it is a compiler diagnostic at run time on whichever
+/// backend was edited last, while the other two keep working.
+///
+/// The two DXC consumers read these consts directly. **The fxc one cannot**:
+/// windows-rs's `s!` builds a NUL-terminated `PCSTR` at compile time and
+/// therefore needs a literal, not a `&str` const — so `gpu/tonemap.rs` keeps
+/// its literals and carries a `const _` assertion that they match these, which
+/// is the same guarantee reached the only way that call site allows.
+pub const GFX_VS: &str = "vsmain";
+pub const GFX_PS: &str = "psmain";
+
 // The GPU BC7 encoder — a scene-upload pass, not a display one, but the same
 // fxc tier for the same reason (it must run before the tracer's kernels).
 pub const BC7ENC_HLSL: &str = include_str!("../shaders/bc7enc.hlsl");
@@ -885,13 +908,46 @@ pub fn trans_defs(scene: &Scene) -> &'static str {
     if scene.any_transmissive && !abl_has("notrans") { "#define TRANS_SHADOW 1" } else { "" }
 }
 
-/// `#define RTGI` — compiles shade_full's real-time-GI bounce block in (the
-/// trans_defs session-lever pattern). `--no-rtgi` omits it, so the unarmed
-/// assembly's shade_full is the verbatim pre-RTGI call — the bit-identity
-/// arm. Reaches every unit that pastes SHADE_HLSLI on BOTH pipelines (the
+/// The GI ladder's STRUCTURE, as compile defines (`--rtgi-bounces N`, the
+/// trans_defs session-lever pattern).
+///
+/// * `RTGI` — shade_full's DETERMINISTIC level-0 gather, at `N >= 1`.
+/// * `RTGI_CORR <p>` — the rouletted correction, at `frac(N) > 0`, carrying
+///   its own probability.
+/// * `RTGI_CORR_L0` — that correction applies at level 0 rather than level 1,
+///   i.e. rung 0.5, where no deterministic gather ran.
+///
+/// Rung 0 omits both, so the unarmed assembly's shade_full is the verbatim
+/// pre-RTGI call — the bit-identity arm — and rung 1 omits the correction, so
+/// the shipping default's instruction stream is the pre-LADDER one too. That
+/// is what keeps both default rungs free of the correction's registers, which
+/// is the whole containment for the Intel spill risk: an armed rung pays the
+/// allocation on every pixel, so a rung nobody asked for must not compile it.
+///
+/// `p` is a DEFINE rather than a CB lane deliberately: the ladder is a
+/// restart-tier session lever (its settings row says so), the free lanes
+/// nearby — `el_meta.zw` — are refreshed WHOLESALE by `refresh_sky_rows` and
+/// would be clobbered on any TOD change, and a compile-time `p` lets DXC fold
+/// the reciprocal. The float-constant-as-define shape is `detail_defs`'.
+///
+/// Reaches every unit that pastes SHADE_HLSLI on BOTH pipelines (the
 /// probe-reach rule); the per-frame fb stand-down rides FLAG_RTGI on top.
-pub fn rtgi_defs() -> &'static str {
-    if crate::shade::rtgi_enabled() { "#define RTGI 1" } else { "" }
+pub fn rtgi_defs() -> String {
+    let n = crate::shade::rtgi_bounces();
+    // ONE derivation, shared with the runtime bit (`FLAG_RTGI_CORR`), so the
+    // compile constant and the per-frame gate cannot disagree about a rung.
+    let pr = crate::gfx::frame::rtgi_corr_p(n);
+    let mut s = String::new();
+    if n >= 1.0 {
+        s.push_str("#define RTGI 1\n");
+    }
+    if pr > 0.0 {
+        s.push_str(&format!("#define RTGI_CORR {pr:.9e}\n"));
+        if n < 1.0 {
+            s.push_str("#define RTGI_CORR_L0 1\n");
+        }
+    }
+    s
 }
 
 /// The AMD candidate-loop TMin workaround — see `rt.hlsli::cand_tmin` for the
@@ -2263,7 +2319,10 @@ pub fn workgraph_src(wavefront: &str, wide: u32, deep: u32) -> String {
 
 #[cfg(test)]
 mod width_ballast_shader_source_tests {
-    use super::{CTR_COUNT, CTR_HLSLI, CTR_TOTAL, CTR_W_LEAF, LEAF_HLSL, WAVEFRONT_HLSL};
+    use super::{
+        CTR_COUNT, CTR_HLSLI, CTR_RTGI_RAYS, CTR_RTGI_RAYS2, CTR_TOTAL, CTR_W_LEAF, LEAF_HLSL,
+        WAVEFRONT_HLSL,
+    };
     const REFERENCE: &str = super::REFERENCE_HLSL;
     const SKY: &str = super::SKY_HLSL;
     const HEMI_LEAF: &str = super::HEMI_LEAF_HLSL;
@@ -2303,9 +2362,19 @@ mod width_ballast_shader_source_tests {
         assert!(WAVEFRONT_HLSL.contains("i < CTR_COUNT"));
         assert!(!WAVEFRONT_HLSL.contains("i < CTR_TOTAL"));
         assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL > CTR_W_LEAF);
-        // ctr.hlsli's literal block mirrors the Rust consts.
-        assert!(CTR_HLSLI.contains("#define CTR_W_LEAF      26u"));
-        assert!(CTR_HLSLI.contains("#define CTR_TOTAL       31u"));
+        // ctr.hlsli's literal block mirrors the Rust consts. DERIVED from the
+        // consts rather than written out: the property worth pinning is that
+        // the two languages AGREE, and a hand-written number pins the agreement
+        // plus a renumbering nobody promised not to do — which is what it did
+        // when the RTGI ladder's second counter pushed the width tail up by
+        // one. Still fully load-bearing: change a Rust const alone and the HLSL
+        // text stops containing the new number.
+        assert!(CTR_HLSLI.contains(&format!("#define CTR_W_LEAF      {CTR_W_LEAF}u")));
+        assert!(CTR_HLSLI.contains(&format!("#define CTR_TOTAL       {CTR_TOTAL}u")));
+        // The GI ladder's counter pair — both halves, because the rung
+        // signature the must-fires read is meaningless if either drifts.
+        assert!(CTR_HLSLI.contains(&format!("#define CTR_RTGI_RAYS    {CTR_RTGI_RAYS}u")));
+        assert!(CTR_HLSLI.contains(&format!("#define CTR_RTGI_RAYS2   {CTR_RTGI_RAYS2}u")));
     }
 
     /// --waveviz: every ID-mint touch (the wv_t locals and their
