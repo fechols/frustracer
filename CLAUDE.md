@@ -4906,7 +4906,12 @@ cargo run --release -- --rtgi-bounces 1.5  # THE GI LADDER (2026-08-12) — real
                                       # --no-rtgi is an alias for 0 and --rtgi for 1, all three
                                       # composing under ONE later-flags-win rule (cli::self_test
                                       # pins the 11-case table). Settings row:
-                                      # Effects/rtgi_bounces, a StepF { 0, 2, step 0.5 } whose
+                                      # Renderer/rtgi_bounces — beside `bounce`, the still-frame
+                                      # hemi tier that TAKES PRECEDENCE over it, because the two
+                                      # are one decision and the precedence is invisible with the
+                                      # pair on different pages (and a bounce budget is not an
+                                      # "effect" in the sense bloom and fireflies are) — a
+                                      # StepF { 0, 2, step 0.5 } whose
                                       # `default` READS `shade::DEFAULT_BOUNCES` (restart tier —
                                       # both GPU blocks are compile defines). A stepper rather
                                       # than a Cycle because the budget genuinely is a continuum

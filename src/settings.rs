@@ -126,6 +126,20 @@ opt_fields! {
         pub preset: u32,
         /// "off" | "ao" | "gi" (the H key; no CLI flag; live, still frames)
         pub bounce: String,
+        /// --rtgi-bounces N — the REAL-TIME GI budget, sitting beside `bounce`
+        /// because the two are one decision: `bounce` is the still-frame
+        /// hemisphere tier and it TAKES PRECEDENCE over this one, which is
+        /// invisible if they live in different groups. Restart: both GPU
+        /// blocks are compile defines, so a live change in a session built
+        /// without them would silently diverge CPU vs GPU.
+        ///
+        /// A FLOAT, not the rung's spelling: the budget genuinely is a
+        /// continuum the parser accepts anywhere in [0,2], and a `StepF` row
+        /// quantizes it to the five rungs by construction. Renamed from the
+        /// `rtgi` bool it replaced, re-typed from the String it briefly was,
+        /// and now re-sectioned — every older key is simply unknown and
+        /// ignored, deliberately unmigrated (the hdr10 precedent).
+        pub rtgi_bounces: f32,
         /// --heightfield / --no-heightfield (ARMS relief; restart — keys the
         /// scene cache and the BVH build)
         pub heightfield: bool,
@@ -278,16 +292,6 @@ opt_fields! {
         pub detail_untex_scale: f32,
         /// --no-amb-bump inverse (restart)
         pub amb_bump: bool,
-        /// --rtgi-bounces N (restart: both GPU blocks are compile defines, so
-        /// a live change in a session built without them would silently
-        /// diverge CPU vs GPU). A FLOAT, not the rung's spelling: the budget
-        /// genuinely is a continuum the parser accepts anywhere in [0,2], and
-        /// a `StepF` row quantizes it to the five rungs by construction, so
-        /// modelling it as five unrelated strings was the tail wagging the
-        /// dog. Renamed from the `rtgi` bool it replaced and re-typed from the
-        /// String it briefly was, so either older key is simply unknown and
-        /// ignored — deliberately unmigrated, the hdr10 precedent.
-        pub rtgi_bounces: f32,
         /// --no-water inverse (restart: keys the scene cache)
         pub water: bool,
         /// --no-foliage-sway inverse (restart: read at scene load / SceneGpu
@@ -781,6 +785,15 @@ fn apply_with(
     if let Some(v) = r.heightfield {
         opts.heightfield = v;
     }
+    if let Some(k) = r.rtgi_bounces {
+        // The CLI's own range, and NaN falls out of it (the `contains` test is
+        // false for NaN) exactly as it does at the parse arm.
+        if k.is_finite() && (0.0..=2.0).contains(&k) {
+            opts.rtgi_bounces = k;
+        } else {
+            warn("renderer.rtgi_bounces", &k.to_string());
+        }
+    }
     // r.preset / r.bounce: session-start state, consumed by run_window.
 
     // Upscaler
@@ -1212,15 +1225,6 @@ fn apply_with(
     if let Some(v) = e.amb_bump {
         opts.amb_bump = v;
     }
-    if let Some(k) = e.rtgi_bounces {
-        // The CLI's own range, and NaN falls out of it (the `contains` test is
-        // false for NaN) exactly as it does at the parse arm.
-        if k.is_finite() && (0.0..=2.0).contains(&k) {
-            opts.rtgi_bounces = k;
-        } else {
-            warn("effects.rtgi_bounces", &k.to_string());
-        }
-    }
     if let Some(v) = e.water {
         opts.water = v;
     }
@@ -1426,6 +1430,24 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("preset", "quality preset (1-3)", "Renderer", Live, Cycle { options: &["1", "2", "3"], default_ix: 1 }, acc_u32!(renderer.preset)),
             item!("spp", "samples per pixel (U cycles)", "Renderer", Live, CycleFwd, acc_u32!(renderer.spp)),
             item!("bounce", "hemi bounce (H cycles)", "Renderer", Live, CycleFwd, acc_str!(renderer.bounce)),
+            // Directly under `bounce`, and in RENDERER rather than Effects,
+            // because the two are ONE decision: both are GI tiers and the
+            // still-frame hemisphere above TAKES PRECEDENCE over this budget,
+            // which no user can infer with the pair on different pages. It is
+            // also not an "effect" in the sense the rest of that group is —
+            // bloom, fireflies and the detail field are things added to a
+            // picture, while this is how the picture's light is computed.
+            //
+            // STEP 0.5 IS LOAD-BEARING, not a taste call: it is a power of two,
+            // so all five stops (0, 0.5, 1, 1.5, 2) are exactly representable in
+            // f32 and the stepper lands on them BITWISE. Two live float-equality
+            // tests depend on that — main's lever line (`!= DEFAULT_BOUNCES`,
+            // which decides whether a departure is announced) and
+            // `gfx::frame::rtgi_corr_p`'s rung split. A 0.1-style step would
+            // accumulate to 0.30000001 and announce a departure from a value the
+            // user had just selected as the default. The default reads the ONE
+            // const, so this row cannot drift from the renderer's own answer.
+            item!("rtgi_bounces", "real-time GI bounces", "Renderer", Restart, StepF { min: 0.0, max: 2.0, step: 0.5, default: crate::shade::DEFAULT_BOUNCES }, acc_f32!(renderer.rtgi_bounces)),
             item!("hybrid", "hybrid tracer (R)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
             item!("dynamic", "dynamic res (T, CPU mode)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
             item!("height_on", "relief rendering (V, armed only)", "Renderer", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
@@ -1464,22 +1486,6 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("nrd_anti_firefly", "NRD anti-firefly filter", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.nrd_anti_firefly)),
             item!("nrd_max_accum_frames", "NRD max accum frames", "Upscaler", Restart, StepU { min: 0, max: 63, step: 5, default: 30 }, acc_u32!(upscaler.nrd_max_accum_frames)),
             // ── Effects
-            // FIRST in the group, deliberately: it is the largest quality/cost
-            // decision on the page (rung 1 -> 2 is +11% CPU frame and +28-37%
-            // of the GPU leaf region), and it had been sitting at row 29 of 32
-            // in a panel that shows ~16 — the least reachable slot in the menu
-            // for the setting most worth finding. The scrollbar made it
-            // discoverable; this makes it the first thing seen.
-            // STEP 0.5 IS LOAD-BEARING, not a taste call: it is a power of two,
-            // so all five stops (0, 0.5, 1, 1.5, 2) are exactly representable in
-            // f32 and the stepper lands on them BITWISE. Two live float-equality
-            // tests depend on that — main's lever line (`!= DEFAULT_BOUNCES`,
-            // which decides whether a departure is announced) and
-            // `gfx::frame::rtgi_corr_p`'s rung split. A 0.1-style step would
-            // accumulate to 0.30000001 and announce a departure from a value the
-            // user had just selected as the default. The default reads the ONE
-            // const, so this row cannot drift from the renderer's own answer.
-            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, StepF { min: 0.0, max: 2.0, step: 0.5, default: crate::shade::DEFAULT_BOUNCES }, acc_f32!(effects.rtgi_bounces)),
             item!("tod", "time of day", "Effects", Live, StepF { min: 0.0, max: 24.0, step: 0.5, default: 12.0 }, acc_f32!(effects.tod)),
             item!("bloom", "bloom (glare)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.bloom)),
             item!("autoexp", "auto-exposure", "Effects", Live, Toggle { default: true }, acc_bool!(effects.autoexp)),
