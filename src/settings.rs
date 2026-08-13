@@ -1464,6 +1464,22 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("nrd_anti_firefly", "NRD anti-firefly filter", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.nrd_anti_firefly)),
             item!("nrd_max_accum_frames", "NRD max accum frames", "Upscaler", Restart, StepU { min: 0, max: 63, step: 5, default: 30 }, acc_u32!(upscaler.nrd_max_accum_frames)),
             // ── Effects
+            // FIRST in the group, deliberately: it is the largest quality/cost
+            // decision on the page (rung 1 -> 2 is +11% CPU frame and +28-37%
+            // of the GPU leaf region), and it had been sitting at row 29 of 32
+            // in a panel that shows ~16 — the least reachable slot in the menu
+            // for the setting most worth finding. The scrollbar made it
+            // discoverable; this makes it the first thing seen.
+            // STEP 0.5 IS LOAD-BEARING, not a taste call: it is a power of two,
+            // so all five stops (0, 0.5, 1, 1.5, 2) are exactly representable in
+            // f32 and the stepper lands on them BITWISE. Two live float-equality
+            // tests depend on that — main's lever line (`!= DEFAULT_BOUNCES`,
+            // which decides whether a departure is announced) and
+            // `gfx::frame::rtgi_corr_p`'s rung split. A 0.1-style step would
+            // accumulate to 0.30000001 and announce a departure from a value the
+            // user had just selected as the default. The default reads the ONE
+            // const, so this row cannot drift from the renderer's own answer.
+            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, StepF { min: 0.0, max: 2.0, step: 0.5, default: crate::shade::DEFAULT_BOUNCES }, acc_f32!(effects.rtgi_bounces)),
             item!("tod", "time of day", "Effects", Live, StepF { min: 0.0, max: 24.0, step: 0.5, default: 12.0 }, acc_f32!(effects.tod)),
             item!("bloom", "bloom (glare)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.bloom)),
             item!("autoexp", "auto-exposure", "Effects", Live, Toggle { default: true }, acc_bool!(effects.autoexp)),
@@ -1496,16 +1512,6 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("detail_ao_strength", "detail AO strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.125, default: 0.125 }, acc_f32!(effects.detail_ao_strength)),
             item!("detail_untex_scale", "detail on untextured (scale)", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 1.0 }, acc_f32!(effects.detail_untex_scale)),
             item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
-            // STEP 0.5 IS LOAD-BEARING, not a taste call: it is a power of two,
-            // so all five stops (0, 0.5, 1, 1.5, 2) are exactly representable in
-            // f32 and the stepper lands on them BITWISE. Two live float-equality
-            // tests depend on that — main's lever line (`!= DEFAULT_BOUNCES`,
-            // which decides whether a departure is announced) and
-            // `gfx::frame::rtgi_corr_p`'s rung split. A 0.1-style step would
-            // accumulate to 0.30000001 and announce a departure from a value the
-            // user had just selected as the default. The default reads the ONE
-            // const, so this row cannot drift from the renderer's own answer.
-            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, StepF { min: 0.0, max: 2.0, step: 0.5, default: crate::shade::DEFAULT_BOUNCES }, acc_f32!(effects.rtgi_bounces)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
             item!("foliage_sway", "foliage sway", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.foliage_sway)),
             item!("foliage_amp", "foliage sway amplitude", "Effects", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 1.0 }, acc_f32!(effects.foliage_amp)),
