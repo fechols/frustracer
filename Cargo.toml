@@ -239,6 +239,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 objc2-metal-fx = { version = "0.3", default-features = false, features = [
     "std",
     "MTLFXTemporalScaler",
+    "MTLFXTemporalDenoisedScaler",
+    "MTLFXFrameInterpolator",
 ] }
 
 [build-dependencies]

@@ -128,6 +128,17 @@ struct Shared {
     /// gate (paused = no frames presented = flying blind).
     drive: [AtomicU32; 3],
     drive_ticks: AtomicU32,
+    /// Keyboard flight ease in seconds (f32 bits) — see `camera::move_ease`.
+    /// Shared (not a spawn-time constant) so the pause menu's Live row can
+    /// move it mid-session; 0 is the hard-step arm. Read once per tick.
+    /// Deliberately does NOT reach the analog stick / trigger / QA-drive
+    /// path, which is already a throttle.
+    move_ease: AtomicU32,
+    /// Raised by `set()` (a teleport), consumed and cleared by the
+    /// integrator: the ramp must be parked so a pose write ARRIVES STOPPED.
+    /// Without it a `tp` mid-flight keeps coasting through the settle, which
+    /// would make a scripted `tp` -> `sync` -> `screenshot` non-repeatable.
+    motion_reset: AtomicBool,
 }
 
 impl FlyCam {
@@ -136,12 +147,14 @@ impl FlyCam {
     /// Send; the thread only ever compares it / hands it to read-only queries.
     /// `attractors` arms world-mode auto-TOD (empty = off, the structural
     /// non-world state); the first manual scrub disables it for the session.
+    /// `move_ease` seeds the keyboard flight ease in seconds (`--move-ease`).
     pub fn spawn(
         hwnd: isize,
         cam0: Camera,
         tod0: f32,
         diag: f32,
         attractors: Vec<TodAttractor>,
+        move_ease: f32,
     ) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(FlyState { cam: cam0, tod: tod0 }),
@@ -151,6 +164,8 @@ impl FlyCam {
             speed: Arc::new(AtomicU32::new(0)),
             drive: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
             drive_ticks: AtomicU32::new(0),
+            move_ease: AtomicU32::new(move_ease.max(0.0).to_bits()),
+            motion_reset: AtomicBool::new(false),
         });
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
@@ -190,7 +205,26 @@ impl FlyCam {
     /// write goes through the shared camera instead of a session-local copy
     /// the integrator would immediately overwrite.
     pub fn set(&self, cam: Camera) {
+        // A teleport must ARRIVE STOPPED — otherwise the keyboard ease keeps
+        // coasting through the new pose and a scripted `tp` -> `sync` ->
+        // `screenshot` drifts during the settle.
+        self.shared.motion_reset.store(true, Relaxed);
         self.shared.state.lock().unwrap().cam = cam;
+    }
+
+    /// Keyboard flight ease in seconds — the pause menu's Live row (and the
+    /// `--move-ease` seed). 0 restores the hard step; negative is clamped
+    /// away so the integrator's `> 0.0` arm is the only predicate.
+    pub fn set_move_ease(&self, secs: f32) {
+        if secs.is_finite() {
+            self.shared.move_ease.store(secs.max(0.0).to_bits(), Relaxed);
+        }
+    }
+
+    /// The live keyboard flight ease, for the menu row's displayed value and
+    /// the base its adjust steps from.
+    pub fn move_ease(&self) -> f32 {
+        f32::from_bits(self.shared.move_ease.load(Relaxed))
     }
 
     /// Arm the QA drive: axes in [-1, 1] for `ticks` 500 Hz integrator
@@ -445,6 +479,12 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
     // modifier held before movement starts is already engaged).
     let mut slow_ctrl = 0.0f32;
     let mut slow_shift = 0.0f32;
+    // Keyboard flight ramp, CAMERA-RELATIVE (x = right, y = up, z = forward) —
+    // the analog stick's own basis, which is what lets it be advanced BEFORE
+    // the pose lock is taken and keeps the idle early-out below a pure input
+    // test. |mv| <= 1 by construction (see camera::move_ease); the ramp reaches
+    // a BITWISE zero on release, which is what re-arms that early-out.
+    let mut mv = Vec3A::ZERO;
     // Last speed value stored (world units/s). Compare-before-store keeps
     // the idle steady state write-free (the snapshot bit-compare
     // discipline); the pause/unfocus and no-input paths park it at 0.0 once.
@@ -473,12 +513,24 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         let focused = unsafe { GetForegroundWindow() } == hwnd;
         if shared.paused.load(Relaxed) || (!focused && drive_ticks == 0) {
             drag = None;
+            // Park the flight ramp with the drag: a gated span presents no
+            // frames (or is not ours), so resuming must not dump a coast into
+            // it. Closing the menu with W still held re-eases from rest.
+            mv = Vec3A::ZERO;
             if prev_speed != 0.0 {
                 prev_speed = 0.0;
                 shared.speed.store(0.0f32.to_bits(), Relaxed);
             }
             continue;
         }
+
+        // A teleport arrives stopped. Load-then-conditional-store rather than
+        // an unconditional swap, so the steady state stays read-only.
+        if shared.motion_reset.load(Relaxed) {
+            shared.motion_reset.store(false, Relaxed);
+            mv = Vec3A::ZERO;
+        }
+        let ease_s = f32::from_bits(shared.move_ease.load(Relaxed));
 
         let down = |vk: u16| focused && unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
         let pad = if focused { poll_pad(&mut pad_backoff) } else { None };
@@ -535,6 +587,28 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         let kdn = down(keys.q);
         let key_any = kw || ks || kd || ka || kup || kdn;
 
+        // --- keyboard flight ease. The target is built from the key flags
+        // ALONE, in the camera-relative basis (x = right, y = up, z = forward)
+        // the analog stick already uses, so the ramp advances without the pose
+        // lock and the early-out below stays a pure input test. `speed` is
+        // applied later and already carries dt + the eased slow factor, so the
+        // two eases compose.
+        //
+        // ONE eased vector, not a scalar plus a latched direction: that is what
+        // makes a direction change SLEW — W->S passes through the origin (a
+        // momentary stop, the inertia) instead of flipping at full speed.
+        let target = if key_any {
+            Vec3A::new(
+                (kd as i32 - ka as i32) as f32,
+                (kup as i32 - kdn as i32) as f32,
+                (kw as i32 - ks as i32) as f32,
+            )
+            .normalize_or_zero()
+        } else {
+            Vec3A::ZERO
+        };
+        mv = crate::camera::move_ease(mv, target, dt, ease_s);
+
         // --- time-of-day scrub: `.`/D-pad-right forward, `,`/D-pad-left
         // reverse (both held = 0). Wall-clock-exact by the same measured-dt
         // argument as displacement.
@@ -552,7 +626,14 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         // auto_tod must integrate with NO input held (the ease keeps running
         // after the flight stops) — but once converged it writes nothing (see
         // below), so an idle converged session still compares bit-equal.
+        // `mv` is tested AFTER this tick's update, which is what keeps a coast
+        // running: skipping a tick would freeze the ramp mid-glide and the
+        // camera would resume from it on the next key press. On the tick the
+        // ramp snaps to a bitwise ZERO the test re-arms, and since a rested
+        // ramp contributes exactly nothing there is no motion to lose — that
+        // exact arrival is why the ease may not be an asymptotic smoother.
         if !key_any
+            && mv == Vec3A::ZERO
             && !pad_move
             && !pad_look
             && !drv_any
@@ -573,7 +654,22 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         let f = cam.forward();
         let r = f.cross(Vec3A::Y).normalize();
         let mut step = Vec3A::ZERO;
-        if key_any {
+        if ease_s > 0.0 {
+            // Eased keyboard flight. The DIRECTION is normalized in WORLD
+            // space, exactly as the pre-ease code did — `f` carries a Y
+            // component when pitched, so the camera basis is not orthonormal
+            // and normalizing the coefficients instead would run a
+            // forward+vertical combination fast. So the only thing the ease
+            // changes is the magnitude, through a smoothstep of the ramp.
+            let s = crate::camera::move_scale(mv);
+            if s > 0.0 {
+                let dir = r * mv.x + Vec3A::Y * mv.y + f * mv.z;
+                if dir != Vec3A::ZERO {
+                    step += dir.normalize() * (s * speed);
+                }
+            }
+        } else if key_any {
+            // Off arm (`--move-ease 0`): the pre-ease hard step, verbatim.
             let mut delta = Vec3A::ZERO;
             if kw {
                 delta += f;

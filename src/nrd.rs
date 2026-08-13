@@ -892,7 +892,7 @@ mod loader {
         pub(super) fn open(path: &Path) -> Result<Lib, String> {
             // SAFETY: `dlopen` runs the library's initializers, which is
             // arbitrary code. NRD's are the C++ runtime's own; the same
-            // argument vk/spirv.rs makes for libdxcompiler.so.
+            // argument spirv.rs makes for libdxcompiler.so.
             unsafe { libloading::Library::new(path) }
                 .map_err(|e| format!("failed to load {}: {e}", path.display()))
         }
@@ -900,7 +900,7 @@ mod loader {
         pub(super) fn sym(lib: &Lib, name: &[u8]) -> Option<*mut std::ffi::c_void> {
             // Deref the `Symbol` to a plain pointer so its borrow of `lib`
             // ends here — that is what lets `load()` move the handle into
-            // `Api` afterwards (vk/spirv.rs's `let create = *create;`).
+            // `Api` afterwards (spirv.rs's `let create = *create;`).
             unsafe { lib.get::<*mut std::ffi::c_void>(name) }.ok().map(|s| *s)
         }
     }

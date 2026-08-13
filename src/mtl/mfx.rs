@@ -300,6 +300,20 @@ impl Mfx {
         })
     }
 
+    /// This scaler as an `MTLFXFrameInterpolatableScaler`, for
+    /// `MTLFXFrameInterpolatorDescriptor::setScaler`.
+    ///
+    /// The interpolator NEEDS one: standalone it is a passthrough — measured,
+    /// see `mtl::mfxfi`'s header — and its descriptor's `scaler` property is
+    /// how a real session chains generation onto reconstruction. Handing out a
+    /// borrow rather than a clone keeps the lifetime obvious: the interpolator
+    /// must not outlive the scaler it was built against.
+    pub fn as_interpolatable(
+        &self,
+    ) -> &ProtocolObject<dyn objc2_metal_fx::MTLFXFrameInterpolatableScaler> {
+        ProtocolObject::from_ref(&*self.scaler)
+    }
+
     /// The upscaled frame as linear f32 RGBA, row-major at the upscale extent.
     pub fn read_output(&self, mtl: &Mtl) -> Result<Vec<f32>, String> {
         let (w, h) = self.upscale;

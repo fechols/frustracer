@@ -70,6 +70,19 @@ rem  this note exists so the absence reads as a decision rather than as drift.
 rem  NRD is pinned BOTH here and in src/nrd.rs (the transcribed structs +
 rem  runtime GetLibraryDesc gate) — move the two together or --nrd sheds loudly.
 set "NRD_TAG=v4.17.3"
+rem  SCRIPT-relative, deliberately NOT %SDKS% (= %CD%\SDKs): the submodule lives
+rem  beside this FILE and is checked out by git, while every other component is
+rem  downloaded into the working directory. They coincide on the normal run from
+rem  the repo root; the two spellings differ only when the script is invoked from
+rem  elsewhere, and there the submodule is still where %~dp0 says. Defined HERE
+rem  rather than inside :do_nrd so the summary row and :nrd_source cannot end up
+rem  testing two different paths.
+set "NRD_SRC=%~dp0SDKs\NRD-src"
+rem  The same path as CMake writes it (forward slashes), which is the form
+rem  :nrd_stale matches CMAKE_HOME_DIRECTORY against. Derived HERE, beside what
+rem  it derives from and by the reasoning directly above: a second spelling of
+rem  NRD_SRC computed at the point of use is exactly how the two drift apart.
+set "NRD_SRC_FWD=%NRD_SRC:\=/%"
 
 rem --- tools ---------------------------------------------------------------
 rem  Absolute System32 paths on purpose, NOT bare names: a PATH with Git for
@@ -154,6 +167,12 @@ call :check "OIDN (--oidn / N)"                      "%SDKS%\oidn.x64.windows\bi
 call :check "PIX markers (--pix-markers)"            "%SDKS%\pix\bin\x64\WinPixEventRuntime.dll"
 call :check "NRD denoiser (--nrd)"                   "%SDKS%\NRD\bin\NRD.dll"
 call :check "  (perf variant, --nrd-perf)"           "%SDKS%\NRD\bin\perf\NRD.dll"
+rem  The SOURCE earns a row of its own because the build reads it directly and
+rem  the two DLL rows above say nothing about it (src/gfx/shaders.rs
+rem  include_str!s NVIDIA's NRD.hlsli). It is also the one row a component
+rem  SUBSET can leave MISSING — `install-prerequisites.bat dxc` never runs
+rem  :nrd_source — and a missing source fails `cargo build`, not `--nrd`.
+call :check "  (source submodule, required to build)" "%NRD_SRC%\Shaders\NRD.hlsli"
 
 rem DLSS is decided at BUILD time, not here (see the header) — but say so in
 rem the summary, where someone looking for the missing DLSS-RR row will look.
@@ -279,6 +298,16 @@ rem  below runs configure -> build -> copy as an unbroken unit, and a build
 rem  must NEVER run without its own configure immediately before it (a stale
 rem  NRDConfig.hlsli from the other arm would silently embed the wrong
 rem  shaders into a DLL the version gate cannot tell apart).
+rem  THE SOURCE IS ENSURED AHEAD OF THE ALREADY-INSTALLED EARLY-OUT, because the
+rem  BUILD needs the source whether or not the DLLs exist: build.rs's
+rem  require_nrd() gates on SDKs\NRD-src\CMakeLists.txt and the main crate
+rem  include_str!s Shaders\NRD.hlsli (src/gfx/shaders.rs, the one compile unit
+rem  that reads NVIDIA's header). So a tree whose SDKs\NRD\bin was carried over
+rem  from another machine — or whose submodule was cleaned after the DLLs were
+rem  built — used to report "[=] nrd already installed" here and then fail
+rem  `cargo build` on the missing submodule, which is the one shape of this
+rem  script's output that names a problem it just declined to look at.
+call :nrd_source || exit /b 0
 if defined FORCE goto :nrd_build
 if exist "%SDKS%\NRD\bin\NRD.dll" if exist "%SDKS%\NRD\bin\perf\NRD.dll" (
     echo [=] nrd already installed
@@ -299,31 +328,19 @@ if not defined CMAKE goto :nrd_no_toolchain
 if not defined VSDIR goto :nrd_no_toolchain
 rem  SOURCE = the git SUBMODULE (SDKs\NRD-src -> NVIDIA-RTX/NRD, pinned by the
 rem  recorded SHA, not by NRD_TAG's string). It replaced the tag-zip download:
-rem  build.rs now HARD-FAILS without it, so the source is guaranteed present by
-rem  the time anyone runs this, and the version lives in git rather than in a
-rem  URL. NRD_TAG survives as the human-readable label the loud lines print and
+rem  the version lives in git rather than in a URL.
+rem  THIS USED TO READ "build.rs now HARD-FAILS without it, so the source is
+rem  guaranteed present by the time anyone runs this" — which is the FALSE
+rem  premise that produced the bug :nrd_source fixes. build.rs fails AFTER this
+rem  script, not before it: the ordinary first-run sequence is clone -> install
+rem  -> build, so this script routinely runs on a tree whose submodule is empty,
+rem  and a hard failure downstream is not a guarantee upstream.
+rem  NRD_TAG survives as the human-readable label the loud lines print and
 rem  as the string src/nrd.rs's GetLibraryDesc gate is written against — keep
-rem  the two in step when the submodule moves.
-set "NRD_SRC=%~dp0SDKs\NRD-src"
-if not exist "%NRD_SRC%\CMakeLists.txt" (
-    echo     [x] nrd: the NRD submodule is missing ^(no CMakeLists at %NRD_SRC%^)
-    echo         run: git submodule update --init SDKs/NRD-src
-    set "FAILED=1"
-    exit /b 0
-)
-rem  THE CACHE IS PER-USER, THE BUILD TREE IS PER-SOURCE-PATH. %CACHE% is one
-rem  %TEMP% dir shared by every checkout on the box, but a CMake build tree
-rem  BAKES IN the absolute source dir, so a second checkout configuring into
-rem  the same nrd-build dies with "does not match the source used to generate
-rem  cache" — a hard stop, not a rebuild, and the fix is not obvious from the
-rem  script's own output (it only says "see the cmake log"). :nrd_stale drops a
-rem  build dir whose CMakeCache names a DIFFERENT source; matching caches are
-rem  left alone, so an incremental rebuild in one checkout still costs nothing.
-rem  Deliberately one shared build dir + a wipe rather than a per-checkout dir:
-rem  the installed DLLs live under each checkout's own SDKs\NRD\bin, so each
-rem  one still builds exactly ONCE, and %TEMP% does not grow a build tree per
-rem  clone. Forward slashes because that is how CMake writes the path.
-set "NRD_SRC_FWD=%NRD_SRC:\=/%"
+rem  the two in step when the submodule moves. NRD_SRC is set and the source
+rem  guaranteed by :nrd_source at the top of this component, so there is no
+rem  presence check here — it would be unreachable, and a second copy of the
+rem  predicate is how the two drift.
 rem  DXIL only (our sessions are D3D12; skipping DXBC/SPIRV halves the shader
 rem  build); encoding pins 2/1 are the build contract src/nrd.rs gates at
 rem  runtime via GetLibraryDesc. SHADERMAKE_DXC_PATH prefers the dxc component's
@@ -441,6 +458,56 @@ if exist "%~1\CMakeCache.txt" (
     exit /b 1
 )
 exit /b 0
+
+rem :nrd_source — ensure SDKs\NRD-src (the NRD source submodule) is checked out.
+rem  The BUILD reads the source directly and independently of the DLLs:
+rem  build.rs's require_nrd() gates on CMakeLists.txt, and src/gfx/shaders.rs
+rem  include_str!s Shaders\NRD.hlsli (NVIDIA's header arrives per checkout from
+rem  NVIDIA's own repository — nothing of theirs is committed here, which is
+rem  exactly why it has to be fetched rather than assumed). So BOTH files are
+rem  the predicate, not just the one build.rs happens to name.
+rem  WHY THIS IS GUARDED RATHER THAN AN UNCONDITIONAL `submodule update --init`:
+rem  that command is idempotent on an in-sync submodule (silent no-op), but on
+rem  one checked out at a DIFFERENT commit it hard-checks-out the recorded SHA,
+rem  and on one carrying uncommitted edits it fails outright — which under this
+rem  script's convention would set FAILED and report the whole install run as
+rem  failed. Both cases mean a developer is mid-bump of the very SHA this tree
+rem  pins, and an installer fetching XeSS has no business moving it.
+rem  git is asked whether init is NEEDED rather than told to do it: the leading
+rem  character of `git submodule status` IS the state — '-' uninitialized, '+'
+rem  present at another commit, 'U' conflicted, ' ' in sync — so the wrong-SHA
+rem  case is REPORTED (a mismatched NRD.hlsli against the pinned NRD_TAG and
+rem  src/nrd.rs's runtime gate is a silent-drift hazard, per this file's header)
+rem  instead of being either clobbered or ignored.
+rem  git itself is optional here — every other component is a plain HTTP
+rem  download and NRD's own FetchContent uses zip URLs — so no-git, or a tree
+rem  that is not a git checkout at all (a source zip, a vendored SDKs dir),
+rem  degrades to the manual instruction rather than to an error about git.
+:nrd_source
+set "NRD_ST="
+for /f "delims=" %%S in ('git -C "%~dp0." submodule status SDKs/NRD-src 2^>nul') do set "NRD_ST=%%S"
+if exist "%NRD_SRC%\CMakeLists.txt" if exist "%NRD_SRC%\Shaders\NRD.hlsli" (
+    if defined NRD_ST if "!NRD_ST:~0,1!"=="+" (
+        rem  '[i]', not '[!]': EnableDelayedExpansion is on for the whole script,
+        rem  so a literal '!' in an echoed string is eaten as a !VAR! reference
+        rem  (measured — '[!] nrd:' printed as '['). The marker vocabulary here
+        rem  is [=] [+] [x] [.] [i] [--] [>], none of which carry that hazard.
+        echo     [i] nrd: SDKs\NRD-src is checked out at a commit other than the one
+        echo         this tree pins ^(git submodule status: !NRD_ST!^). Left alone — but
+        echo         %NRD_TAG% is what src/nrd.rs's version gate expects, so a --nrd
+        echo         session may shed loudly. `git submodule update SDKs/NRD-src` reverts.
+    )
+    exit /b 0
+)
+if not defined NRD_ST goto :nrd_source_manual
+echo     [+] initializing the NRD source submodule ^(SDKs\NRD-src^)
+git -C "%~dp0." submodule update --init SDKs/NRD-src
+if exist "%NRD_SRC%\CMakeLists.txt" if exist "%NRD_SRC%\Shaders\NRD.hlsli" exit /b 0
+:nrd_source_manual
+echo     [x] nrd: the NRD source submodule is missing ^(no %NRD_SRC%\CMakeLists.txt^)
+echo         run: git submodule update --init SDKs/NRD-src
+set "FAILED=1"
+exit /b 1
 
 rem =========================== helpers ======================================
 

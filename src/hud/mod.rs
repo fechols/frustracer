@@ -895,6 +895,13 @@ impl Hud {
         }
     }
 
+    /// Is the loading page up? `session()` reads it to tell a FIRST entry (the
+    /// page is still live, and its eager init must keep repainting it) from a
+    /// resize re-entry, which needs no extra parameter to say so.
+    pub fn is_loading(&self) -> bool {
+        self.ui.get_loading()
+    }
+
     /// Show or hide the loading page. Hiding it reveals the frame behind — a
     /// full-window change (the page's scrim covers everything), so the next
     /// `frame()`/`raster()` repaints wholesale.

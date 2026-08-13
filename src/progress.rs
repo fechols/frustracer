@@ -213,6 +213,60 @@ pub fn tick() {
     DONE.fetch_add(1, Relaxed);
 }
 
+/// Advance by `n` at once. The GPU upload's unit is MiB of work, not one per
+/// item: its steps differ in cost by four orders of magnitude (a 4-byte
+/// material stream vs a 64 MB texture band), so a one-per-submit counter would
+/// race to 99% through the thousands of small texture submits and then sit
+/// still through the acceleration-structure build. Same relaxed, lock-free
+/// discipline as `tick()`.
+#[inline]
+pub fn tick_n(n: u32) {
+    if !active() {
+        return;
+    }
+    DONE.fetch_add(n, Relaxed);
+}
+
+/// Re-label the current phase's DETAIL row WITHOUT touching its counters —
+/// the sub-step name inside one long metered phase ("geometry" -> "textures"
+/// -> "acceleration structures" inside `GpuUpload`). `phase()` is the wrong
+/// call for that: it resets `DONE`, so a bar built from one unit space would
+/// snap back to zero at every sub-step.
+///
+/// Honours `MULTI` for the same reason `phase()` does — during a fan-out the
+/// detail belongs to whoever armed the block, not to whichever part published
+/// last.
+pub fn detail(s: &str) {
+    if !active() || MULTI.load(Relaxed) {
+        return;
+    }
+    if let Ok(mut d) = DETAIL.lock() {
+        d.clear();
+        d.push_str(s);
+    }
+}
+
+/// The phase's work is DONE — land the bar on exactly 100% whatever the
+/// estimate said. Never lowers `DONE` (an overshoot is already clamped by
+/// `fraction`), so this closes an UNDERSHOOT and nothing else.
+///
+/// It exists because a `total` is a cost MODEL and some arms are invisible to
+/// it: the GPU upload's denominator is computed before the session picks a
+/// tracer, so a `--no-blas-split` boot never ticks the acceleration-structure
+/// share it reserved and a wavefront boot ticks a software-tree upload it
+/// never reserved. Both are honest estimates; only the endpoint has to be
+/// exact, and asserting it once at the end is cheaper and more robust than an
+/// accounting identity every arm has to maintain.
+pub fn finish_phase() {
+    if !active() {
+        return;
+    }
+    let (done, total) = (DONE.load(Relaxed), TOTAL.load(Relaxed));
+    if total > done {
+        DONE.fetch_add(total - done, Relaxed);
+    }
+}
+
 /// A clamped completion fraction in `[0, 1]`. `total == 0` => 0.0 (the caller
 /// treats indeterminate as the marquee case separately via the snapshot).
 pub fn fraction(done: u32, total: u32) -> f32 {
@@ -271,8 +325,20 @@ pub fn self_test() -> Result<(), String> {
     stage(3, 7, "ignored");
     stage_done("ignored");
     tick();
+    tick_n(64);
+    detail("ignored");
+    finish_phase();
     if snapshot().is_some() {
         return Err("inactive sink produced a snapshot".into());
+    }
+    // …and nothing landed in the state either. `snapshot()` alone cannot see
+    // that: the first ACTIVE `phase()` below resets `DONE`, so a publisher
+    // that forgot its `active()` guard would leak silently.
+    if DONE.load(Relaxed) != 0 || TOTAL.load(Relaxed) != 0 || STAGE_TOTAL.load(Relaxed) != 0 {
+        return Err("inactive publish reached the counters".into());
+    }
+    if DETAIL.lock().map_or(false, |d| !d.is_empty()) {
+        return Err("inactive publish reached the detail row".into());
     }
 
     // Fraction clamp + endpoints.
@@ -319,6 +385,28 @@ pub fn self_test() -> Result<(), String> {
     tick();
     let ok = snapshot().is_some_and(|s| s.done == 2 && s.total == 4 && (s.frac - 0.5).abs() < 1e-6);
 
+    // `tick_n` accumulates like `tick`, and `detail` re-labels WITHOUT
+    // resetting the counter — the property the GpuUpload bar rests on (a
+    // sub-step rename mid-phase must not snap the bar back to zero).
+    phase(Phase::GpuUpload, "geometry", 100);
+    tick_n(30);
+    tick();
+    detail("textures");
+    tick_n(9);
+    let ok_n = snapshot().is_some_and(|s| {
+        s.done == 40 && s.total == 100 && s.detail == "textures" && (s.frac - 0.4).abs() < 1e-6
+    });
+
+    // `finish_phase` closes an UNDERSHOOT exactly (the arm whose cost model
+    // reserved units nobody ticked) and leaves an OVERSHOOT alone — it must
+    // never walk the counter backwards, since `fraction` already clamps and a
+    // caller may keep ticking after it.
+    finish_phase();
+    let ok_fin = snapshot().is_some_and(|s| s.done == 100 && (s.frac - 1.0).abs() < 1e-6);
+    tick_n(25);
+    finish_phase();
+    let ok_fin_over = snapshot().is_some_and(|s| s.done == 125 && s.frac == 1.0);
+
     // The stage row COUNTS completions: arm at 0/n, then one bump per island,
     // and the row names whichever finished last (the parallel contract).
     stage(0, 7, "");
@@ -337,6 +425,7 @@ pub fn self_test() -> Result<(), String> {
     let ok_multi = {
         let _multi = multi_guard();
         phase(Phase::Textures, "some part's detail", 4);
+        detail("a part's rename");
         snapshot().is_some_and(|s| {
             s.total == 0
                 && s.frac < 0.0
@@ -366,11 +455,20 @@ pub fn self_test() -> Result<(), String> {
     if !ok {
         return Err("active tick/fraction did not track".into());
     }
+    if !ok_n {
+        return Err("tick_n did not accumulate, or detail() reset the counter".into());
+    }
+    if !ok_fin {
+        return Err("finish_phase did not close the undershoot to exactly 100%".into());
+    }
+    if !ok_fin_over {
+        return Err("finish_phase walked an overshot counter backwards".into());
+    }
     if !ok_stage {
         return Err("stage_done did not count completions".into());
     }
     if !ok_multi {
-        return Err("multi-mode phase published a fraction or clobbered the detail".into());
+        return Err("multi-mode phase/detail published a fraction or clobbered the detail".into());
     }
     if !ok_multi_off {
         return Err("leaving multi mode left the phase counters dirty".into());

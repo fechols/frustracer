@@ -154,6 +154,14 @@ mod sh;
 // sky call site in the renderer.
 mod sky;
 mod sphcell;
+// HLSL -> SPIR-V: the corpus's SECOND code generator, beside `gpu/dxc.rs`'s
+// DXIL. Not under `vk/` (where it lived until `--check-msl` arrived) because
+// it names no backend type and now has two consumers — Vulkan eats the SPIR-V
+// directly, Metal eats it through spirv-cross. `vk::spirv` re-exports it, so
+// every existing call site is unchanged. unix-only for the one reason its
+// header gives: DXC's `LPCWSTR` is a 4-byte `wchar_t` off Windows.
+#[cfg(unix)]
+mod spirv;
 mod stats;
 mod prof;
 mod replay;
@@ -172,7 +180,7 @@ mod mtl;
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
 // The Vulkan backend, peer of `gpu/` over the shared `gfx/` core. unix-only
-// for exactly one reason today — DXC's `wchar_t` width — see vk/spirv.rs.
+// for exactly one reason today — DXC's `wchar_t` width — see src/spirv.rs.
 #[cfg(unix)]
 mod vk;
 mod world;
@@ -358,6 +366,7 @@ fn main() {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_msl,
         check_vk,
         check_gpu,
         check_dxr,
@@ -1015,6 +1024,9 @@ fn main() {
         // carries it, so `--check-spirv san-miguel.obj` gates arms the
         // procedural scene cannot reach.
         || check_spirv
+        // Scene-keyed for the line above's reason, and it is the SAME corpus:
+        // both gates enumerate it through `corpus_units`.
+        || check_msl
         // NOT scene-keyed: the smoke kernel is one file with no scene-derived
         // defines, so this gate is a pure function of the device.
         || check_vk
@@ -1312,10 +1324,30 @@ fn main() {
         {
             // Said, not silently skipped: the SPIR-V path is one `wchar_t`
             // width and one library name away from working here — see the
-            // header in src/vk/spirv.rs.
+            // header in src/spirv.rs.
             eprintln!(
-                "--check-spirv is unix-only today (the Vulkan backend's SPIR-V \
-                 compiler); see src/vk/spirv.rs for what the Windows arm needs"
+                "--check-spirv is unix-only today (the corpus's SPIR-V \
+                 compiler); see src/spirv.rs for what the Windows arm needs"
+            );
+            std::process::exit(2);
+        }
+    }
+    if check_msl {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_msl(&scene);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2, not a SKIP — the --check-fsr3 convention: an explicitly
+            // requested gate on the wrong OS is an ENVIRONMENT error, while a
+            // missing toolchain on the RIGHT OS is what SKIPs.
+            eprintln!(
+                "--check-msl compiles the shipping corpus to Metal `.metallib`s, so it is \
+                 macOS-only: `xcrun metal` has no counterpart elsewhere. The SPIR-V half \
+                 it builds on runs on every unix in --check-spirv, and the corpus both \
+                 gates enumerate is the same one (main.rs::corpus_units)."
             );
             std::process::exit(2);
         }
@@ -13996,54 +14028,33 @@ fn compute_entries(src: &str) -> Vec<String> {
     out
 }
 
+/// A compile unit: how to target it, and how to find its entry points.
 #[cfg(unix)]
-fn run_check_spirv(scene: &scene::Scene) -> i32 {
+enum Shape {
+    /// Compute: entries scanned out of the assembled source.
+    Compute(&'static str),
+    /// A DXR library — every `[shader(...)]` export at once, no `-E`.
+    Lib(String),
+    /// The display pair, which every `.hlsl` here spells identically.
+    Gfx,
+}
+
+/// The SHIPPING corpus, assembled exactly as a session assembles it.
+///
+/// SHARED BY `--check-spirv` AND `--check-msl` ON PURPOSE, and it is not a
+/// tidiness move: the Metal gate's entire premise is "the same source through
+/// a second code generator", and two `push!` lists would let the two gates
+/// drift onto different corpora while both stayed green — the drift no gate in
+/// this tree could see, which is the same argument `crate::spirv`'s header
+/// makes for fetching both DXC drops from one release tag.
+///
+/// `Err` is the vendor-arm anti-vacuity failure, which belongs here rather
+/// than in either caller because it is a property of the ASSEMBLY.
+#[cfg(unix)]
+fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, String> {
     use gfx::shaders as sh;
     use gfx::vocab::Vendor;
 
-    let mut ok = true;
-
-    // ---- S0: the pure half. Runs with or without a compiler on disk. ----
-    match vk::spirv::self_test() {
-        Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
-        Err(e) => {
-            eprintln!("check-spirv: FAIL S0 {e}");
-            ok = false;
-        }
-    }
-    // The reflector is pure SPIR-V and belongs to the same stage: it reads
-    // what a module DECLARES, which is the half of the descriptor story
-    // `spirv-val` cannot see (it validates a module, and knows nothing about
-    // the layout that module will be bound against).
-    match vk::reflect::self_test() {
-        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
-        Err(e) => {
-            eprintln!("check-spirv: FAIL S0 reflect: {e}");
-            ok = false;
-        }
-    }
-
-    // ---- S1: the compiler. A missing drop is a normal condition. ----
-    let dir = vk::spirv::default_dir();
-    let dxc = match vk::spirv::Spirv::load(&dir) {
-        Ok(d) => d,
-        Err(e) => {
-            println!("check-spirv: SKIP S1 ({e})");
-            return i32::from(!ok);
-        }
-    };
-    println!("check-spirv: S1 {} loaded from {dir}", vk::spirv::LIB_NAME);
-
-    // ---- S2: assemble the corpus. ----
-    /// A compile unit: how to target it, and how to find its entry points.
-    enum Shape {
-        /// Compute: entries scanned out of the assembled source.
-        Compute(&'static str),
-        /// A DXR library — every `[shader(...)]` export at once, no `-E`.
-        Lib(String),
-        /// The display pair, which every `.hlsl` here spells identically.
-        Gfx,
-    }
     let mut units: Vec<(String, String, Shape)> = Vec::new();
     // Dedupe by SOURCE: the vendor and sway arms below usually assemble to
     // the same bytes, and compiling one unit twice under two names would
@@ -14094,11 +14105,9 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // a real difference to find — CAND_TMIN0, the RDNA4 candidate-loop
     // workaround whose absence was worth 2x on textured scenes — so demand it.
     if vendor_arms < 2 {
-        eprintln!(
-            "check-spirv: FAIL S2 the vendor arms assembled identically — \
-             cand_defs no longer distinguishes them, so this run covered one"
-        );
-        ok = false;
+        return Err("the vendor arms assembled identically — cand_defs no longer \
+                    distinguishes them, so this run covered one"
+            .into());
     }
 
     // The DXR pipeline, every `--dxr-inline` arm. Mode 0 is the lib_6_3
@@ -14155,6 +14164,11 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // `VK_AMDX_shader_enqueue` translation exists but that extension is a
     // vendor provisional, and the file is a default-off env lever measured as
     // a wash. See gfx/mod.rs.
+    //
+    // NEITHER EXCLUSION IS METAL-SHAPED, and the Metal gate does not add one:
+    // `mtl::msl::Expect` classifies what it CANNOT compile (the DXR library
+    // shape) rather than dropping it from the corpus, so the count stays
+    // comparable between the two gates and a unit that starts working says so.
 
     // The display stage. These are the tree's only fxc units (cs_5_0/ps_5_0 —
     // see the "bloom no-DXC precedent"), so Vulkan compiles them at the SM 6
@@ -14167,6 +14181,98 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     push!("blit", sh::BLIT_HLSL.to_string(), Shape::Gfx);
     push!("hud", sh::HUD_HLSL.to_string(), Shape::Gfx);
     push!("waveviz", sh::WAVEVIZ_HLSL.to_string(), Shape::Gfx);
+
+    Ok(units)
+}
+
+/// The (entry, target) jobs a unit yields, or `Err` if a compute unit yields
+/// none — anti-vacuity shared by both gates, because a unit that compiled
+/// nothing reads exactly like a unit that compiled cleanly.
+#[cfg(unix)]
+fn corpus_jobs(name: &str, src: &str, shape: &Shape) -> Result<Vec<(String, String)>, String> {
+    use gfx::shaders as sh;
+    Ok(match shape {
+        Shape::Lib(t) => vec![(String::new(), t.clone())],
+        Shape::Gfx => {
+            // The names come from `gfx::shaders`, which is where the
+            // Vulkan display stage reads them too — so this gate and its
+            // consumer cannot drift onto different entry points.
+            vec![
+                (sh::GFX_VS.to_string(), "vs_6_0".into()),
+                (sh::GFX_PS.to_string(), "ps_6_0".into()),
+            ]
+        }
+        Shape::Compute(t) => {
+            let e = compute_entries(src);
+            if e.is_empty() {
+                return Err(format!("{name}: no [numthreads] entry point found"));
+            }
+            e.into_iter().map(|e| (e, (*t).to_string())).collect()
+        }
+    })
+}
+
+#[cfg(unix)]
+fn run_check_spirv(scene: &scene::Scene) -> i32 {
+    let mut ok = true;
+
+    // ---- S0: the pure half. Runs with or without a compiler on disk. ----
+    // `crate::spirv`, not `vk::spirv`: the module moved OUT of that backend
+    // because it names none of it, and this gate's own subject is the corpus
+    // rather than Vulkan (`--check-msl` reaches the same module the same way).
+    // The `vk::spirv` re-export stays for the backend's real call sites.
+    match crate::spirv::self_test() {
+        Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 {e}");
+            ok = false;
+        }
+    }
+    // The reflector is pure SPIR-V and belongs to the same stage: it reads
+    // what a module DECLARES, which is the half of the descriptor story
+    // `spirv-val` cannot see (it validates a module, and knows nothing about
+    // the layout that module will be bound against). It IS Vulkan-owned,
+    // unlike the compiler above — the descriptor-set layout it feeds is.
+    match vk::reflect::self_test() {
+        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 reflect: {e}");
+            ok = false;
+        }
+    }
+
+    // ---- S1: the compiler. A missing drop is a normal condition. ----
+    let dir = crate::spirv::default_dir();
+    let dxc = match crate::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-spirv: SKIP S1 ({e})");
+            return i32::from(!ok);
+        }
+    };
+    println!("check-spirv: S1 {} loaded from {dir}", crate::spirv::LIB_NAME);
+
+    // ---- S2: assemble the corpus. ----
+    // SHARED with `--check-msl` — see `corpus_units`. The two gates compile
+    // one corpus through two code generators, and that is only true if they
+    // enumerate it in one place.
+    let units = match corpus_units(scene) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S2 {e}");
+            // The summary line even on an early return: every other exit from
+            // this function ends with one, so a run that stopped without it
+            // reads like a crash rather than a verdict. NOT for CI's benefit —
+            // that job runs `set -eo pipefail`, so a non-zero gate aborts the
+            // step before its grep, and the grep's "it skipped" message is
+            // therefore only ever evaluated on an exit-0 run, where it is
+            // accurate. `run_check_msl`'s equivalent paths print it too, and
+            // the two gates disagreeing about their own convention is the
+            // thing worth not shipping.
+            println!("CHECK-SPIRV FAILED");
+            return 1;
+        }
+    };
 
     // ---- S3: spirv-val, if the drop is here. ----
     let val = {
@@ -14195,32 +14301,39 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     let tmp = std::env::temp_dir().join(format!("frustracer-spirv-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
+    // `FR_SPIRV_DUMP=<dir>` — keep every compiled module instead of deleting
+    // it. The SPIR-V analogue of `gpu/dxc.rs`'s `FR_DUMP_HLSL`, which is
+    // Windows-only, and the same reason: the corpus is assembled by string
+    // concatenation, so no file on disk is what a compiler ever saw, and a
+    // module nobody can extract is a module nobody can put through a second
+    // tool. That second tool is `spirv-cross`, which is how `--check-msl`'s
+    // arg set was settled — see `mtl::msl`.
+    //
+    // The dump is INDEPENDENT of S3: the write below is gated on `val` today
+    // because validation is the only thing that wanted a file, and a dump that
+    // silently produced nothing without spirv-tools installed would be the
+    // read-only-probe trap this repository keeps re-learning.
+    let dump = std::env::var_os("FR_SPIRV_DUMP").map(std::path::PathBuf::from);
+    if let Some(d) = dump.as_ref() {
+        match std::fs::create_dir_all(d) {
+            Ok(()) => println!("check-spirv: FR_SPIRV_DUMP — writing modules to {}", d.display()),
+            Err(e) => eprintln!("check-spirv: FR_SPIRV_DUMP={} unusable ({e})", d.display()),
+        }
+    }
+
     // ---- compile + validate ----
     let (mut compiled, mut validated, mut failed) = (0usize, 0usize, 0usize);
     for (name, src, shape) in &units {
-        // (entry, target) pairs for this unit.
-        let jobs: Vec<(String, String)> = match shape {
-            Shape::Lib(t) => vec![(String::new(), t.clone())],
-            Shape::Gfx => {
-                // The names come from `gfx::shaders`, which is where the
-                // Vulkan display stage reads them too — so this gate and its
-                // consumer cannot drift onto different entry points.
-                vec![
-                    (sh::GFX_VS.to_string(), "vs_6_0".into()),
-                    (sh::GFX_PS.to_string(), "ps_6_0".into()),
-                ]
-            }
-            Shape::Compute(t) => {
-                let e = compute_entries(src);
-                if e.is_empty() {
-                    // Anti-vacuity: a unit that yields no entries compiled
-                    // nothing, and a silent zero reads exactly like a pass.
-                    eprintln!("check-spirv: FAIL S2 {name}: no [numthreads] entry point found");
-                    ok = false;
-                    failed += 1;
-                    continue;
-                }
-                e.into_iter().map(|e| (e, (*t).to_string())).collect()
+        // (entry, target) pairs for this unit. Anti-vacuity — a unit that
+        // yields no entries compiled nothing, and a silent zero reads exactly
+        // like a pass — lives in `corpus_jobs`, shared with `--check-msl`.
+        let jobs = match corpus_jobs(name, src, shape) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("check-spirv: FAIL S2 {e}");
+                ok = false;
+                failed += 1;
+                continue;
             }
         };
         for (entry, target) in jobs {
@@ -14239,12 +14352,16 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
                 }
             };
             compiled += 1;
-            let Some(val) = val.as_ref() else { continue };
-            let path = tmp.join(format!("{}.spv", what.replace(['[', ']', ':', '+'], "_")));
+            if val.is_none() && dump.is_none() {
+                continue;
+            }
+            let stem = what.replace(['[', ']', ':', '+'], "_");
+            let path = dump.as_ref().unwrap_or(&tmp).join(format!("{stem}.spv"));
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             if std::fs::write(&path, &bytes).is_err() {
                 continue;
             }
+            let Some(val) = val.as_ref() else { continue };
             match std::process::Command::new(val).arg(&path).output() {
                 Ok(o) if o.status.success() => validated += 1,
                 Ok(o) => {
@@ -14261,7 +14378,9 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
                     failed += 1;
                 }
             }
-            let _ = std::fs::remove_file(&path);
+            if dump.is_none() {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
     let _ = std::fs::remove_dir(&tmp);
@@ -14274,7 +14393,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // The assembled byte count is in the summary because the unit and module
     // COUNTS cannot distinguish two scenes: san-miguel arms ALPHA_CUTOUT and
     // TRANS_SHADOW where the procedural scene arms neither, and both produce
-    // the same 46 units. Two identical counts beside two different sizes is a
+    // the same 47 units. Two identical counts beside two different sizes is a
     // gate that keyed on the scene; two identical sizes would mean it did
     // not, and nothing else here would have said so.
     let bytes: usize = units.iter().map(|(_, s, _)| s.len()).sum();
@@ -14293,6 +14412,218 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         }
     }
     println!("CHECK-SPIRV {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
+}
+
+/// `--check-msl`: the Metal shader toolchain — the corpus's THIRD code
+/// generator, and the first rung of a Metal tracer.
+///
+/// `--check-spirv` proves the corpus reaches SPIR-V. This proves it reaches a
+/// `.metallib`, which is a different claim and the one a Metal backend rests
+/// on. It renders nothing and binds nothing: what compiles and what refuses is
+/// the entire product, exactly as M2a was for the Vulkan port.
+///
+/// M0 the pure arg-set/classifier half | M1 the tools | M2 assemble + DXC |
+/// M3 spirv-cross | M4 `metal`/`metallib` | M5 the verdict per class.
+///
+/// THE VERDICT HAS TEETH IN BOTH DIRECTIONS, which is what keeps the
+/// known-failing list from rotting into a whitelist: a unit expected to
+/// compile and failing is a FAIL, and a unit expected to fail and COMPILING is
+/// also a FAIL, because that means a workaround landed or spirv-cross fixed
+/// the bug and `mtl::msl::Expect` is now lying. The second half is the one a
+/// normal "known failures" list never has.
+#[cfg(target_os = "macos")]
+fn run_check_msl(scene: &scene::Scene) -> i32 {
+    use mtl::msl::{expect_of, Expect};
+
+    let mut ok = true;
+
+    // ---- M0: pure. No tools, no device, no corpus. ----
+    match mtl::msl::self_test() {
+        Ok(()) => println!("check-msl: M0 arg set + unit classification OK"),
+        Err(e) => {
+            eprintln!("check-msl: FAIL M0 {e}");
+            ok = false;
+        }
+    }
+
+    // ---- M1: the tools. Absence is an environment fact, so it SKIPs. ----
+    let scratch = std::env::temp_dir().join(format!("frustracer-msl-{}", std::process::id()));
+    let msl = match mtl::msl::Msl::find(scratch.clone()) {
+        Ok(m) => m,
+        Err(e) if e.absent => {
+            println!("check-msl: SKIP M1 ({})", e.msg);
+            return i32::from(!ok);
+        }
+        Err(e) => {
+            eprintln!("check-msl: FAIL M1 {}", e.msg);
+            println!("CHECK-MSL FAILED");
+            return 1;
+        }
+    };
+    println!("check-msl: M1 {}", msl.line());
+
+    // ---- M2: the same DXC half `--check-spirv` runs, on the same corpus. ----
+    let dir = crate::spirv::default_dir();
+    let dxc = match crate::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-msl: SKIP M2 ({e})");
+            let _ = std::fs::remove_dir_all(&scratch);
+            return i32::from(!ok);
+        }
+    };
+    println!("check-msl: M2 {} loaded from {dir}", crate::spirv::LIB_NAME);
+    let units = match corpus_units(scene) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("check-msl: FAIL M2 {e}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            println!("CHECK-MSL FAILED");
+            return 1;
+        }
+    };
+
+    // ---- M3/M4: transpile and compile, tallied per expectation class. ----
+    let (mut spv, mut lib_ok, mut lib_bytes) = (0usize, 0usize, 0usize);
+    // Per-class tallies. Both halves are kept for each, because "how many of
+    // this class failed" and "how many compiled anyway" are different facts
+    // and the verdict below treats the two classes ASYMMETRICALLY.
+    let (mut no_analogue, mut tool_defect) = (0usize, 0usize);
+    let mut defect_ok = 0usize;
+    let mut surprises: Vec<String> = Vec::new();
+    let mut list: Vec<String> = Vec::new();
+    for (name, src, shape) in &units {
+        let want = expect_of(name);
+        let jobs = match corpus_jobs(name, src, shape) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("check-msl: FAIL M2 {e}");
+                ok = false;
+                continue;
+            }
+        };
+        for (entry, target) in jobs {
+            let what =
+                if entry.is_empty() { name.clone() } else { format!("{name}:{entry}") };
+            let stem = what.replace(['[', ']', ':', '+'], "_");
+            let words = match dxc.compile(src, &entry, &target, &what, false) {
+                Ok(w) => w,
+                Err(e) => {
+                    // A DXC failure here is not this gate's subject —
+                    // `--check-spirv` owns that — but it must not be silent.
+                    eprintln!("check-msl: FAIL M2 {e}");
+                    ok = false;
+                    continue;
+                }
+            };
+            spv += 1;
+            let got = msl
+                .transpile(&words, &stem)
+                .and_then(|src| msl.compile(&src, &stem).map(|b| b.len()));
+            match (got, want) {
+                (Ok(n), Expect::Metallib) => {
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    list.push(format!("{what} -> {n} B"));
+                }
+                (Ok(n), Expect::NoAnalogue) => {
+                    // The stale-table alarm, and it is HARD for this class
+                    // alone: `NoAnalogue` is a CAPABILITY claim — Metal has no
+                    // analogue for a DXIL ray-tracing library — so one
+                    // compiling is not configuration luck, it is news, and the
+                    // message says which arm to move.
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    surprises.push(format!(
+                        "{what} is classified NoAnalogue but COMPILED ({n} B) — Metal \
+                         grew an analogue for the DXR library shape, or spirv-cross \
+                         did; move it to Metallib and record what changed"
+                    ));
+                }
+                (Ok(n), Expect::ToolDefect) => {
+                    // SOFT, and deliberately: a codegen bug's presence is a
+                    // property of the configuration and the tool version. This
+                    // very unit compiles on an ALPHA_CUTOUT scene and under
+                    // --sw-rays. Failing here would fail the gate on exactly
+                    // the configurations where the corpus does BETTER.
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    defect_ok += 1;
+                }
+                (Err(e), Expect::Metallib) => {
+                    eprintln!("check-msl: FAIL M4 {what}: {e}");
+                    ok = false;
+                }
+                (Err(_), Expect::NoAnalogue) => no_analogue += 1,
+                (Err(_), Expect::ToolDefect) => tool_defect += 1,
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // ---- M5: the verdict. ----
+    for s in &surprises {
+        eprintln!("check-msl: FAIL M5 {s}");
+        ok = false;
+    }
+    // A corpus that assembled to nothing would report a clean sweep, and so
+    // would one where every unit happened to be a known-failing one.
+    if spv == 0 {
+        eprintln!("check-msl: FAIL M2 the corpus assembled zero units");
+        ok = false;
+    }
+    if lib_ok == 0 {
+        eprintln!("check-msl: FAIL M5 nothing reached a .metallib");
+        ok = false;
+    }
+    // `NoAnalogue` must still be REACHED, or the hard teeth above score an
+    // empty set: a corpus that stopped emitting DXR libraries would leave the
+    // class vacuous and nothing would say the gate had stopped covering it.
+    // This one is safe to demand because `dxr-lib` is enumerated on every
+    // scene and under every lever — unlike `ToolDefect`, which is
+    // configuration-dependent and is REPORTED below instead.
+    if no_analogue == 0 {
+        eprintln!(
+            "check-msl: FAIL M5 no unit exercised NoAnalogue — either the corpus \
+             stopped producing DXR libraries or the classifier stopped matching, \
+             and in both cases this run's capability teeth gated nothing"
+        );
+        ok = false;
+    }
+    // Bytes, not just counts: the unit count cannot tell two scenes apart
+    // (san-miguel arms ALPHA_CUTOUT and TRANS_SHADOW, the procedural scene
+    // arms neither, and both assemble the same 47 units) — the same reason
+    // `--check-spirv` prints its assembled size.
+    let asm: usize = units.iter().map(|(_, s, _)| s.len()).sum();
+    println!(
+        "check-msl: M3/M4 {} units ({asm} B assembled) -> {spv} SPIR-V -> \
+         {lib_ok} metallib ({lib_bytes} B)",
+        units.len()
+    );
+    println!(
+        "check-msl: M5 expected failures — {no_analogue} DXR-library (no Metal analogue), \
+         {tool_defect} spirv-cross scoping defect (see mtl::msl::Expect)"
+    );
+    // Say when the defect did not reproduce, rather than leaving a silent
+    // zero: that zero is a real difference between configurations (the opaque
+    // `occluded_q` arm is what trips it), and reading it as "the gate covered
+    // everything" is the mistake this line exists to prevent.
+    if tool_defect == 0 && defect_ok > 0 {
+        println!(
+            "check-msl: M5 NOTE the spirv-cross scoping defect did NOT reproduce in \
+             this configuration — {defect_ok} ToolDefect-classified module(s) compiled. \
+             That is expected on an ALPHA_CUTOUT/TRANS_SHADOW scene and under \
+             --sw-rays; the procedural scene with hardware rays is the arm that \
+             reproduces it."
+        );
+    }
+    if std::env::var_os("FR_MSL_LIST").is_some() {
+        for l in &list {
+            println!("check-msl:   {l}");
+        }
+    }
+    println!("CHECK-MSL {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
 }
 
@@ -14460,6 +14791,15 @@ fn run_check_vk(
     // tracer. That is also what makes it reachable on a device with no surface
     // support at all, and therefore in CI on llvmpipe.
     if !run_check_vk_display(&hg, &sp) {
+        ok = false;
+    }
+
+    // ---- V19: the same pipeline, into a SWAPCHAIN image. ----
+    //
+    // Beside V18 rather than inside it: it owns a surface and a swapchain and
+    // stands down on three independent environment facts, none of which should
+    // be able to take the offscreen arm with it.
+    if !run_check_vk_present(&hg, &sp) {
         ok = false;
     }
 
@@ -14831,6 +15171,385 @@ fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
         ok = false;
     }
     ok
+}
+
+/// V19 — the same pipeline, into a SWAPCHAIN image, and presented.
+///
+/// V18 proves this backend can rasterise and that its tone curve matches
+/// `tone::map`. It says nothing about PRESENTATION, which is a different
+/// resource class (images the presentation engine owns, in layouts nothing
+/// else here enters) reached through a different API. This is that path, run
+/// against `VK_EXT_headless_surface` so it needs no window and therefore runs
+/// on a CI box with no GPU.
+///
+/// THE CLAIM IS A BYTE IDENTITY AT THE NEGOTIATED FORMAT: the same `Passes`
+/// drawing into a swapchain image must produce the same bytes as into an
+/// offscreen image of that same format. That is deliberately not V18's fixed
+/// sdr wire — it decouples from format negotiation entirely, so it stays an
+/// EXACT comparison rather than a tolerance, which is the strongest shape
+/// available and the one V14 and V17 already use.
+///
+/// THE IDENTITY ALONE IS VACUOUS, and that is not a hypothetical: `record_to`
+/// opens its rendering block with `LOAD_OP_CLEAR`, so deleting the draw gives
+/// BOTH targets the same zeros and the byte comparison PASSES. Three
+/// independent arms close it, each answering a question the identity cannot:
+///
+/// - the CPU oracle (V18's `tone::map` comparison, at this format's own
+///   tolerance) — proves the bytes are the real image rather than a clear;
+/// - alpha at maximum — both display pixel shaders write 1.0 unconditionally
+///   while the oracle compares RGB only, so this is a free per-pixel coverage
+///   witness that a clear (which writes 0) cannot fake;
+/// - a `0xEE` sentinel flooded into the acquired image before the draw.
+///
+/// THE SENTINEL SEPARATES THREE OUTCOMES, not the usual two, and it is free:
+/// the pattern means everything ran; the CLEAR colour means the render pass
+/// ran and the draw did not; the SENTINEL SURVIVING means the draw went to a
+/// DIFFERENT image than the one that was flooded and copied — a real failure
+/// mode once an index is threaded through flood, render, copy and present, and
+/// one that garbage-looking output would otherwise be blamed for. It is
+/// written by a draw-less `LOAD_OP_CLEAR` rather than `vkCmdClearColorImage`
+/// deliberately: the latter needs `TRANSFER_DST` usage, which the offscreen
+/// twin does not carry, so using it would put a DIFFERENCE between the two
+/// images whose equality this whole gate asserts.
+///
+/// THE PRESENT IS PROVED BY EXHAUSTION. Nothing scans out, so `VK_SUCCESS` out
+/// of `vkQueuePresentKHR` is a statement about a function call and not about a
+/// frame going anywhere. So the gate runs ONE MORE CYCLE THAN THERE ARE
+/// IMAGES: the last acquire can only succeed if the presentation engine
+/// RELEASED an image this gate presented, and `ACQUIRE_TIMEOUT_NS` is finite
+/// precisely so a present that did nothing reports a failure instead of
+/// hanging. The acquire ORDER is printed and never asserted — the spec
+/// constrains none of it.
+///
+/// SKIPs (exit 0, `true`) on three independent environment facts, each an
+/// honest reason a box cannot present rather than a defect: no surface pair on
+/// the instance, no `VK_KHR_swapchain` on the device, no graphics queue in the
+/// family the pick chose. `vk::swapchain::skip_reason` names which.
+#[cfg(unix)]
+fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use ash::vk as avk;
+    use vk::display;
+    use vk::swapchain::Swapchain;
+
+    let ve0 = vk::device::validation_errors();
+    let vkd = &hg.vk;
+
+    // V18's fixture, and it transplants with no resize logic because the
+    // headless surface reports `currentExtent = 0xFFFFFFFF` (measured on both
+    // ICDs here), i.e. the swapchain picks its own size.
+    const TW: u32 = 64;
+    const TH: u32 = 32;
+    let n = (TW * TH) as usize;
+
+    let sc = match Swapchain::new(hg, TW, TH) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("check-vk: SKIP V19 ({})", vk::swapchain::skip_reason(hg));
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 swapchain: {e}");
+            return false;
+        }
+    };
+
+    let mut ok = true;
+    println!(
+        "check-vk: V19 headless surface: {:?} {}x{}, {} image(s), FIFO",
+        sc.fmt,
+        sc.w,
+        sc.h,
+        sc.image_count()
+    );
+
+    // The tolerance is a property of the NEGOTIATED wire, so derive it rather
+    // than assuming V18's sdr one — the surface's own preference here is
+    // 8-bit, but a 10-bit surface must be scored at ten bits.
+    let tol = if sc.fmt == avk::Format::A2B10G10R10_UNORM_PACK32 {
+        1.0 / 1023.0 + 1e-4
+    } else {
+        1.0 / 255.0 + 1e-6
+    };
+
+    // V18's ramp, verbatim: the same geometric span with the same two pinned
+    // low entries, so the oracle arm below is that gate's comparison rather
+    // than a second one that could drift from it.
+    const RAMP_LO: f32 = 1e-3;
+    const RAMP_HI: f32 = 6e4;
+    let span = (n - 3) as f32;
+    let radiance = |i: usize| -> f32 {
+        match i {
+            0 => 0.0,
+            1 => 1.0,
+            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+        }
+    };
+    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
+
+    let cleanup = |sc: &Swapchain| sc.destroy(vkd);
+
+    let src = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        avk::Format::R16G16B16A16_SFLOAT,
+        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 source image: {e}");
+            cleanup(&sc);
+            return false;
+        }
+    };
+
+    // ONE `Passes`, at the swapchain's own format, used for BOTH targets. That
+    // is what makes the identity a statement about the TARGET rather than
+    // about two pipelines that happen to agree.
+    let passes = match display::Passes::new(hg, sp, sc.fmt) {
+        Ok(p) => {
+            p.bind_source(vkd, src.view);
+            p
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 display passes ({:?}): {e}", sc.fmt);
+            src.destroy(vkd);
+            cleanup(&sc);
+            return false;
+        }
+    };
+
+    let params = display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
+
+    let fin = |ok: bool| -> bool {
+        passes.destroy(vkd);
+        src.destroy(vkd);
+        cleanup(&sc);
+        ok
+    };
+
+    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
+        eprintln!("check-vk: FAIL V19 ramp upload: {e}");
+        return fin(false);
+    }
+    if let Err(e) = passes.set_params(vkd, params) {
+        eprintln!("check-vk: FAIL V19 params: {e}");
+        return fin(false);
+    }
+
+    // ---- The offscreen reference, rendered once. ----
+    let off = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        sc.fmt,
+        avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 offscreen image: {e}");
+            return fin(false);
+        }
+    };
+    let want = {
+        let r = hg
+            .run(|d, cmd| passes.record(d, cmd, &off, true))
+            .and_then(|_| display::read_target(hg, &off, 4));
+        off.destroy(vkd);
+        match r {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 offscreen render: {e}");
+                return fin(false);
+            }
+        }
+    };
+
+    // The sentinel, as a float clear and as the byte it must land on. 238/255
+    // round-trips EXACTLY through an 8-bit UNORM, so a surviving texel is
+    // unambiguous rather than approximately unambiguous.
+    const SENTINEL: f32 = 238.0 / 255.0;
+
+    // A staging buffer for the copy-before-present, reused across cycles.
+    let stage = match vkd.buffer((n * 4) as u64, avk::BufferUsageFlags::TRANSFER_DST, true) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 staging buffer: {e}");
+            return fin(false);
+        }
+    };
+
+    // ---- The cycles. ONE MORE THAN THERE ARE IMAGES. ----
+    let cycles = sc.image_count() + 1;
+    let mut order = Vec::with_capacity(cycles);
+    let mut identity_bad = 0usize;
+    let mut oracle_worst = 0.0f32;
+    let mut alpha_bad = 0usize;
+    let mut sentinel_alive = 0usize;
+    let mut clear_alive = 0usize;
+
+    for cycle in 0..cycles {
+        let idx = match sc.acquire() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 cycle {cycle}: {e}");
+                ok = false;
+                break;
+            }
+        };
+        order.push(idx);
+
+        let (wait, stages) = sc.wait_pair();
+        let signal = sc.signal(idx);
+        let rec = hg.run_present(&wait, &stages, &signal, |d, cmd| {
+            // Flood, then draw. `record_to`'s opening barrier is FROM
+            // UNDEFINED, which discards — so on the correct path the sentinel
+            // is gone by construction and the readback shows the image. It
+            // survives only if the draw went somewhere else, which is exactly
+            // the outcome it is here to name.
+            sc.clear_to(d, cmd, idx, [SENTINEL, SENTINEL, SENTINEL, SENTINEL]);
+            passes.record_to(d, cmd, sc.images[idx], sc.view(idx), sc.w, sc.h, true);
+            // Copy BEFORE presenting: ownership returns to the presentation
+            // engine at present, so this is the last moment the bytes are
+            // readable at all.
+            unsafe {
+                let region = avk::BufferImageCopy::default()
+                    .image_subresource(
+                        avk::ImageSubresourceLayers::default()
+                            .aspect_mask(avk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(avk::Extent3D { width: sc.w, height: sc.h, depth: 1 });
+                d.cmd_copy_image_to_buffer(
+                    cmd,
+                    sc.images[idx],
+                    avk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    stage.buf,
+                    &[region],
+                );
+            }
+            sc.to_present_layout(d, cmd, idx);
+        });
+        if let Err(e) = rec {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} submit: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = sc.present(vkd, idx) {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} present: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = hg.wait_submit() {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} wait: {e}");
+            ok = false;
+            break;
+        }
+
+        let got = match vkd.read(&stage, n * 4) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 cycle {cycle} readback: {e}");
+                ok = false;
+                break;
+            }
+        };
+
+        for i in 0..n {
+            let px = &got[i * 4..i * 4 + 4];
+            if px != &want[i * 4..i * 4 + 4] {
+                identity_bad += 1;
+            }
+            let have = display::decode(px, sc.fmt);
+            let q = |v: f32| half::f16::from_f32(v).to_f32();
+            let c = glam::Vec3A::new(q(ramp[i * 3]), q(ramp[i * 3 + 1]), q(ramp[i * 3 + 2]));
+            let w = tone::map(c, tone::ToneParams::SDR);
+            for ch in 0..3 {
+                let d = (have[ch] - w[ch]).abs() / (1.0f32).max(w[ch].abs());
+                oracle_worst = oracle_worst.max(d);
+            }
+            if display::decode_alpha(px, sc.fmt) < 1.0 {
+                alpha_bad += 1;
+            }
+            // The three-way classification. Both comparisons are on DECODED
+            // values so a 10-bit surface reads the same way an 8-bit one does.
+            if have.iter().all(|v| (v - SENTINEL).abs() < 2.0 / 255.0) {
+                sentinel_alive += 1;
+            } else if have.iter().all(|v| *v < 1.0 / 255.0) {
+                clear_alive += 1;
+            }
+        }
+    }
+
+    vkd.free_buffer(&stage);
+
+    if ok {
+        if identity_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 swapchain vs offscreen — {identity_bad} texel(s) of \
+                 {} differ. Same pipeline, same format, two targets: this is the present \
+                 path's own claim.",
+                n * cycles
+            );
+            ok = false;
+        }
+        if sentinel_alive > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 {sentinel_alive} texel(s) still carry the 0xEE sentinel — \
+                 the draw went to a DIFFERENT image than the one flooded and copied"
+            );
+            ok = false;
+        } else if clear_alive == n * cycles {
+            eprintln!(
+                "check-vk: FAIL V19 every texel is the clear colour — the render pass ran and \
+                 the DRAW did not"
+            );
+            ok = false;
+        }
+        if oracle_worst > tol {
+            eprintln!(
+                "check-vk: FAIL V19 presented image vs tone::map — worst {oracle_worst:.2e} > \
+                 {tol:.2e}. The byte identity alone cannot see this: two targets that were \
+                 BOTH wrong agree."
+            );
+            ok = false;
+        }
+        if alpha_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 {alpha_bad} texel(s) with alpha below maximum — the draw \
+                 did not cover them"
+            );
+            ok = false;
+        }
+        if ok {
+            println!(
+                "check-vk: V19 present path: {cycles} cycle(s) over {} image(s) — swapchain vs \
+                 offscreen byte-identical over {} texel(s) | oracle worst {oracle_worst:.2e} \
+                 (limit {tol:.2e}) | alpha full | sentinel survivors 0",
+                sc.image_count(),
+                n * cycles
+            );
+            println!(
+                "check-vk: V19   acquire order {order:?} — reported, never asserted (the spec \
+                 constrains none of it); the LAST acquire succeeding is the proof the engine \
+                 released an image this gate presented"
+            );
+        }
+    }
+
+    // The device must be idle before the swapchain and its semaphores go: a
+    // presented image is still referenced by the presentation engine, and the
+    // last submit's semaphore is still in flight.
+    unsafe {
+        let _ = vkd.device.device_wait_idle();
+    }
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!("check-vk: FAIL V19 {ve} validation error(s) in the present path");
+        ok = false;
+    }
+    fin(ok)
 }
 
 /// V10 — the BC7 encoder, scored through the hardware decoder.
@@ -15984,7 +16703,37 @@ fn run_check_vk_render(
     let mut sum_c = [0.0f64; 3];
     let mut sum_g = [0.0f64; 3];
     let mut sum_abs = 0.0f64;
+    // NON-FINITE AND NEGATIVE ARE DIFFERENT FAILURES, and this gate counted
+    // them as one — the D3D12 suites' own correction (`check-dxr`'s radiance
+    // A/B, which carries the full argument) applied to the backend that never
+    // got it. A NaN or Inf is always a defect. A negative sample is not: the
+    // GI ladder's stochastic rungs estimate the ambient as
+    // `tail + (G - tail)/p`, an UNBIASED estimator of a non-negative quantity,
+    // and such an estimator may legitimately sample below zero — exactly when
+    // `G < tail*(1 - p)`. Conflated, a real NaN and the ladder's honest tail
+    // read identically, which is how this stage went red on a healthy tree.
+    //
+    // MEASURED HERE by sweeping the ladder, and the shape is the attribution:
+    //
+    //     rung   0    0.5    1     1.5    2
+    //     p      0    0.5    0     0.5    1.0
+    //     neg    0    453    0     11     5      (of 1.44M channels)
+    //
+    // The two DETERMINISTIC rungs read EXACTLY ZERO and every rung with a live
+    // correction reads non-zero, so `rtgi_corr_p > 0` is not a vacuous arming
+    // predicate — it is the line the data falls on. The count drops as p rises
+    // (the estimator's tail narrows), and 0.5 beats 1.5 at the same p because
+    // its correction sits at LEVEL 0, where `tail` is the primary surface's own
+    // ambient rather than a bounce's. Rung 2's residual 5 at p = 1.0 is fp
+    // cancellation in `tail + (G - tail)`, which is not exactly `G`.
+    //
+    // AND THE OLD `continue` DROPPED THE NEGATIVE TAIL FROM THE MEAN, which is
+    // worse than the miscount: clamping or excluding the low samples BIASES
+    // the statistic upward, and not biasing the mean is the one property the
+    // ladder exists to have. Negatives are now counted AND accumulated;
+    // only non-finites are skipped, and for a different reason (see below).
     let mut nonfinite = 0usize;
+    let mut negative = 0usize;
     // SPLIT BY WHAT THE PRIMARY RAY HIT, because the two populations fail for
     // different reasons and a single number cannot tell them apart: sky is the
     // dome + disc + the cloud caches with no material in sight, geometry is
@@ -15997,9 +16746,16 @@ fn run_check_vk_render(
     for i in 0..px * 3 {
         let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
         let g = gpu_a.get(i).copied().unwrap_or(f32::NAN) * inv;
-        if !g.is_finite() || g < 0.0 {
+        if !g.is_finite() {
             nonfinite += 1;
+            // SKIPPED FROM THE SUMS, unlike a negative: one NaN makes every
+            // statistic below it NaN, so a gate that kept it would report
+            // nothing about the 1.44M samples that are fine. The count is the
+            // assertion; the mean is for attribution.
             continue;
+        }
+        if g < 0.0 {
+            negative += 1;
         }
         sum_c[i % 3] += f64::from(c);
         sum_g[i % 3] += f64::from(g);
@@ -16037,7 +16793,7 @@ fn run_check_vk_render(
     }
     println!(
         "check-vk: V6 radiance A/B over {frames} frames: per-channel mean rel diff {:.3}% | \
-         mean abs px diff {:.4} | non-finite {nonfinite}",
+         mean abs px diff {:.4} | non-finite {nonfinite} | negative {negative}",
         mean_rel * 100.0,
         sum_abs / (px * 3) as f64
     );
@@ -16052,7 +16808,25 @@ fn run_check_vk_render(
         (hit_g - hit_c) / hit_c.max(1e-9) * 100.0
     );
     if nonfinite > 0 {
-        fail(&mut ok, format!("{nonfinite} non-finite/negative GPU channels"));
+        fail(&mut ok, format!("{nonfinite} non-finite GPU channels"));
+    }
+    // A stochastic rung may sample negative (see above); no other configuration
+    // may, and even an armed one only in the tail. The bound is on HOW MANY
+    // rather than on whether — 0.1% of samples, which is orders above anything
+    // the ladder produces and still catches a sign error, since that would flip
+    // a POPULATION rather than a fringe. `rtgi_corr_p` is the ONE derivation
+    // both the compile define and the runtime bit read, so this arms exactly
+    // when the correction does.
+    let neg_ok =
+        crate::gfx::frame::rtgi_corr_p(shade::rtgi_bounces()) > 0.0 && negative <= px * 3 / 1000;
+    if negative > 0 && !neg_ok {
+        fail(
+            &mut ok,
+            format!(
+                "{negative} negative GPU channels — legitimate only in a stochastic GI \
+                 rung's tail (--rtgi-bounces with a fractional part, or rung 2)"
+            ),
+        );
     }
     // Anti-vacuity: a pair of all-black images agrees perfectly.
     if sum_c.iter().sum::<f64>() <= 0.0 || sum_g.iter().sum::<f64>() <= 0.0 {
@@ -20721,6 +21495,21 @@ fn fsr3_upscale_check(
 #[cfg(target_os = "macos")]
 const MFX_BILINEAR_MIN: f64 = 4.5e-3;
 
+/// How much less high-frequency content the DENOISED scaler must carry than the
+/// plain one, on byte-identical inputs at identical extents (X5).
+///
+/// MEASURED ON THIS ARM, never inherited — the rule `MFX_BILINEAR_MIN`'s doc
+/// states, applied again: a number that describes FidelityFX's or Apple's
+/// UPSCALER on this scene says nothing about Apple's DENOISER on it. Measured
+/// on the default scene: **33.8% with world-space normals, 28.8% with view**
+/// (`FR_MFXDN_NORMALS`), so the floor sits six times under the lower of the two
+/// — both are legitimate configurations of a diagnostic lever, and the failure
+/// this rejects (guides unbound, or no denoise happening at all) lands at or
+/// below ZERO. A low floor therefore loses no discrimination, while a snug one
+/// would fail on any scene that is quieter to begin with.
+#[cfg(target_os = "macos")]
+const MFXDN_LAPLACIAN_DROP_MIN: f64 = 0.05;
+
 /// How strongly MetalFX's and FSR3's deviations from a common bilinear
 /// reference must agree. See the cross-check block in `metalfx_upscale_check`
 /// for why this is a CORRELATION and not a distance — the tempting distance
@@ -20901,6 +21690,107 @@ fn run_check_metalfx(
             // ---- X3: a real upscale, scored ----------------------------------
             if let Err(e) = metalfx_upscale_check(m, scene, bvh, cam0) {
                 fail(format!("X3 {e}"));
+            }
+
+            // ---- X4: the DENOISED scaler builds, and its matrix ABI holds ----
+            //
+            // A SEPARATE SKIP FROM X1's, and the two are different facts:
+            // `MTLFXTemporalDenoisedScaler` is API_AVAILABLE(macos(26.0)) where
+            // the plain one is 13.0, so a Mac that fully supports X1-X3 can
+            // legitimately have nothing here. Probed with a raw class lookup
+            // because objc2's generated class reference PANICS when the class is
+            // missing — see `mtl::mfxdn`'s header.
+            if !mtl::mfxdn::MfxDn::available() {
+                println!(
+                    "check-metalfx: SKIP X4-X5 — MTLFXTemporalDenoisedScaler is macOS 26.0+ \
+                     and this system predates it (the plain scaler is 13.0+, hence X1-X3 above)"
+                );
+            } else if !mtl::mfxdn::MfxDn::supported(m) {
+                println!(
+                    "check-metalfx: SKIP X4-X5 — MTLFXTemporalDenoisedScalerDescriptor.\
+                     supportsDevice is false for this device"
+                );
+            } else {
+                let (dmin, dmax) = mtl::mfxdn::MfxDn::scale_range(m);
+                println!(
+                    "check-metalfx: X4 denoised scaler supported — input scale range \
+                     {dmin:.2}x..{dmax:.2}x"
+                );
+                let t0 = std::time::Instant::now();
+                match mtl::mfxdn::MfxDn::new(m, (401, 227), (802, 454)) {
+                    Ok(s) => {
+                        println!(
+                            "check-metalfx: X4 denoised scaler created — 401x227 -> 802x454, \
+                             {} ms (synchronous init)",
+                            t0.elapsed().as_millis()
+                        );
+                        let ours = (objc2_metal::MTLTextureUsage::ShaderRead
+                            | objc2_metal::MTLTextureUsage::ShaderWrite
+                            | objc2_metal::MTLTextureUsage::RenderTarget)
+                            .0;
+                        let u = s.required_usage();
+                        for (what, need) in u {
+                            if need.0 & !ours != 0 {
+                                fail(format!(
+                                    "X4 the denoised scaler needs {what} usage {:#x}, and \
+                                     Mtl::texture hands out {ours:#x} — not a superset",
+                                    need.0
+                                ));
+                            }
+                        }
+                        println!(
+                            "check-metalfx: X4 texture usage OK — {} planes, all within the \
+                             harness's {ours:#x}: {}",
+                            u.len(),
+                            u.iter()
+                                .map(|(n, v)| format!("{n} {:#x}", v.0))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+
+                        drop(s);
+                        println!("check-metalfx: X4 denoised scaler destroyed OK");
+                    }
+                    Err(e) => fail(format!("X4 {e}")),
+                }
+
+                // ---- X5: a real denoise, scored --------------------------
+                if let Err(e) = metalfx_denoise_check(m, scene, bvh, cam0) {
+                    fail(format!("X5 {e}"));
+                }
+
+                // ---- X6: a real interpolated frame, scored ---------------
+                //
+                // Its own availability question again: same framework and the
+                // same 26.0 floor as the denoised scaler, but a separate class,
+                // so a device could in principle have one and not the other.
+                if !mtl::mfxfi::Mfxfi::supported(m) {
+                    println!(
+                        "check-metalfx: SKIP X6 — MTLFXFrameInterpolator is unavailable or \
+                         unsupported on this device"
+                    );
+                } else if std::env::var("MTL_SHADER_VALIDATION").is_ok() {
+                    // NOT OUR KERNEL, AND NOT OPTIONAL TO SKIP. Under shader
+                    // validation one of MetalFX's own interpolation kernels
+                    // dispatches a 32x32 threadgroup while the validated device
+                    // limit drops to 832 threads, and Metal ABORTS THE PROCESS
+                    // on the assertion rather than failing the encode:
+                    //
+                    //   _validateThreadsPerThreadgroup:1310: failed assertion
+                    //   `... (1024) must be <= 832. (kernel threadgroup size limit)'
+                    //
+                    // We author no compute kernels on this path, so there is
+                    // nothing here to fix; skipping keeps the VALIDATED run —
+                    // the stricter one, and the one this gate's own NOTE tells
+                    // people to prefer — runnable at all. Re-test on a newer OS.
+                    println!(
+                        "check-metalfx: SKIP X6 — MTL_SHADER_VALIDATION is set, and MetalFX's \
+                         own interpolation kernel exceeds the validated threadgroup limit \
+                         (1024 > 832), which aborts the process. Run X6 unvalidated."
+                    );
+                } else if let Err(e) = metalfx_interp_check(m, scene, bvh, cam0) {
+                    fail(format!("X6 {e}"));
+                }
             }
         }
     }
@@ -21411,6 +22301,625 @@ fn metalfx_upscale_check(
              magnitude above can distinguish (FR_MFX_JITTER=neg is the other arm)"
         );
     }
+    Ok(())
+}
+
+/// X5: two real rendered frames through the real denoised scaler, scored — and
+/// unlike every other Metal stage, scored on a DIRECTIONAL claim.
+///
+/// B2 and B3 are upscalers, and an upscaler has no direction: `--check-fsr3`'s
+/// own notes record that its quality comparison is report-only because mean-|d|
+/// against a converged reference rewards blur and INVERTS between scenes (FSR3
+/// beats bilinear on the procedural scene and loses on san-miguel with
+/// identical wiring). A denoiser does have one — noise must go DOWN — so this
+/// is the first assertion on this platform that is about quality rather than
+/// wiring.
+///
+/// **THE CONTROL IS THE PLAIN SCALER, NOT A RESAMPLER**, and that is what makes
+/// the claim tight. Both arms consume byte-identical planes at identical
+/// extents and both upscale 2x; the only difference is that one denoises. So
+/// "the denoised output carries less high-frequency content" is a comparison
+/// between two reconstructions of one frame, with no scene-dependent bias to
+/// argue about — where a bilinear reference would have confounded the denoise
+/// with the upscale (a 2x upscale reduces per-pixel Laplacian all by itself).
+/// It doubles as the anti-vacuity: two arms that agreed would mean the denoise
+/// did nothing.
+#[cfg(target_os = "macos")]
+fn metalfx_denoise_check(
+    m: &mtl::device::Mtl,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> Result<(), String> {
+    use std::sync::atomic::AtomicU32;
+
+    // The same extents, quality, dolly and jitter as X3 and `fsr3_upscale_check`
+    // — three arms read against each other on identical work.
+    let (rw, rh) = (321usize, 181usize);
+    let (uw, uh) = (rw * 2, rh * 2);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi_bounces: 0.0,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+
+    let render = |g: &dlss::GBufs,
+                  accum: &[AtomicU32],
+                  basis: camera::CamBasis,
+                  prev: Option<camera::CamBasis>,
+                  frame: u32,
+                  jitter: (f32, f32)| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: false,
+            rw,
+            rh,
+            accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(g),
+            fsr_buf: None,
+            prev_cam: prev,
+            frame_jitter: Some(jitter),
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+    };
+
+    // The jitter lever, X3's shape with its own name — see `mtl::mfxdn`'s
+    // header on why the two scalers' polarities are separate constants. The
+    // same two-jitters rule applies: the sign belongs on the REPORT, never on
+    // the renderer's sample offset, or the lever stops being a mirror.
+    let jsign = match std::env::var("FR_MFXDN_JITTER").as_deref() {
+        Ok("raw") => 1.0f32,
+        Ok("neg") => -1.0f32,
+        Ok(v) => {
+            println!("check-metalfx: FR_MFXDN_JITTER={v:?} unrecognized — using the default");
+            mtl::mfxdn::JITTER_SIGN
+        }
+        Err(_) => mtl::mfxdn::JITTER_SIGN,
+    };
+    let jit_render = |f: u32| dlss::jitter_for(f);
+    let jit = |f: u32| {
+        let (jx, jy) = jit_render(f);
+        (jx * jsign, jy * jsign)
+    };
+
+    // FULL `GBufs`, never `new_slim`: the slim variant leaves all five guide
+    // planes zero-length and `GBufs::write` skips their stores, so this stage
+    // is the one place on this platform where those planes are read at all.
+    let accum_a = alloc32(rw * rh * 3);
+    let accum_b = alloc32(rw * rh * 3);
+    let ga = dlss::GBufs::new(rw, rh);
+    let gb = dlss::GBufs::new(rw, rh);
+    let basis_a = cam0.basis(rw, rh);
+    let cam_b = Camera { pos: cam0.pos + cam0.forward() * (0.02 * scene.diag), ..cam0 };
+    let basis_b = cam_b.basis(rw, rh);
+    render(&ga, &accum_a, basis_a, None, 0, jit_render(0));
+    render(&gb, &accum_b, basis_b, Some(basis_a), 1, jit_render(1));
+
+    // Only for `FR_MFXDN_NORMALS=view`, which transforms the normal plane at
+    // staging time. The scaler itself is handed no matrices — see the finding
+    // block in `mtl::mfxdn`.
+    let w2v_a = dlss::cam_matrices(&cam0, rw, rh, near, far).world_to_view;
+    let w2v_b = dlss::cam_matrices(&cam_b, rw, rh, near, far).world_to_view;
+
+    // A fresh scaler per run, X3's reason: MetalFX's history is internal and
+    // per-object, so there is no other way to have a warmed and an unwarmed one.
+    let run_with = |seq: &[(u32, bool)],
+                    gb_over: Option<&dlss::GBufs>|
+     -> Result<(Vec<f32>, Vec<u16>), String> {
+        let f = mtl::mfxdn::MfxDn::new(m, (rw, rh), (uw, uh))?;
+        for &(frame, reset) in seq {
+            let (acc, g, w2v) = if frame == 0 {
+                (&accum_a, &ga, w2v_a)
+            } else {
+                (&accum_b, gb_over.unwrap_or(&gb), w2v_b)
+            };
+            f.stage(m, acc, g, near, far, w2v);
+            f.dispatch(m, &mtl::mfxdn::MfxDnParams { jitter: jit(frame), reset })?;
+        }
+        Ok((f.read_output(m)?, f.read_output_bits(m)?))
+    };
+    let run = |seq: &[(u32, bool)]| run_with(seq, None);
+
+    let t0 = std::time::Instant::now();
+    let (warm, warm_bits) = run(&[(0, true), (1, false)])?;
+    let (cold, _cold_bits) = run(&[(1, true)])?;
+    let (_warm2, warm2_bits) = run(&[(0, true), (1, false)])?;
+    let setup_ms = t0.elapsed().as_millis();
+
+    // ---- finite, non-negative, and actually written ------------------------
+    let bad = warm.iter().filter(|v| !v.is_finite() || **v < 0.0).count();
+    if bad != 0 {
+        return Err(format!("{bad} of {} output channels are non-finite or negative", warm.len()));
+    }
+    let mean = |v: &[f32]| {
+        v.chunks(4).map(|p| (p[0] + p[1] + p[2]) / 3.0).sum::<f32>() / (v.len() / 4) as f32
+    };
+    let in_mean = {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh * 3 {
+            s += f64::from(f32::from_bits(accum_b[i].load(Relaxed)));
+        }
+        (s / (rw * rh * 3) as f64) as f32
+    };
+    let out_mean = mean(&warm);
+    if out_mean <= 0.0 {
+        return Err("the output is uniformly zero — the denoised scaler wrote nothing".into());
+    }
+    // Meaningful only because auto-exposure is OFF — `mtl::mfx`'s header.
+    let ratio = out_mean / in_mean;
+    if !(0.5..=2.0).contains(&ratio) {
+        return Err(format!(
+            "output mean {out_mean:.4} is {ratio:.3}x the input's {in_mean:.4} — a denoiser \
+             redistributes energy, it does not expose"
+        ));
+    }
+
+    // ---- determinism -------------------------------------------------------
+    //
+    // Written STRICT, as X3's is, because MetalFX's history is internal and
+    // opaque — there is no known cause for a split, unlike FidelityFX, which
+    // declares its internal resources UNINITIALIZED and therefore needs one.
+    // An INTEGER ULP distance over f16 bit patterns, never a relative bound on
+    // widened floats: a failure cannot be answered by moving a threshold.
+    let ulp = |a: &[u16], b: &[u16]| -> (usize, u16) {
+        let mut n = 0usize;
+        let mut worst = 0u16;
+        for (x, y) in a.iter().zip(b) {
+            let d = x.abs_diff(*y);
+            if d != 0 {
+                n += 1;
+                worst = worst.max(d);
+            }
+        }
+        (n, worst)
+    };
+    let (n_warm, ulp_warm) = ulp(&warm_bits, &warm2_bits);
+    if n_warm != 0 {
+        return Err(format!(
+            "an accumulating frame differs across scalers in {n_warm} of {} channels (worst \
+             {ulp_warm} ULP) — MetalFX's history is internal, so there is no known cause to \
+             attribute this to; investigate rather than widening a bound",
+            warm_bits.len()
+        ));
+    }
+
+    // ---- history is real ---------------------------------------------------
+    let mean_abs = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter().zip(b).map(|(x, y)| f64::from((x - y).abs())).sum::<f64>() / a.len() as f64
+    };
+    let rel_hist = mean_abs(&warm, &cold) / f64::from(out_mean).max(1e-6);
+    if rel_hist < 1e-3 {
+        return Err(format!(
+            "a warmed history and a reset one differ by {rel_hist:.2e} of the mean — the \
+             denoised scaler is not accumulating anything"
+        ));
+    }
+
+    // ---- THE DENOISE CLAIM, against the plain scaler on identical inputs ----
+    let plain = {
+        let f = mtl::mfx::Mfx::new(m, (rw, rh), (uw, uh))?;
+        for &(frame, reset) in &[(0u32, true), (1u32, false)] {
+            let (acc, g) = if frame == 0 { (&accum_a, &ga) } else { (&accum_b, &gb) };
+            f.stage(m, acc, g, near, far);
+            f.dispatch(m, &mtl::mfx::MfxParams { jitter: jit(frame), reset })?;
+        }
+        f.read_output(m)?
+    };
+    // 4-neighbour Laplacian of luma, the `--check-oidn` metric. Interior only,
+    // so the border's one-sided stencil never enters either arm's mean.
+    let laplacian = |v: &[f32]| -> f64 {
+        let lum = |i: usize| {
+            f64::from(v[i * 4]) * 0.2126 + f64::from(v[i * 4 + 1]) * 0.7152
+                + f64::from(v[i * 4 + 2]) * 0.0722
+        };
+        let mut s = 0.0f64;
+        for y in 1..uh - 1 {
+            for x in 1..uw - 1 {
+                let i = y * uw + x;
+                s += (4.0 * lum(i) - lum(i - 1) - lum(i + 1) - lum(i - uw) - lum(i + uw)).abs();
+            }
+        }
+        s / ((uw - 2) * (uh - 2)) as f64
+    };
+    let (lap_dn, lap_plain) = (laplacian(&warm), laplacian(&plain));
+    let drop = 1.0 - lap_dn / lap_plain.max(1e-12);
+    if drop < MFXDN_LAPLACIAN_DROP_MIN {
+        return Err(format!(
+            "the denoised arm's high-frequency content is {lap_dn:.4} against the plain \
+             scaler's {lap_plain:.4} on byte-identical inputs — a {:.1}% drop, under the \
+             {:.1}% this arm measures. Both reconstruct the same frame at the same extents \
+             and only one denoises, so at this level the guides are not reaching it or it is \
+             not denoising",
+            drop * 100.0,
+            MFXDN_LAPLACIAN_DROP_MIN * 100.0
+        ));
+    }
+    eprintln!(
+        "check-metalfx: X5 denoise {rw}x{rh} -> {uw}x{uh} OK — energy {ratio:.3}x, history \
+         {rel_hist:.3e}, Laplacian {lap_dn:.4} vs the plain scaler's {lap_plain:.4} ({:.1}% \
+         less high-frequency content); accumulating frames bit-exact across scalers, 4 scalers \
+         in {setup_ms} ms",
+        drop * 100.0
+    );
+
+    // ---- the guides are actually reaching the scaler ------------------------
+    //
+    // NOTHING ABOVE PROVES THIS. Every assertion so far is satisfied by a
+    // denoised scaler with its five guide planes bound to untouched zero
+    // textures: it would still be finite, still preserve energy, still
+    // accumulate, and still denoise (less well). That is the M3d texture-probe
+    // shape — an operation that never happened compares clean — so the guides
+    // get the same treatment: zero ONE of them and require the output to move.
+    let zeroed = |which: &str| -> dlss::GBufs {
+        let g = dlss::GBufs::new(rw, rh);
+        let copy = |dst: &[std::sync::atomic::AtomicU16],
+                    src: &[std::sync::atomic::AtomicU16],
+                    skip: bool| {
+            if skip {
+                return;
+            }
+            for (d, s) in dst.iter().zip(src) {
+                d.store(s.load(Relaxed), Relaxed);
+            }
+        };
+        copy(&g.normal_rough, &gb.normal_rough, which == "normal");
+        copy(&g.diff_alb, &gb.diff_alb, which == "diffuse-albedo");
+        copy(&g.spec_alb, &gb.spec_alb, which == "specular-albedo");
+        copy(&g.spec_hit_t, &gb.spec_hit_t, which == "specular-hit");
+        copy(&g.ripple_amp, &gb.ripple_amp, false);
+        copy(&g.mvec, &gb.mvec, false);
+        for (d, s) in g.depth.iter().zip(&gb.depth) {
+            d.store(s.load(Relaxed), Relaxed);
+        }
+        g
+    };
+    // THE PROBE NEEDS ITS OWN ANTI-VACUITY. Zeroing a plane that is ALREADY
+    // zero cannot move anything, so a failure would say "the guide is not
+    // reaching the scaler" about a scene that simply has nothing to put in it.
+    // `spec_hit_t` is exactly that risk: `GPixel` stores 0 when no reflection
+    // was traced, so a pose with no glossy surfaces has an all-zero plane.
+    // ONE PLANE IS REPORTED RATHER THAN ASSERTED, and it is a measured finding
+    // about MetalFX rather than a softened bound. `specular-hit` is an OPTIONAL
+    // input: the descriptor accepts `setSpecularHitDistanceTextureEnabled(true)`
+    // and reads it back true (`mtl::mfxdn::new` fails if it does not), the
+    // created scaler reports wanting `ShaderRead` on that plane, we bind it —
+    // and zeroing it leaves the output BIT-IDENTICAL, at a pose where 12.7% of
+    // the plane is non-zero. So it is accepted, advertised and unused on this
+    // driver. The wiring stays, because it is correct and costs one texture,
+    // and a future macOS that starts reading it would then need no change; what
+    // does not stay is an assertion that would fail for a reason outside this
+    // tree. Re-check it on a newer OS: the day it starts moving, promote it.
+    for which in ["normal", "diffuse-albedo", "specular-albedo", "specular-hit"] {
+        let src = match which {
+            "normal" => &gb.normal_rough,
+            "diffuse-albedo" => &gb.diff_alb,
+            "specular-albedo" => &gb.spec_alb,
+            _ => &gb.spec_hit_t,
+        };
+        let nz = src.iter().filter(|a| a.load(Relaxed) != 0).count();
+        if nz == 0 {
+            eprintln!(
+                "check-metalfx: X5 guide {which} SKIPPED — the plane is all-zero at this pose, \
+                 so zeroing it is a no-op and the probe would score the scene rather than the \
+                 wiring"
+            );
+            continue;
+        }
+        let g = zeroed(which);
+        let (other, _) = run_with(&[(0, true), (1, false)], Some(&g))?;
+        let d = mean_abs(&warm, &other) / f64::from(out_mean).max(1e-6);
+        let optional = which == "specular-hit";
+        if d < 1e-4 && !optional {
+            return Err(format!(
+                "zeroing the {which} plane moved the output by {d:.2e} of the mean — that \
+                 guide is not reaching the scaler, and every assertion above is satisfied \
+                 without it"
+            ));
+        }
+        eprintln!(
+            "check-metalfx: X5 guide {} — {which} {d:.3e} ({nz}/{} texels non-zero)",
+            if d < 1e-4 { "REPORTED, unused by this driver" } else { "plumbed" },
+            src.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// X6: a real interpolated frame, scored against the pose it should have been.
+///
+/// Frame generation's product is presented CADENCE, and a headless harness has
+/// no presentation — so the natural assumption is that this can only assert
+/// wiring. It can do better, because an in-between frame has a GROUND TRUTH
+/// that costs one more render: the midpoint pose. A and B are the two rendered
+/// frames, M is what sits between them, and the interpolation of A->B is
+/// required to land closer to M than a 50/50 BLEND of A and B does.
+///
+/// The blend is the answer available for free, so beating it is what shows the
+/// motion vectors were used rather than the two images averaged — the same role
+/// `MFX_BILINEAR_MIN` plays for the upscaler arms, in the currency this one
+/// happens to have. It still cannot score PACING, and does not claim to.
+#[cfg(target_os = "macos")]
+fn metalfx_interp_check(
+    m: &mtl::device::Mtl,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> Result<(), String> {
+    use std::sync::atomic::AtomicU32;
+
+    // 1:1, so the output can be compared against a rendered frame directly
+    // rather than against an upscale of one.
+    let (rw, rh) = (321usize, 181usize);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi_bounces: 0.0,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+    // CONVERGED frames, unlike X3/X5's 1-spp ones: the subject here is whether
+    // an in-between frame lands on the right GEOMETRY, and 1-spp noise would
+    // put a floor under every distance below that has nothing to do with it.
+    let samples = 8u32;
+    let render = |g: Option<&dlss::GBufs>,
+                  accum: &[AtomicU32],
+                  basis: camera::CamBasis,
+                  prev: Option<camera::CamBasis>| {
+        for k in 0..samples {
+            let ctx = FrameCtx {
+                sway_mv: None,
+                scene,
+                bvh,
+                cam: basis,
+                q,
+                frame: k,
+                jitter: k > 0,
+                rw,
+                rh,
+                accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::check(scene.diag),
+                fireflies: crate::fireflies::Fireflies::check(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: g,
+                fsr_buf: None,
+                prev_cam: prev,
+                frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: true,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, true);
+        }
+    };
+
+    let step = 0.02 * scene.diag;
+    let cam_m = Camera { pos: cam0.pos + cam0.forward() * (step * 0.5), ..cam0 };
+    let cam_b = Camera { pos: cam0.pos + cam0.forward() * step, ..cam0 };
+    let (ba, bm, bb) = (cam0.basis(rw, rh), cam_m.basis(rw, rh), cam_b.basis(rw, rh));
+    let (aa, am, ab) = (alloc32(rw * rh * 3), alloc32(rw * rh * 3), alloc32(rw * rh * 3));
+    // ONE G-BUFFER PER FRAME THAT GETS DISPATCHED, not one shared. A and B are
+    // both handed to the scaler below, and each dispatch must carry ITS OWN
+    // depth: sharing B's would hand frame A a depth buffer describing a pose it
+    // is not at. A is a reset frame so nothing downstream reprojects against
+    // it, which is exactly why the wrong version of this is easy to miss and
+    // cheap to avoid. The midpoint needs none — it is only ever a reference.
+    let (ga, gb) = (dlss::GBufs::new_slim(rw, rh), dlss::GBufs::new_slim(rw, rh));
+    // A has no previous frame, so its MV plane is the zero one a first frame
+    // legitimately has.
+    render(Some(&ga), &aa, ba, None);
+    render(None, &am, bm, None);
+    // B's G-buffer carries the motion from B back to A, which is the direction
+    // `GBufs::mvec` stores and the one Apple's convention documents.
+    render(Some(&gb), &ab, bb, Some(ba));
+
+    let avg = |a: &[AtomicU32]| -> Vec<f32> {
+        let inv = 1.0 / samples as f32;
+        a.iter().map(|v| f32::from_bits(v.load(Relaxed)) * inv).collect()
+    };
+    let (va, vm, vb) = (avg(&aa), avg(&am), avg(&ab));
+    // The averaged frames must reach the interpolator as the same bits the
+    // comparison uses, so they are written back into scratch accum buffers.
+    let store = |v: &[f32]| -> Vec<AtomicU32> {
+        v.iter().map(|x| AtomicU32::new(x.to_bits())).collect()
+    };
+    let (sa, sb) = (store(&va), store(&vb));
+
+    // A SCALER IS ATTACHED, and it is not optional: standalone the interpolator
+    // ignores `prevColorTexture` entirely and returns the current colour —
+    // measured, with the plant that proves it (handing it frame B as the
+    // PREVIOUS frame produced a byte-identical result). Its descriptor's
+    // `scaler` property is how a real session chains generation onto
+    // reconstruction, so the gate builds that configuration rather than a
+    // simpler one that does not work.
+    let sc = mtl::mfx::Mfx::new(m, (rw, rh), (rw, rh))?;
+    // The scaler is driven over A then B first, so its history describes the
+    // same motion the interpolator is asked to bridge.
+    for (acc, g, reset) in [(&sa, &ga, true), (&sb, &gb, false)] {
+        sc.stage(m, acc, g, near, far);
+        sc.dispatch(m, &mtl::mfx::MfxParams { jitter: (0.0, 0.0), reset })?;
+    }
+    let f = mtl::mfxfi::Mfxfi::new(m, (rw, rh), (rw, rh), Some(sc.as_interpolatable()))?;
+    let ours = (objc2_metal::MTLTextureUsage::ShaderRead
+        | objc2_metal::MTLTextureUsage::ShaderWrite
+        | objc2_metal::MTLTextureUsage::RenderTarget)
+        .0;
+    for (what, need) in f.required_usage() {
+        if need.0 & !ours != 0 {
+            return Err(format!(
+                "the interpolator needs {what} usage {:#x}, and Mtl::texture hands out \
+                 {ours:#x} — not a superset",
+                need.0
+            ));
+        }
+    }
+    // A PRIMING DISPATCH FIRST, because a reset frame has no history and the
+    // interpolator answers it by passing the current colour through — measured:
+    // a single reset dispatch lands 5.3e-5 from frame B against an A-to-B
+    // distance of 8.0e-2, i.e. it IS frame B. So the sequence a real presenter
+    // would produce is what gets recorded: one frame establishing history, then
+    // the interpolating one. That is the same shape as the temporal scalers'
+    // `reset` contract in `mtl::mfx`, and the same reason.
+    f.stage_prev(m, &sa);
+    f.stage(m, &sa, &ga, near, far);
+    f.dispatch(
+        m,
+        &mtl::mfxfi::FiParams {
+            jitter: (0.0, 0.0),
+            reset: true,
+            delta_time: 1.0 / 60.0,
+            near,
+            far,
+            fov_y: cam0.fov_y,
+        },
+    )?;
+    f.stage_prev(m, &sa);
+    f.stage(m, &sb, &gb, near, far);
+    f.dispatch(
+        m,
+        &mtl::mfxfi::FiParams {
+            jitter: (0.0, 0.0),
+            reset: false,
+            // A NOMINAL 60 Hz step, never a wall clock: a real one would make
+            // this gate's inputs a function of machine load, which is the rule
+            // `nrd_gpu::NOMINAL_DT_MS` states for the same reason.
+            delta_time: 1.0 / 60.0,
+            near,
+            far,
+            fov_y: cam0.fov_y,
+        },
+    )?;
+    let out = f.read_output(m)?;
+
+    let bad = out.iter().filter(|v| !v.is_finite() || **v < 0.0).count();
+    if bad != 0 {
+        return Err(format!("{bad} of {} output channels are non-finite or negative", out.len()));
+    }
+    // Mean per-channel RGB distance. The STRIDE is explicit because the two
+    // things compared here are not the same shape — the interpolator's output
+    // is RGBA and every rendered frame is RGB — and a closure that assumed one
+    // of them read 58100 pixels past the end of the other.
+    let dist = |o: &[f32], os: usize, r: &[f32]| -> f64 {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh {
+            for c in 0..3 {
+                s += f64::from((o[i * os + c] - r[i * 3 + c]).abs());
+            }
+        }
+        s / (rw * rh * 3) as f64
+    };
+    let mean_m = vm.iter().map(|v| f64::from(*v)).sum::<f64>() / vm.len() as f64;
+    if mean_m <= 0.0 {
+        return Err("the midpoint reference is uniformly zero — the probe is degenerate".into());
+    }
+    let out_mean = out.chunks(4).map(|p| f64::from(p[0] + p[1] + p[2]) / 3.0).sum::<f64>()
+        / (rw * rh) as f64;
+    if out_mean <= 0.0 {
+        return Err("the output is uniformly zero — the interpolator wrote nothing".into());
+    }
+    let blend: Vec<f32> = va.iter().zip(&vb).map(|(x, y)| (x + y) * 0.5).collect();
+    let (d_m, d_blend, d_a, d_b) = (
+        dist(&out, 4, &vm),
+        dist(&blend, 3, &vm),
+        dist(&out, 4, &va),
+        dist(&out, 4, &vb),
+    );
+
+    // WHAT THIS STAGE CAN AND CANNOT ASSERT, measured rather than assumed.
+    //
+    // The claim this gate was designed around — that the interpolated frame
+    // lands closer to the true midpoint pose than a 50/50 blend of its own
+    // inputs — DOES NOT HOLD, because on this driver the interpolator returns
+    // the CURRENT frame. Three independent configurations produce a
+    // byte-identical result: a single reset dispatch, a primed pair, and a
+    // driven `MTLFXTemporalScaler` attached through the descriptor's `scaler`
+    // property. The plant that settles it is handing the interpolator frame B
+    // as its PREVIOUS frame: the output does not change by one bit, so
+    // `prevColorTexture` is not read at all.
+    //
+    // The reading is that frame interpolation is tied to PRESENTATION — its
+    // product is a paced pair of frames on a display, and this harness has no
+    // display. So the assertions below are the wiring ones (it creates, it
+    // accepts our formats and usages, it dispatches, it writes a finite
+    // non-empty frame), and the interpolation quality is REPORTED with the
+    // numbers that show why it is not asserted. That is deliberately not the
+    // same as a passing gate: a green X6 here means the plumbing is ready for a
+    // presentation stage, not that generation works.
+    //
+    // WHAT WOULD CHANGE THE VERDICT: a presented sequence. When macOS gets a
+    // window in this tree, drive this through it and the midpoint claim becomes
+    // available — the code for it is above and the constant it wants is the
+    // one printed here.
+    let d_ab = {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh * 3 {
+            s += f64::from((va[i] - vb[i]).abs());
+        }
+        s / (rw * rh * 3) as f64
+    };
+    let passthrough = d_b < 0.01 * d_ab;
+    eprintln!(
+        "check-metalfx: X6 interpolation {rw}x{rh} — created, dispatched, finite, \
+             non-empty. REPORTED: {d_m:.4e} from the true midpoint vs a 50/50 blend's \
+             {d_blend:.4e}; endpoints A {d_a:.4e} / B {d_b:.4e} against an A-to-B distance \
+             of {d_ab:.4e}{}",
+        if passthrough {
+            " — i.e. the output IS the current frame; interpolation needs a presentation \
+             path, see the block above"
+        } else {
+            " — the output is a genuine in-between frame, so the midpoint claim above is \
+             now assertable: promote it"
+        }
+    );
     Ok(())
 }
 
@@ -24343,6 +25852,254 @@ fn cine_encode(dir: &str, shot: &cinematic::Shot, cine: &cinematic::CineOpts) {
     }
 }
 
+/// macOS reconstruction for the cinematic CPU arm — the Metal analogue of
+/// `gpu::CineUp`.
+///
+/// **A STAGE ON THE CPU ARM, NOT A NEW ARM.** `cinematic::pick_arm` is pure and
+/// gated in `--check`, and the tracer really is still the CPU one; what changes
+/// is only what happens to its frames. So `pick_arm` gains no case and the
+/// label gains a suffix, which is what keeps `--cinematic-dry-run` honest.
+///
+/// The preference ladder is the chain's shape: DENOISED scaler -> plain scaler
+/// -> accumulation (today's behaviour), each degrading loudly. Denoised first
+/// because a 1-spp path-traced frame is exactly what it is for; `--no-upscale`
+/// selects accumulation outright.
+///
+/// **1:1, not an upscale.** MetalFX's supported input-scale range starts at
+/// 1.0, so the reconstructor runs DLAA-shaped at the shot's own resolution —
+/// the same choice `gpu::CineUp` makes on Windows ("100% render scale"). A
+/// capture has no frame budget to buy back, so trading resolution for speed
+/// would be spending the one thing the mode exists to maximise.
+#[cfg(target_os = "macos")]
+enum CineArm {
+    Dn(mtl::mfxdn::MfxDn),
+    Plain(mtl::mfx::Mfx),
+}
+
+#[cfg(target_os = "macos")]
+struct CineRecon {
+    mtl: mtl::device::Mtl,
+    arm: CineArm,
+    g: dlss::GBufs,
+    /// FREE-RUNNING across the whole shot, never restarted per output frame —
+    /// `run_cinematic_gpu`'s contract, and the reason is that restarting it
+    /// would re-walk the same short prefix of the Halton sequence for every
+    /// frame, which is a biased lattice rather than a new one.
+    seq: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl CineRecon {
+    fn wire(rw: usize, rh: usize, upscale: bool) -> Option<CineRecon> {
+        if !upscale {
+            eprintln!("cinematic: --no-upscale — capturing by accumulation");
+            return None;
+        }
+        let mtl = match mtl::device::Mtl::new() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("cinematic: no Metal device ({e}) — capturing by accumulation");
+                return None;
+            }
+        };
+        // FULL `GBufs`: the denoised arm reads all five guide planes, and the
+        // slim variant leaves them zero-length. The plain arm ignores them,
+        // which costs ~24 B/px of stores it does not need — accepted, because
+        // one buffer for both arms is what keeps the two paths comparable on
+        // identical work.
+        let g = dlss::GBufs::new(rw, rh);
+        if mtl::mfxdn::MfxDn::supported(&mtl) {
+            match mtl::mfxdn::MfxDn::new(&mtl, (rw, rh), (rw, rh)) {
+                Ok(d) => {
+                    eprintln!(
+                        "cinematic: MetalFX temporal DENOISED reconstruction at {rw}x{rh} (1:1)"
+                    );
+                    return Some(CineRecon { mtl, arm: CineArm::Dn(d), g, seq: 0 });
+                }
+                Err(e) => eprintln!("cinematic: denoised scaler unavailable ({e}) — trying plain"),
+            }
+        } else if mtl::mfxdn::MfxDn::available() {
+            eprintln!("cinematic: the denoised scaler does not support this device — trying plain");
+        } else {
+            eprintln!(
+                "cinematic: MTLFXTemporalDenoisedScaler is macOS 26.0+ and this system predates \
+                 it — trying the plain scaler"
+            );
+        }
+        if mtl::mfx::Mfx::supported(&mtl) {
+            match mtl::mfx::Mfx::new(&mtl, (rw, rh), (rw, rh)) {
+                Ok(s) => {
+                    eprintln!("cinematic: MetalFX temporal reconstruction at {rw}x{rh} (1:1)");
+                    return Some(CineRecon { mtl, arm: CineArm::Plain(s), g, seq: 0 });
+                }
+                Err(e) => eprintln!("cinematic: plain scaler unavailable ({e})"),
+            }
+        }
+        eprintln!("cinematic: no MetalFX reconstruction — capturing by accumulation");
+        None
+    }
+
+    fn label(&self) -> &'static str {
+        match self.arm {
+            CineArm::Dn(_) => "CPU+MFX-DN",
+            CineArm::Plain(_) => "CPU+MFX",
+        }
+    }
+
+    /// One reconstruction pass over an already-rendered 1-spp frame.
+    fn pass(&self, accum: &[AtomicU32], near: f32, far: f32, jitter: (f32, f32), reset: bool)
+    -> Result<(), String> {
+        match &self.arm {
+            CineArm::Dn(d) => {
+                // The world_to_view here serves ONLY `FR_MFXDN_NORMALS=view`;
+                // the scaler is handed no matrices (see `mtl::mfxdn`).
+                d.stage(&self.mtl, accum, &self.g, near, far, glam::Mat4::IDENTITY);
+                d.dispatch(
+                    &self.mtl,
+                    &mtl::mfxdn::MfxDnParams {
+                        jitter: (
+                            jitter.0 * mtl::mfxdn::JITTER_SIGN,
+                            jitter.1 * mtl::mfxdn::JITTER_SIGN,
+                        ),
+                        reset,
+                    },
+                )
+            }
+            CineArm::Plain(s) => {
+                s.stage(&self.mtl, accum, &self.g, near, far);
+                s.dispatch(
+                    &self.mtl,
+                    &mtl::mfx::MfxParams {
+                        jitter: (
+                            jitter.0 * mtl::mfx::JITTER_SIGN,
+                            jitter.1 * mtl::mfx::JITTER_SIGN,
+                        ),
+                        reset,
+                    },
+                )
+            }
+        }
+    }
+
+    fn read(&self) -> Result<Vec<f32>, String> {
+        match &self.arm {
+            CineArm::Dn(d) => d.read_output(&self.mtl),
+            CineArm::Plain(s) => s.read_output(&self.mtl),
+        }
+    }
+}
+
+/// One reconstructed OUTPUT frame: `shot.samples` fresh 1-spp sub-frames at a
+/// fixed pose, each fed to the temporal reconstructor, and the model's state
+/// read back at the end.
+///
+/// THE SUB-FRAME CONTRACT IS `run_cinematic_gpu`'s, copied rather than
+/// approximated, and each clause earns its place:
+///
+/// * `seq` FREE-RUNS across the whole shot, so the Halton phase never restarts
+///   — restarting it would re-walk one short biased prefix per frame.
+/// * `reset` fires ONLY at `seq == 0`. Every later frame inherits history, which
+///   is what a temporal reconstructor is for.
+/// * OUTPUT FRAME 0 GETS A WARM-UP of `JITTER_PHASE - samples` emitting passes.
+///   Without it frame 0 is reconstructed from under half a jitter phase AND on
+///   a biased lattice, while frame f has `(f+1)*samples` of accumulated
+///   evidence — a discontinuity that shows once per lap in a looping clip. It
+///   is self-limiting (a 256-sample still is already several phases, so the
+///   subtraction saturates) and is deliberately NOT applied to the accumulation
+///   path, where N sub-frames in and one unweighted mean out makes frame 0
+///   statistically identical to frame 5.
+///
+/// STRUCTURE REPLAY IS NOT USED HERE, and that is a real cost stated rather
+/// than hidden: the accumulation path replays sub-frames 1..N-1 because their
+/// pose is bit-identical, and so is this path's — but each sub-frame here needs
+/// its own G-buffer and its own jitter, and `render_frame_replay` re-shades
+/// from a fresh ctx without re-deriving the G-buffer writes the reconstructor
+/// depends on. Wiring replay into this arm is a follow-on, worth roughly the
+/// frustum-query share of a sub-frame.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn cine_reconstruct(
+    r: &mut CineRecon,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    fs: &CineFrame,
+    basis: camera::CamBasis,
+    prev_basis: Option<camera::CamBasis>,
+    sun: Vec3A,
+    q: Quality,
+    opts: &Opts,
+    shot: &cinematic::Shot,
+    f: u32,
+    info: &[AtomicU32],
+    tbuf: &[AtomicU32],
+    stats: &Stats,
+    rw: usize,
+    rh: usize,
+) -> Result<Vec<f32>, String> {
+    let (near, far) = dlss::near_far(scene.diag);
+    let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+    let warm = if f == 0 { dlss::JITTER_PHASE.saturating_sub(shot.samples as u32) } else { 0 };
+    let passes = warm + shot.samples as u32;
+
+    for i in 0..passes {
+        let seq = r.seq;
+        let jitter = dlss::jitter_for(seq);
+        // A fresh 1-spp frame, never accumulated: the reconstructor IS the
+        // integrator here, exactly as it is in an interactive upscaler session.
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame: seq,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info,
+            tbuf,
+            stats,
+            sun,
+            clouds: fs.clouds,
+            fireflies: fs.fireflies,
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(&r.g),
+            fsr_buf: None,
+            // Within an output frame the pose is FIXED, so sub-frames after the
+            // first reproject against themselves and the MV plane is zero —
+            // correct, and what a still frame should hand a temporal model. The
+            // first sub-frame of frame f > 0 carries the real inter-frame
+            // motion.
+            prev_cam: if i == 0 { prev_basis } else { Some(basis) },
+            frame_jitter: Some(jitter),
+            spp: opts.spp,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: true,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: opts.defer_shade,
+        };
+        render::render_frame(&ctx, true);
+        r.pass(&accum, near, far, jitter, seq == 0)?;
+        r.seq += 1;
+    }
+
+    // RGBA -> the RGB layout `cine_write_frame` shares with the accumulation
+    // path, so all three arms reach one tone curve (`cine_write_frame` owns it).
+    let out = r.read()?;
+    let mut hdr = Vec::with_capacity(rw * rh * 3);
+    for p in out.chunks(4).take(rw * rh) {
+        hdr.extend_from_slice(&p[..3]);
+    }
+    Ok(hdr)
+}
+
 /// The CPU arm. Mirrors `run_spin`'s frame construction, with two differences
 /// that define the mode: `accumulate: true` over `shot.samples` sub-frames at a
 /// FIXED pose, and structure replay across those sub-frames.
@@ -24377,14 +26134,61 @@ fn run_cinematic_cpu(
         let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
         let mut present = vec![0u32; rw * rh];
         let replay_cache = replay::ReplayCache::new(rw, rh);
+        // GI shots stay on accumulation whatever else is available: the
+        // hemisphere integrator is a still-frame accumulation contract, and a
+        // reconstructor fed one bounce sample per sub-frame would be
+        // reconstructing from an estimator that never converged. The GPU arm
+        // makes the same exclusion for the same reason.
+        #[cfg(target_os = "macos")]
+        let mut recon = CineRecon::wire(rw, rh, opts.chain != upchain::UpChain::NONE && !shot.gi);
         let frames = shot.kind.frames();
         let mut prev_hour: Option<f32> = None;
+        #[cfg(target_os = "macos")]
+        let mut prev_basis: Option<camera::CamBasis> = None;
         let t_shot = Instant::now();
 
         for f in 0..frames {
             let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
             let basis = fs.cam.basis(rw, rh);
             let sun = render::sun_dir(scene);
+            // THE SHED FALLS THROUGH, IT DOES NOT SKIP. A mid-shot
+            // reconstruction failure drops to accumulation for the REST of the
+            // shot and for THIS FRAME — an `Err` arm that jumped to the next
+            // `f` would leave a hole in the numbered sequence, which is worse
+            // than a noisier frame: `cine_encode` feeds ffmpeg an image2
+            // pattern, whose input stops at the first missing index, so one
+            // failed frame would truncate the whole clip. Hence the flag rather
+            // than the obvious `continue`.
+            #[cfg(target_os = "macos")]
+            let mut reconstructed = false;
+            #[cfg(target_os = "macos")]
+            if let Some(r) = recon.as_mut() {
+                match cine_reconstruct(
+                    r, scene, bvh, &fs, basis, prev_basis, sun, q, opts, shot, f, &info, &tbuf,
+                    &stats, rw, rh,
+                ) {
+                    Ok(hdr) => {
+                        let label = r.label();
+                        cine_write_frame(
+                            &dir, shot, cine, f, &hdr, &info, &mut present, &fs, rw, rh, label,
+                        );
+                        cine_progress(shot, f, frames, t_shot, fs.hour);
+                        prev_basis = Some(basis);
+                        reconstructed = true;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cinematic: reconstruction failed ({e}) — shedding to accumulation \
+                             for this frame and the rest of this shot"
+                        );
+                        recon = None;
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if reconstructed {
+                continue;
+            }
             let mut replay_ready = false;
             for k in 0..shot.samples {
                 // k == 0 traces and records; k > 0 replays that structure.
@@ -26420,6 +28224,10 @@ fn cine_composite_hud(
                                 spp: 1,
                                 preset: 2,
                                 hud: true,
+                                // A Live row reads its value from HERE, and
+                                // Default is 0 ("off") — the shot must show
+                                // the real shipping default, not a lie.
+                                move_ease: camera::MOVE_EASE_S,
                                 ..Default::default()
                             };
                             // Headless capture renders Settings::default() —
@@ -28984,6 +30792,23 @@ fn run_check(
         }
         Err(e) => {
             eprintln!("cli self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Keyboard flight ease — the flycam integrator's pure half. The arm that
+    // matters is EXACT REST: the ramp must reach a bitwise zero on key
+    // release, or the integrator's idle early-out never re-arms and an idle
+    // session re-writes cam.pos forever, silently defeating plain
+    // accumulation / structure replay / every upscaler history. Lives in
+    // camera.rs precisely so it gates off Windows too (flycam is cfg'd).
+    let camera_ok = match camera::self_test() {
+        Ok(()) => {
+            eprintln!("camera self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("camera self-test: FAIL — {e}");
             false
         }
     };
@@ -31673,6 +33498,7 @@ fn run_check(
         ("upchain", upchain_ok),
         ("settings", settings_ok),
         ("cli", cli_ok),
+        ("camera", camera_ok),
         ("qa", qa_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
@@ -32207,6 +34033,77 @@ fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>, dn_fold: 
     }
 }
 
+/// ~30 Hz repaint of the loading page. THE one implementation: the scene-load
+/// loop, the GPU upload's `PumpSubmit`, and the eager-init boundaries in
+/// `session()` all come through here, so the page cannot drift between the
+/// phases of one boot.
+///
+/// Safe to call thousands of times — the throttle is what makes it so. Input
+/// is polled EVERY call (it is cheap, and it is what keeps the window from
+/// being ghosted by Windows); the raster + present are the expensive half and
+/// run at most every `LOAD_TICK_MS`.
+#[cfg(windows)]
+const LOAD_TICK_MS: u128 = 33;
+
+#[cfg(windows)]
+fn load_tick(
+    hud: &mut Option<hud::Hud>,
+    inp: &mut input::Input,
+    gpu: &mut gpu::GpuContext,
+    bg: &CpuPresent,
+    start: Instant,
+    last: &mut Instant,
+    // Repaint even if the throttle has not expired. The eager init's coarse
+    // boundaries are seconds apart and there are only a handful of them —
+    // each is worth a frame.
+    force: bool,
+) {
+    // A long BLAS build / sidecar store can't be interrupted cleanly; the OS
+    // reclaims the device on exit, and a truncated world.fcache is a silent
+    // cache miss by construction.
+    if inp.poll(None).quit {
+        eprintln!("frustracer: quit during load");
+        std::process::exit(0);
+    }
+    if !force && last.elapsed().as_millis() < LOAD_TICK_MS {
+        return;
+    }
+    *last = Instant::now();
+    if let Some(hd) = hud.as_mut() {
+        let snap = progress::snapshot().unwrap_or_default();
+        // A ~1.6 s marquee sweep for the indeterminate phases (world BVH
+        // build) — its whole job is to show liveness there.
+        let marquee = (start.elapsed().as_secs_f32() / 1.6).fract();
+        if let Some(hf) = hd.loading_frame(&snap, marquee) {
+            gpu.hud_stage(hf);
+        }
+    }
+    gpu.set_hud_visible(true);
+    let _ = bg.blit(gpu);
+}
+
+/// `load_tick`'s borrows, bundled so the GPU upload and the tracer
+/// constructors can drive it through `gpu::LoadUi` (which hands the context
+/// back per call — see `PumpSubmit`). Everything is BORROWED, including the
+/// throttle clock: a caller builds one of these for the length of one init
+/// call and gets its `hud`/`inp` back afterwards, with the repaint cadence
+/// carried across.
+#[cfg(windows)]
+struct LoadScreen<'a> {
+    hud: &'a mut Option<hud::Hud>,
+    inp: &'a mut input::Input,
+    bg: &'a CpuPresent,
+    start: Instant,
+    last: &'a mut Instant,
+}
+
+#[cfg(windows)]
+impl gpu::LoadUi for LoadScreen<'_> {
+    fn tick(&mut self, gpu: &mut gpu::GpuContext) {
+        load_tick(self.hud, self.inp, gpu, self.bg, self.start, self.last, false);
+    }
+}
+
 #[cfg(windows)]
 fn run_window(
     req: SceneRequest,
@@ -32384,30 +34281,12 @@ fn run_window(
         // near-opaque scrim covers it. `.blit` composites the staged HUD.
         let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
         let load_start = Instant::now();
-        loop {
-            let edges = inp.poll(None);
-            if edges.quit {
-                // A long BLAS build / sidecar store can't be interrupted
-                // cleanly; the OS reclaims the device on exit, and a truncated
-                // world.fcache is a silent cache miss by construction.
-                eprintln!("frustracer: quit during load");
-                std::process::exit(0);
-            }
-            if worker.is_finished() {
-                break;
-            }
-            if let Some(hd) = hud.as_mut() {
-                let snap = progress::snapshot().unwrap_or_default();
-                // A ~1.6 s marquee sweep for the indeterminate phases (world
-                // BVH build) — its whole job is to show liveness there.
-                let marquee = (load_start.elapsed().as_secs_f32() / 1.6).fract();
-                if let Some(hf) = hd.loading_frame(&snap, marquee) {
-                    gpu.hud_stage(hf);
-                }
-            }
-            gpu.set_hud_visible(true);
-            let _ = load_bg.blit(&mut gpu);
-            std::thread::sleep(Duration::from_millis(33));
+        // `load_tick` already throttles, so the sleep is only here to keep an
+        // idle spin off a core while the worker owns the wall clock.
+        let mut last = Instant::now() - Duration::from_millis(LOAD_TICK_MS as u64);
+        while !worker.is_finished() {
+            load_tick(&mut hud, &mut inp, &mut gpu, &load_bg, load_start, &mut last, false);
+            std::thread::sleep(Duration::from_millis(8));
         }
     }
     let loaded = match worker.join() {
@@ -32438,21 +34317,48 @@ fn run_window(
             }
         }
     }
-    // One more loading frame for the GPU-upload phase: the eager --dxr init
-    // (BC7 encode + BLAS/TLAS build) runs synchronously inside the first
-    // session and blocks ~1 s with no event pump, so freeze this label on
-    // screen across it. The page clears on the session's first HUD frame.
-    progress::phase(progress::Phase::GpuUpload, "", 0);
-    {
-        let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
-        if let Some(hd) = hud.as_mut() {
-            let snap = progress::snapshot().unwrap_or_default();
-            if let Some(hf) = hd.loading_frame(&snap, 0.0) {
-                gpu.hud_stage(hf);
-            }
+    // The GPU upload, with the page LIVE across it. It used to draw one frozen
+    // frame here and let the eager tracer init run inside `session()` with no
+    // event pump at all — thousands of blocking submits behind a marquee
+    // stopped mid-sweep, and a window Windows ghosted as "not responding".
+    //
+    // Hoisting the shared scene core out of the session is what makes it
+    // pumpable: `upload_scene_core` has `&mut GpuContext` free, so it can hand
+    // the whole context to a repaint between submits (`gpu::PumpSubmit`).
+    // `ensure_scene_gpu` then serves the cached Rc and the session's
+    // `init_trace`/`init_dxr` upload nothing.
+    //
+    // Gated on a GPU tracer being ATTEMPTED: under `--cpu` the core would be
+    // gigabytes serving nobody. If the tracer then fails to build,
+    // `evict_unused_scene_gpu` drops it on the same reasoning.
+    if opts.gpu || opts.dxr {
+        progress::stage(0, 0, ""); // the world loader's "7 / 7" row is stale here
+        progress::phase(
+            progress::Phase::GpuUpload,
+            "geometry",
+            gpu::trace::upload_units(&scene, opts.bc7),
+        );
+        let bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
+        let mut last = Instant::now() - Duration::from_millis(LOAD_TICK_MS as u64);
+        let mut ls = LoadScreen {
+            hud: &mut hud,
+            inp: &mut inp,
+            bg: &bg,
+            start: Instant::now(),
+            last: &mut last,
+        };
+        if let Err(e) = gpu.upload_scene_core(&scene, &bvh, opts.bc7, &mut ls) {
+            // Not fatal here: the session's own init will retry through
+            // `ensure_scene_gpu` and own the failure arm (tracer latch + the
+            // CPU-renderer fallback line).
+            eprintln!("gpu scene: eager upload failed ({e}); the session will retry");
         }
-        gpu.set_hud_visible(true);
-        let _ = load_bg.blit(&mut gpu);
+        // The staged work is done, so land the bar on 100% rather than on
+        // whatever `upload_units` guessed — see `progress::finish_phase`. What
+        // follows (shader compile, and on the wavefront arm the tracer's own
+        // tree upload) is unmetered by construction, and the DETAIL row names
+        // it instead.
+        progress::finish_phase();
     }
     // World auto-TOD attractors + audio cues — both need the world layout the
     // load produced, so they move here (from main()) after the join.
@@ -32477,12 +34383,10 @@ fn run_window(
         },
         _ => audio::Cues::None,
     };
-    // Clear the loading page; the session's first hud.frame uploads its removal
-    // as a dirty rect (set_loading forces a full-window repaint of the reveal).
-    if let Some(hd) = hud.as_mut() {
-        hd.set_loading(false);
-    }
-    progress::phase(progress::Phase::Idle, "", 0);
+    // The loading page deliberately STAYS UP into the session: its eager
+    // tracer init (shader compile, denoiser, upscaler wiring) is the rest of
+    // the boot's blocking work, and `session()` keeps the page live across it
+    // and clears it once frames are about to start.
 
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
     // (spawned here, not per session, so the pose survives resize rebuilds —
@@ -32495,6 +34399,7 @@ fn run_window(
         opts.tod.unwrap_or_else(scene::default_tod),
         scene.diag,
         attractors,
+        opts.move_ease,
     );
     // Audio lives here beside the FlyCam for the same reason: a resize
     // re-enters session(), and the loops must keep playing through the
@@ -32707,6 +34612,28 @@ fn session(
     h: usize,
 ) -> SessionEnd {
     let p0: Option<Persist> = *persist;
+    // FIRST ENTRY: the loading page is still up (run_window leaves it live on
+    // purpose), and everything between here and the frame loop — shader
+    // compile, the tracer's own tree upload, denoiser and upscaler wiring —
+    // is seconds of blocking work on this thread. `load_step!` repaints the
+    // page at each coarse boundary and, just as importantly, drains the
+    // window's message queue so Windows never ghosts it. A resize re-entry
+    // has no page and every expansion is inert.
+    let loading = hud.as_ref().is_some_and(|hd| hd.is_loading());
+    let load_bg = loading.then(|| CpuPresent::new(w, h, gpu.encoding(), gpu.tone()));
+    let load_t0 = Instant::now();
+    let mut load_last = Instant::now();
+    // A macro, not a closure: this needs `hud`/`inp`/`gpu` mutably at each
+    // site, and a closure holding all three would conflict with every other
+    // use of them in the init below.
+    macro_rules! load_step {
+        ($detail:expr) => {
+            if let Some(bg) = &load_bg {
+                progress::detail($detail);
+                load_tick(hud, inp, gpu, bg, load_t0, &mut load_last, true);
+            }
+        };
+    }
     // Denoiser/pipeline intents: first entry from the CLI flags, re-entries
     // from the persisted runtime state (the CLI branches below double as the
     // restore path — they rebuild the contexts at the new size).
@@ -33081,7 +35008,17 @@ fn session(
                 if opts.frd_explicit { "frd" } else { "nrd" }
             );
         }
+        load_step!("loading shader compiler");
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+            // Reborrowed, not moved: the page must survive this call for the
+            // rest of the session to keep using `hud`/`inp`.
+            let mut ls = load_bg.as_ref().map(|bg| LoadScreen {
+                hud: &mut *hud,
+                inp: &mut *inp,
+                bg,
+                start: load_t0,
+                last: &mut load_last,
+            });
             gpu.init_trace(
                 &dxc,
                 scene,
@@ -33096,6 +35033,7 @@ fn session(
                     .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
+                ls.as_mut().map(|l| l as &mut dyn gpu::LoadUi),
             )
         }) {
             Ok(()) => {
@@ -33449,7 +35387,16 @@ fn session(
         if compose && opts.lock_scale.is_none() {
             lock_dynamic_note("dxr", (dxw, dxh));
         }
+        load_step!("loading shader compiler");
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+            // Reborrowed, not moved — see the init_trace site.
+            let mut ls = load_bg.as_ref().map(|bg| LoadScreen {
+                hud: &mut *hud,
+                inp: &mut *inp,
+                bg,
+                start: load_t0,
+                last: &mut load_last,
+            });
             gpu.init_dxr(
                 &dxc,
                 scene,
@@ -33464,6 +35411,7 @@ fn session(
                     .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
+                ls.as_mut().map(|l| l as &mut dyn gpu::LoadUi),
             )
         }) {
             Ok(()) => {
@@ -33584,6 +35532,18 @@ fn session(
     // broken. A minimized window reports a 0 dimension and never commits.
     const RESIZE_SETTLE_MS: u128 = 250;
     let mut pending_resize: Option<Instant> = None;
+
+    // Init is done, so the loading page comes down here rather than in
+    // run_window: everything above this line is the rest of the boot's
+    // blocking work, and the page stayed live across it (`load_step!`). The
+    // session's first hud.frame uploads the removal as a dirty rect
+    // (set_loading forces a full-window repaint of the reveal).
+    if loading {
+        if let Some(hd) = hud.as_mut() {
+            hd.set_loading(false);
+        }
+        progress::phase(progress::Phase::Idle, "", 0);
+    }
 
     // Init is done and frames start now, so the integrator may fly again (it
     // spawned paused, and a resize re-entry paused it). Everything above this
@@ -34083,6 +36043,7 @@ fn session(
                 fireflies: fireflies::enabled(),
                 fireflies_count: fireflies::count(),
                 emissive_lights: emissive::enabled(),
+                move_ease: fly.move_ease(),
             };
             if hd.menu_open() && menu_rows_stale {
                 menu_rows_stale = false;
@@ -34139,6 +36100,11 @@ fn session(
                                 settings::MenuFx::CycleSpp => edges.cycle_spp = true,
                                 settings::MenuFx::Quality(n) => edges.quality = Some(n),
                                 settings::MenuFx::SetTod(t) => fly.set_tod(t),
+                                settings::MenuFx::MoveEase(s) => {
+                                    // Input response, not shading or
+                                    // visibility — no reset of any kind.
+                                    fly.set_move_ease(s);
+                                }
                                 settings::MenuFx::ToggleBloom => {
                                     // Display-stage — deliberately NO reset
                                     // (the --no-bloom bit-identity argument).
@@ -34556,6 +36522,8 @@ fn session(
                                         .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
+                                    // Mid-session: no loading page to keep live.
+                                    None,
                                 )
                             });
                             if let Err(e) = built {
@@ -34642,6 +36610,8 @@ fn session(
                                         .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
+                                    // Mid-session: no loading page to keep live.
+                                    None,
                                 )
                             });
                             if let Err(e) = built {
