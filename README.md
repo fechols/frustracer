@@ -876,18 +876,30 @@ and extract to `scenes/intel-sponza/` if you want to reproduce those numbers.
 The manual is over. What follows is the engineering write-up: how it works,
 what was measured, and what was tried and removed.
 
-## The developer's notebook — `CLAUDE.md`
+## The developer's notebook
 
-`CLAUDE.md` at the repository root is the real design document — around 400 KB
-of it, organised by subsystem. It records *why* each decision was made, what
-was measured, and what was tried and thrown away, and it is written for
-whoever, or whatever, edits the code next.
+The real design document records *why* each decision was made, what was
+measured, and what was tried and thrown away, and it is written for whoever, or
+whatever, edits the code next. It lives in three places.
 
-It is too large to browse blind. The useful entry points are `## Commands` (the
-complete flag reference, with the reasoning behind each default), `##
-Correctness invariants (the bug class to guard)` (the rules that must not
-break), and `## Architecture notes` (the module map). Each subsystem then has
-its own section.
+`CLAUDE.md` at the repository root is the **working contract** — about 20 KB,
+and the only part loaded automatically. It carries what an editor must not get
+wrong: the soundness counters that must read exactly zero, the one-sky rule, the
+discipline every new feature follows, and an index of the ~220 flags.
+
+`docs/history/` is the **campaign archive** — about 900 KB across 15 files, one
+per subsystem, from `denoisers.md` through `vulkan-backend.md`. This is the
+measurement record: what each number was, on which hardware, and which bug the
+gate was written to catch. `docs/history/README.md` indexes it.
+
+`CLAUDE_Historical.md` is the notebook those files were extracted from, now a
+~336 KB index. Its `## Commands` block lists every flag with a pointer to the
+file holding its story, and it still carries the cross-cutting sections —
+`## Correctness invariants (the bug class to guard)` (the rules that must not
+break) and `## Architecture notes` (the module map).
+
+It was one 1.33 MB file until 2026-08-12. The split was mechanical and
+byte-exact: reassembling the pieces reproduces the original file's checksum.
 
 ## Why a BVH for the scene?
 
