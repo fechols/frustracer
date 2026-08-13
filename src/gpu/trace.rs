@@ -1186,19 +1186,20 @@ impl SwTreesGpu {
             + bvh.tri_idx.len() * 4
             + ft.map_or(0, |f| f.quantized_bytes());
         let ring = d3d12::UploadBuffer::new(device, STAGE_CHUNK.min(bytes.max(4096)))?;
+        let mut batch = Batch::new(&ring);
         let bvh_nodes = stream_buffer(
             device,
             sub,
-            &ring,
+            &mut batch,
             &bvh.nodes,
             crate::gfx::scene::gpu_bvh_node,
             srv,
         )?;
-        let tri_idx = stream_buffer(device, sub, &ring, &bvh.tri_idx, |t| *t, srv)?;
+        let tri_idx = stream_buffer(device, sub, &mut batch, &bvh.tri_idx, |t| *t, srv)?;
         let ftree_nodes = match ft {
             Some(f) => {
                 let qn = f.quantized();
-                Some(stream_buffer(device, sub, &ring, &qn, |n| *n, srv)?)
+                Some(stream_buffer(device, sub, &mut batch, &qn, |n| *n, srv)?)
             }
             None => None,
         };
@@ -1207,10 +1208,13 @@ impl SwTreesGpu {
         let ft_bnode = match ft {
             Some(f) if sw_rays_leaf() => {
                 let flat = f.bnode_flat();
-                Some(stream_buffer(device, sub, &ring, &flat, |t| *t, srv)?)
+                Some(stream_buffer(device, sub, &mut batch, &flat, |t| *t, srv)?)
             }
             _ => None,
         };
+        // Nothing below reads these buffers, but the caller will — the trees
+        // must be resident before `TraceGpu::new` binds them.
+        batch.flush(sub)?;
         let bnode_bytes = ft_bnode.as_ref().map_or(0, |_| ft.map_or(0, |f| f.nodes.len() * 32));
         eprintln!(
             "gpu sw-trees: {} MB (binary bvh + tri idx{}{})",
@@ -1229,21 +1233,232 @@ impl SwTreesGpu {
     }
 }
 
-/// Stream `src` into a new default-heap buffer through `ring`, `map`ping each
-/// element into the mapped staging pointer chunk-by-chunk (identity for
-/// layout-compatible streams, a repack for Vec3A→float3 / BvhNode→GpuBvhNode).
-/// Each chunk is one blocking `Submit::run_list`; the final chunk's list also
-/// records the COPY_DEST→`after` transition. Empty streams get a 4-byte dummy
-/// created directly in `after`.
+/// Ring bytes staged before a flush is forced. Deliberately well under the
+/// 256 MiB ring: it trades a little throughput for a flush every ~20-40 ms,
+/// and a flush is the loading page's only chance to repaint (each one is a
+/// `gpu::PumpSubmit` tick) as well as the bound on any single blocking span.
+const BATCH_BYTES: usize = 32 << 20;
+
+/// Every ring reservation is 512-aligned. `CopyTextureRegion`'s buffer
+/// footprint requires `D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT` (512) and a
+/// root SRV — the BC7 encoder's source — requires 16; one rule covers both,
+/// and the waste is bounded by 512 B per staged chunk.
+const RING_ALIGN: usize = 512;
+
+/// The staging ring's write cursor plus the copies that read it, so ONE
+/// blocking submit can carry many chunks instead of one.
+///
+/// `Submit::run_list` records, executes and BLOCKS — `D3d::run_once` drains
+/// the queue before it borrows slot 0's allocator AND again after, so every
+/// call is up to two `WaitForSingleObject(INFINITE)` on the calling thread.
+/// The upload used to make one such call per ring chunk and per (texture,
+/// mip) band: ~3500 on a 313-texture world, i.e. ~7000 blocking waits, which
+/// is most of the boot's "not responding" window. The Vulkan backend already
+/// rejects that shape for the same reason (`vk::stage`: one submit per ring
+/// fill, "not one per (texture, mip)").
+///
+/// THE INVARIANT IS UNCHANGED, only where it is enforced. Staged bytes must
+/// not be overwritten before the GPU has read them; today the blocking wait
+/// after every single chunk is what guarantees it. Here the cursor hands out
+/// increasing offsets and the ring is rewound ONLY at a flush, which waits —
+/// so the guarantee is per RING FILL rather than per chunk.
+///
+/// Flush boundaries are a pure function of the scene's sizes — never a clock
+/// — so the submit structure is deterministic and the uploaded bytes, and
+/// every buffer built from them, are identical to the unbatched path.
+///
+/// CALLER RULE: anything that submits or reads back OUTSIDE the batch (the
+/// FR_SPLIT_AUDIT readbacks, the acceleration-structure builds) must `flush`
+/// first — pending copies have not reached the GPU yet, and a readback that
+/// jumped the queue would see stale bytes.
+struct Batch<'a> {
+    ring: &'a d3d12::UploadBuffer,
+    /// Next free ring byte. Rewound to 0 by `flush`.
+    cursor: usize,
+    /// Copies recorded against the bytes staged so far, replayed into one
+    /// command list at the flush. Closures rather than an op enum on purpose:
+    /// the recording code stays verbatim where it was, so there is no
+    /// parameter list to transcribe into a descriptor and back out again.
+    ops: Vec<Box<dyn FnMut(&ID3D12GraphicsCommandList) -> Result<()> + 'a>>,
+    /// Bytes staged since the last flush — the flush budget.
+    staged: usize,
+    /// Bytes staged in total, and how many whole MiB of that the progress bar
+    /// has been told about. Ticking the difference keeps the remainder from
+    /// drifting over thousands of sub-MiB chunks.
+    total: u64,
+    ticked: u64,
+    /// `enc_ms`'s accounting. A flush carrying encode work attributes its wall
+    /// time to the BC7 encode — the old per-band submit timing, now per batch.
+    /// A batch mixing arms over-attributes; the line is a diagnostic.
+    enc_dirty: bool,
+    enc_ms: f64,
+}
+
+impl<'a> Batch<'a> {
+    fn new(ring: &'a d3d12::UploadBuffer) -> Self {
+        Self {
+            ring,
+            cursor: 0,
+            ops: Vec::new(),
+            staged: 0,
+            total: 0,
+            ticked: 0,
+            enc_dirty: false,
+            enc_ms: 0.0,
+        }
+    }
+
+    /// The ring, borrowed for `'a` rather than for `self` — so a staged write
+    /// or a recorded op can name it while the batch itself is borrowed.
+    fn ring(&self) -> &'a d3d12::UploadBuffer {
+        self.ring
+    }
+
+    /// The largest chunk worth staging in one go: the flush budget, or the
+    /// whole ring when that is smaller (a tiny scene sizes the ring down).
+    fn chunk_cap(&self) -> usize {
+        BATCH_BYTES.min(self.ring.size)
+    }
+
+    /// Reserve `bytes` of ring space and return its offset, flushing first if
+    /// they do not fit or the budget is spent.
+    fn reserve(&mut self, bytes: usize, sub: &mut dyn d3d12::Submit) -> Result<usize> {
+        debug_assert!(bytes <= self.ring.size, "batch: chunk over ring capacity");
+        let off = self.cursor.next_multiple_of(RING_ALIGN);
+        if off + bytes > self.ring.size || self.staged >= BATCH_BYTES {
+            self.flush(sub)?;
+        }
+        let off = self.cursor.next_multiple_of(RING_ALIGN);
+        self.cursor = off + bytes;
+        self.staged += bytes;
+        self.total += bytes as u64;
+        Ok(off)
+    }
+
+    fn push(&mut self, op: impl FnMut(&ID3D12GraphicsCommandList) -> Result<()> + 'a) {
+        self.ops.push(Box::new(op));
+    }
+
+    /// Mark the pending batch as carrying BC7 encode work (see `enc_dirty`).
+    fn mark_enc(&mut self) {
+        self.enc_dirty = true;
+    }
+
+    /// Execute everything staged so far and rewind the ring. A no-op when
+    /// nothing is pending, so it is safe to call defensively.
+    fn flush(&mut self, sub: &mut dyn d3d12::Submit) -> Result<()> {
+        if self.ops.is_empty() {
+            self.cursor = 0;
+            self.staged = 0;
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        {
+            let ops = &mut self.ops;
+            sub.run_list(&mut |l| {
+                for op in ops.iter_mut() {
+                    op(l)?;
+                }
+                Ok(())
+            })?;
+        }
+        if self.enc_dirty {
+            self.enc_ms += t0.elapsed().as_secs_f64() * 1e3;
+            self.enc_dirty = false;
+        }
+        self.ops.clear();
+        self.cursor = 0;
+        self.staged = 0;
+        let mib = self.total >> 20;
+        crate::progress::tick_n((mib - self.ticked) as u32);
+        self.ticked = mib;
+        Ok(())
+    }
+}
+
+/// Chunk BLAS builds (and compaction copies) per blocking submit.
+///
+/// They used to go in ONE list each: on a several-hundred-chunk world that is
+/// a ~1 s serialized GPU chain behind a single `INFINITE` wait, and nothing
+/// can present during one submit (there is one queue), so the loading bar
+/// necessarily stalled there. Batching gives ~14 pump points on THE WORLD.
+///
+/// The built structures are UNCHANGED: a submit boundary is a strictly
+/// stronger barrier than the shared-scratch UAV barrier it replaces between
+/// two chunks, and every batch keeps that barrier internally.
+const AS_BATCH: usize = 64;
+
+/// Triangles per progress unit for the acceleration-structure build — its
+/// cost tracks TRIANGLES, not staged bytes, and `upload_units` reserves the
+/// matching share of the bar. Doubled at the tick sites because two passes
+/// (build, then compact + TLAS) each walk every chunk.
+const AS_TRIS_PER_UNIT: u64 = 50_000;
+
+/// Publish the acceleration-structure share of the upload bar. `done` is the
+/// caller's running triangle count and `ticked` the units already published,
+/// so the sub-unit remainder never drifts across batches.
+fn as_tick(done: u64, ticked: &mut u64) {
+    let u = done / (2 * AS_TRIS_PER_UNIT);
+    crate::progress::tick_n((u - *ticked) as u32);
+    *ticked = u;
+}
+
+/// The GPU upload's progress unit total, in MiB of staged work plus a time
+/// weight for the acceleration-structure build. Published by the interactive
+/// boot before `upload_scene_core` so the loading bar has a denominator; the
+/// batch ticks against it as it flushes.
+///
+/// It is a TIME estimate wearing byte units, not an accounting identity — the
+/// bar only has to advance smoothly, `fraction()` clamps any overshoot, and
+/// the caller lands it on exactly 100% at the end (`progress::finish_phase`)
+/// rather than trusting the arithmetic. Arms it cannot see from here — the
+/// wavefront's own software-tree upload, which happens later inside
+/// `TraceGpu::new` — therefore just top the bar out early, which is why that
+/// endpoint call exists.
+pub fn upload_units(scene: &Scene, bc7_mode: bc7::Bc7Mode) -> u32 {
+    let mut bytes = scene_stream_bytes(scene) as u64;
+    // `--blas-split` (the default) re-streams the whole index set twice more:
+    // `blas_indices` at 12 B/tri and `blas_tri` at 4 B/tri. On THE WORLD that
+    // is 527 MiB — MEASURED as exactly the gap between this estimate and the
+    // bar's real end (7767 predicted vs 8294 ticked) before it was counted.
+    if crate::blas_split::max_prims().is_some() {
+        bytes += scene.indices.len() as u64 * 16;
+    }
+    for t in &scene.textures {
+        let cpu_blk = matches!(bc7_mode, bc7::Bc7Mode::Cpu(_)) && bc7::should_compress(t);
+        for (w, h) in std::iter::once((t.w, t.h)).chain(t.mips.iter().map(|m| (m.w, m.h))) {
+            // Mirrors the texture loop's per-arm staging: encoded block rows
+            // on the CPU arm, aligned source texel rows on the other two.
+            bytes += if cpu_blk {
+                d3d12::block_pitch(w) as u64 * bc7::blocks(h) as u64
+            } else {
+                d3d12::aligned_pitch(w as usize * 4) as u64 * h as u64
+            };
+        }
+    }
+    // The AS build moves no staged bytes but costs real seconds, and its cost
+    // tracks TRIANGLES. ~20 MiB-equivalents per million triangles puts a
+    // 34M-triangle world's ~1 s build at roughly the same share of the bar as
+    // the second or so its texture set takes.
+    let as_units = (scene.indices.len() as u64 / AS_TRIS_PER_UNIT) << 20;
+    ((bytes + as_units) >> 20).clamp(1, u32::MAX as u64) as u32
+}
+
+/// Stream `src` into a new default-heap buffer through the batch's ring,
+/// `map`ping each element into the mapped staging pointer chunk-by-chunk
+/// (identity for layout-compatible streams, a repack for Vec3A→float3 /
+/// BvhNode→GpuBvhNode). Chunks accumulate into the batch — see `Batch` for why
+/// that is sound — and the final chunk's op also records the COPY_DEST→`after`
+/// transition. Empty streams get a 4-byte dummy created directly in `after`.
 ///
 /// CONTRACT: `map` is called exactly ONCE per element, in `src` order — the
 /// `blas_indices` stream's chunk cursor (SceneGpu::new_uploaded) depends on
 /// it. Parallelizing the map or retrying a ring chunk would silently desync
 /// that cursor into wrong BLAS geometry.
-fn stream_buffer<T: Copy, U: Copy>(
+fn stream_buffer<'a, T: Copy, U: Copy>(
     device: &ID3D12Device,
     sub: &mut dyn d3d12::Submit,
-    ring: &d3d12::UploadBuffer,
+    batch: &mut Batch<'a>,
     src: &[T],
     map: impl Fn(&T) -> U,
     after: D3D12_RESOURCE_STATES,
@@ -1251,6 +1466,7 @@ fn stream_buffer<T: Copy, U: Copy>(
     if src.is_empty() {
         return committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, after);
     }
+    let ring = batch.ring();
     let total = std::mem::size_of::<U>() * src.len();
     let dst = committed_buffer(
         device,
@@ -1258,28 +1474,42 @@ fn stream_buffer<T: Copy, U: Copy>(
         D3D12_RESOURCE_FLAG_NONE,
         D3D12_RESOURCE_STATE_COPY_DEST,
     )?;
-    let per = (ring.size / std::mem::size_of::<U>()).max(1);
+    // Chunk to the batch budget rather than the whole ring: several chunks
+    // then ride one submit, and a chunk is small enough that the flush cadence
+    // stays repaint-shaped. `.max(1)` is the pre-batch behaviour for the
+    // degenerate case of one element larger than the cap.
+    let per = (batch.chunk_cap() / std::mem::size_of::<U>()).max(1);
     let mut e = 0usize;
     while e < src.len() {
         let n = per.min(src.len() - e);
+        let bytes = n * std::mem::size_of::<U>();
+        // Reserve BEFORE the map: a flush here rewinds the ring, so the write
+        // must land at the offset that survives it.
+        let stage = batch.reserve(bytes, sub)?;
         unsafe {
-            let out = std::slice::from_raw_parts_mut(ring.ptr as *mut U, n);
+            let out = std::slice::from_raw_parts_mut(ring.ptr.add(stage) as *mut U, n);
             for (o, s) in out.iter_mut().zip(&src[e..e + n]) {
                 *o = map(s);
             }
         }
         let off = (e * std::mem::size_of::<U>()) as u64;
-        let bytes = (n * std::mem::size_of::<U>()) as u64;
         let last = e + n == src.len();
-        sub.run_list(&mut |l| {
-            unsafe { l.CopyBufferRegion(&dst, off, &ring.resource, 0, bytes) };
+        let dst_op = dst.clone();
+        batch.push(move |l| {
+            unsafe {
+                l.CopyBufferRegion(&dst_op, off, &ring.resource, stage as u64, bytes as u64)
+            };
             if last {
                 unsafe {
-                    l.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_DEST, after)])
+                    l.ResourceBarrier(&[transition(
+                        &dst_op,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        after,
+                    )])
                 };
             }
             Ok(())
-        })?;
+        });
         e += n;
     }
     Ok(dst)
@@ -1479,36 +1709,42 @@ impl SceneGpu {
                 .min(scene_stream_bytes(scene).max(4096))
                 .max(max_tex_pitch),
         )?;
+        let mut batch = Batch::new(&ring);
+        // The batch's borrow of the ring, named separately so a `move` op
+        // closure captures the (Copy) REFERENCE rather than the buffer — and
+        // so the owned `ring` binding survives to be dropped early, before
+        // the acceleration-structure build asks for its own hundreds of MB.
+        let ring_ref = batch.ring();
 
         let positions_b = stream_buffer(
             device,
             sub,
-            &ring,
+            &mut batch,
             &scene.positions,
             |p| [p.x, p.y, p.z],
             srv,
         )?;
         let normals_b =
-            stream_buffer(device, sub, &ring, &scene.normals, |n| [n.x, n.y, n.z], srv)?;
+            stream_buffer(device, sub, &mut batch, &scene.normals, |n| [n.x, n.y, n.z], srv)?;
         // [u32;3] tris flatten to the u32 index stream by layout.
-        let indices_b = stream_buffer(device, sub, &ring, &scene.indices, |t| *t, srv)?;
-        let tri_mat = stream_buffer(device, sub, &ring, &scene.tri_mat, |t| *t, srv)?;
+        let indices_b = stream_buffer(device, sub, &mut batch, &scene.indices, |t| *t, srv)?;
+        let tri_mat = stream_buffer(device, sub, &mut batch, &scene.tri_mat, |t| *t, srv)?;
         let texcoords_b = stream_buffer(
             device,
             sub,
-            &ring,
+            &mut batch,
             &scene.texcoords,
             |t| [t.x, t.y],
             srv,
         )?;
         let materials = crate::gfx::scene::gpu_materials(scene);
-        let materials_b = stream_buffer(device, sub, &ring, &materials, |m| *m, srv)?;
+        let materials_b = stream_buffer(device, sub, &mut batch, &materials, |m| *m, srv)?;
         let mat_cutout = crate::gfx::scene::mat_cutout(scene);
-        let mat_cutout_b = stream_buffer(device, sub, &ring, &mat_cutout, |m| *m, srv)?;
+        let mat_cutout_b = stream_buffer(device, sub, &mut batch, &mat_cutout, |m| *m, srv)?;
         let mat_height = crate::gfx::scene::mat_height(scene);
-        let mat_height_b = stream_buffer(device, sub, &ring, &mat_height, |m| *m, srv)?;
+        let mat_height_b = stream_buffer(device, sub, &mut batch, &mat_height, |m| *m, srv)?;
         let mat_shadow = crate::gfx::scene::mat_shadow(scene);
-        let mat_shadow_b = stream_buffer(device, sub, &ring, &mat_shadow, |m| *m, srv)?;
+        let mat_shadow_b = stream_buffer(device, sub, &mut batch, &mat_shadow, |m| *m, srv)?;
         // BC7 (ON BY DEFAULT — --no-bc7 kills): block-compress the OPAQUE
         // 4-aligned textures on upload (8 bpp vs 32 — Intel Sponza's set is
         // 4.6 GB of VRAM as RGBA8). Alpha-masked cutout textures are EXCLUDED
@@ -1577,7 +1813,10 @@ impl SceneGpu {
         // RGBA8, never an implicit CPU-encode stall (the default-on contract;
         // --check-gpu's bc7-gpu gate turns the same failure into a suite
         // FAIL so it can't rot silently).
-        let mut gpu_enc: Option<super::bc7gpu::Bc7Enc> = None;
+        // `Rc` because a band's recorded op now outlives the band: the ops
+        // ride the batch until its flush, so each holds the encoder (and
+        // therefore its block buffer) alive until the work it names has run.
+        let mut gpu_enc: Option<std::rc::Rc<super::bc7gpu::Bc7Enc>> = None;
         if let bc7::Bc7Mode::Gpu(_) = bc7_mode {
             if compress.iter().any(|&c| c) {
                 let block_cap = scene
@@ -1593,7 +1832,7 @@ impl SceneGpu {
                     .max()
                     .unwrap_or(0);
                 match super::bc7gpu::Bc7Enc::new(device, block_cap) {
-                    Ok(e) => gpu_enc = Some(e),
+                    Ok(e) => gpu_enc = Some(std::rc::Rc::new(e)),
                     Err(e) => {
                         eprintln!(
                             "bc7: GPU encoder unavailable ({e}) — textures upload UNCOMPRESSED \
@@ -1619,12 +1858,16 @@ impl SceneGpu {
         // rows, dropped as we go so steady-state RAM is unchanged.
         //
         // The band-loop arm per (texture, mip): what one ring "unit" is.
+        #[derive(Clone, Copy)]
         enum TexArm {
             Rgba,   // unit = 1 texel row, straight CopyTextureRegion
             CpuBlk, // unit = 1 ENCODED block row, straight CopyTextureRegion
             GpuEnc, // unit = 4 SOURCE texel rows, dispatch + copy-out
         }
         let mut textures_v = Vec::new();
+        if !scene.textures.is_empty() {
+            crate::progress::detail(if bc7_mode.armed() { "textures (BC7)" } else { "textures" });
+        }
         for (i, t) in scene.textures.iter().enumerate() {
             let fmt = if compress[i] {
                 bc7::dxgi_format(t)
@@ -1673,10 +1916,18 @@ impl SceneGpu {
                     }
                     TexArm::Rgba => (row_pitch, mh as usize, 1),
                 };
-                let band = (ring.size / pitch).max(1).min(rows_total);
+                // Bands are cut to the BATCH budget, not the whole ring: a
+                // 4K mip 0 stages ~64 MB, which as one band would be a single
+                // blocking span twice the budget. Splitting it changes only
+                // how many `CopyTextureRegion`s cover the subresource — the
+                // loop already supported multiple bands, and `h_tex` below
+                // still reaches `mh` exactly on the last one.
+                let band = (batch.chunk_cap() / pitch).max(1).min(rows_total);
                 let mut r0 = 0usize;
                 while r0 < rows_total {
                     let rows = band.min(rows_total - r0);
+                    let stage = batch.reserve(rows * pitch, sub)?;
+                    let base = unsafe { ring_ref.ptr.add(stage) };
                     for r in 0..rows {
                         match arm {
                             TexArm::CpuBlk => {
@@ -1686,7 +1937,7 @@ impl SceneGpu {
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
                                         src.as_ptr(),
-                                        ring.ptr.add(r * pitch),
+                                        base.add(r * pitch),
                                         src_pitch,
                                     )
                                 };
@@ -1705,7 +1956,7 @@ impl SceneGpu {
                                     unsafe {
                                         std::ptr::copy_nonoverlapping(
                                             row.as_flattened().as_ptr(),
-                                            ring.ptr.add(r * pitch + k * row_pitch),
+                                            base.add(r * pitch + k * row_pitch),
                                             mw as usize * 4,
                                         )
                                     };
@@ -1717,7 +1968,7 @@ impl SceneGpu {
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
                                         row.as_flattened().as_ptr(),
-                                        ring.ptr.add(r * pitch),
+                                        base.add(r * pitch),
                                         mw as usize * 4,
                                     )
                                 };
@@ -1733,35 +1984,54 @@ impl SceneGpu {
                     let y0 = r0 * row_h;
                     let h_tex = (rows * row_h).min(mh as usize - y0) as u32;
                     let last = mip + 1 == n_mips && r0 + rows == rows_total;
-                    let t_enc = matches!(arm, TexArm::GpuEnc).then(std::time::Instant::now);
-                    sub.run_list(&mut |l| {
+                    if matches!(arm, TexArm::GpuEnc) {
+                        batch.mark_enc();
+                    }
+                    // Every band's op names its OWN ring slice (`stage`), which
+                    // is what lets several ride one list. Consecutive GpuEnc
+                    // pairs still share the one block buffer, and are ordered
+                    // by `record_copy_out`'s own UAV↔COPY_SOURCE transitions.
+                    let dst_op = dst.clone();
+                    let enc_op = gpu_enc.clone();
+                    batch.push(move |l| {
                         match arm {
                             TexArm::GpuEnc => {
-                                let enc = gpu_enc.as_ref().expect("GpuEnc arm without encoder");
+                                let enc = enc_op.as_ref().expect("GpuEnc arm without encoder");
                                 // h_tex is exactly the texel rows staged above.
                                 enc.record_encode(
                                     l,
-                                    &ring.resource,
+                                    &ring_ref.resource,
+                                    stage as u64,
                                     mw,
                                     h_tex,
                                     row_pitch as u32,
                                     rows as u32,
                                     gpu_effort,
                                 );
-                                enc.record_copy_out(l, &dst, mip as u32, y0 as u32, fmt, mw, h_tex);
+                                enc.record_copy_out(
+                                    l,
+                                    &dst_op,
+                                    mip as u32,
+                                    y0 as u32,
+                                    fmt,
+                                    mw,
+                                    h_tex,
+                                );
                             }
                             TexArm::CpuBlk | TexArm::Rgba => {
                                 let fp = match arm {
-                                    TexArm::CpuBlk => d3d12::footprint_block(fmt, mw, h_tex, 0),
-                                    _ => d3d12::footprint(fmt, mw, h_tex, 4, 0),
+                                    TexArm::CpuBlk => {
+                                        d3d12::footprint_block(fmt, mw, h_tex, stage as u64)
+                                    }
+                                    _ => d3d12::footprint(fmt, mw, h_tex, 4, stage as u64),
                                 };
                                 unsafe {
                                     l.CopyTextureRegion(
-                                        &d3d12::loc_subresource_mip(&dst, mip as u32),
+                                        &d3d12::loc_subresource_mip(&dst_op, mip as u32),
                                         0,
                                         y0 as u32,
                                         0,
-                                        &d3d12::loc_footprint(&ring.resource, fp),
+                                        &d3d12::loc_footprint(&ring_ref.resource, fp),
                                         None,
                                     )
                                 };
@@ -1770,17 +2040,14 @@ impl SceneGpu {
                         if last {
                             unsafe {
                                 l.ResourceBarrier(&[transition(
-                                    &dst,
+                                    &dst_op,
                                     D3D12_RESOURCE_STATE_COPY_DEST,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                 )])
                             };
                         }
                         Ok(())
-                    })?;
-                    if let Some(t0) = t_enc {
-                        enc_ms += t0.elapsed().as_secs_f64() * 1e3;
-                    }
+                    });
                     r0 += rows;
                 }
             }
@@ -1789,6 +2056,11 @@ impl SceneGpu {
             bc7_blocks[i] = None;
             textures_v.push(dst);
         }
+        // Every texture band has to have RUN before the encoder goes: the ops
+        // hold `Rc`s to it, and the loud line below reports the encode time
+        // the flushes measured.
+        batch.flush(sub)?;
+        enc_ms += batch.enc_ms;
         drop(gpu_enc);
 
         if !scene.textures.is_empty() {
@@ -2003,7 +2275,7 @@ impl SceneGpu {
             let aux_positions = if wins.aux.is_empty() {
                 None
             } else {
-                Some(stream_buffer(device, sub, &ring, &wins.aux, |v| *v, srv)?)
+                Some(stream_buffer(device, sub, &mut batch, &wins.aux, |v| *v, srv)?)
             };
             // The reordered index stream, mapped straight out of the plan — no
             // transient CPU copy of the whole buffer (12 B/tri would be 1 GB on
@@ -2013,7 +2285,7 @@ impl SceneGpu {
             let blas_indices = stream_buffer(
                 device,
                 sub,
-                &ring,
+                &mut batch,
                 &plan.packed_tris,
                 |&t| {
                     let (idx, mut c) = cursor.get();
@@ -2025,8 +2297,13 @@ impl SceneGpu {
                 },
                 srv,
             )?;
-            let blas_tri_b = stream_buffer(device, sub, &ring, &plan.packed_tris, |t| *t, srv)?;
-            let chunk_base_b = stream_buffer(device, sub, &ring, &plan.chunk_base, |b| *b, srv)?;
+            let blas_tri_b = stream_buffer(device, sub, &mut batch, &plan.packed_tris, |t| *t, srv)?;
+            let chunk_base_b = stream_buffer(device, sub, &mut batch, &plan.chunk_base, |b| *b, srv)?;
+            // Everything below submits or reads back OUTSIDE the batch (the
+            // audit's readbacks, then the acceleration-structure builds), so
+            // the staged copies have to reach the GPU first — see `Batch`.
+            batch.flush(sub)?;
+            crate::progress::detail("acceleration structures");
             // FR_SPLIT_AUDIT=1 — one-shot diagnostic (the bistro-dusk shard
             // hunt): read the two remap buffers straight back and memcmp
             // against the CPU plan, so "the GPU sees wrong remap DATA" can be
@@ -2098,6 +2375,9 @@ impl SceneGpu {
                     None => String::new(),
                 }
             );
+            // The batch is finished (flushed before the builds above); drop
+            // it so the 256 MB staging ring can go before this returns.
+            drop(batch);
             drop(ring);
             return Ok(Self {
                 positions: positions_b,
@@ -2124,6 +2404,11 @@ impl SceneGpu {
                 n_mats: scene.materials.len() as u32,
             });
         }
+
+        // The `--no-blas-split` arm's own out-of-batch boundary (the split arm
+        // above flushed before its builds and returned).
+        batch.flush(sub)?;
+        crate::progress::detail("acceleration structures");
 
         let geom = geometry_desc(
             &positions_b,
@@ -2299,6 +2584,7 @@ impl SceneGpu {
         drop(instance);
         drop(scratch);
         drop(blas_full);
+        drop(batch);
         drop(ring);
 
         eprintln!(
@@ -2883,46 +3169,60 @@ fn build_split_blas(
     )?;
     let csize_rb = d3d12::ReadbackBuffer::new(device, n * 8)?;
     let csize_va = unsafe { csize_buf.GetGPUVirtualAddress() };
-    sub.run_list(&mut |list| {
-        let list4: ID3D12GraphicsCommandList4 =
-            list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
-        for (i, g) in geoms.iter().enumerate() {
-            let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-                DestAccelerationStructureData: build_va + build_off[i],
-                Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-                    Flags: flags,
-                    NumDescs: 1,
-                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                        pGeometryDescs: g,
+    let mut as_done = 0u64;
+    let mut as_ticked = 0u64;
+    for lo in (0..n).step_by(AS_BATCH) {
+        let hi = (lo + AS_BATCH).min(n);
+        let last = hi == n;
+        sub.run_list(&mut |list| {
+            let list4: ID3D12GraphicsCommandList4 =
+                list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+            for (i, g) in geoms.iter().enumerate().take(hi).skip(lo) {
+                let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                    DestAccelerationStructureData: build_va + build_off[i],
+                    Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                        Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                        Flags: flags,
+                        NumDescs: 1,
+                        DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                        Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                            pGeometryDescs: g,
+                        },
                     },
-                },
-                SourceAccelerationStructureData: 0,
-                ScratchAccelerationStructureData: scratch_va,
-            };
-            let postbuild = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
-                DestBuffer: csize_va + (i * 8) as u64,
-                InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
-            };
-            unsafe { list4.BuildRaytracingAccelerationStructure(&desc, Some(&[postbuild])) };
-            // The scratch buffer is shared, so consecutive builds MUST NOT
-            // overlap — this barrier is the serialization, not an optimization
-            // to remove. (The bistro-dusk shard hunt proved this sync SOUND on
-            // RDNA4 by fencing every build individually and measuring no
-            // change — the shards were the index-value defect, not a race.)
-            unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
-        }
-        unsafe {
-            list.ResourceBarrier(&[transition(
-                &csize_buf,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )])
-        };
-        unsafe { list.CopyBufferRegion(&csize_rb.resource, 0, &csize_buf, 0, (n * 8) as u64) };
-        Ok(())
-    })?;
+                    SourceAccelerationStructureData: 0,
+                    ScratchAccelerationStructureData: scratch_va,
+                };
+                let postbuild = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                    DestBuffer: csize_va + (i * 8) as u64,
+                    InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+                };
+                unsafe { list4.BuildRaytracingAccelerationStructure(&desc, Some(&[postbuild])) };
+                // The scratch buffer is shared, so consecutive builds MUST NOT
+                // overlap — this barrier is the serialization, not an optimization
+                // to remove. (The bistro-dusk shard hunt proved this sync SOUND on
+                // RDNA4 by fencing every build individually and measuring no
+                // change — the shards were the index-value defect, not a race.)
+                unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+            }
+            // The postbuild sizes are read back once, after the LAST batch has
+            // written its slots.
+            if last {
+                unsafe {
+                    list.ResourceBarrier(&[transition(
+                        &csize_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )])
+                };
+                unsafe {
+                    list.CopyBufferRegion(&csize_rb.resource, 0, &csize_buf, 0, (n * 8) as u64)
+                };
+            }
+            Ok(())
+        })?;
+        as_done += (lo..hi).map(|i| plan.tris(i).len() as u64).sum::<u64>();
+        as_tick(as_done, &mut as_ticked);
+    }
 
     let csizes: Vec<u64> = {
         let mut ptr = std::ptr::null_mut();
@@ -2990,42 +3290,54 @@ fn build_split_blas(
     let instances_va = unsafe { instances.resource.GetGPUVirtualAddress() };
 
     // Submit 2: compact every chunk into the exact-size arena, then build the
-    // TLAS against the COMPACTED addresses.
-    sub.run_list(&mut |list| {
-        let list4: ID3D12GraphicsCommandList4 =
-            list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
-        for i in 0..n {
-            unsafe {
-                list4.CopyRaytracingAccelerationStructure(
-                    arena_va + final_off[i],
-                    build_va + build_off[i],
-                    if compact[i] {
-                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT
-                    } else {
-                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE
+    // TLAS against the COMPACTED addresses. Batched like the build pass — the
+    // TLAS rides the LAST batch, after every copy it reads has landed.
+    let mut cp_done = 0u64;
+    let mut cp_ticked = 0u64;
+    for lo in (0..n).step_by(AS_BATCH) {
+        let hi = (lo + AS_BATCH).min(n);
+        let last = hi == n;
+        sub.run_list(&mut |list| {
+            let list4: ID3D12GraphicsCommandList4 =
+                list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+            for i in lo..hi {
+                unsafe {
+                    list4.CopyRaytracingAccelerationStructure(
+                        arena_va + final_off[i],
+                        build_va + build_off[i],
+                        if compact[i] {
+                            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT
+                        } else {
+                            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE
+                        },
+                    )
+                };
+            }
+            unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+            if !last {
+                return Ok(());
+            }
+            let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: unsafe { tlas.GetGPUVirtualAddress() },
+                Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                    Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                    NumDescs: n as u32,
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        InstanceDescs: instances_va,
                     },
-                )
-            };
-        }
-        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
-        let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-            DestAccelerationStructureData: unsafe { tlas.GetGPUVirtualAddress() },
-            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                NumDescs: n as u32,
-                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    InstanceDescs: instances_va,
                 },
-            },
-            SourceAccelerationStructureData: 0,
-            ScratchAccelerationStructureData: scratch_va,
-        };
-        unsafe { list4.BuildRaytracingAccelerationStructure(&desc, None) };
-        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
-        Ok(())
-    })?;
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: scratch_va,
+            };
+            unsafe { list4.BuildRaytracingAccelerationStructure(&desc, None) };
+            unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+            Ok(())
+        })?;
+        cp_done += (lo..hi).map(|i| plan.tris(i).len() as u64).sum::<u64>();
+        as_tick(cp_done, &mut cp_ticked);
+    }
 
     let report = format!(
         "blas {} MB (compacted from {}) | tlas {} MB | transient scratch {} MB (freed)",
@@ -5602,6 +5914,7 @@ pub fn bc7_fidelity(
                 enc.record_encode(
                     l,
                     &stage.resource,
+                    0,
                     tw,
                     th,
                     row_pitch as u32,
@@ -5841,7 +6154,7 @@ pub fn bc7_gpu_self_test(hg: &mut HeadlessGpu) -> Result<()> {
             D3D12_RESOURCE_STATE_COPY_DEST,
         )?;
         hg.run_list(&mut |l| {
-            enc.record_encode(l, &stage.resource, w, h, row_pitch as u32, bc7::blocks(h), effort);
+            enc.record_encode(l, &stage.resource, 0, w, h, row_pitch as u32, bc7::blocks(h), effort);
             enc.record_copy_out(l, &tex, 0, 0, fmt, w, h);
             unsafe {
                 l.ResourceBarrier(&[transition(

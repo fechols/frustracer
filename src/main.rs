@@ -33259,6 +33259,77 @@ fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>, dn_fold: 
     }
 }
 
+/// ~30 Hz repaint of the loading page. THE one implementation: the scene-load
+/// loop, the GPU upload's `PumpSubmit`, and the eager-init boundaries in
+/// `session()` all come through here, so the page cannot drift between the
+/// phases of one boot.
+///
+/// Safe to call thousands of times — the throttle is what makes it so. Input
+/// is polled EVERY call (it is cheap, and it is what keeps the window from
+/// being ghosted by Windows); the raster + present are the expensive half and
+/// run at most every `LOAD_TICK_MS`.
+#[cfg(windows)]
+const LOAD_TICK_MS: u128 = 33;
+
+#[cfg(windows)]
+fn load_tick(
+    hud: &mut Option<hud::Hud>,
+    inp: &mut input::Input,
+    gpu: &mut gpu::GpuContext,
+    bg: &CpuPresent,
+    start: Instant,
+    last: &mut Instant,
+    // Repaint even if the throttle has not expired. The eager init's coarse
+    // boundaries are seconds apart and there are only a handful of them —
+    // each is worth a frame.
+    force: bool,
+) {
+    // A long BLAS build / sidecar store can't be interrupted cleanly; the OS
+    // reclaims the device on exit, and a truncated world.fcache is a silent
+    // cache miss by construction.
+    if inp.poll(None).quit {
+        eprintln!("frustracer: quit during load");
+        std::process::exit(0);
+    }
+    if !force && last.elapsed().as_millis() < LOAD_TICK_MS {
+        return;
+    }
+    *last = Instant::now();
+    if let Some(hd) = hud.as_mut() {
+        let snap = progress::snapshot().unwrap_or_default();
+        // A ~1.6 s marquee sweep for the indeterminate phases (world BVH
+        // build) — its whole job is to show liveness there.
+        let marquee = (start.elapsed().as_secs_f32() / 1.6).fract();
+        if let Some(hf) = hd.loading_frame(&snap, marquee) {
+            gpu.hud_stage(hf);
+        }
+    }
+    gpu.set_hud_visible(true);
+    let _ = bg.blit(gpu);
+}
+
+/// `load_tick`'s borrows, bundled so the GPU upload and the tracer
+/// constructors can drive it through `gpu::LoadUi` (which hands the context
+/// back per call — see `PumpSubmit`). Everything is BORROWED, including the
+/// throttle clock: a caller builds one of these for the length of one init
+/// call and gets its `hud`/`inp` back afterwards, with the repaint cadence
+/// carried across.
+#[cfg(windows)]
+struct LoadScreen<'a> {
+    hud: &'a mut Option<hud::Hud>,
+    inp: &'a mut input::Input,
+    bg: &'a CpuPresent,
+    start: Instant,
+    last: &'a mut Instant,
+}
+
+#[cfg(windows)]
+impl gpu::LoadUi for LoadScreen<'_> {
+    fn tick(&mut self, gpu: &mut gpu::GpuContext) {
+        load_tick(self.hud, self.inp, gpu, self.bg, self.start, self.last, false);
+    }
+}
+
 #[cfg(windows)]
 fn run_window(
     req: SceneRequest,
@@ -33436,30 +33507,12 @@ fn run_window(
         // near-opaque scrim covers it. `.blit` composites the staged HUD.
         let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
         let load_start = Instant::now();
-        loop {
-            let edges = inp.poll(None);
-            if edges.quit {
-                // A long BLAS build / sidecar store can't be interrupted
-                // cleanly; the OS reclaims the device on exit, and a truncated
-                // world.fcache is a silent cache miss by construction.
-                eprintln!("frustracer: quit during load");
-                std::process::exit(0);
-            }
-            if worker.is_finished() {
-                break;
-            }
-            if let Some(hd) = hud.as_mut() {
-                let snap = progress::snapshot().unwrap_or_default();
-                // A ~1.6 s marquee sweep for the indeterminate phases (world
-                // BVH build) — its whole job is to show liveness there.
-                let marquee = (load_start.elapsed().as_secs_f32() / 1.6).fract();
-                if let Some(hf) = hd.loading_frame(&snap, marquee) {
-                    gpu.hud_stage(hf);
-                }
-            }
-            gpu.set_hud_visible(true);
-            let _ = load_bg.blit(&mut gpu);
-            std::thread::sleep(Duration::from_millis(33));
+        // `load_tick` already throttles, so the sleep is only here to keep an
+        // idle spin off a core while the worker owns the wall clock.
+        let mut last = Instant::now() - Duration::from_millis(LOAD_TICK_MS as u64);
+        while !worker.is_finished() {
+            load_tick(&mut hud, &mut inp, &mut gpu, &load_bg, load_start, &mut last, false);
+            std::thread::sleep(Duration::from_millis(8));
         }
     }
     let loaded = match worker.join() {
@@ -33490,21 +33543,48 @@ fn run_window(
             }
         }
     }
-    // One more loading frame for the GPU-upload phase: the eager --dxr init
-    // (BC7 encode + BLAS/TLAS build) runs synchronously inside the first
-    // session and blocks ~1 s with no event pump, so freeze this label on
-    // screen across it. The page clears on the session's first HUD frame.
-    progress::phase(progress::Phase::GpuUpload, "", 0);
-    {
-        let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
-        if let Some(hd) = hud.as_mut() {
-            let snap = progress::snapshot().unwrap_or_default();
-            if let Some(hf) = hd.loading_frame(&snap, 0.0) {
-                gpu.hud_stage(hf);
-            }
+    // The GPU upload, with the page LIVE across it. It used to draw one frozen
+    // frame here and let the eager tracer init run inside `session()` with no
+    // event pump at all — thousands of blocking submits behind a marquee
+    // stopped mid-sweep, and a window Windows ghosted as "not responding".
+    //
+    // Hoisting the shared scene core out of the session is what makes it
+    // pumpable: `upload_scene_core` has `&mut GpuContext` free, so it can hand
+    // the whole context to a repaint between submits (`gpu::PumpSubmit`).
+    // `ensure_scene_gpu` then serves the cached Rc and the session's
+    // `init_trace`/`init_dxr` upload nothing.
+    //
+    // Gated on a GPU tracer being ATTEMPTED: under `--cpu` the core would be
+    // gigabytes serving nobody. If the tracer then fails to build,
+    // `evict_unused_scene_gpu` drops it on the same reasoning.
+    if opts.gpu || opts.dxr {
+        progress::stage(0, 0, ""); // the world loader's "7 / 7" row is stale here
+        progress::phase(
+            progress::Phase::GpuUpload,
+            "geometry",
+            gpu::trace::upload_units(&scene, opts.bc7),
+        );
+        let bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
+        let mut last = Instant::now() - Duration::from_millis(LOAD_TICK_MS as u64);
+        let mut ls = LoadScreen {
+            hud: &mut hud,
+            inp: &mut inp,
+            bg: &bg,
+            start: Instant::now(),
+            last: &mut last,
+        };
+        if let Err(e) = gpu.upload_scene_core(&scene, &bvh, opts.bc7, &mut ls) {
+            // Not fatal here: the session's own init will retry through
+            // `ensure_scene_gpu` and own the failure arm (tracer latch + the
+            // CPU-renderer fallback line).
+            eprintln!("gpu scene: eager upload failed ({e}); the session will retry");
         }
-        gpu.set_hud_visible(true);
-        let _ = load_bg.blit(&mut gpu);
+        // The staged work is done, so land the bar on 100% rather than on
+        // whatever `upload_units` guessed — see `progress::finish_phase`. What
+        // follows (shader compile, and on the wavefront arm the tracer's own
+        // tree upload) is unmetered by construction, and the DETAIL row names
+        // it instead.
+        progress::finish_phase();
     }
     // World auto-TOD attractors + audio cues — both need the world layout the
     // load produced, so they move here (from main()) after the join.
@@ -33529,12 +33609,10 @@ fn run_window(
         },
         _ => audio::Cues::None,
     };
-    // Clear the loading page; the session's first hud.frame uploads its removal
-    // as a dirty rect (set_loading forces a full-window repaint of the reveal).
-    if let Some(hd) = hud.as_mut() {
-        hd.set_loading(false);
-    }
-    progress::phase(progress::Phase::Idle, "", 0);
+    // The loading page deliberately STAYS UP into the session: its eager
+    // tracer init (shader compile, denoiser, upscaler wiring) is the rest of
+    // the boot's blocking work, and `session()` keeps the page live across it
+    // and clears it once frames are about to start.
 
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
     // (spawned here, not per session, so the pose survives resize rebuilds —
@@ -33760,6 +33838,28 @@ fn session(
     h: usize,
 ) -> SessionEnd {
     let p0: Option<Persist> = *persist;
+    // FIRST ENTRY: the loading page is still up (run_window leaves it live on
+    // purpose), and everything between here and the frame loop — shader
+    // compile, the tracer's own tree upload, denoiser and upscaler wiring —
+    // is seconds of blocking work on this thread. `load_step!` repaints the
+    // page at each coarse boundary and, just as importantly, drains the
+    // window's message queue so Windows never ghosts it. A resize re-entry
+    // has no page and every expansion is inert.
+    let loading = hud.as_ref().is_some_and(|hd| hd.is_loading());
+    let load_bg = loading.then(|| CpuPresent::new(w, h, gpu.encoding(), gpu.tone()));
+    let load_t0 = Instant::now();
+    let mut load_last = Instant::now();
+    // A macro, not a closure: this needs `hud`/`inp`/`gpu` mutably at each
+    // site, and a closure holding all three would conflict with every other
+    // use of them in the init below.
+    macro_rules! load_step {
+        ($detail:expr) => {
+            if let Some(bg) = &load_bg {
+                progress::detail($detail);
+                load_tick(hud, inp, gpu, bg, load_t0, &mut load_last, true);
+            }
+        };
+    }
     // Denoiser/pipeline intents: first entry from the CLI flags, re-entries
     // from the persisted runtime state (the CLI branches below double as the
     // restore path — they rebuild the contexts at the new size).
@@ -34134,7 +34234,17 @@ fn session(
                 if opts.frd_explicit { "frd" } else { "nrd" }
             );
         }
+        load_step!("loading shader compiler");
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+            // Reborrowed, not moved: the page must survive this call for the
+            // rest of the session to keep using `hud`/`inp`.
+            let mut ls = load_bg.as_ref().map(|bg| LoadScreen {
+                hud: &mut *hud,
+                inp: &mut *inp,
+                bg,
+                start: load_t0,
+                last: &mut load_last,
+            });
             gpu.init_trace(
                 &dxc,
                 scene,
@@ -34149,6 +34259,7 @@ fn session(
                     .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
+                ls.as_mut().map(|l| l as &mut dyn gpu::LoadUi),
             )
         }) {
             Ok(()) => {
@@ -34502,7 +34613,16 @@ fn session(
         if compose && opts.lock_scale.is_none() {
             lock_dynamic_note("dxr", (dxw, dxh));
         }
+        load_step!("loading shader compiler");
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+            // Reborrowed, not moved — see the init_trace site.
+            let mut ls = load_bg.as_ref().map(|bg| LoadScreen {
+                hud: &mut *hud,
+                inp: &mut *inp,
+                bg,
+                start: load_t0,
+                last: &mut load_last,
+            });
             gpu.init_dxr(
                 &dxc,
                 scene,
@@ -34517,6 +34637,7 @@ fn session(
                     .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
+                ls.as_mut().map(|l| l as &mut dyn gpu::LoadUi),
             )
         }) {
             Ok(()) => {
@@ -34637,6 +34758,18 @@ fn session(
     // broken. A minimized window reports a 0 dimension and never commits.
     const RESIZE_SETTLE_MS: u128 = 250;
     let mut pending_resize: Option<Instant> = None;
+
+    // Init is done, so the loading page comes down here rather than in
+    // run_window: everything above this line is the rest of the boot's
+    // blocking work, and the page stayed live across it (`load_step!`). The
+    // session's first hud.frame uploads the removal as a dirty rect
+    // (set_loading forces a full-window repaint of the reveal).
+    if loading {
+        if let Some(hd) = hud.as_mut() {
+            hd.set_loading(false);
+        }
+        progress::phase(progress::Phase::Idle, "", 0);
+    }
 
     // Init is done and frames start now, so the integrator may fly again (it
     // spawned paused, and a resize re-entry paused it). Everything above this
@@ -35615,6 +35748,8 @@ fn session(
                                         .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
+                                    // Mid-session: no loading page to keep live.
+                                    None,
                                 )
                             });
                             if let Err(e) = built {
@@ -35701,6 +35836,8 @@ fn session(
                                         .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
+                                    // Mid-session: no loading page to keep live.
+                                    None,
                                 )
                             });
                             if let Err(e) = built {
