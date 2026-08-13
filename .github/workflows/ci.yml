@@ -469,6 +469,43 @@ jobs:
       - name: FidelityFX SDK 1.1.4 source
         run: ./install-prerequisites.sh fsr3src
 
+      # DXC, for --check-msl: it starts from the same HLSL -> SPIR-V step
+      # --check-spirv runs, so it needs SDKs/dxc-macos. Unlike the Linux job's
+      # tarball this is a SOURCE BUILD (~10 min on Apple silicon): upstream
+      # publishes no macOS binary at DXC_TAG, and a community build would break
+      # the one-release-tag invariant that keeps the compiler emitting DXIL and
+      # the one emitting SPIR-V on the same HLSL front end — the drift no gate
+      # in this tree could see. Hence the cache: a miss is minutes, a hit is
+      # the installer's own `skip` sentinel and costs nothing.
+      #
+      # SPLIT restore/save, unlike the four `actions/cache@v4` uses elsewhere in
+      # this file, and the reason is the ten minutes: the combined action saves
+      # in a POST step, which is skipped when any earlier step failed — so a red
+      # `--check-msl` below would throw the build away and the next red run
+      # would pay for it again, exactly when iteration is most expensive. Saving
+      # HERE, immediately after the build, makes the gates' outcome irrelevant
+      # without needing `save-always` (deprecated in cache v4.2) or an
+      # `if: always()` that would also fire on a failed build. Guarded on the
+      # restore's own miss, since re-saving a hit is a warning per run.
+      - name: DXC version
+        id: dxcver
+        run: echo "tag=$(sed -n 's/^DXC_TAG=//p' install-prerequisites.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@v4
+        id: dxccache
+        with:
+          path: SDKs/dxc-macos
+          key: dxc-macos-${{ steps.dxcver.outputs.tag }}
+
+      - name: DXC (source build at the pinned tag)
+        run: ./install-prerequisites.sh dxc
+
+      - uses: actions/cache/save@v4
+        if: steps.dxccache.outputs.cache-hit != 'true'
+        with:
+          path: SDKs/dxc-macos
+          key: dxc-macos-${{ steps.dxcver.outputs.tag }}
+
       # Kept from the probe, because it is what makes a FUTURE image change
       # readable: if the Metal toolchain ever leaves the image, the guard below
       # fails on a metallib table of zero and this step is where you see WHY in
@@ -537,10 +574,33 @@ jobs:
       # it must NOT be read as MetalFX having CI coverage. Do not "tighten" the
       # guard to its X3 line: that would fail on an environment fact.
       #
-      # BOTH GATES RUN BEFORE ANY GUARD IS EVALUATED. The first draft asserted
-      # after each, so the fsr3 failure above exited the step and --check-metalfx
-      # never ran at all — one gate's failure hid the other's whole result, on
-      # the very run that was meant to tell us what MetalFX does on this device.
+      # --check-msl IS THE COVERAGE --check-metalfx CANNOT GIVE, and that is the
+      # reason it is here rather than a nice-to-have: it needs the shader
+      # TOOLCHAIN (spirv-cross + `xcrun metal`, both already installed above for
+      # FidelityFX) and no GPU at all, so the paravirtual device that makes
+      # MetalFX skip is irrelevant to it. It compiles the whole shipping corpus
+      # to `.metallib` — 65 of 78 modules, the other 13 being two NAMED classes
+      # its M5 line reports — so a break in the assembly, the arg set, or the
+      # Metal front end fails here on every push.
+      #
+      # GUARDED ON M3/M4, not just on PASSED: the gate SKIPs (exit 0) when the
+      # toolchain is absent, so PASSED alone would go green on an image that
+      # lost spirv-cross or the Metal cryptex — the same asymmetry the two gates
+      # above already carry. The M3/M4 line is printed only on a path that
+      # compiled something.
+      #
+      # DXC IS REQUIRED FOR IT and is NOT the drop the other two use: --check-msl
+      # starts from the same HLSL -> SPIR-V step --check-spirv runs, so it needs
+      # SDKs/dxc-macos. That is a SOURCE BUILD on this platform (upstream ships
+      # no macOS binary at the pinned tag, and using a community build would
+      # break the one-release-tag invariant that keeps the DXIL and SPIR-V front
+      # ends identical), so it is cached on DXC_TAG like the Vulkan job's.
+      #
+      # ALL THREE GATES RUN BEFORE ANY GUARD IS EVALUATED. The first draft
+      # asserted after each, so the fsr3 failure above exited the step and
+      # --check-metalfx never ran at all — one gate's failure hid the other's
+      # whole result, on the very run that was meant to tell us what MetalFX
+      # does on this device.
       - name: Gates (Metal)
         shell: bash
         run: |
@@ -548,12 +608,17 @@ jobs:
           rc=0
           cargo run --profile quick -- --check-fsr3    2>&1 | tee fsr3.log    || rc=1
           cargo run --profile quick -- --check-metalfx 2>&1 | tee metalfx.log || rc=1
+          cargo run --profile quick -- --check-msl     2>&1 | tee msl.log     || rc=1
           grep -q "check-fsr3: PASSED" fsr3.log \
             || { echo "::error::--check-fsr3 did not pass"; rc=1; }
           grep -q "check-fsr3: U4 upscale" fsr3.log \
             || { echo "::error::--check-fsr3 did not run a real upscale — the GPU half skipped:"; grep -E "SKIP U[0-9]" fsr3.log || true; rc=1; }
           grep -q "check-metalfx: PASSED" metalfx.log \
             || { echo "::error::--check-metalfx did not pass"; rc=1; }
+          grep -q "CHECK-MSL PASSED" msl.log \
+            || { echo "::error::--check-msl did not pass"; rc=1; }
+          grep -q "check-msl: M3/M4" msl.log \
+            || { echo "::error::--check-msl compiled nothing — the toolchain skipped:"; grep -E "SKIP M[0-9]" msl.log || true; rc=1; }
           exit $rc
 
       - uses: actions/upload-artifact@v4
@@ -563,4 +628,5 @@ jobs:
           path: |
             fsr3.log
             metalfx.log
+            msl.log
           if-no-files-found: warn

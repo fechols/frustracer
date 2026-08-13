@@ -154,6 +154,14 @@ mod sh;
 // sky call site in the renderer.
 mod sky;
 mod sphcell;
+// HLSL -> SPIR-V: the corpus's SECOND code generator, beside `gpu/dxc.rs`'s
+// DXIL. Not under `vk/` (where it lived until `--check-msl` arrived) because
+// it names no backend type and now has two consumers — Vulkan eats the SPIR-V
+// directly, Metal eats it through spirv-cross. `vk::spirv` re-exports it, so
+// every existing call site is unchanged. unix-only for the one reason its
+// header gives: DXC's `LPCWSTR` is a 4-byte `wchar_t` off Windows.
+#[cfg(unix)]
+mod spirv;
 mod stats;
 mod prof;
 mod replay;
@@ -172,7 +180,7 @@ mod mtl;
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
 // The Vulkan backend, peer of `gpu/` over the shared `gfx/` core. unix-only
-// for exactly one reason today — DXC's `wchar_t` width — see vk/spirv.rs.
+// for exactly one reason today — DXC's `wchar_t` width — see src/spirv.rs.
 #[cfg(unix)]
 mod vk;
 mod world;
@@ -358,6 +366,7 @@ fn main() {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_msl,
         check_vk,
         check_gpu,
         check_dxr,
@@ -1015,6 +1024,9 @@ fn main() {
         // carries it, so `--check-spirv san-miguel.obj` gates arms the
         // procedural scene cannot reach.
         || check_spirv
+        // Scene-keyed for the line above's reason, and it is the SAME corpus:
+        // both gates enumerate it through `corpus_units`.
+        || check_msl
         // NOT scene-keyed: the smoke kernel is one file with no scene-derived
         // defines, so this gate is a pure function of the device.
         || check_vk
@@ -1312,10 +1324,30 @@ fn main() {
         {
             // Said, not silently skipped: the SPIR-V path is one `wchar_t`
             // width and one library name away from working here — see the
-            // header in src/vk/spirv.rs.
+            // header in src/spirv.rs.
             eprintln!(
-                "--check-spirv is unix-only today (the Vulkan backend's SPIR-V \
-                 compiler); see src/vk/spirv.rs for what the Windows arm needs"
+                "--check-spirv is unix-only today (the corpus's SPIR-V \
+                 compiler); see src/spirv.rs for what the Windows arm needs"
+            );
+            std::process::exit(2);
+        }
+    }
+    if check_msl {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_msl(&scene);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2, not a SKIP — the --check-fsr3 convention: an explicitly
+            // requested gate on the wrong OS is an ENVIRONMENT error, while a
+            // missing toolchain on the RIGHT OS is what SKIPs.
+            eprintln!(
+                "--check-msl compiles the shipping corpus to Metal `.metallib`s, so it is \
+                 macOS-only: `xcrun metal` has no counterpart elsewhere. The SPIR-V half \
+                 it builds on runs on every unix in --check-spirv, and the corpus both \
+                 gates enumerate is the same one (main.rs::corpus_units)."
             );
             std::process::exit(2);
         }
@@ -13996,54 +14028,33 @@ fn compute_entries(src: &str) -> Vec<String> {
     out
 }
 
+/// A compile unit: how to target it, and how to find its entry points.
 #[cfg(unix)]
-fn run_check_spirv(scene: &scene::Scene) -> i32 {
+enum Shape {
+    /// Compute: entries scanned out of the assembled source.
+    Compute(&'static str),
+    /// A DXR library — every `[shader(...)]` export at once, no `-E`.
+    Lib(String),
+    /// The display pair, which every `.hlsl` here spells identically.
+    Gfx,
+}
+
+/// The SHIPPING corpus, assembled exactly as a session assembles it.
+///
+/// SHARED BY `--check-spirv` AND `--check-msl` ON PURPOSE, and it is not a
+/// tidiness move: the Metal gate's entire premise is "the same source through
+/// a second code generator", and two `push!` lists would let the two gates
+/// drift onto different corpora while both stayed green — the drift no gate in
+/// this tree could see, which is the same argument `crate::spirv`'s header
+/// makes for fetching both DXC drops from one release tag.
+///
+/// `Err` is the vendor-arm anti-vacuity failure, which belongs here rather
+/// than in either caller because it is a property of the ASSEMBLY.
+#[cfg(unix)]
+fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, String> {
     use gfx::shaders as sh;
     use gfx::vocab::Vendor;
 
-    let mut ok = true;
-
-    // ---- S0: the pure half. Runs with or without a compiler on disk. ----
-    match vk::spirv::self_test() {
-        Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
-        Err(e) => {
-            eprintln!("check-spirv: FAIL S0 {e}");
-            ok = false;
-        }
-    }
-    // The reflector is pure SPIR-V and belongs to the same stage: it reads
-    // what a module DECLARES, which is the half of the descriptor story
-    // `spirv-val` cannot see (it validates a module, and knows nothing about
-    // the layout that module will be bound against).
-    match vk::reflect::self_test() {
-        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
-        Err(e) => {
-            eprintln!("check-spirv: FAIL S0 reflect: {e}");
-            ok = false;
-        }
-    }
-
-    // ---- S1: the compiler. A missing drop is a normal condition. ----
-    let dir = vk::spirv::default_dir();
-    let dxc = match vk::spirv::Spirv::load(&dir) {
-        Ok(d) => d,
-        Err(e) => {
-            println!("check-spirv: SKIP S1 ({e})");
-            return i32::from(!ok);
-        }
-    };
-    println!("check-spirv: S1 {} loaded from {dir}", vk::spirv::LIB_NAME);
-
-    // ---- S2: assemble the corpus. ----
-    /// A compile unit: how to target it, and how to find its entry points.
-    enum Shape {
-        /// Compute: entries scanned out of the assembled source.
-        Compute(&'static str),
-        /// A DXR library — every `[shader(...)]` export at once, no `-E`.
-        Lib(String),
-        /// The display pair, which every `.hlsl` here spells identically.
-        Gfx,
-    }
     let mut units: Vec<(String, String, Shape)> = Vec::new();
     // Dedupe by SOURCE: the vendor and sway arms below usually assemble to
     // the same bytes, and compiling one unit twice under two names would
@@ -14094,11 +14105,9 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // a real difference to find — CAND_TMIN0, the RDNA4 candidate-loop
     // workaround whose absence was worth 2x on textured scenes — so demand it.
     if vendor_arms < 2 {
-        eprintln!(
-            "check-spirv: FAIL S2 the vendor arms assembled identically — \
-             cand_defs no longer distinguishes them, so this run covered one"
-        );
-        ok = false;
+        return Err("the vendor arms assembled identically — cand_defs no longer \
+                    distinguishes them, so this run covered one"
+            .into());
     }
 
     // The DXR pipeline, every `--dxr-inline` arm. Mode 0 is the lib_6_3
@@ -14155,6 +14164,11 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // `VK_AMDX_shader_enqueue` translation exists but that extension is a
     // vendor provisional, and the file is a default-off env lever measured as
     // a wash. See gfx/mod.rs.
+    //
+    // NEITHER EXCLUSION IS METAL-SHAPED, and the Metal gate does not add one:
+    // `mtl::msl::Expect` classifies what it CANNOT compile (the DXR library
+    // shape) rather than dropping it from the corpus, so the count stays
+    // comparable between the two gates and a unit that starts working says so.
 
     // The display stage. These are the tree's only fxc units (cs_5_0/ps_5_0 —
     // see the "bloom no-DXC precedent"), so Vulkan compiles them at the SM 6
@@ -14167,6 +14181,98 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     push!("blit", sh::BLIT_HLSL.to_string(), Shape::Gfx);
     push!("hud", sh::HUD_HLSL.to_string(), Shape::Gfx);
     push!("waveviz", sh::WAVEVIZ_HLSL.to_string(), Shape::Gfx);
+
+    Ok(units)
+}
+
+/// The (entry, target) jobs a unit yields, or `Err` if a compute unit yields
+/// none — anti-vacuity shared by both gates, because a unit that compiled
+/// nothing reads exactly like a unit that compiled cleanly.
+#[cfg(unix)]
+fn corpus_jobs(name: &str, src: &str, shape: &Shape) -> Result<Vec<(String, String)>, String> {
+    use gfx::shaders as sh;
+    Ok(match shape {
+        Shape::Lib(t) => vec![(String::new(), t.clone())],
+        Shape::Gfx => {
+            // The names come from `gfx::shaders`, which is where the
+            // Vulkan display stage reads them too — so this gate and its
+            // consumer cannot drift onto different entry points.
+            vec![
+                (sh::GFX_VS.to_string(), "vs_6_0".into()),
+                (sh::GFX_PS.to_string(), "ps_6_0".into()),
+            ]
+        }
+        Shape::Compute(t) => {
+            let e = compute_entries(src);
+            if e.is_empty() {
+                return Err(format!("{name}: no [numthreads] entry point found"));
+            }
+            e.into_iter().map(|e| (e, (*t).to_string())).collect()
+        }
+    })
+}
+
+#[cfg(unix)]
+fn run_check_spirv(scene: &scene::Scene) -> i32 {
+    let mut ok = true;
+
+    // ---- S0: the pure half. Runs with or without a compiler on disk. ----
+    // `crate::spirv`, not `vk::spirv`: the module moved OUT of that backend
+    // because it names none of it, and this gate's own subject is the corpus
+    // rather than Vulkan (`--check-msl` reaches the same module the same way).
+    // The `vk::spirv` re-export stays for the backend's real call sites.
+    match crate::spirv::self_test() {
+        Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 {e}");
+            ok = false;
+        }
+    }
+    // The reflector is pure SPIR-V and belongs to the same stage: it reads
+    // what a module DECLARES, which is the half of the descriptor story
+    // `spirv-val` cannot see (it validates a module, and knows nothing about
+    // the layout that module will be bound against). It IS Vulkan-owned,
+    // unlike the compiler above — the descriptor-set layout it feeds is.
+    match vk::reflect::self_test() {
+        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 reflect: {e}");
+            ok = false;
+        }
+    }
+
+    // ---- S1: the compiler. A missing drop is a normal condition. ----
+    let dir = crate::spirv::default_dir();
+    let dxc = match crate::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-spirv: SKIP S1 ({e})");
+            return i32::from(!ok);
+        }
+    };
+    println!("check-spirv: S1 {} loaded from {dir}", crate::spirv::LIB_NAME);
+
+    // ---- S2: assemble the corpus. ----
+    // SHARED with `--check-msl` — see `corpus_units`. The two gates compile
+    // one corpus through two code generators, and that is only true if they
+    // enumerate it in one place.
+    let units = match corpus_units(scene) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S2 {e}");
+            // The summary line even on an early return: every other exit from
+            // this function ends with one, so a run that stopped without it
+            // reads like a crash rather than a verdict. NOT for CI's benefit —
+            // that job runs `set -eo pipefail`, so a non-zero gate aborts the
+            // step before its grep, and the grep's "it skipped" message is
+            // therefore only ever evaluated on an exit-0 run, where it is
+            // accurate. `run_check_msl`'s equivalent paths print it too, and
+            // the two gates disagreeing about their own convention is the
+            // thing worth not shipping.
+            println!("CHECK-SPIRV FAILED");
+            return 1;
+        }
+    };
 
     // ---- S3: spirv-val, if the drop is here. ----
     let val = {
@@ -14195,32 +14301,39 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     let tmp = std::env::temp_dir().join(format!("frustracer-spirv-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
+    // `FR_SPIRV_DUMP=<dir>` — keep every compiled module instead of deleting
+    // it. The SPIR-V analogue of `gpu/dxc.rs`'s `FR_DUMP_HLSL`, which is
+    // Windows-only, and the same reason: the corpus is assembled by string
+    // concatenation, so no file on disk is what a compiler ever saw, and a
+    // module nobody can extract is a module nobody can put through a second
+    // tool. That second tool is `spirv-cross`, which is how `--check-msl`'s
+    // arg set was settled — see `mtl::msl`.
+    //
+    // The dump is INDEPENDENT of S3: the write below is gated on `val` today
+    // because validation is the only thing that wanted a file, and a dump that
+    // silently produced nothing without spirv-tools installed would be the
+    // read-only-probe trap this repository keeps re-learning.
+    let dump = std::env::var_os("FR_SPIRV_DUMP").map(std::path::PathBuf::from);
+    if let Some(d) = dump.as_ref() {
+        match std::fs::create_dir_all(d) {
+            Ok(()) => println!("check-spirv: FR_SPIRV_DUMP — writing modules to {}", d.display()),
+            Err(e) => eprintln!("check-spirv: FR_SPIRV_DUMP={} unusable ({e})", d.display()),
+        }
+    }
+
     // ---- compile + validate ----
     let (mut compiled, mut validated, mut failed) = (0usize, 0usize, 0usize);
     for (name, src, shape) in &units {
-        // (entry, target) pairs for this unit.
-        let jobs: Vec<(String, String)> = match shape {
-            Shape::Lib(t) => vec![(String::new(), t.clone())],
-            Shape::Gfx => {
-                // The names come from `gfx::shaders`, which is where the
-                // Vulkan display stage reads them too — so this gate and its
-                // consumer cannot drift onto different entry points.
-                vec![
-                    (sh::GFX_VS.to_string(), "vs_6_0".into()),
-                    (sh::GFX_PS.to_string(), "ps_6_0".into()),
-                ]
-            }
-            Shape::Compute(t) => {
-                let e = compute_entries(src);
-                if e.is_empty() {
-                    // Anti-vacuity: a unit that yields no entries compiled
-                    // nothing, and a silent zero reads exactly like a pass.
-                    eprintln!("check-spirv: FAIL S2 {name}: no [numthreads] entry point found");
-                    ok = false;
-                    failed += 1;
-                    continue;
-                }
-                e.into_iter().map(|e| (e, (*t).to_string())).collect()
+        // (entry, target) pairs for this unit. Anti-vacuity — a unit that
+        // yields no entries compiled nothing, and a silent zero reads exactly
+        // like a pass — lives in `corpus_jobs`, shared with `--check-msl`.
+        let jobs = match corpus_jobs(name, src, shape) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("check-spirv: FAIL S2 {e}");
+                ok = false;
+                failed += 1;
+                continue;
             }
         };
         for (entry, target) in jobs {
@@ -14239,12 +14352,16 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
                 }
             };
             compiled += 1;
-            let Some(val) = val.as_ref() else { continue };
-            let path = tmp.join(format!("{}.spv", what.replace(['[', ']', ':', '+'], "_")));
+            if val.is_none() && dump.is_none() {
+                continue;
+            }
+            let stem = what.replace(['[', ']', ':', '+'], "_");
+            let path = dump.as_ref().unwrap_or(&tmp).join(format!("{stem}.spv"));
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             if std::fs::write(&path, &bytes).is_err() {
                 continue;
             }
+            let Some(val) = val.as_ref() else { continue };
             match std::process::Command::new(val).arg(&path).output() {
                 Ok(o) if o.status.success() => validated += 1,
                 Ok(o) => {
@@ -14261,7 +14378,9 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
                     failed += 1;
                 }
             }
-            let _ = std::fs::remove_file(&path);
+            if dump.is_none() {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
     let _ = std::fs::remove_dir(&tmp);
@@ -14274,7 +14393,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // The assembled byte count is in the summary because the unit and module
     // COUNTS cannot distinguish two scenes: san-miguel arms ALPHA_CUTOUT and
     // TRANS_SHADOW where the procedural scene arms neither, and both produce
-    // the same 46 units. Two identical counts beside two different sizes is a
+    // the same 47 units. Two identical counts beside two different sizes is a
     // gate that keyed on the scene; two identical sizes would mean it did
     // not, and nothing else here would have said so.
     let bytes: usize = units.iter().map(|(_, s, _)| s.len()).sum();
@@ -14293,6 +14412,218 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         }
     }
     println!("CHECK-SPIRV {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
+}
+
+/// `--check-msl`: the Metal shader toolchain — the corpus's THIRD code
+/// generator, and the first rung of a Metal tracer.
+///
+/// `--check-spirv` proves the corpus reaches SPIR-V. This proves it reaches a
+/// `.metallib`, which is a different claim and the one a Metal backend rests
+/// on. It renders nothing and binds nothing: what compiles and what refuses is
+/// the entire product, exactly as M2a was for the Vulkan port.
+///
+/// M0 the pure arg-set/classifier half | M1 the tools | M2 assemble + DXC |
+/// M3 spirv-cross | M4 `metal`/`metallib` | M5 the verdict per class.
+///
+/// THE VERDICT HAS TEETH IN BOTH DIRECTIONS, which is what keeps the
+/// known-failing list from rotting into a whitelist: a unit expected to
+/// compile and failing is a FAIL, and a unit expected to fail and COMPILING is
+/// also a FAIL, because that means a workaround landed or spirv-cross fixed
+/// the bug and `mtl::msl::Expect` is now lying. The second half is the one a
+/// normal "known failures" list never has.
+#[cfg(target_os = "macos")]
+fn run_check_msl(scene: &scene::Scene) -> i32 {
+    use mtl::msl::{expect_of, Expect};
+
+    let mut ok = true;
+
+    // ---- M0: pure. No tools, no device, no corpus. ----
+    match mtl::msl::self_test() {
+        Ok(()) => println!("check-msl: M0 arg set + unit classification OK"),
+        Err(e) => {
+            eprintln!("check-msl: FAIL M0 {e}");
+            ok = false;
+        }
+    }
+
+    // ---- M1: the tools. Absence is an environment fact, so it SKIPs. ----
+    let scratch = std::env::temp_dir().join(format!("frustracer-msl-{}", std::process::id()));
+    let msl = match mtl::msl::Msl::find(scratch.clone()) {
+        Ok(m) => m,
+        Err(e) if e.absent => {
+            println!("check-msl: SKIP M1 ({})", e.msg);
+            return i32::from(!ok);
+        }
+        Err(e) => {
+            eprintln!("check-msl: FAIL M1 {}", e.msg);
+            println!("CHECK-MSL FAILED");
+            return 1;
+        }
+    };
+    println!("check-msl: M1 {}", msl.line());
+
+    // ---- M2: the same DXC half `--check-spirv` runs, on the same corpus. ----
+    let dir = crate::spirv::default_dir();
+    let dxc = match crate::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-msl: SKIP M2 ({e})");
+            let _ = std::fs::remove_dir_all(&scratch);
+            return i32::from(!ok);
+        }
+    };
+    println!("check-msl: M2 {} loaded from {dir}", crate::spirv::LIB_NAME);
+    let units = match corpus_units(scene) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("check-msl: FAIL M2 {e}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            println!("CHECK-MSL FAILED");
+            return 1;
+        }
+    };
+
+    // ---- M3/M4: transpile and compile, tallied per expectation class. ----
+    let (mut spv, mut lib_ok, mut lib_bytes) = (0usize, 0usize, 0usize);
+    // Per-class tallies. Both halves are kept for each, because "how many of
+    // this class failed" and "how many compiled anyway" are different facts
+    // and the verdict below treats the two classes ASYMMETRICALLY.
+    let (mut no_analogue, mut tool_defect) = (0usize, 0usize);
+    let mut defect_ok = 0usize;
+    let mut surprises: Vec<String> = Vec::new();
+    let mut list: Vec<String> = Vec::new();
+    for (name, src, shape) in &units {
+        let want = expect_of(name);
+        let jobs = match corpus_jobs(name, src, shape) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("check-msl: FAIL M2 {e}");
+                ok = false;
+                continue;
+            }
+        };
+        for (entry, target) in jobs {
+            let what =
+                if entry.is_empty() { name.clone() } else { format!("{name}:{entry}") };
+            let stem = what.replace(['[', ']', ':', '+'], "_");
+            let words = match dxc.compile(src, &entry, &target, &what, false) {
+                Ok(w) => w,
+                Err(e) => {
+                    // A DXC failure here is not this gate's subject —
+                    // `--check-spirv` owns that — but it must not be silent.
+                    eprintln!("check-msl: FAIL M2 {e}");
+                    ok = false;
+                    continue;
+                }
+            };
+            spv += 1;
+            let got = msl
+                .transpile(&words, &stem)
+                .and_then(|src| msl.compile(&src, &stem).map(|b| b.len()));
+            match (got, want) {
+                (Ok(n), Expect::Metallib) => {
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    list.push(format!("{what} -> {n} B"));
+                }
+                (Ok(n), Expect::NoAnalogue) => {
+                    // The stale-table alarm, and it is HARD for this class
+                    // alone: `NoAnalogue` is a CAPABILITY claim — Metal has no
+                    // analogue for a DXIL ray-tracing library — so one
+                    // compiling is not configuration luck, it is news, and the
+                    // message says which arm to move.
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    surprises.push(format!(
+                        "{what} is classified NoAnalogue but COMPILED ({n} B) — Metal \
+                         grew an analogue for the DXR library shape, or spirv-cross \
+                         did; move it to Metallib and record what changed"
+                    ));
+                }
+                (Ok(n), Expect::ToolDefect) => {
+                    // SOFT, and deliberately: a codegen bug's presence is a
+                    // property of the configuration and the tool version. This
+                    // very unit compiles on an ALPHA_CUTOUT scene and under
+                    // --sw-rays. Failing here would fail the gate on exactly
+                    // the configurations where the corpus does BETTER.
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    defect_ok += 1;
+                }
+                (Err(e), Expect::Metallib) => {
+                    eprintln!("check-msl: FAIL M4 {what}: {e}");
+                    ok = false;
+                }
+                (Err(_), Expect::NoAnalogue) => no_analogue += 1,
+                (Err(_), Expect::ToolDefect) => tool_defect += 1,
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // ---- M5: the verdict. ----
+    for s in &surprises {
+        eprintln!("check-msl: FAIL M5 {s}");
+        ok = false;
+    }
+    // A corpus that assembled to nothing would report a clean sweep, and so
+    // would one where every unit happened to be a known-failing one.
+    if spv == 0 {
+        eprintln!("check-msl: FAIL M2 the corpus assembled zero units");
+        ok = false;
+    }
+    if lib_ok == 0 {
+        eprintln!("check-msl: FAIL M5 nothing reached a .metallib");
+        ok = false;
+    }
+    // `NoAnalogue` must still be REACHED, or the hard teeth above score an
+    // empty set: a corpus that stopped emitting DXR libraries would leave the
+    // class vacuous and nothing would say the gate had stopped covering it.
+    // This one is safe to demand because `dxr-lib` is enumerated on every
+    // scene and under every lever — unlike `ToolDefect`, which is
+    // configuration-dependent and is REPORTED below instead.
+    if no_analogue == 0 {
+        eprintln!(
+            "check-msl: FAIL M5 no unit exercised NoAnalogue — either the corpus \
+             stopped producing DXR libraries or the classifier stopped matching, \
+             and in both cases this run's capability teeth gated nothing"
+        );
+        ok = false;
+    }
+    // Bytes, not just counts: the unit count cannot tell two scenes apart
+    // (san-miguel arms ALPHA_CUTOUT and TRANS_SHADOW, the procedural scene
+    // arms neither, and both assemble the same 47 units) — the same reason
+    // `--check-spirv` prints its assembled size.
+    let asm: usize = units.iter().map(|(_, s, _)| s.len()).sum();
+    println!(
+        "check-msl: M3/M4 {} units ({asm} B assembled) -> {spv} SPIR-V -> \
+         {lib_ok} metallib ({lib_bytes} B)",
+        units.len()
+    );
+    println!(
+        "check-msl: M5 expected failures — {no_analogue} DXR-library (no Metal analogue), \
+         {tool_defect} spirv-cross scoping defect (see mtl::msl::Expect)"
+    );
+    // Say when the defect did not reproduce, rather than leaving a silent
+    // zero: that zero is a real difference between configurations (the opaque
+    // `occluded_q` arm is what trips it), and reading it as "the gate covered
+    // everything" is the mistake this line exists to prevent.
+    if tool_defect == 0 && defect_ok > 0 {
+        println!(
+            "check-msl: M5 NOTE the spirv-cross scoping defect did NOT reproduce in \
+             this configuration — {defect_ok} ToolDefect-classified module(s) compiled. \
+             That is expected on an ALPHA_CUTOUT/TRANS_SHADOW scene and under \
+             --sw-rays; the procedural scene with hardware rays is the arm that \
+             reproduces it."
+        );
+    }
+    if std::env::var_os("FR_MSL_LIST").is_some() {
+        for l in &list {
+            println!("check-msl:   {l}");
+        }
+    }
+    println!("CHECK-MSL {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
 }
 

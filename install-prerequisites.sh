@@ -485,7 +485,7 @@ do_dxc() {
 #
 # NOT a hard failure when the toolchain is missing, unlike do_nrd's: nothing in
 # a macOS build LINKS this, it is dlopen'd by --check-spirv/--check-vk alone
-# (src/vk/spirv.rs), so its absence costs two gates rather than a tree that no
+# (src/spirv.rs), so its absence costs two gates rather than a tree that no
 # longer compiles.
 do_dxc_macos() {
     if skip "$SDKS/dxc-macos/lib/libdxcompiler.dylib" "dxc (macos, SPIR-V)"; then

@@ -6213,8 +6213,19 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # target; re-probe when an RDNA4 discrete card returns.
 cargo run --release -- --check-dxr    # DXR pipeline gate suite (needs a real RT GPU + the DXC DLLs;
                                       # composes with --stress; exit 2 = environment, 1 = a gate failed)
-cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, gated (unix; src/vk/spirv.rs
+cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (unix; src/spirv.rs
                                       # + run_check_spirv in main.rs, 2026-08-10 — the Vulkan port's M2a).
+                                      # NOTE the module MOVED out of `src/vk/` on 2026-08-12 (it names
+                                      # no `ash` type and never did — it is the corpus's second CODE
+                                      # GENERATOR, and since --check-msl consumes the same SPIR-V through
+                                      # spirv-cross, leaving it under vk/ would make the Metal gate
+                                      # import the Vulkan backend). `vk::spirv` re-exports it, so every
+                                      # call site is unchanged; the -fvk-*-shift constants stay a VULKAN
+                                      # choice and Metal deliberately does not reuse them (see
+                                      # --check-msl). The unit ENUMERATION also moved, into
+                                      # main.rs::corpus_units, shared with --check-msl — the two gates'
+                                      # premise is "one corpus, two code generators", which two `push!`
+                                      # lists could quietly falsify while both stayed green.
                                       # Assembles the SHIPPING corpus through gfx::shaders — the same
                                       # functions a session calls, which is what M1 moving the assembly
                                       # into the shared core BOUGHT — and compiles every unit to SPIR-V,
@@ -6350,6 +6361,143 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # argument array is UTF-32. Vulkan-on-Windows needs that cfg, the
                                       # library name, and the module/dep cfg lifted — nothing else; the
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
+cargo run --release -- --check-msl    # THE METAL SHADER TOOLCHAIN, gated (macOS; src/mtl/msl.rs +
+                                      # run_check_msl in main.rs, 2026-08-12 — the Metal port's C1, and
+                                      # the first rung of a Metal TRACER rather than another consumer
+                                      # of the CPU G-buffer). Takes --check-spirv's corpus one generator
+                                      # further: SPIR-V -> MSL (spirv-cross) -> AIR -> .metallib (xcrun
+                                      # metal). It renders nothing, binds nothing and dispatches
+                                      # nothing — what reaches a metallib and what refuses IS the
+                                      # product, the shape M2a had for Vulkan, where it found the one
+                                      # blocker nobody predicted. M0 pure arg set + classifier | M1 the
+                                      # tools (absent -> SKIP) | M2 assemble + DXC | M3 spirv-cross |
+                                      # M4 metal/metallib | M5 the verdict. Wrong OS = exit 2 (the
+                                      # --check-fsr3 convention). MEASURED: 47 units -> 78 SPIR-V -> 65
+                                      # metallib (2852234 B) on the procedural scene; 73 on
+                                      # san-miguel-low-poly; 61 of 66 under --sw-rays.
+                                      # M1'S PROBE CHECKS THE EXIT STATUS, NOT THE LAUNCH, and the two
+                                      # differ for a reason that is easy to get backwards: the process
+                                      # being launched is `xcrun`, which exists on any box with the
+                                      # Command Line Tools, so a missing Metal toolchain shows up as
+                                      # `xcrun -sdk macosx metal --version` LAUNCHING FINE and exiting
+                                      # 72 (measured). A launch-only probe therefore cannot see it at
+                                      # all — and the Metal toolchain is a separate MobileAsset cryptex
+                                      # the Xcode manifest does not list, so "Xcode present, `metal`
+                                      # absent" is exactly the shape of a box that lacks it. It shipped
+                                      # that way for a day: the gate let such a box past M1 and turned
+                                      # an environment fact into ~65 M4 failures, inverting the
+                                      # absent-is-a-SKIP contract the module is written around. The
+                                      # SPIRV-CROSS PROBE ABOVE IT IS DELIBERATELY THE OTHER WAY —
+                                      # spirv-cross treats `--version` as a usage error and exits
+                                      # non-zero on a HEALTHY install, so launch is the only signal
+                                      # there, while `metal` and `metallib` both exit 0 (measured). Two
+                                      # probes, two rules, per tool. TEETH: `METAL=/usr/bin/false`
+                                      # (launchable, cannot answer) and `METALLIB=/nonexistent` (cannot
+                                      # launch) must BOTH read `SKIP M1` at exit 0.
+                                      # THE ROUTE, settled on evidence: metal-shaderconverter (Apple's
+                                      # own DXIL -> metallib tool) is OUT — not installed with Xcode,
+                                      # not an xcrun tool, and it consumes SIGNED DXIL, whose signer
+                                      # dxil.dll is Windows-only (the same fact the NRD entry records).
+                                      # spirv-cross is the route build.rs already runs for FidelityFX
+                                      # and CI already installs.
+                                      # THE ARG SET, every entry measured (mtl::msl::CROSS_ARGS):
+                                      # --msl --msl-version 30000 --msl-argument-buffers
+                                      # --msl-argument-buffer-tier 2 --msl-device-argument-buffer 1.
+                                      # The device-argument-buffer SET is a derivation, not a literal:
+                                      # texs[] is register(t10, space1), the register SPACE becomes the
+                                      # descriptor SET, and spirv-cross requires runtime-sized arrays in
+                                      # DEVICE storage argument buffers ("Runtime sized variables must
+                                      # be in device storage argument buffers" is the exact refusal
+                                      # without it); self_test pins the constant and the flag agree.
+                                      # --msl-decoration-binding is ABSENT, and the reasoning was
+                                      # CORRECTED mid-milestone rather than merely stated: WITHOUT
+                                      # argument buffers it is fatal (measured, `bloom` alone emits
+                                      # [[texture(1000)]], [[texture(2000)]], [[sampler(3000)]] against
+                                      # Metal's 0-127 / 0-15 — the FFX precedent, which lost 112 of 160
+                                      # permutations to ONE sampler at 1001 and is fixed by
+                                      # build.rs::remap_ffx_samplers' single subtraction; ours would
+                                      # need three). WITH them it is merely MOOT — resources move
+                                      # inside an argument-buffer struct as [[id(n)]], measured
+                                      # [[id(0)]] [[id(1000)]] [[id(2000)]] [[id(3000)]] at
+                                      # [[buffer(0)]], where no such ceiling applies, and the same 65
+                                      # compile either way. So self_test pins the IMPLICATION that is
+                                      # true (asking for it REQUIRES argument buffers) rather than its
+                                      # absence, which would pin a preference. Either way the milestone
+                                      # boundary holds: the Metal argument indices are spirv-cross's
+                                      # business, so NOTHING may hardcode one — C2 derives the map (from
+                                      # Metal reflection or spirv-cross's own output), exactly as
+                                      # vk::reflect derives the Vulkan one.
+                                      # -ffp-contract=off is NOT needed and that was a surprise:
+                                      # spirv-cross PRESERVES NoContraction, emitting
+                                      # `[[clang::optnone]] T spvFMul(T l, T r){return fma(l,r,T(0));}`
+                                      # plus MSL's precise:: namespace — so the corpus's `precise`
+                                      # discipline (ftree.hlsli's decoded boxes must CONTAIN the true
+                                      # ones or every prune stops being conservative) survives the
+                                      # crossing. __METAL_FAST_MATH__ is 0 by default too.
+                                      # THE FINDING THAT OVERTURNED THE PLAN: spirv-cross LOWERS
+                                      # RayQuery to Metal. leaf/reference/leaf_fb/hemi_leaf all reach
+                                      # AIR with hardware ray tracing intact, as
+                                      # raytracing::acceleration_structure<raytracing::instancing> and
+                                      # raytracing::intersection_query — so a Metal tracer does NOT need
+                                      # --sw-rays, which was the milestone's founding premise. What
+                                      # Metal has no analogue for is the DXR PIPELINE shape (raygen/
+                                      # closest-hit/miss/SBT), i.e. the 5 dxr-lib modules, which the
+                                      # port does not need: what is being ported is the wavefront tracer.
+                                      # THE VERDICT IS ASYMMETRIC BY CLASS (mtl::msl::Expect), and the
+                                      # asymmetry is the milestone's own lesson: NoAnalogue is a
+                                      # CAPABILITY claim, so a dxr-lib that ever COMPILES is a hard FAIL
+                                      # ("Metal grew an analogue... move it to Metallib") and the class
+                                      # must still be REACHED (dxr-lib is enumerated on every scene under
+                                      # every lever, so demanding it is safe). ToolDefect is a BUG-
+                                      # PRESENCE claim and is REPORTED, never required — because bug
+                                      # presence is configuration-dependent: the 8 hemi_wave failures
+                                      # need the OPAQUE occluded_q arm, so an ALPHA_CUTOUT/TRANS_SHADOW
+                                      # scene compiles them (73/78) and --sw-rays has no RayQuery to
+                                      # mis-scope at all (61/66). A first draft demanded both classes
+                                      # fire and FAILED on exactly the configurations where the corpus
+                                      # does BETTER — caught by running the scene-keyed arm, which is
+                                      # why the verification list has one. A zero prints a NOTE rather
+                                      # than a silent 0.
+                                      # THE DEFECT ITSELF (upstream, not ours): check_empty_cell calls
+                                      # occluded_q six times under [unroll]; each declares its own
+                                      # RayQuery, but SPIR-V requires every OpVariable in a function's
+                                      # FIRST block, so the six unrolled bodies share one function-scope
+                                      # variable — and spirv-cross declares it inside a do{}while(false)
+                                      # and references it after the block closes ("use of undeclared
+                                      # identifier '_194'"). MEASURED IDENTICAL on spirv-cross 1.4.350.1
+                                      # and 1.4.357.0 (this box was upgraded to match CI, which installs
+                                      # unpinned — and the build.rs toolstamp correctly invalidated the
+                                      # FFX metallib cache and re-transpiled all 80, with --check-fsr3's
+                                      # numbers unmoved to the digit). WORKAROUND MEASURED AND NOT
+                                      # SHIPPED: [loop] instead of [unroll] takes the corpus to 73/78 —
+                                      # it is a codegen change to a path D3D12 and Vulkan both compile
+                                      # and NEITHER is verifiable from a macOS box, for code that only
+                                      # runs under a verify probe, so it belongs to C2 with those two
+                                      # suites re-run.
+                                      # FR_MSL_LIST=1 names every module that reached a metallib, with
+                                      # its size (the FR_SPIRV_LIST idiom). Its sibling landed on the
+                                      # SPIR-V side and is what made all of the above measurement rather
+                                      # than argument: FR_SPIRV_DUMP=<dir> on --check-spirv keeps every
+                                      # compiled module instead of deleting it — the analogue of
+                                      # gpu/dxc.rs's Windows-only FR_DUMP_HLSL, and deliberately
+                                      # INDEPENDENT of S3 so it works without spirv-tools installed.
+                                      # CI: in the check-metal job, and it is the coverage
+                                      # --check-metalfx CANNOT give — it needs the shader TOOLCHAIN and
+                                      # no GPU, so the paravirtual device that makes MetalFX skip is
+                                      # irrelevant to it. Guarded on the M3/M4 line as well as PASSED
+                                      # (the gate SKIPs on an absent toolchain, so PASSED alone would go
+                                      # green on an image that lost spirv-cross or the Metal cryptex).
+                                      # Needs SDKs/dxc-macos, a ~10-min SOURCE build at DXC_TAG (upstream
+                                      # publishes no macOS binary, and a community build would break the
+                                      # one-release-tag invariant that keeps the DXIL and SPIR-V front
+                                      # ends identical), cached on the tag.
+                                      # Touch mtl/msl.rs / CROSS_ARGS / Expect / corpus_units /
+                                      # corpus_jobs -> run --check-msl on the procedural scene AND
+                                      # san-miguel-low-poly AND --sw-rays (the three configurations
+                                      # disagree, which is the point), --check-spirv both arms (the
+                                      # shared enumeration), --check-fsr3 and --check-metalfx (build.rs
+                                      # shares the spirv-cross toolstamp), --check + cargo test, then
+                                      # restore the Windows goldens
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
                                       # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9; --sw-rays covered
@@ -8491,7 +8639,7 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # default `loaded` feature dlopens libvulkan.so.1 and resolves every
                                       # entry point by symbol: the same footprint policy as dxc/oidn/xess/
                                       # nrd, so nothing links Vulkan and every other --check* stays
-                                      # unaffected. unix-only today for the same reason vk/spirv.rs is —
+                                      # unaffected. unix-only today for the same reason src/spirv.rs is —
                                       # nothing here forbids Vulkan on Windows, the Windows build simply
                                       # must not gain a dependency it does not yet use
 cargo run --release -- --check-fsr3   # FSR3 UPSCALING ON METAL, gated (macOS; src/mtl/ +

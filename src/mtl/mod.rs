@@ -64,15 +64,29 @@
 //! rather than five `Option`s on `Trio` precisely because of that un-share
 //! condition — its own doc gives the argument.
 //!
+//! `msl` is the ONE module here that is not a G-buffer consumer, and it is the
+//! first rung of a tracer rather than another arm beside them: the corpus's
+//! third code generator, HLSL -> SPIR-V -> MSL -> `.metallib`, gated by
+//! `--check-msl`. It renders nothing and binds nothing by design. Read its
+//! header before touching the arg set — every flag in it is a measurement,
+//! including one that `build.rs` passes for FidelityFX and this route must
+//! not.
+//!
+//! It also retired the premise the tracer plan was written on: **spirv-cross
+//! lowers `RayQuery` to Metal**, so `leaf`/`reference`/`leaf_fb`/`hemi_leaf`
+//! compile with hardware ray tracing intact and a Metal tracer does not need
+//! `--sw-rays`.
+//!
 //! Nothing here is reachable from `src/gfx/`. The entry points are
-//! `--check-fsr3`, `--check-metalfx`, and — since B4 — `--cinematic`, whose CPU
-//! arm reconstructs through `mfxdn` (or `mfx`) when one is available. That last
-//! one is the first thing on this platform that produces a PICTURE rather than
-//! a number.
+//! `--check-fsr3`, `--check-metalfx`, `--check-msl`, and — since B4 —
+//! `--cinematic`, whose CPU arm reconstructs through `mfxdn` (or `mfx`) when
+//! one is available. That last one is the first thing on this platform that
+//! produces a PICTURE rather than a number.
 
 pub mod device;
 pub mod fsr3;
 pub mod mfx;
 pub mod mfxdn;
 pub mod mfxfi;
+pub mod msl;
 pub mod planes;

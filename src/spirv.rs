@@ -1,5 +1,7 @@
-//! HLSL -> SPIR-V for the Vulkan backend: the twin of `gpu/dxc.rs`, compiling
-//! the IDENTICAL concatenated source that backend compiles to DXIL.
+//! HLSL -> SPIR-V: the twin of `gpu/dxc.rs`, compiling the IDENTICAL
+//! concatenated source that backend compiles to DXIL. Consumed by the Vulkan
+//! backend directly and by the Metal one through `spirv-cross` — see "Two
+//! consumers" below.
 //!
 //! Same footprint policy every SDK in this tree states: nothing links the
 //! compiler. `libdxcompiler.so` is `dlopen`'d at run time from a gitignored
@@ -65,12 +67,34 @@
 //!
 //! # Measured
 //!
-//! The whole shipping corpus — 40 units, 84 entry points, assembled by
+//! The whole shipping corpus — **47 units → 78 modules**, assembled by
 //! `gfx::shaders` exactly as a session assembles them, including all four
 //! `--dxr-inline` libraries with their RayQuery/any-hit machinery, the
 //! wavefront ladder, FRD's three kernels and the FSR composite — compiles
 //! under this flag set and passes `spirv-val`, with zero edits to any
-//! `.hlsl`. `--check-spirv` is that measurement, wired as a gate.
+//! `.hlsl`. `--check-spirv` is that measurement, wired as a gate. The
+//! `--sw-rays` arm reads 37 → 66, which is also the anti-vacuity proof that
+//! the lever reaches the assembly (7 965 832 B vs 5 461 519 B).
+//!
+//! Treat those as a SNAPSHOT: the counts move with the corpus, and the header
+//! said "40 units, 84 entry points" for long enough that two other places in
+//! the tree disagreed with it and with each other. The gate prints the live
+//! numbers; this paragraph is orientation, not a pin.
+//!
+//! # Two consumers, not one
+//!
+//! Vulkan eats this SPIR-V directly. **Metal eats it through `spirv-cross`**
+//! (`mtl::msl`, gated by `--check-msl`), which is why this module is
+//! `crate::spirv` rather than `vk::spirv` — it names no backend type and
+//! never did. `vk::spirv` re-exports it so no call site moved.
+//!
+//! One consequence worth knowing before changing the shift constants below:
+//! the Metal route CANNOT use them as argument indices. `--msl-decoration-
+//! binding` makes the Metal index equal the SPIR-V binding, and Metal allows
+//! textures 0-127 and samplers 0-15 — so `SHIFT_T`/`SHIFT_U`/`SHIFT_S` are
+//! all out of bounds there. `mtl::msl` therefore drops that flag and lets
+//! spirv-cross renumber per namespace; see its header for the measurement.
+//! These constants remain a VULKAN choice, and are free to stay one.
 //!
 //! # The one platform fact that makes this module unix-only
 //!
