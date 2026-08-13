@@ -6220,8 +6220,19 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # target; re-probe when an RDNA4 discrete card returns.
 cargo run --release -- --check-dxr    # DXR pipeline gate suite (needs a real RT GPU + the DXC DLLs;
                                       # composes with --stress; exit 2 = environment, 1 = a gate failed)
-cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, gated (unix; src/vk/spirv.rs
+cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (unix; src/spirv.rs
                                       # + run_check_spirv in main.rs, 2026-08-10 — the Vulkan port's M2a).
+                                      # NOTE the module MOVED out of `src/vk/` on 2026-08-12 (it names
+                                      # no `ash` type and never did — it is the corpus's second CODE
+                                      # GENERATOR, and since --check-msl consumes the same SPIR-V through
+                                      # spirv-cross, leaving it under vk/ would make the Metal gate
+                                      # import the Vulkan backend). `vk::spirv` re-exports it, so every
+                                      # call site is unchanged; the -fvk-*-shift constants stay a VULKAN
+                                      # choice and Metal deliberately does not reuse them (see
+                                      # --check-msl). The unit ENUMERATION also moved, into
+                                      # main.rs::corpus_units, shared with --check-msl — the two gates'
+                                      # premise is "one corpus, two code generators", which two `push!`
+                                      # lists could quietly falsify while both stayed green.
                                       # Assembles the SHIPPING corpus through gfx::shaders — the same
                                       # functions a session calls, which is what M1 moving the assembly
                                       # into the shared core BOUGHT — and compiles every unit to SPIR-V,
@@ -6357,6 +6368,143 @@ cargo run --release -- --check-spirv  # THE VULKAN BACKEND'S SHADER TOOLCHAIN, g
                                       # argument array is UTF-32. Vulkan-on-Windows needs that cfg, the
                                       # library name, and the module/dep cfg lifted — nothing else; the
                                       # vtables, CLSIDs, flags and binding scheme are already neutral
+cargo run --release -- --check-msl    # THE METAL SHADER TOOLCHAIN, gated (macOS; src/mtl/msl.rs +
+                                      # run_check_msl in main.rs, 2026-08-12 — the Metal port's C1, and
+                                      # the first rung of a Metal TRACER rather than another consumer
+                                      # of the CPU G-buffer). Takes --check-spirv's corpus one generator
+                                      # further: SPIR-V -> MSL (spirv-cross) -> AIR -> .metallib (xcrun
+                                      # metal). It renders nothing, binds nothing and dispatches
+                                      # nothing — what reaches a metallib and what refuses IS the
+                                      # product, the shape M2a had for Vulkan, where it found the one
+                                      # blocker nobody predicted. M0 pure arg set + classifier | M1 the
+                                      # tools (absent -> SKIP) | M2 assemble + DXC | M3 spirv-cross |
+                                      # M4 metal/metallib | M5 the verdict. Wrong OS = exit 2 (the
+                                      # --check-fsr3 convention). MEASURED: 47 units -> 78 SPIR-V -> 65
+                                      # metallib (2852234 B) on the procedural scene; 73 on
+                                      # san-miguel-low-poly; 61 of 66 under --sw-rays.
+                                      # M1'S PROBE CHECKS THE EXIT STATUS, NOT THE LAUNCH, and the two
+                                      # differ for a reason that is easy to get backwards: the process
+                                      # being launched is `xcrun`, which exists on any box with the
+                                      # Command Line Tools, so a missing Metal toolchain shows up as
+                                      # `xcrun -sdk macosx metal --version` LAUNCHING FINE and exiting
+                                      # 72 (measured). A launch-only probe therefore cannot see it at
+                                      # all — and the Metal toolchain is a separate MobileAsset cryptex
+                                      # the Xcode manifest does not list, so "Xcode present, `metal`
+                                      # absent" is exactly the shape of a box that lacks it. It shipped
+                                      # that way for a day: the gate let such a box past M1 and turned
+                                      # an environment fact into ~65 M4 failures, inverting the
+                                      # absent-is-a-SKIP contract the module is written around. The
+                                      # SPIRV-CROSS PROBE ABOVE IT IS DELIBERATELY THE OTHER WAY —
+                                      # spirv-cross treats `--version` as a usage error and exits
+                                      # non-zero on a HEALTHY install, so launch is the only signal
+                                      # there, while `metal` and `metallib` both exit 0 (measured). Two
+                                      # probes, two rules, per tool. TEETH: `METAL=/usr/bin/false`
+                                      # (launchable, cannot answer) and `METALLIB=/nonexistent` (cannot
+                                      # launch) must BOTH read `SKIP M1` at exit 0.
+                                      # THE ROUTE, settled on evidence: metal-shaderconverter (Apple's
+                                      # own DXIL -> metallib tool) is OUT — not installed with Xcode,
+                                      # not an xcrun tool, and it consumes SIGNED DXIL, whose signer
+                                      # dxil.dll is Windows-only (the same fact the NRD entry records).
+                                      # spirv-cross is the route build.rs already runs for FidelityFX
+                                      # and CI already installs.
+                                      # THE ARG SET, every entry measured (mtl::msl::CROSS_ARGS):
+                                      # --msl --msl-version 30000 --msl-argument-buffers
+                                      # --msl-argument-buffer-tier 2 --msl-device-argument-buffer 1.
+                                      # The device-argument-buffer SET is a derivation, not a literal:
+                                      # texs[] is register(t10, space1), the register SPACE becomes the
+                                      # descriptor SET, and spirv-cross requires runtime-sized arrays in
+                                      # DEVICE storage argument buffers ("Runtime sized variables must
+                                      # be in device storage argument buffers" is the exact refusal
+                                      # without it); self_test pins the constant and the flag agree.
+                                      # --msl-decoration-binding is ABSENT, and the reasoning was
+                                      # CORRECTED mid-milestone rather than merely stated: WITHOUT
+                                      # argument buffers it is fatal (measured, `bloom` alone emits
+                                      # [[texture(1000)]], [[texture(2000)]], [[sampler(3000)]] against
+                                      # Metal's 0-127 / 0-15 — the FFX precedent, which lost 112 of 160
+                                      # permutations to ONE sampler at 1001 and is fixed by
+                                      # build.rs::remap_ffx_samplers' single subtraction; ours would
+                                      # need three). WITH them it is merely MOOT — resources move
+                                      # inside an argument-buffer struct as [[id(n)]], measured
+                                      # [[id(0)]] [[id(1000)]] [[id(2000)]] [[id(3000)]] at
+                                      # [[buffer(0)]], where no such ceiling applies, and the same 65
+                                      # compile either way. So self_test pins the IMPLICATION that is
+                                      # true (asking for it REQUIRES argument buffers) rather than its
+                                      # absence, which would pin a preference. Either way the milestone
+                                      # boundary holds: the Metal argument indices are spirv-cross's
+                                      # business, so NOTHING may hardcode one — C2 derives the map (from
+                                      # Metal reflection or spirv-cross's own output), exactly as
+                                      # vk::reflect derives the Vulkan one.
+                                      # -ffp-contract=off is NOT needed and that was a surprise:
+                                      # spirv-cross PRESERVES NoContraction, emitting
+                                      # `[[clang::optnone]] T spvFMul(T l, T r){return fma(l,r,T(0));}`
+                                      # plus MSL's precise:: namespace — so the corpus's `precise`
+                                      # discipline (ftree.hlsli's decoded boxes must CONTAIN the true
+                                      # ones or every prune stops being conservative) survives the
+                                      # crossing. __METAL_FAST_MATH__ is 0 by default too.
+                                      # THE FINDING THAT OVERTURNED THE PLAN: spirv-cross LOWERS
+                                      # RayQuery to Metal. leaf/reference/leaf_fb/hemi_leaf all reach
+                                      # AIR with hardware ray tracing intact, as
+                                      # raytracing::acceleration_structure<raytracing::instancing> and
+                                      # raytracing::intersection_query — so a Metal tracer does NOT need
+                                      # --sw-rays, which was the milestone's founding premise. What
+                                      # Metal has no analogue for is the DXR PIPELINE shape (raygen/
+                                      # closest-hit/miss/SBT), i.e. the 5 dxr-lib modules, which the
+                                      # port does not need: what is being ported is the wavefront tracer.
+                                      # THE VERDICT IS ASYMMETRIC BY CLASS (mtl::msl::Expect), and the
+                                      # asymmetry is the milestone's own lesson: NoAnalogue is a
+                                      # CAPABILITY claim, so a dxr-lib that ever COMPILES is a hard FAIL
+                                      # ("Metal grew an analogue... move it to Metallib") and the class
+                                      # must still be REACHED (dxr-lib is enumerated on every scene under
+                                      # every lever, so demanding it is safe). ToolDefect is a BUG-
+                                      # PRESENCE claim and is REPORTED, never required — because bug
+                                      # presence is configuration-dependent: the 8 hemi_wave failures
+                                      # need the OPAQUE occluded_q arm, so an ALPHA_CUTOUT/TRANS_SHADOW
+                                      # scene compiles them (73/78) and --sw-rays has no RayQuery to
+                                      # mis-scope at all (61/66). A first draft demanded both classes
+                                      # fire and FAILED on exactly the configurations where the corpus
+                                      # does BETTER — caught by running the scene-keyed arm, which is
+                                      # why the verification list has one. A zero prints a NOTE rather
+                                      # than a silent 0.
+                                      # THE DEFECT ITSELF (upstream, not ours): check_empty_cell calls
+                                      # occluded_q six times under [unroll]; each declares its own
+                                      # RayQuery, but SPIR-V requires every OpVariable in a function's
+                                      # FIRST block, so the six unrolled bodies share one function-scope
+                                      # variable — and spirv-cross declares it inside a do{}while(false)
+                                      # and references it after the block closes ("use of undeclared
+                                      # identifier '_194'"). MEASURED IDENTICAL on spirv-cross 1.4.350.1
+                                      # and 1.4.357.0 (this box was upgraded to match CI, which installs
+                                      # unpinned — and the build.rs toolstamp correctly invalidated the
+                                      # FFX metallib cache and re-transpiled all 80, with --check-fsr3's
+                                      # numbers unmoved to the digit). WORKAROUND MEASURED AND NOT
+                                      # SHIPPED: [loop] instead of [unroll] takes the corpus to 73/78 —
+                                      # it is a codegen change to a path D3D12 and Vulkan both compile
+                                      # and NEITHER is verifiable from a macOS box, for code that only
+                                      # runs under a verify probe, so it belongs to C2 with those two
+                                      # suites re-run.
+                                      # FR_MSL_LIST=1 names every module that reached a metallib, with
+                                      # its size (the FR_SPIRV_LIST idiom). Its sibling landed on the
+                                      # SPIR-V side and is what made all of the above measurement rather
+                                      # than argument: FR_SPIRV_DUMP=<dir> on --check-spirv keeps every
+                                      # compiled module instead of deleting it — the analogue of
+                                      # gpu/dxc.rs's Windows-only FR_DUMP_HLSL, and deliberately
+                                      # INDEPENDENT of S3 so it works without spirv-tools installed.
+                                      # CI: in the check-metal job, and it is the coverage
+                                      # --check-metalfx CANNOT give — it needs the shader TOOLCHAIN and
+                                      # no GPU, so the paravirtual device that makes MetalFX skip is
+                                      # irrelevant to it. Guarded on the M3/M4 line as well as PASSED
+                                      # (the gate SKIPs on an absent toolchain, so PASSED alone would go
+                                      # green on an image that lost spirv-cross or the Metal cryptex).
+                                      # Needs SDKs/dxc-macos, a ~10-min SOURCE build at DXC_TAG (upstream
+                                      # publishes no macOS binary, and a community build would break the
+                                      # one-release-tag invariant that keeps the DXIL and SPIR-V front
+                                      # ends identical), cached on the tag.
+                                      # Touch mtl/msl.rs / CROSS_ARGS / Expect / corpus_units /
+                                      # corpus_jobs -> run --check-msl on the procedural scene AND
+                                      # san-miguel-low-poly AND --sw-rays (the three configurations
+                                      # disagree, which is the point), --check-spirv both arms (the
+                                      # shared enumeration), --check-fsr3 and --check-metalfx (build.rs
+                                      # shares the spirv-cross toolstamp), --check + cargo test, then
+                                      # restore the Windows goldens
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # + src/vk/headless.rs, 2026-08-10 — the Vulkan port's M2b+M2c,
                                       # M3a's V5, M3b/M3d's V6, M3c's V7, M3e's V8, M3f's V9; --sw-rays covered
@@ -8287,6 +8435,137 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # path), cargo test, --check-vk on procedural +
                                       # san-miguel-low-poly, both FR_VK_RES parities, --sw-rays,
                                       # llvmpipe, --check-spirv and tools/win-cross-check.sh
+                                      # V19 — THE PRESENT PATH (B6a rung 2, 2026-08-12): a swapchain
+                                      # over `VK_EXT_headless_surface`, so this backend PRESENTS.
+                                      # V18 proved it can rasterise; presentation is a different
+                                      # resource class (images the presentation engine owns, in a
+                                      # layout nothing else here enters) through a different API,
+                                      # and a real surface needs a window — which needs a windowing
+                                      # crate and an input design (B6b). The headless surface splits
+                                      # that: acquire, render, present, engine recycles, no display
+                                      # attached. What it CANNOT prove is pacing (no vblank, no
+                                      # scanout) — that is B6b's, and this module says so rather
+                                      # than implying otherwise. THE CLAIM IS A BYTE IDENTITY AT THE
+                                      # NEGOTIATED FORMAT: the same `Passes` into a swapchain image
+                                      # must produce the same bytes as into an offscreen image of
+                                      # that format — deliberately not V18's fixed sdr wire, since
+                                      # that decouples from format negotiation entirely and stays
+                                      # EXACT rather than a tolerance (the V14/V17 shape).
+                                      # THE IDENTITY ALONE IS VACUOUS, MEASURED NOT ARGUED:
+                                      # `record_to` opens with `LOAD_OP_CLEAR`, so deleting the draw
+                                      # gives BOTH targets the same zeros and the byte comparison
+                                      # PASSES — fired as a tooth, and the identity arm stayed
+                                      # silent while three others caught it. Those three: the CPU
+                                      # oracle (V18's `tone::map` comparison at the negotiated
+                                      # format's own tolerance — worst 2.37e-3, V18's sdr figure to
+                                      # the digit); ALPHA at maximum (both display pixel shaders
+                                      # write 1.0 unconditionally while the oracle compares RGB
+                                      # only, and a clear writes 0); and a `0xEE` SENTINEL flooded
+                                      # before the draw. THE SENTINEL IS THREE-WAY and free: the
+                                      # pattern = everything ran; the CLEAR colour = the render pass
+                                      # ran and the draw did not; the SENTINEL SURVIVING = the draw
+                                      # went to a DIFFERENT image than the one flooded and copied.
+                                      # Both middle and last outcomes were fired as separate teeth
+                                      # and give DIFFERENT diagnoses. Written by a draw-less
+                                      # `LOAD_OP_CLEAR` rather than `vkCmdClearColorImage`
+                                      # deliberately: the latter needs TRANSFER_DST, which the
+                                      # offscreen twin does not carry, so it would put a difference
+                                      # between the two images whose equality the gate asserts.
+                                      # THE PRESENT IS PROVED BY EXHAUSTION — nothing scans out, so
+                                      # `VK_SUCCESS` is a statement about a function call. Run
+                                      # `images.len() + 1` cycles: the last acquire can only succeed
+                                      # if the engine RELEASED one, and `ACQUIRE_TIMEOUT_NS` is
+                                      # FINITE so a present that did nothing reports rather than
+                                      # hangs. Acquire order is PRINTED, never asserted (the spec
+                                      # constrains none of it) — measured [0, 1, 0, 2, 0] over 4
+                                      # images, i.e. recycling visible by cycle 2.
+                                      # ONE RENDER-FINISHED SEMAPHORE PER IMAGE, and that is not a
+                                      # preference: a single shared one shipped first and the
+                                      # validation layer named it exactly ("is being signaled by
+                                      # VkQueue ..., but it may still be in use by VkSwapchainKHR").
+                                      # A binary semaphore may not be re-signalled while a wait is
+                                      # outstanding, and a present's wait has no CPU-visible
+                                      # completion — the harness fence covers the SUBMIT. Per-image
+                                      # makes reuse PROVABLY safe: acquiring image N means the
+                                      # engine released N, which means the present that waited on
+                                      # `render_done[N]` completed. The ACQUIRE semaphore needs no
+                                      # such treatment for a different reason, not by luck —
+                                      # `wait_submit` blocks before the next acquire.
+                                      # `Passes::record_to` takes (img, view, w, h) rather than
+                                      # `&Image` because a swapchain image owns no `VkDeviceMemory`
+                                      # and `Image::mem` is private and non-`Option`; `record` stays
+                                      # a thin wrapper so V18's recording is TEXTUALLY unchanged.
+                                      # Its two transitions were ALREADY right — `UNDEFINED ->
+                                      # COLOR_ATTACHMENT_OPTIMAL` is correct for a freshly acquired
+                                      # image and the tail to `TRANSFER_SRC_OPTIMAL` is exactly
+                                      # where a copy-before-present wants it — so rung 2 appends ONE
+                                      # barrier and edits neither.
+                                      # `display::rgb_offsets` IS THE DEFECT THIS CAUGHT BEFORE IT
+                                      # SHIPPED: `decode`'s catch-all read BGRA, right for the one
+                                      # 8-bit format rung 1 renders and silently wrong for the
+                                      # other — and the headless surface's OWN first format, on both
+                                      # ICDs here, is `R8G8B8A8_UNORM`, i.e. exactly what a present
+                                      # path taking the driver's preference negotiates. Inheriting
+                                      # it would have swapped R and B in 255 of every 256 texels of
+                                      # a hashed pattern while every other assertion stayed green,
+                                      # because a swizzle preserves alpha, coverage, AND a byte
+                                      # compare of two images that were BOTH swizzled. One statement
+                                      # of byte order now, consulted by `decode` and the identity,
+                                      # returning `Option` so an unknown format is REFUSED at
+                                      # negotiation rather than guessed (and `decode` returns NaN
+                                      # there, which fails every comparison it reaches).
+                                      # `_SRGB` is refused too: the pixel shader applies its own
+                                      # `pow(1/2.2)` and the hardware would encode it twice — a
+                                      # wrong image that still looks plausible.
+                                      # V19 SKIPS ON llvmpipe, AND THAT IS A MEASURED lavapipe
+                                      # DEFECT rather than a limitation: it advertises
+                                      # `VK_KHR_swapchain`, accepts a headless surface, and answers
+                                      # EVERY capability query — present support, formats, FIFO,
+                                      # `supportedUsageFlags` — and then `vkCreateSwapchainKHR`
+                                      # JUMPS TO ADDRESS ZERO inside its own frames (`#0 0x0 / #1..4
+                                      # libvulkan_lvp.so`), reproducing identically with validation
+                                      # DISABLED while RADV runs the same code clean. A segfault is
+                                      # not a failure mode a gate can report — it takes the process
+                                      # down mid-suite — and CI runs --check-vk on llvmpipe every
+                                      # push, so the skip is PRE-EMPTIVE (before the call) unlike
+                                      # V11/V13's skip-on-returned-error. `FR_VK_PRESENT_SOFTWARE=1`
+                                      # forces the attempt, verified live to still segfault, so the
+                                      # re-test is one variable the day Mesa fixes it. CONSEQUENCE:
+                                      # **V19 does NOT join ci.yml's forbidden-skip list** — it
+                                      # cannot run there — which is why the display stage's CI
+                                      # coverage stops at V18.
+                                      # `VkHeadless::run_present`/`wait_submit` are `run`'s siblings:
+                                      # a present sits BETWEEN the submit and the wait, so a call
+                                      # that blocked before returning could not express it.
+                                      # Fence-only WOULD work here (same-queue ordering + a CPU
+                                      # wait) and is recorded as the fallback, but B6b needs the
+                                      # semaphore path, so rung 2 proves the shape the window
+                                      # inherits rather than a gate-only shortcut.
+                                      # MEASURED (RADV, 64x32, 4 images, FIFO,
+                                      # `R8G8B8A8_UNORM`): byte-identical over 10240 texels across 5
+                                      # cycles, oracle worst 2.37e-3 (limit 3.92e-3), alpha full,
+                                      # sentinel survivors 0, validation clean — on procedural,
+                                      # san-miguel-low-poly, rungholt, both FR_VK_RES parities and
+                                      # --sw-rays. FOUR TEETH FIRED, each naming its own defect and
+                                      # all four SEPARATING: no draw (clear-colour outcome + oracle
+                                      # + alpha, identity SILENT); draw into another image (sentinel
+                                      # outcome + identity + oracle + alpha); pipeline format !=
+                                      # swapchain format (validation ONLY — every value arm passes,
+                                      # since both targets went through the same wrong pipeline and
+                                      # RADV honours the view's format, which is the sharpest
+                                      # argument in this file for CI running the layer armed);
+                                      # missing `PRESENT_SRC_KHR` transition (validation, named).
+                                      # Touch `src/vk/swapchain.rs` / `Passes::record_to` /
+                                      # `display::rgb_offsets` / `run_present`/`wait_submit` / the
+                                      # surface+swapchain extension enables in `device.rs` -> run
+                                      # --check (goldens byte-identical — rung 2 touches no shading
+                                      # path), cargo test, --check-vk on procedural +
+                                      # san-miguel-low-poly + rungholt, both FR_VK_RES parities,
+                                      # --sw-rays, llvmpipe (V19 SKIPs), --check-spirv, --check-fsr,
+                                      # --check-nrd and tools/win-cross-check.sh — the last is not
+                                      # optional here: `mod vk` is cfg(unix), so a new gate function
+                                      # needs `#[cfg(unix)]` and nothing else on this box catches
+                                      # its absence
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
@@ -8498,7 +8777,7 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # default `loaded` feature dlopens libvulkan.so.1 and resolves every
                                       # entry point by symbol: the same footprint policy as dxc/oidn/xess/
                                       # nrd, so nothing links Vulkan and every other --check* stays
-                                      # unaffected. unix-only today for the same reason vk/spirv.rs is —
+                                      # unaffected. unix-only today for the same reason src/spirv.rs is —
                                       # nothing here forbids Vulkan on Windows, the Windows build simply
                                       # must not gain a dependency it does not yet use
 cargo run --release -- --check-fsr3   # FSR3 UPSCALING ON METAL, gated (macOS; src/mtl/ +

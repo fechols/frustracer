@@ -154,6 +154,14 @@ mod sh;
 // sky call site in the renderer.
 mod sky;
 mod sphcell;
+// HLSL -> SPIR-V: the corpus's SECOND code generator, beside `gpu/dxc.rs`'s
+// DXIL. Not under `vk/` (where it lived until `--check-msl` arrived) because
+// it names no backend type and now has two consumers — Vulkan eats the SPIR-V
+// directly, Metal eats it through spirv-cross. `vk::spirv` re-exports it, so
+// every existing call site is unchanged. unix-only for the one reason its
+// header gives: DXC's `LPCWSTR` is a 4-byte `wchar_t` off Windows.
+#[cfg(unix)]
+mod spirv;
 mod stats;
 mod prof;
 mod replay;
@@ -172,7 +180,7 @@ mod mtl;
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
 // The Vulkan backend, peer of `gpu/` over the shared `gfx/` core. unix-only
-// for exactly one reason today — DXC's `wchar_t` width — see vk/spirv.rs.
+// for exactly one reason today — DXC's `wchar_t` width — see src/spirv.rs.
 #[cfg(unix)]
 mod vk;
 mod world;
@@ -358,6 +366,7 @@ fn main() {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_msl,
         check_vk,
         check_gpu,
         check_dxr,
@@ -1015,6 +1024,9 @@ fn main() {
         // carries it, so `--check-spirv san-miguel.obj` gates arms the
         // procedural scene cannot reach.
         || check_spirv
+        // Scene-keyed for the line above's reason, and it is the SAME corpus:
+        // both gates enumerate it through `corpus_units`.
+        || check_msl
         // NOT scene-keyed: the smoke kernel is one file with no scene-derived
         // defines, so this gate is a pure function of the device.
         || check_vk
@@ -1312,10 +1324,30 @@ fn main() {
         {
             // Said, not silently skipped: the SPIR-V path is one `wchar_t`
             // width and one library name away from working here — see the
-            // header in src/vk/spirv.rs.
+            // header in src/spirv.rs.
             eprintln!(
-                "--check-spirv is unix-only today (the Vulkan backend's SPIR-V \
-                 compiler); see src/vk/spirv.rs for what the Windows arm needs"
+                "--check-spirv is unix-only today (the corpus's SPIR-V \
+                 compiler); see src/spirv.rs for what the Windows arm needs"
+            );
+            std::process::exit(2);
+        }
+    }
+    if check_msl {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_msl(&scene);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2, not a SKIP — the --check-fsr3 convention: an explicitly
+            // requested gate on the wrong OS is an ENVIRONMENT error, while a
+            // missing toolchain on the RIGHT OS is what SKIPs.
+            eprintln!(
+                "--check-msl compiles the shipping corpus to Metal `.metallib`s, so it is \
+                 macOS-only: `xcrun metal` has no counterpart elsewhere. The SPIR-V half \
+                 it builds on runs on every unix in --check-spirv, and the corpus both \
+                 gates enumerate is the same one (main.rs::corpus_units)."
             );
             std::process::exit(2);
         }
@@ -13996,54 +14028,33 @@ fn compute_entries(src: &str) -> Vec<String> {
     out
 }
 
+/// A compile unit: how to target it, and how to find its entry points.
 #[cfg(unix)]
-fn run_check_spirv(scene: &scene::Scene) -> i32 {
+enum Shape {
+    /// Compute: entries scanned out of the assembled source.
+    Compute(&'static str),
+    /// A DXR library — every `[shader(...)]` export at once, no `-E`.
+    Lib(String),
+    /// The display pair, which every `.hlsl` here spells identically.
+    Gfx,
+}
+
+/// The SHIPPING corpus, assembled exactly as a session assembles it.
+///
+/// SHARED BY `--check-spirv` AND `--check-msl` ON PURPOSE, and it is not a
+/// tidiness move: the Metal gate's entire premise is "the same source through
+/// a second code generator", and two `push!` lists would let the two gates
+/// drift onto different corpora while both stayed green — the drift no gate in
+/// this tree could see, which is the same argument `crate::spirv`'s header
+/// makes for fetching both DXC drops from one release tag.
+///
+/// `Err` is the vendor-arm anti-vacuity failure, which belongs here rather
+/// than in either caller because it is a property of the ASSEMBLY.
+#[cfg(unix)]
+fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, String> {
     use gfx::shaders as sh;
     use gfx::vocab::Vendor;
 
-    let mut ok = true;
-
-    // ---- S0: the pure half. Runs with or without a compiler on disk. ----
-    match vk::spirv::self_test() {
-        Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
-        Err(e) => {
-            eprintln!("check-spirv: FAIL S0 {e}");
-            ok = false;
-        }
-    }
-    // The reflector is pure SPIR-V and belongs to the same stage: it reads
-    // what a module DECLARES, which is the half of the descriptor story
-    // `spirv-val` cannot see (it validates a module, and knows nothing about
-    // the layout that module will be bound against).
-    match vk::reflect::self_test() {
-        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
-        Err(e) => {
-            eprintln!("check-spirv: FAIL S0 reflect: {e}");
-            ok = false;
-        }
-    }
-
-    // ---- S1: the compiler. A missing drop is a normal condition. ----
-    let dir = vk::spirv::default_dir();
-    let dxc = match vk::spirv::Spirv::load(&dir) {
-        Ok(d) => d,
-        Err(e) => {
-            println!("check-spirv: SKIP S1 ({e})");
-            return i32::from(!ok);
-        }
-    };
-    println!("check-spirv: S1 {} loaded from {dir}", vk::spirv::LIB_NAME);
-
-    // ---- S2: assemble the corpus. ----
-    /// A compile unit: how to target it, and how to find its entry points.
-    enum Shape {
-        /// Compute: entries scanned out of the assembled source.
-        Compute(&'static str),
-        /// A DXR library — every `[shader(...)]` export at once, no `-E`.
-        Lib(String),
-        /// The display pair, which every `.hlsl` here spells identically.
-        Gfx,
-    }
     let mut units: Vec<(String, String, Shape)> = Vec::new();
     // Dedupe by SOURCE: the vendor and sway arms below usually assemble to
     // the same bytes, and compiling one unit twice under two names would
@@ -14094,11 +14105,9 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // a real difference to find — CAND_TMIN0, the RDNA4 candidate-loop
     // workaround whose absence was worth 2x on textured scenes — so demand it.
     if vendor_arms < 2 {
-        eprintln!(
-            "check-spirv: FAIL S2 the vendor arms assembled identically — \
-             cand_defs no longer distinguishes them, so this run covered one"
-        );
-        ok = false;
+        return Err("the vendor arms assembled identically — cand_defs no longer \
+                    distinguishes them, so this run covered one"
+            .into());
     }
 
     // The DXR pipeline, every `--dxr-inline` arm. Mode 0 is the lib_6_3
@@ -14155,6 +14164,11 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // `VK_AMDX_shader_enqueue` translation exists but that extension is a
     // vendor provisional, and the file is a default-off env lever measured as
     // a wash. See gfx/mod.rs.
+    //
+    // NEITHER EXCLUSION IS METAL-SHAPED, and the Metal gate does not add one:
+    // `mtl::msl::Expect` classifies what it CANNOT compile (the DXR library
+    // shape) rather than dropping it from the corpus, so the count stays
+    // comparable between the two gates and a unit that starts working says so.
 
     // The display stage. These are the tree's only fxc units (cs_5_0/ps_5_0 —
     // see the "bloom no-DXC precedent"), so Vulkan compiles them at the SM 6
@@ -14167,6 +14181,98 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     push!("blit", sh::BLIT_HLSL.to_string(), Shape::Gfx);
     push!("hud", sh::HUD_HLSL.to_string(), Shape::Gfx);
     push!("waveviz", sh::WAVEVIZ_HLSL.to_string(), Shape::Gfx);
+
+    Ok(units)
+}
+
+/// The (entry, target) jobs a unit yields, or `Err` if a compute unit yields
+/// none — anti-vacuity shared by both gates, because a unit that compiled
+/// nothing reads exactly like a unit that compiled cleanly.
+#[cfg(unix)]
+fn corpus_jobs(name: &str, src: &str, shape: &Shape) -> Result<Vec<(String, String)>, String> {
+    use gfx::shaders as sh;
+    Ok(match shape {
+        Shape::Lib(t) => vec![(String::new(), t.clone())],
+        Shape::Gfx => {
+            // The names come from `gfx::shaders`, which is where the
+            // Vulkan display stage reads them too — so this gate and its
+            // consumer cannot drift onto different entry points.
+            vec![
+                (sh::GFX_VS.to_string(), "vs_6_0".into()),
+                (sh::GFX_PS.to_string(), "ps_6_0".into()),
+            ]
+        }
+        Shape::Compute(t) => {
+            let e = compute_entries(src);
+            if e.is_empty() {
+                return Err(format!("{name}: no [numthreads] entry point found"));
+            }
+            e.into_iter().map(|e| (e, (*t).to_string())).collect()
+        }
+    })
+}
+
+#[cfg(unix)]
+fn run_check_spirv(scene: &scene::Scene) -> i32 {
+    let mut ok = true;
+
+    // ---- S0: the pure half. Runs with or without a compiler on disk. ----
+    // `crate::spirv`, not `vk::spirv`: the module moved OUT of that backend
+    // because it names none of it, and this gate's own subject is the corpus
+    // rather than Vulkan (`--check-msl` reaches the same module the same way).
+    // The `vk::spirv` re-export stays for the backend's real call sites.
+    match crate::spirv::self_test() {
+        Ok(()) => println!("check-spirv: S0 binding scheme + blob checks OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 {e}");
+            ok = false;
+        }
+    }
+    // The reflector is pure SPIR-V and belongs to the same stage: it reads
+    // what a module DECLARES, which is the half of the descriptor story
+    // `spirv-val` cannot see (it validates a module, and knows nothing about
+    // the layout that module will be bound against). It IS Vulkan-owned,
+    // unlike the compiler above — the descriptor-set layout it feeds is.
+    match vk::reflect::self_test() {
+        Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S0 reflect: {e}");
+            ok = false;
+        }
+    }
+
+    // ---- S1: the compiler. A missing drop is a normal condition. ----
+    let dir = crate::spirv::default_dir();
+    let dxc = match crate::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-spirv: SKIP S1 ({e})");
+            return i32::from(!ok);
+        }
+    };
+    println!("check-spirv: S1 {} loaded from {dir}", crate::spirv::LIB_NAME);
+
+    // ---- S2: assemble the corpus. ----
+    // SHARED with `--check-msl` — see `corpus_units`. The two gates compile
+    // one corpus through two code generators, and that is only true if they
+    // enumerate it in one place.
+    let units = match corpus_units(scene) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("check-spirv: FAIL S2 {e}");
+            // The summary line even on an early return: every other exit from
+            // this function ends with one, so a run that stopped without it
+            // reads like a crash rather than a verdict. NOT for CI's benefit —
+            // that job runs `set -eo pipefail`, so a non-zero gate aborts the
+            // step before its grep, and the grep's "it skipped" message is
+            // therefore only ever evaluated on an exit-0 run, where it is
+            // accurate. `run_check_msl`'s equivalent paths print it too, and
+            // the two gates disagreeing about their own convention is the
+            // thing worth not shipping.
+            println!("CHECK-SPIRV FAILED");
+            return 1;
+        }
+    };
 
     // ---- S3: spirv-val, if the drop is here. ----
     let val = {
@@ -14195,32 +14301,39 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     let tmp = std::env::temp_dir().join(format!("frustracer-spirv-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
+    // `FR_SPIRV_DUMP=<dir>` — keep every compiled module instead of deleting
+    // it. The SPIR-V analogue of `gpu/dxc.rs`'s `FR_DUMP_HLSL`, which is
+    // Windows-only, and the same reason: the corpus is assembled by string
+    // concatenation, so no file on disk is what a compiler ever saw, and a
+    // module nobody can extract is a module nobody can put through a second
+    // tool. That second tool is `spirv-cross`, which is how `--check-msl`'s
+    // arg set was settled — see `mtl::msl`.
+    //
+    // The dump is INDEPENDENT of S3: the write below is gated on `val` today
+    // because validation is the only thing that wanted a file, and a dump that
+    // silently produced nothing without spirv-tools installed would be the
+    // read-only-probe trap this repository keeps re-learning.
+    let dump = std::env::var_os("FR_SPIRV_DUMP").map(std::path::PathBuf::from);
+    if let Some(d) = dump.as_ref() {
+        match std::fs::create_dir_all(d) {
+            Ok(()) => println!("check-spirv: FR_SPIRV_DUMP — writing modules to {}", d.display()),
+            Err(e) => eprintln!("check-spirv: FR_SPIRV_DUMP={} unusable ({e})", d.display()),
+        }
+    }
+
     // ---- compile + validate ----
     let (mut compiled, mut validated, mut failed) = (0usize, 0usize, 0usize);
     for (name, src, shape) in &units {
-        // (entry, target) pairs for this unit.
-        let jobs: Vec<(String, String)> = match shape {
-            Shape::Lib(t) => vec![(String::new(), t.clone())],
-            Shape::Gfx => {
-                // The names come from `gfx::shaders`, which is where the
-                // Vulkan display stage reads them too — so this gate and its
-                // consumer cannot drift onto different entry points.
-                vec![
-                    (sh::GFX_VS.to_string(), "vs_6_0".into()),
-                    (sh::GFX_PS.to_string(), "ps_6_0".into()),
-                ]
-            }
-            Shape::Compute(t) => {
-                let e = compute_entries(src);
-                if e.is_empty() {
-                    // Anti-vacuity: a unit that yields no entries compiled
-                    // nothing, and a silent zero reads exactly like a pass.
-                    eprintln!("check-spirv: FAIL S2 {name}: no [numthreads] entry point found");
-                    ok = false;
-                    failed += 1;
-                    continue;
-                }
-                e.into_iter().map(|e| (e, (*t).to_string())).collect()
+        // (entry, target) pairs for this unit. Anti-vacuity — a unit that
+        // yields no entries compiled nothing, and a silent zero reads exactly
+        // like a pass — lives in `corpus_jobs`, shared with `--check-msl`.
+        let jobs = match corpus_jobs(name, src, shape) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("check-spirv: FAIL S2 {e}");
+                ok = false;
+                failed += 1;
+                continue;
             }
         };
         for (entry, target) in jobs {
@@ -14239,12 +14352,16 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
                 }
             };
             compiled += 1;
-            let Some(val) = val.as_ref() else { continue };
-            let path = tmp.join(format!("{}.spv", what.replace(['[', ']', ':', '+'], "_")));
+            if val.is_none() && dump.is_none() {
+                continue;
+            }
+            let stem = what.replace(['[', ']', ':', '+'], "_");
+            let path = dump.as_ref().unwrap_or(&tmp).join(format!("{stem}.spv"));
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             if std::fs::write(&path, &bytes).is_err() {
                 continue;
             }
+            let Some(val) = val.as_ref() else { continue };
             match std::process::Command::new(val).arg(&path).output() {
                 Ok(o) if o.status.success() => validated += 1,
                 Ok(o) => {
@@ -14261,7 +14378,9 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
                     failed += 1;
                 }
             }
-            let _ = std::fs::remove_file(&path);
+            if dump.is_none() {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
     let _ = std::fs::remove_dir(&tmp);
@@ -14274,7 +14393,7 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // The assembled byte count is in the summary because the unit and module
     // COUNTS cannot distinguish two scenes: san-miguel arms ALPHA_CUTOUT and
     // TRANS_SHADOW where the procedural scene arms neither, and both produce
-    // the same 46 units. Two identical counts beside two different sizes is a
+    // the same 47 units. Two identical counts beside two different sizes is a
     // gate that keyed on the scene; two identical sizes would mean it did
     // not, and nothing else here would have said so.
     let bytes: usize = units.iter().map(|(_, s, _)| s.len()).sum();
@@ -14293,6 +14412,218 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
         }
     }
     println!("CHECK-SPIRV {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
+}
+
+/// `--check-msl`: the Metal shader toolchain — the corpus's THIRD code
+/// generator, and the first rung of a Metal tracer.
+///
+/// `--check-spirv` proves the corpus reaches SPIR-V. This proves it reaches a
+/// `.metallib`, which is a different claim and the one a Metal backend rests
+/// on. It renders nothing and binds nothing: what compiles and what refuses is
+/// the entire product, exactly as M2a was for the Vulkan port.
+///
+/// M0 the pure arg-set/classifier half | M1 the tools | M2 assemble + DXC |
+/// M3 spirv-cross | M4 `metal`/`metallib` | M5 the verdict per class.
+///
+/// THE VERDICT HAS TEETH IN BOTH DIRECTIONS, which is what keeps the
+/// known-failing list from rotting into a whitelist: a unit expected to
+/// compile and failing is a FAIL, and a unit expected to fail and COMPILING is
+/// also a FAIL, because that means a workaround landed or spirv-cross fixed
+/// the bug and `mtl::msl::Expect` is now lying. The second half is the one a
+/// normal "known failures" list never has.
+#[cfg(target_os = "macos")]
+fn run_check_msl(scene: &scene::Scene) -> i32 {
+    use mtl::msl::{expect_of, Expect};
+
+    let mut ok = true;
+
+    // ---- M0: pure. No tools, no device, no corpus. ----
+    match mtl::msl::self_test() {
+        Ok(()) => println!("check-msl: M0 arg set + unit classification OK"),
+        Err(e) => {
+            eprintln!("check-msl: FAIL M0 {e}");
+            ok = false;
+        }
+    }
+
+    // ---- M1: the tools. Absence is an environment fact, so it SKIPs. ----
+    let scratch = std::env::temp_dir().join(format!("frustracer-msl-{}", std::process::id()));
+    let msl = match mtl::msl::Msl::find(scratch.clone()) {
+        Ok(m) => m,
+        Err(e) if e.absent => {
+            println!("check-msl: SKIP M1 ({})", e.msg);
+            return i32::from(!ok);
+        }
+        Err(e) => {
+            eprintln!("check-msl: FAIL M1 {}", e.msg);
+            println!("CHECK-MSL FAILED");
+            return 1;
+        }
+    };
+    println!("check-msl: M1 {}", msl.line());
+
+    // ---- M2: the same DXC half `--check-spirv` runs, on the same corpus. ----
+    let dir = crate::spirv::default_dir();
+    let dxc = match crate::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-msl: SKIP M2 ({e})");
+            let _ = std::fs::remove_dir_all(&scratch);
+            return i32::from(!ok);
+        }
+    };
+    println!("check-msl: M2 {} loaded from {dir}", crate::spirv::LIB_NAME);
+    let units = match corpus_units(scene) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("check-msl: FAIL M2 {e}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            println!("CHECK-MSL FAILED");
+            return 1;
+        }
+    };
+
+    // ---- M3/M4: transpile and compile, tallied per expectation class. ----
+    let (mut spv, mut lib_ok, mut lib_bytes) = (0usize, 0usize, 0usize);
+    // Per-class tallies. Both halves are kept for each, because "how many of
+    // this class failed" and "how many compiled anyway" are different facts
+    // and the verdict below treats the two classes ASYMMETRICALLY.
+    let (mut no_analogue, mut tool_defect) = (0usize, 0usize);
+    let mut defect_ok = 0usize;
+    let mut surprises: Vec<String> = Vec::new();
+    let mut list: Vec<String> = Vec::new();
+    for (name, src, shape) in &units {
+        let want = expect_of(name);
+        let jobs = match corpus_jobs(name, src, shape) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("check-msl: FAIL M2 {e}");
+                ok = false;
+                continue;
+            }
+        };
+        for (entry, target) in jobs {
+            let what =
+                if entry.is_empty() { name.clone() } else { format!("{name}:{entry}") };
+            let stem = what.replace(['[', ']', ':', '+'], "_");
+            let words = match dxc.compile(src, &entry, &target, &what, false) {
+                Ok(w) => w,
+                Err(e) => {
+                    // A DXC failure here is not this gate's subject —
+                    // `--check-spirv` owns that — but it must not be silent.
+                    eprintln!("check-msl: FAIL M2 {e}");
+                    ok = false;
+                    continue;
+                }
+            };
+            spv += 1;
+            let got = msl
+                .transpile(&words, &stem)
+                .and_then(|src| msl.compile(&src, &stem).map(|b| b.len()));
+            match (got, want) {
+                (Ok(n), Expect::Metallib) => {
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    list.push(format!("{what} -> {n} B"));
+                }
+                (Ok(n), Expect::NoAnalogue) => {
+                    // The stale-table alarm, and it is HARD for this class
+                    // alone: `NoAnalogue` is a CAPABILITY claim — Metal has no
+                    // analogue for a DXIL ray-tracing library — so one
+                    // compiling is not configuration luck, it is news, and the
+                    // message says which arm to move.
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    surprises.push(format!(
+                        "{what} is classified NoAnalogue but COMPILED ({n} B) — Metal \
+                         grew an analogue for the DXR library shape, or spirv-cross \
+                         did; move it to Metallib and record what changed"
+                    ));
+                }
+                (Ok(n), Expect::ToolDefect) => {
+                    // SOFT, and deliberately: a codegen bug's presence is a
+                    // property of the configuration and the tool version. This
+                    // very unit compiles on an ALPHA_CUTOUT scene and under
+                    // --sw-rays. Failing here would fail the gate on exactly
+                    // the configurations where the corpus does BETTER.
+                    lib_ok += 1;
+                    lib_bytes += n;
+                    defect_ok += 1;
+                }
+                (Err(e), Expect::Metallib) => {
+                    eprintln!("check-msl: FAIL M4 {what}: {e}");
+                    ok = false;
+                }
+                (Err(_), Expect::NoAnalogue) => no_analogue += 1,
+                (Err(_), Expect::ToolDefect) => tool_defect += 1,
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // ---- M5: the verdict. ----
+    for s in &surprises {
+        eprintln!("check-msl: FAIL M5 {s}");
+        ok = false;
+    }
+    // A corpus that assembled to nothing would report a clean sweep, and so
+    // would one where every unit happened to be a known-failing one.
+    if spv == 0 {
+        eprintln!("check-msl: FAIL M2 the corpus assembled zero units");
+        ok = false;
+    }
+    if lib_ok == 0 {
+        eprintln!("check-msl: FAIL M5 nothing reached a .metallib");
+        ok = false;
+    }
+    // `NoAnalogue` must still be REACHED, or the hard teeth above score an
+    // empty set: a corpus that stopped emitting DXR libraries would leave the
+    // class vacuous and nothing would say the gate had stopped covering it.
+    // This one is safe to demand because `dxr-lib` is enumerated on every
+    // scene and under every lever — unlike `ToolDefect`, which is
+    // configuration-dependent and is REPORTED below instead.
+    if no_analogue == 0 {
+        eprintln!(
+            "check-msl: FAIL M5 no unit exercised NoAnalogue — either the corpus \
+             stopped producing DXR libraries or the classifier stopped matching, \
+             and in both cases this run's capability teeth gated nothing"
+        );
+        ok = false;
+    }
+    // Bytes, not just counts: the unit count cannot tell two scenes apart
+    // (san-miguel arms ALPHA_CUTOUT and TRANS_SHADOW, the procedural scene
+    // arms neither, and both assemble the same 47 units) — the same reason
+    // `--check-spirv` prints its assembled size.
+    let asm: usize = units.iter().map(|(_, s, _)| s.len()).sum();
+    println!(
+        "check-msl: M3/M4 {} units ({asm} B assembled) -> {spv} SPIR-V -> \
+         {lib_ok} metallib ({lib_bytes} B)",
+        units.len()
+    );
+    println!(
+        "check-msl: M5 expected failures — {no_analogue} DXR-library (no Metal analogue), \
+         {tool_defect} spirv-cross scoping defect (see mtl::msl::Expect)"
+    );
+    // Say when the defect did not reproduce, rather than leaving a silent
+    // zero: that zero is a real difference between configurations (the opaque
+    // `occluded_q` arm is what trips it), and reading it as "the gate covered
+    // everything" is the mistake this line exists to prevent.
+    if tool_defect == 0 && defect_ok > 0 {
+        println!(
+            "check-msl: M5 NOTE the spirv-cross scoping defect did NOT reproduce in \
+             this configuration — {defect_ok} ToolDefect-classified module(s) compiled. \
+             That is expected on an ALPHA_CUTOUT/TRANS_SHADOW scene and under \
+             --sw-rays; the procedural scene with hardware rays is the arm that \
+             reproduces it."
+        );
+    }
+    if std::env::var_os("FR_MSL_LIST").is_some() {
+        for l in &list {
+            println!("check-msl:   {l}");
+        }
+    }
+    println!("CHECK-MSL {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
 }
 
@@ -14460,6 +14791,15 @@ fn run_check_vk(
     // tracer. That is also what makes it reachable on a device with no surface
     // support at all, and therefore in CI on llvmpipe.
     if !run_check_vk_display(&hg, &sp) {
+        ok = false;
+    }
+
+    // ---- V19: the same pipeline, into a SWAPCHAIN image. ----
+    //
+    // Beside V18 rather than inside it: it owns a surface and a swapchain and
+    // stands down on three independent environment facts, none of which should
+    // be able to take the offscreen arm with it.
+    if !run_check_vk_present(&hg, &sp) {
         ok = false;
     }
 
@@ -14831,6 +15171,385 @@ fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
         ok = false;
     }
     ok
+}
+
+/// V19 — the same pipeline, into a SWAPCHAIN image, and presented.
+///
+/// V18 proves this backend can rasterise and that its tone curve matches
+/// `tone::map`. It says nothing about PRESENTATION, which is a different
+/// resource class (images the presentation engine owns, in layouts nothing
+/// else here enters) reached through a different API. This is that path, run
+/// against `VK_EXT_headless_surface` so it needs no window and therefore runs
+/// on a CI box with no GPU.
+///
+/// THE CLAIM IS A BYTE IDENTITY AT THE NEGOTIATED FORMAT: the same `Passes`
+/// drawing into a swapchain image must produce the same bytes as into an
+/// offscreen image of that same format. That is deliberately not V18's fixed
+/// sdr wire — it decouples from format negotiation entirely, so it stays an
+/// EXACT comparison rather than a tolerance, which is the strongest shape
+/// available and the one V14 and V17 already use.
+///
+/// THE IDENTITY ALONE IS VACUOUS, and that is not a hypothetical: `record_to`
+/// opens its rendering block with `LOAD_OP_CLEAR`, so deleting the draw gives
+/// BOTH targets the same zeros and the byte comparison PASSES. Three
+/// independent arms close it, each answering a question the identity cannot:
+///
+/// - the CPU oracle (V18's `tone::map` comparison, at this format's own
+///   tolerance) — proves the bytes are the real image rather than a clear;
+/// - alpha at maximum — both display pixel shaders write 1.0 unconditionally
+///   while the oracle compares RGB only, so this is a free per-pixel coverage
+///   witness that a clear (which writes 0) cannot fake;
+/// - a `0xEE` sentinel flooded into the acquired image before the draw.
+///
+/// THE SENTINEL SEPARATES THREE OUTCOMES, not the usual two, and it is free:
+/// the pattern means everything ran; the CLEAR colour means the render pass
+/// ran and the draw did not; the SENTINEL SURVIVING means the draw went to a
+/// DIFFERENT image than the one that was flooded and copied — a real failure
+/// mode once an index is threaded through flood, render, copy and present, and
+/// one that garbage-looking output would otherwise be blamed for. It is
+/// written by a draw-less `LOAD_OP_CLEAR` rather than `vkCmdClearColorImage`
+/// deliberately: the latter needs `TRANSFER_DST` usage, which the offscreen
+/// twin does not carry, so using it would put a DIFFERENCE between the two
+/// images whose equality this whole gate asserts.
+///
+/// THE PRESENT IS PROVED BY EXHAUSTION. Nothing scans out, so `VK_SUCCESS` out
+/// of `vkQueuePresentKHR` is a statement about a function call and not about a
+/// frame going anywhere. So the gate runs ONE MORE CYCLE THAN THERE ARE
+/// IMAGES: the last acquire can only succeed if the presentation engine
+/// RELEASED an image this gate presented, and `ACQUIRE_TIMEOUT_NS` is finite
+/// precisely so a present that did nothing reports a failure instead of
+/// hanging. The acquire ORDER is printed and never asserted — the spec
+/// constrains none of it.
+///
+/// SKIPs (exit 0, `true`) on three independent environment facts, each an
+/// honest reason a box cannot present rather than a defect: no surface pair on
+/// the instance, no `VK_KHR_swapchain` on the device, no graphics queue in the
+/// family the pick chose. `vk::swapchain::skip_reason` names which.
+#[cfg(unix)]
+fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use ash::vk as avk;
+    use vk::display;
+    use vk::swapchain::Swapchain;
+
+    let ve0 = vk::device::validation_errors();
+    let vkd = &hg.vk;
+
+    // V18's fixture, and it transplants with no resize logic because the
+    // headless surface reports `currentExtent = 0xFFFFFFFF` (measured on both
+    // ICDs here), i.e. the swapchain picks its own size.
+    const TW: u32 = 64;
+    const TH: u32 = 32;
+    let n = (TW * TH) as usize;
+
+    let sc = match Swapchain::new(hg, TW, TH) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("check-vk: SKIP V19 ({})", vk::swapchain::skip_reason(hg));
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 swapchain: {e}");
+            return false;
+        }
+    };
+
+    let mut ok = true;
+    println!(
+        "check-vk: V19 headless surface: {:?} {}x{}, {} image(s), FIFO",
+        sc.fmt,
+        sc.w,
+        sc.h,
+        sc.image_count()
+    );
+
+    // The tolerance is a property of the NEGOTIATED wire, so derive it rather
+    // than assuming V18's sdr one — the surface's own preference here is
+    // 8-bit, but a 10-bit surface must be scored at ten bits.
+    let tol = if sc.fmt == avk::Format::A2B10G10R10_UNORM_PACK32 {
+        1.0 / 1023.0 + 1e-4
+    } else {
+        1.0 / 255.0 + 1e-6
+    };
+
+    // V18's ramp, verbatim: the same geometric span with the same two pinned
+    // low entries, so the oracle arm below is that gate's comparison rather
+    // than a second one that could drift from it.
+    const RAMP_LO: f32 = 1e-3;
+    const RAMP_HI: f32 = 6e4;
+    let span = (n - 3) as f32;
+    let radiance = |i: usize| -> f32 {
+        match i {
+            0 => 0.0,
+            1 => 1.0,
+            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+        }
+    };
+    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
+
+    let cleanup = |sc: &Swapchain| sc.destroy(vkd);
+
+    let src = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        avk::Format::R16G16B16A16_SFLOAT,
+        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 source image: {e}");
+            cleanup(&sc);
+            return false;
+        }
+    };
+
+    // ONE `Passes`, at the swapchain's own format, used for BOTH targets. That
+    // is what makes the identity a statement about the TARGET rather than
+    // about two pipelines that happen to agree.
+    let passes = match display::Passes::new(hg, sp, sc.fmt) {
+        Ok(p) => {
+            p.bind_source(vkd, src.view);
+            p
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 display passes ({:?}): {e}", sc.fmt);
+            src.destroy(vkd);
+            cleanup(&sc);
+            return false;
+        }
+    };
+
+    let params = display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
+
+    let fin = |ok: bool| -> bool {
+        passes.destroy(vkd);
+        src.destroy(vkd);
+        cleanup(&sc);
+        ok
+    };
+
+    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
+        eprintln!("check-vk: FAIL V19 ramp upload: {e}");
+        return fin(false);
+    }
+    if let Err(e) = passes.set_params(vkd, params) {
+        eprintln!("check-vk: FAIL V19 params: {e}");
+        return fin(false);
+    }
+
+    // ---- The offscreen reference, rendered once. ----
+    let off = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        sc.fmt,
+        avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 offscreen image: {e}");
+            return fin(false);
+        }
+    };
+    let want = {
+        let r = hg
+            .run(|d, cmd| passes.record(d, cmd, &off, true))
+            .and_then(|_| display::read_target(hg, &off, 4));
+        off.destroy(vkd);
+        match r {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 offscreen render: {e}");
+                return fin(false);
+            }
+        }
+    };
+
+    // The sentinel, as a float clear and as the byte it must land on. 238/255
+    // round-trips EXACTLY through an 8-bit UNORM, so a surviving texel is
+    // unambiguous rather than approximately unambiguous.
+    const SENTINEL: f32 = 238.0 / 255.0;
+
+    // A staging buffer for the copy-before-present, reused across cycles.
+    let stage = match vkd.buffer((n * 4) as u64, avk::BufferUsageFlags::TRANSFER_DST, true) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 staging buffer: {e}");
+            return fin(false);
+        }
+    };
+
+    // ---- The cycles. ONE MORE THAN THERE ARE IMAGES. ----
+    let cycles = sc.image_count() + 1;
+    let mut order = Vec::with_capacity(cycles);
+    let mut identity_bad = 0usize;
+    let mut oracle_worst = 0.0f32;
+    let mut alpha_bad = 0usize;
+    let mut sentinel_alive = 0usize;
+    let mut clear_alive = 0usize;
+
+    for cycle in 0..cycles {
+        let idx = match sc.acquire() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 cycle {cycle}: {e}");
+                ok = false;
+                break;
+            }
+        };
+        order.push(idx);
+
+        let (wait, stages) = sc.wait_pair();
+        let signal = sc.signal(idx);
+        let rec = hg.run_present(&wait, &stages, &signal, |d, cmd| {
+            // Flood, then draw. `record_to`'s opening barrier is FROM
+            // UNDEFINED, which discards — so on the correct path the sentinel
+            // is gone by construction and the readback shows the image. It
+            // survives only if the draw went somewhere else, which is exactly
+            // the outcome it is here to name.
+            sc.clear_to(d, cmd, idx, [SENTINEL, SENTINEL, SENTINEL, SENTINEL]);
+            passes.record_to(d, cmd, sc.images[idx], sc.view(idx), sc.w, sc.h, true);
+            // Copy BEFORE presenting: ownership returns to the presentation
+            // engine at present, so this is the last moment the bytes are
+            // readable at all.
+            unsafe {
+                let region = avk::BufferImageCopy::default()
+                    .image_subresource(
+                        avk::ImageSubresourceLayers::default()
+                            .aspect_mask(avk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(avk::Extent3D { width: sc.w, height: sc.h, depth: 1 });
+                d.cmd_copy_image_to_buffer(
+                    cmd,
+                    sc.images[idx],
+                    avk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    stage.buf,
+                    &[region],
+                );
+            }
+            sc.to_present_layout(d, cmd, idx);
+        });
+        if let Err(e) = rec {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} submit: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = sc.present(vkd, idx) {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} present: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = hg.wait_submit() {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} wait: {e}");
+            ok = false;
+            break;
+        }
+
+        let got = match vkd.read(&stage, n * 4) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 cycle {cycle} readback: {e}");
+                ok = false;
+                break;
+            }
+        };
+
+        for i in 0..n {
+            let px = &got[i * 4..i * 4 + 4];
+            if px != &want[i * 4..i * 4 + 4] {
+                identity_bad += 1;
+            }
+            let have = display::decode(px, sc.fmt);
+            let q = |v: f32| half::f16::from_f32(v).to_f32();
+            let c = glam::Vec3A::new(q(ramp[i * 3]), q(ramp[i * 3 + 1]), q(ramp[i * 3 + 2]));
+            let w = tone::map(c, tone::ToneParams::SDR);
+            for ch in 0..3 {
+                let d = (have[ch] - w[ch]).abs() / (1.0f32).max(w[ch].abs());
+                oracle_worst = oracle_worst.max(d);
+            }
+            if display::decode_alpha(px, sc.fmt) < 1.0 {
+                alpha_bad += 1;
+            }
+            // The three-way classification. Both comparisons are on DECODED
+            // values so a 10-bit surface reads the same way an 8-bit one does.
+            if have.iter().all(|v| (v - SENTINEL).abs() < 2.0 / 255.0) {
+                sentinel_alive += 1;
+            } else if have.iter().all(|v| *v < 1.0 / 255.0) {
+                clear_alive += 1;
+            }
+        }
+    }
+
+    vkd.free_buffer(&stage);
+
+    if ok {
+        if identity_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 swapchain vs offscreen — {identity_bad} texel(s) of \
+                 {} differ. Same pipeline, same format, two targets: this is the present \
+                 path's own claim.",
+                n * cycles
+            );
+            ok = false;
+        }
+        if sentinel_alive > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 {sentinel_alive} texel(s) still carry the 0xEE sentinel — \
+                 the draw went to a DIFFERENT image than the one flooded and copied"
+            );
+            ok = false;
+        } else if clear_alive == n * cycles {
+            eprintln!(
+                "check-vk: FAIL V19 every texel is the clear colour — the render pass ran and \
+                 the DRAW did not"
+            );
+            ok = false;
+        }
+        if oracle_worst > tol {
+            eprintln!(
+                "check-vk: FAIL V19 presented image vs tone::map — worst {oracle_worst:.2e} > \
+                 {tol:.2e}. The byte identity alone cannot see this: two targets that were \
+                 BOTH wrong agree."
+            );
+            ok = false;
+        }
+        if alpha_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 {alpha_bad} texel(s) with alpha below maximum — the draw \
+                 did not cover them"
+            );
+            ok = false;
+        }
+        if ok {
+            println!(
+                "check-vk: V19 present path: {cycles} cycle(s) over {} image(s) — swapchain vs \
+                 offscreen byte-identical over {} texel(s) | oracle worst {oracle_worst:.2e} \
+                 (limit {tol:.2e}) | alpha full | sentinel survivors 0",
+                sc.image_count(),
+                n * cycles
+            );
+            println!(
+                "check-vk: V19   acquire order {order:?} — reported, never asserted (the spec \
+                 constrains none of it); the LAST acquire succeeding is the proof the engine \
+                 released an image this gate presented"
+            );
+        }
+    }
+
+    // The device must be idle before the swapchain and its semaphores go: a
+    // presented image is still referenced by the presentation engine, and the
+    // last submit's semaphore is still in flight.
+    unsafe {
+        let _ = vkd.device.device_wait_idle();
+    }
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!("check-vk: FAIL V19 {ve} validation error(s) in the present path");
+        ok = false;
+    }
+    fin(ok)
 }
 
 /// V10 — the BC7 encoder, scored through the hardware decoder.
@@ -15984,7 +16703,37 @@ fn run_check_vk_render(
     let mut sum_c = [0.0f64; 3];
     let mut sum_g = [0.0f64; 3];
     let mut sum_abs = 0.0f64;
+    // NON-FINITE AND NEGATIVE ARE DIFFERENT FAILURES, and this gate counted
+    // them as one — the D3D12 suites' own correction (`check-dxr`'s radiance
+    // A/B, which carries the full argument) applied to the backend that never
+    // got it. A NaN or Inf is always a defect. A negative sample is not: the
+    // GI ladder's stochastic rungs estimate the ambient as
+    // `tail + (G - tail)/p`, an UNBIASED estimator of a non-negative quantity,
+    // and such an estimator may legitimately sample below zero — exactly when
+    // `G < tail*(1 - p)`. Conflated, a real NaN and the ladder's honest tail
+    // read identically, which is how this stage went red on a healthy tree.
+    //
+    // MEASURED HERE by sweeping the ladder, and the shape is the attribution:
+    //
+    //     rung   0    0.5    1     1.5    2
+    //     p      0    0.5    0     0.5    1.0
+    //     neg    0    453    0     11     5      (of 1.44M channels)
+    //
+    // The two DETERMINISTIC rungs read EXACTLY ZERO and every rung with a live
+    // correction reads non-zero, so `rtgi_corr_p > 0` is not a vacuous arming
+    // predicate — it is the line the data falls on. The count drops as p rises
+    // (the estimator's tail narrows), and 0.5 beats 1.5 at the same p because
+    // its correction sits at LEVEL 0, where `tail` is the primary surface's own
+    // ambient rather than a bounce's. Rung 2's residual 5 at p = 1.0 is fp
+    // cancellation in `tail + (G - tail)`, which is not exactly `G`.
+    //
+    // AND THE OLD `continue` DROPPED THE NEGATIVE TAIL FROM THE MEAN, which is
+    // worse than the miscount: clamping or excluding the low samples BIASES
+    // the statistic upward, and not biasing the mean is the one property the
+    // ladder exists to have. Negatives are now counted AND accumulated;
+    // only non-finites are skipped, and for a different reason (see below).
     let mut nonfinite = 0usize;
+    let mut negative = 0usize;
     // SPLIT BY WHAT THE PRIMARY RAY HIT, because the two populations fail for
     // different reasons and a single number cannot tell them apart: sky is the
     // dome + disc + the cloud caches with no material in sight, geometry is
@@ -15997,9 +16746,16 @@ fn run_check_vk_render(
     for i in 0..px * 3 {
         let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
         let g = gpu_a.get(i).copied().unwrap_or(f32::NAN) * inv;
-        if !g.is_finite() || g < 0.0 {
+        if !g.is_finite() {
             nonfinite += 1;
+            // SKIPPED FROM THE SUMS, unlike a negative: one NaN makes every
+            // statistic below it NaN, so a gate that kept it would report
+            // nothing about the 1.44M samples that are fine. The count is the
+            // assertion; the mean is for attribution.
             continue;
+        }
+        if g < 0.0 {
+            negative += 1;
         }
         sum_c[i % 3] += f64::from(c);
         sum_g[i % 3] += f64::from(g);
@@ -16037,7 +16793,7 @@ fn run_check_vk_render(
     }
     println!(
         "check-vk: V6 radiance A/B over {frames} frames: per-channel mean rel diff {:.3}% | \
-         mean abs px diff {:.4} | non-finite {nonfinite}",
+         mean abs px diff {:.4} | non-finite {nonfinite} | negative {negative}",
         mean_rel * 100.0,
         sum_abs / (px * 3) as f64
     );
@@ -16052,7 +16808,25 @@ fn run_check_vk_render(
         (hit_g - hit_c) / hit_c.max(1e-9) * 100.0
     );
     if nonfinite > 0 {
-        fail(&mut ok, format!("{nonfinite} non-finite/negative GPU channels"));
+        fail(&mut ok, format!("{nonfinite} non-finite GPU channels"));
+    }
+    // A stochastic rung may sample negative (see above); no other configuration
+    // may, and even an armed one only in the tail. The bound is on HOW MANY
+    // rather than on whether — 0.1% of samples, which is orders above anything
+    // the ladder produces and still catches a sign error, since that would flip
+    // a POPULATION rather than a fringe. `rtgi_corr_p` is the ONE derivation
+    // both the compile define and the runtime bit read, so this arms exactly
+    // when the correction does.
+    let neg_ok =
+        crate::gfx::frame::rtgi_corr_p(shade::rtgi_bounces()) > 0.0 && negative <= px * 3 / 1000;
+    if negative > 0 && !neg_ok {
+        fail(
+            &mut ok,
+            format!(
+                "{negative} negative GPU channels — legitimate only in a stochastic GI \
+                 rung's tail (--rtgi-bounces with a fractional part, or rung 2)"
+            ),
+        );
     }
     // Anti-vacuity: a pair of all-black images agrees perfectly.
     if sum_c.iter().sum::<f64>() <= 0.0 || sum_g.iter().sum::<f64>() <= 0.0 {

@@ -805,6 +805,15 @@ pub struct Cli {
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
+    /// `--check-msl`: take that same corpus one generator further — SPIR-V ->
+    /// MSL (spirv-cross) -> AIR -> `.metallib` (`xcrun metal`). The first rung
+    /// of a Metal tracer, and macOS-only because the Apple tools are.
+    ///
+    /// It compiles and nothing else: no device, no binding, no dispatch. What
+    /// reaches a metallib and what refuses IS the product — the shape M2a
+    /// (`--check-spirv`) had for the Vulkan port, where it found the one
+    /// blocker nobody predicted.
+    pub check_msl: bool,
     /// `--check-vk`: bring up a real Vulkan device, run the indirect-dispatch
     /// smoke chain on it, probe the compiled subgroup width at every group
     /// width the tracer dispatches, bind every tracer kernel against the
@@ -1100,6 +1109,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_fsr3 = false;
     let mut check_metalfx = false;
     let mut check_spirv = false;
+    let mut check_msl = false;
     let mut check_vk = false;
     let mut no_xess_explicit = false;
     let mut fsr_forced = false;
@@ -1161,6 +1171,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--check-fsr3" => check_fsr3 = true,
             "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
+            "--check-msl" => check_msl = true,
             "--check-vk" => check_vk = true,
             "--nrd" => {
                 opts.nrd = true;
@@ -2490,6 +2501,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_msl,
         check_vk,
         check_gpu,
         check_dxr,
@@ -2674,6 +2686,10 @@ pub fn usage() {
                 eprintln!("  --check-spirv headless (unix): assemble the shipping kernel corpus and compile every");
                 eprintln!("                unit to SPIR-V for the Vulkan backend, then spirv-val each module —");
                 eprintln!("                needs SDKs/dxc-linux (install-prerequisites.sh dxc); no GPU");
+                eprintln!("  --check-msl   headless (macOS): the same corpus one generator further — SPIR-V ->");
+                eprintln!("                MSL (spirv-cross) -> .metallib (xcrun metal). The first rung of a Metal");
+                eprintln!("                tracer: it compiles and nothing else, so what refuses IS the product.");
+                eprintln!("                Needs SDKs/dxc-macos + spirv-cross + the Metal toolchain; no GPU");
                 eprintln!("  --check-vk    headless (unix): bring up a real Vulkan device and run the indirect-");
                 eprintln!("                dispatch smoke chain on it (constants, storage buffers, a GPU-written");
                 eprintln!("                counter turned into dispatch args, vkCmdDispatchIndirect consuming");
