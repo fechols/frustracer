@@ -1,5 +1,7 @@
-//! The three input planes every Metal upscaler consumes — allocated, formatted
-//! and staged in one place.
+//! The input planes the Metal upscalers consume — allocated, formatted and
+//! staged in one place. `Trio` is the three every one of them reads;
+//! `Guides` is the five more the DENOISED scaler reads, and it is a separate
+//! struct for a reason its own doc gives.
 //!
 //! **This is a dedup, not an abstraction, and the distinction is what makes it
 //! allowed.** `src/mtl/mod.rs` states the rule: share MATH and VOCABULARY,
@@ -148,5 +150,120 @@ impl Trio {
 
         crate::fsr::stage_depth(&mut buf[..rw * rh * 4], rw * 4, &g.depth, rw, rh, near, far);
         mtl.upload(&self.depth, rw, rh, rw * 4, &buf[..rw * rh * 4]);
+    }
+}
+
+/// The DENOISER guide formats. Same rule as the trio's above — allocated and
+/// declared from one const, because a mismatch reads as garbage.
+///
+/// `NORMAL` and `ALBEDO` are `RGBA16Float` rather than a 3-component format
+/// because Metal has no RGB16Float: 3-channel pixel formats do not exist in the
+/// API at all. The fourth channel is therefore not a choice we are making, and
+/// `fsr::stage_normal`/`stage_albedo` zero it rather than leave it undefined.
+pub const NORMAL: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
+pub const ROUGHNESS: MTLPixelFormat = MTLPixelFormat::R16Float;
+pub const ALBEDO: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
+pub const HIT_DIST: MTLPixelFormat = MTLPixelFormat::R16Float;
+
+/// The five guide planes `MTLFXTemporalDenoisedScaler` reads beyond the trio,
+/// at one extent, in `Shared` storage.
+///
+/// **A SEPARATE STRUCT, AND THAT IS THE MODULE RULE BEING OBEYED RATHER THAN
+/// SIDESTEPPED.** The obvious shape is five `Option` fields on `Trio` — and
+/// this file's own header forbids exactly that: "shared code acquires
+/// parameters, and a `Trio` that grows an `Option<reactive_mask>` or a flags
+/// word IS the forbidden trait spelled as a struct. So: if this ever needs a
+/// conditional, delete it and inline both copies."
+///
+/// It is also what protects the thing `Trio` exists for. Its value is that the
+/// two upscalers provably see the SAME BYTES, which is what makes their
+/// cross-check evidence; an `Option` on `Trio` would mean one consumer's
+/// allocation depended on which consumer it was, and the "identical by
+/// construction" claim would quietly become "identical for the three fields
+/// that happen not to be optional".
+///
+/// So `Trio` is untouched, `mtl::mfxdn` composes the two, and the two upscalers
+/// keep their guarantee. The cost is one more extent to keep in step, which is
+/// what the assert in `stage` is for.
+pub struct Guides {
+    pub normal: Retained<ProtocolObject<dyn MTLTexture>>,
+    pub roughness: Retained<ProtocolObject<dyn MTLTexture>>,
+    pub diff_alb: Retained<ProtocolObject<dyn MTLTexture>>,
+    pub spec_alb: Retained<ProtocolObject<dyn MTLTexture>>,
+    pub hit_dist: Retained<ProtocolObject<dyn MTLTexture>>,
+    extent: (usize, usize),
+}
+
+impl Guides {
+    /// Allocate at `extent`. Unlike `Trio` this is always the EXACT input
+    /// extent, because its only consumer is the denoised scaler and that path
+    /// has no sub-rect mechanism at all — `inputContentWidth`/`Height` are
+    /// dropped from `MTLFXTemporalDenoisedScalerBase`, so the scaler always
+    /// consumes the full `inputWidth x inputHeight`. The assert in `stage` is
+    /// therefore an equality in practice and an inequality by contract.
+    pub fn new(mtl: &Mtl, extent: (usize, usize)) -> Result<Guides, String> {
+        let (w, h) = extent;
+        let t = |f: MTLPixelFormat, what: &str| {
+            mtl.texture(w, h, f, MTLStorageMode::Shared).map_err(|e| format!("{what}: {e}"))
+        };
+        Ok(Guides {
+            normal: t(NORMAL, "normal plane")?,
+            roughness: t(ROUGHNESS, "roughness plane")?,
+            diff_alb: t(ALBEDO, "diffuse albedo plane")?,
+            spec_alb: t(ALBEDO, "specular albedo plane")?,
+            hit_dist: t(HIT_DIST, "specular hit distance plane")?,
+            extent,
+        })
+    }
+
+    /// Stage the five guides into the planes' top-left `rw x rh` sub-rect.
+    ///
+    /// PRECONDITION ON `g`: a FULL `GBufs`, never `GBufs::new_slim`. The slim
+    /// variant leaves every plane read here zero-length and `GBufs::write`
+    /// skips their stores, so a slim buffer would panic on the first index
+    /// rather than merely produce a black guide — which is the good failure,
+    /// and is why this is stated rather than defended against.
+    pub fn stage(
+        &self,
+        mtl: &Mtl,
+        g: &crate::dlss::GBufs,
+        render: (usize, usize),
+    ) {
+        let (rw, rh) = render;
+
+        // The same two real asserts as `Trio::stage`, for the same two reasons
+        // spelled out there — `debug_assert` is dead in this tree, and the row
+        // casts in `fsr::stage_*` carry an alignment precondition a `Vec<u8>`
+        // does not promise.
+        assert!(
+            rw <= self.extent.0 && rh <= self.extent.1,
+            "guide stage extent {rw}x{rh} exceeds the planes' {}x{}",
+            self.extent.0,
+            self.extent.1,
+        );
+
+        // One scratch at the widest plane's 8 B/px; the 2 B/px planes take a
+        // prefix, exactly as the trio's 4 B/px ones do.
+        let mut buf = vec![0u8; rw * rh * 8];
+        assert!(
+            buf.as_ptr() as usize % 4 == 0,
+            "staging scratch is {}-aligned; fsr::stage_* casts rows to f32/f16",
+            1 << (buf.as_ptr() as usize).trailing_zeros().min(8),
+        );
+
+        crate::fsr::stage_normal(&mut buf, rw * 8, &g.normal_rough, rw, rh);
+        mtl.upload(&self.normal, rw, rh, rw * 8, &buf);
+
+        crate::fsr::stage_albedo(&mut buf, rw * 8, &g.diff_alb, rw, rh);
+        mtl.upload(&self.diff_alb, rw, rh, rw * 8, &buf);
+
+        crate::fsr::stage_albedo(&mut buf, rw * 8, &g.spec_alb, rw, rh);
+        mtl.upload(&self.spec_alb, rw, rh, rw * 8, &buf);
+
+        crate::fsr::stage_roughness(&mut buf[..rw * rh * 2], rw * 2, &g.normal_rough, rw, rh);
+        mtl.upload(&self.roughness, rw, rh, rw * 2, &buf[..rw * rh * 2]);
+
+        crate::fsr::stage_hit_dist(&mut buf[..rw * rh * 2], rw * 2, &g.spec_hit_t, rw, rh);
+        mtl.upload(&self.hit_dist, rw, rh, rw * 2, &buf[..rw * rh * 2]);
     }
 }

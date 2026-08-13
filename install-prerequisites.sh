@@ -485,7 +485,7 @@ do_dxc() {
 #
 # NOT a hard failure when the toolchain is missing, unlike do_nrd's: nothing in
 # a macOS build LINKS this, it is dlopen'd by --check-spirv/--check-vk alone
-# (src/vk/spirv.rs), so its absence costs two gates rather than a tree that no
+# (src/spirv.rs), so its absence costs two gates rather than a tree that no
 # longer compiles.
 do_dxc_macos() {
     if skip "$SDKS/dxc-macos/lib/libdxcompiler.dylib" "dxc (macos, SPIR-V)"; then
@@ -725,7 +725,55 @@ do_pix() {
 # THE DLL HALF IS STILL NOT PRODUCIBLE HERE, and the reason is dxil.dll — the
 # Windows-only DXIL signer — not CMake or MSVC. A mingw cross-build would hand
 # D3D12 unsigned DXIL, which it refuses to load.
+# nrd_source — ensure SDKs/NRD-src (the NRD source submodule) is checked out.
+# The .bat carries the twin of this; read its header for the full reasoning.
+# In short: the BUILD reads the source directly and independently of any
+# artifact (build.rs's require_nrd() gates on CMakeLists.txt, and
+# src/gfx/shaders.rs include_str!s Shaders/NRD.hlsli), so an artifact-present
+# tree whose submodule was cleaned used to report "[=] nrd already installed"
+# and then fail `cargo build`.
+#
+# IT RUNS ON EVERY PLATFORM, ahead of the not-consumed-here return below, and
+# that placement is the point rather than an accident: NRD_HLSLI_RAW is an
+# UNGATED const in the platform-neutral gfx::shaders, so macOS needs the source
+# to compile even though require_nrd() deliberately requires no ARTIFACT there
+# ("a gate with no subject"). A macOS run that printed "nrd skipped" and left
+# the submodule empty was telling the truth about the artifact and the wrong
+# thing about the build.
+#
+# Asking git whether init is NEEDED, rather than telling it to init: the leading
+# character of `git submodule status` IS the state ('-' uninitialized, '+' at
+# another commit, 'U' conflicted, ' ' in sync). An unconditional
+# `submodule update --init` is a silent no-op when in sync, but hard-checks-out
+# the recorded SHA when it is not and fails outright on local edits — both of
+# which mean someone is mid-bump of the very SHA this tree pins. So '+' is
+# REPORTED, never clobbered. git stays optional (every other component is an
+# HTTP download): no git, or a non-git tree, degrades to the manual instruction.
+nrd_source() {
+    local src="$ROOT/SDKs/NRD-src" st=""
+    st=$(git -C "$ROOT" submodule status SDKs/NRD-src 2>/dev/null) || st=""
+    if [[ -e $src/CMakeLists.txt && -e $src/Shaders/NRD.hlsli ]]; then
+        if [[ ${st:0:1} == "+" ]]; then
+            echo "    [i] nrd: SDKs/NRD-src is checked out at a commit other than the one"
+            echo "        this tree pins (git submodule status: $st). Left alone — but"
+            echo "        $NRD_TAG is what src/nrd.rs's version gate expects, so a --nrd"
+            echo "        session may shed loudly; \`git submodule update SDKs/NRD-src\` reverts."
+        fi
+        return 0
+    fi
+    if [[ -n $st ]]; then
+        echo "    [+] initializing the NRD source submodule (SDKs/NRD-src)"
+        git -C "$ROOT" submodule update --init SDKs/NRD-src
+        [[ -e $src/CMakeLists.txt && -e $src/Shaders/NRD.hlsli ]] && return 0
+    fi
+    echo "    [x] nrd: SDKs/NRD-src is empty (the submodule was not checked out)"
+    echo "            git submodule update --init SDKs/NRD-src"
+    fail
+    return 1
+}
+
 do_nrd() {
+    nrd_source || return 0
     if [[ $OS != linux ]]; then
         local where="Windows"
         [[ -n ${WSL_DISTRO_NAME:-} ]] && where="the Windows side of this WSL install"
@@ -748,13 +796,9 @@ do_nrd() {
         return 0
     fi
 
+    # No presence check here: nrd_source() above guarantees the source or bails,
+    # and a second copy of the predicate is how the two drift.
     local src="$ROOT/SDKs/NRD-src"
-    if [[ ! -e $src/CMakeLists.txt ]]; then
-        echo "    [x] nrd: SDKs/NRD-src is empty (the submodule was not checked out)"
-        echo "            git submodule update --init SDKs/NRD-src"
-        fail
-        return 0
-    fi
     # THE TOOLCHAIN PROBE IS AN UNCONDITIONAL FAILURE, not the usual
     # named-only one, and it is COUPLED to build.rs: require_nrd() panics on a
     # missing libNRD.so for a native Linux build, so a skip here would leave a
@@ -881,6 +925,13 @@ check "OIDN (--oidn / N)" "$SDKS/oidn.x64.windows/bin/OpenImageDenoise.dll"
 check "PIX markers (--pix-markers)" "$SDKS/pix/bin/x64/WinPixEventRuntime.dll"
 check "NRD denoiser (--nrd)" "$SDKS/NRD/bin/NRD.dll"
 check "  (perf variant, --nrd-perf)" "$SDKS/NRD/bin/perf/NRD.dll"
+# The SOURCE earns its own row (the FSR3 pair below is the precedent) because no
+# artifact row implies it: the build reads it directly on EVERY platform via
+# src/gfx/shaders.rs's include_str!, and a component SUBSET (`... dxc`) never
+# runs nrd_source. Sharpest on macOS, where the artifact rows above are MISSING
+# by design ("nrd skipped") and so say nothing about whether `cargo build` will
+# work — a missing source fails the build, not `--nrd`.
+check "  (source submodule, required to build)" "$SDKS/NRD-src/Shaders/NRD.hlsli"
 echo "---- host-native ($OS; vulkan backend port) ----"
 if [[ $OS == linux ]]; then
     check "DXC -> SPIR-V" "$SDKS/dxc-linux/bin/dxc"

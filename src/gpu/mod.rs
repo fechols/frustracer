@@ -769,6 +769,68 @@ struct DualKeep {
     arm: dual::Arm,
 }
 
+/// The loading screen, seen from inside a blocking init step.
+///
+/// The boot's long pole is `SceneGpu::new_uploaded`, and every blocking thing
+/// it does goes through one `Submit::run_list`. Presenting the loading page,
+/// though, needs `&mut GpuContext` — the ONE present funnel
+/// (`fullscreen_to_backbuffer`) owns the FG handshake and the SDR/Sdr10/HDR10
+/// encodings, and a second present path would have to reproduce both. The
+/// upload borrows `&mut self.d3d`, a FIELD of that context, so a callback
+/// handed down from `ensure_scene_gpu` could never reach the rest of it.
+///
+/// `PumpSubmit` below dissolves that: a submitter that OWNS the whole context
+/// and repaints between submits. This trait is the other half — everything
+/// the repaint needs that the GPU side must not know about (the Slint HUD, the
+/// SDL event pump), supplied by `main.rs` and handed the context per call.
+///
+/// Implementors MUST throttle their own present rate: on a 313-texture world
+/// this fires thousands of times.
+pub trait LoadUi {
+    /// Pump OS input and repaint the loading page.
+    fn tick(&mut self, gpu: &mut GpuContext);
+}
+
+/// The `LoadUi` of a session with no loading page — a resize re-entry, or a
+/// lazy SPACE/F tracer build mid-session. Keeps ONE submit path through the
+/// tracer constructors instead of a `match` that would have to duplicate
+/// their argument lists; the cost is a virtual call per submit, against a
+/// full queue drain.
+pub struct NoLoadUi;
+
+impl LoadUi for NoLoadUi {
+    fn tick(&mut self, _gpu: &mut GpuContext) {}
+}
+
+/// A `Submit` that keeps the loading page live across a scene upload.
+///
+/// Delegates to the real `D3d` submitter and then repaints, so the window
+/// stays interactive and the progress bar advances through an upload that
+/// would otherwise be one multi-second span with no message pump.
+///
+/// Interleaving a present with `run_once` on the one queue is not new: the
+/// mid-session SPACE/F mode switch already uploads a scene between two
+/// presented frames. The only cost is that `run_once`'s leading `wait_idle`
+/// now sometimes waits on a present.
+pub struct PumpSubmit<'a> {
+    gpu: &'a mut GpuContext,
+    ui: &'a mut dyn LoadUi,
+}
+
+impl d3d12::Submit for PumpSubmit<'_> {
+    fn run_list(
+        &mut self,
+        f: &mut dyn FnMut(&ID3D12GraphicsCommandList) -> Result<()>,
+    ) -> Result<()> {
+        // Disjoint field borrows: the submit takes `gpu.d3d`, the repaint takes
+        // the whole context — sequentially, never at once.
+        let Self { gpu, ui } = self;
+        d3d12::Submit::run_list(&mut gpu.d3d, f)?;
+        ui.tick(gpu);
+        Ok(())
+    }
+}
+
 pub struct GpuContext {
     /// `--dual-gpu`. FIRST FIELD deliberately — see `DualState`.
     dual: Option<DualState>,
@@ -2689,23 +2751,39 @@ impl GpuContext {
         dn: Option<DnKind>,
         debug: bool,
         bc7_mode: crate::bc7::Bc7Mode,
+        // The loading page on the FIRST session entry, so the eager init can
+        // repaint across it — `None` for a resize re-entry or a lazy SPACE/F
+        // build, where there is no page to keep live.
+        ui: Option<&mut dyn LoadUi>,
     ) -> Result<()> {
+        let mut no_ui = NoLoadUi;
+        let ui: &mut dyn LoadUi = match ui {
+            Some(u) => u,
+            None => &mut no_ui,
+        };
         let dev = self.d3d.device.clone();
         let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
-        let tg = trace::TraceGpu::new(
-            &dev,
-            dxc,
-            scene,
-            bvh,
-            core,
-            rw,
-            rh,
-            gbuf,
-            nppd.is_some(),
-            dn.is_some(),
-            debug,
-            &mut self.d3d,
-        );
+        ui.tick(self);
+        // The tracer's OWN uploads — the software BVH + wide tree, hundreds of
+        // MB on a world-scale scene — go through the pumping submitter too.
+        crate::progress::detail("compiling shaders");
+        let tg = {
+            let mut sub = PumpSubmit { gpu: self, ui: &mut *ui };
+            trace::TraceGpu::new(
+                &dev,
+                dxc,
+                scene,
+                bvh,
+                core,
+                rw,
+                rh,
+                gbuf,
+                nppd.is_some(),
+                dn.is_some(),
+                debug,
+                &mut sub,
+            )
+        };
         let mut tg = match tg {
             Ok(t) => t,
             Err(e) => {
@@ -2713,6 +2791,7 @@ impl GpuContext {
                 return Err(e);
             }
         };
+        ui.tick(self);
         // Upscaler sessions: wire the live upscaler's input planes as feed
         // targets — the feed kernel writes them directly, no CPU upload.
         // (Failures before `self.trace = Some(..)` evict the cached core —
@@ -2774,6 +2853,8 @@ impl GpuContext {
                 self.evict_unused_scene_gpu();
                 return Err("the denoiser and --nppd both claim the pre-upscale color slot".into());
             }
+            crate::progress::detail("starting denoiser");
+            ui.tick(self);
             if let Err(e) = self.arm_denoiser_for(&dev, dxc, dn, rw, rh, debug, &mut |t| {
                 tg.wire_nrd_feed(&dev, matches!(dn, DnKind::Nrd(_)), t)
             })
@@ -3305,6 +3386,39 @@ impl GpuContext {
         Ok(self.scene_gpu.clone().expect("just ensured"))
     }
 
+    /// Build the shared scene core EAGERLY, with the loading page live across
+    /// it — the interactive boot's version of `ensure_scene_gpu`.
+    ///
+    /// Called once from `run_window` before the first `session()`, so the
+    /// session's own `init_trace`/`init_dxr` find the core already cached and
+    /// upload nothing. Splitting it out (rather than teaching
+    /// `ensure_scene_gpu` about the UI) is what makes the borrow work: this
+    /// has `&mut self` FREE, which is exactly what `PumpSubmit` needs and what
+    /// a method already holding `&mut self.d3d` can never hand back.
+    ///
+    /// A no-op when a core is already cached, and harmless if the session then
+    /// fails to build a tracer at all — `evict_unused_scene_gpu` drops it.
+    pub fn upload_scene_core(
+        &mut self,
+        scene: &crate::scene::Scene,
+        bvh: &crate::bvh::Bvh,
+        bc7_mode: crate::bc7::Bc7Mode,
+        ui: &mut dyn LoadUi,
+    ) -> Result<()> {
+        if self.scene_gpu.is_some() {
+            return Ok(());
+        }
+        // Clone the device FIRST: `PumpSubmit` takes the whole context, so no
+        // borrow of `self` may still be alive when it is built.
+        let dev = self.d3d.device.clone();
+        let core = {
+            let mut sub = PumpSubmit { gpu: self, ui: &mut *ui };
+            trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut sub, bc7_mode)?
+        };
+        self.scene_gpu = Some(std::rc::Rc::new(core));
+        Ok(())
+    }
+
     /// The init-failure eviction arm: when tracer construction fails and no
     /// tracer is live, a cached core is ~gigabytes serving nobody under the
     /// CPU renderer — drop it (the failure latch in main.rs means nothing
@@ -3421,12 +3535,31 @@ impl GpuContext {
         dn: Option<DnKind>,
         debug: bool,
         bc7_mode: crate::bc7::Bc7Mode,
+        // See `init_trace`'s.
+        ui: Option<&mut dyn LoadUi>,
     ) -> Result<()> {
         if self.dxr.is_some() {
             return Ok(());
         }
+        let mut no_ui = NoLoadUi;
+        let ui: &mut dyn LoadUi = match ui {
+            Some(u) => u,
+            None => &mut no_ui,
+        };
         let dev = self.d3d.device.clone();
         let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
+        // `DxrGpu::new` takes no submitter, so this arm BRACKETS the build
+        // rather than pumping through it — which leaves it as the boot's one
+        // span with no repaint. MEASURED on THE WORLD (4090, warm driver
+        // shader cache): 2.0 s, comfortably under the ~5 s at which Windows
+        // ghosts a window, against 5.6 s for the upload this now pumps and
+        // ~10 s for the scene load before it. A COLD D3DSCache is worse (up
+        // to ~8 s observed on a first run) and would ghost — the fix if that
+        // ever matters is a pump hook between its `dxc.compile` calls, of
+        // which there are several (library, resolve, sky, feed, bridge), not
+        // one opaque call.
+        crate::progress::detail("compiling shaders");
+        ui.tick(self);
         let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, dn.is_some(), debug)
         {
             Ok(d) => d,
@@ -3435,6 +3568,7 @@ impl GpuContext {
                 return Err(e);
             }
         };
+        ui.tick(self);
         if gbuf {
             // Pre-store failure: evict the cached core (the init_trace shape).
             let wired = self
@@ -3447,6 +3581,8 @@ impl GpuContext {
         // Pre-upscale denoising — arm_denoiser_for, DXR flavor (one shared
         // block, one shared engine instance — see init_trace's call site).
         if let Some(dn) = dn {
+            crate::progress::detail("starting denoiser");
+            ui.tick(self);
             if let Err(e) = self.arm_denoiser_for(&dev, dxc, dn, rw, rh, debug, &mut |t| {
                 d.wire_nrd_feed(&dev, matches!(dn, DnKind::Nrd(_)), t)
             })

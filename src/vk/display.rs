@@ -323,6 +323,22 @@ pub fn read_target(hg: &VkHeadless, img: &Image, bpp: usize) -> Result<Vec<u8>, 
     r
 }
 
+/// The four fields a colour target must supply to `Passes::record_to`.
+///
+/// Private, and it exists for a documentation reason rather than an
+/// abstraction one: rebinding `dst` to this inside `record_to` leaves that
+/// function's body the TEXTUAL original, so "rung 2 did not change how V18
+/// records" is checkable by reading the diff rather than by trusting a
+/// re-typed body. An owned `Image` and a presentation-engine-owned swapchain
+/// image both project onto it.
+#[derive(Clone, Copy)]
+struct Target {
+    img: vk::Image,
+    view: vk::ImageView,
+    w: u32,
+    h: u32,
+}
+
 /// The display pipelines, their one derived layout, and the descriptor set
 /// both draw against.
 pub struct Passes {
@@ -530,6 +546,43 @@ impl Passes {
     /// one bool, two PSOs, one layout — so the blit arm is reachable with no
     /// second descriptor set and no second recording path.
     pub fn record(&self, d: &ash::Device, cmd: vk::CommandBuffer, dst: &Image, tonemap: bool) {
+        self.record_to(d, cmd, dst.img, dst.view, dst.w, dst.h, tonemap);
+    }
+
+    /// `record` over the four fields it actually uses, so a target this module
+    /// does not OWN can be one.
+    ///
+    /// The split exists for exactly one caller — the swapchain, whose images
+    /// are created and owned by the presentation engine and therefore have no
+    /// `VkDeviceMemory` at all. `Image::mem` is private and non-`Option`, so
+    /// the alternative was teaching `Image` to be sometimes-unowned: a
+    /// nullable field on the type every other display path uses, to serve the
+    /// one path that never allocates. Borrowing four fields is smaller and
+    /// keeps `Image`'s invariant ("this handle owns that allocation") intact.
+    ///
+    /// `record` above stays as the thin wrapper so V18's recording is
+    /// TEXTUALLY unchanged rather than merely equivalent.
+    ///
+    /// THE TWO TRANSITIONS ARE ALREADY RIGHT FOR A SWAPCHAIN IMAGE and neither
+    /// is parameterised, which is worth stating because it looks like an
+    /// oversight: the opening `UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL` is
+    /// correct for a freshly acquired image (its contents are undefined by
+    /// contract, and we clear), and the closing
+    /// `COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL` is exactly where a
+    /// copy-before-present wants it. The present path appends ONE further
+    /// barrier to `PRESENT_SRC_KHR` after its copy; it does not edit these.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_to(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        img: vk::Image,
+        view: vk::ImageView,
+        w: u32,
+        h: u32,
+        tonemap: bool,
+    ) {
+        let dst = Target { img, view, w, h };
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
@@ -640,14 +693,49 @@ impl Passes {
     }
 }
 
+/// The byte offsets of R, G and B in one texel of an 8-bit RGBA-family format,
+/// or `None` for a format whose order this module does not know.
+///
+/// ONE STATEMENT OF BYTE ORDER, consulted by `decode` AND by the present
+/// path's byte identity, and it exists because the alternative shipped a
+/// latent defect for as long as rung 1 did. `decode`'s catch-all arm read
+/// `px[2], px[1], px[0]` — BGRA — which is right for the ONE 8-bit format
+/// rung 1 ever renders and silently wrong for the other. The headless
+/// surface's own preferred format, measured on BOTH ICDs on this box, is
+/// `R8G8B8A8_UNORM`: it is `formats[0]`, i.e. exactly what a present path that
+/// took the driver's first choice would negotiate. Inheriting the catch-all
+/// there would have swapped R and B at every texel where they differ —
+/// **255 in 256** of a hashed pattern — while every other assertion in the
+/// gate stayed green, because a swizzle preserves alpha, preserves coverage,
+/// and preserves a byte-for-byte comparison of two images that were BOTH
+/// swizzled.
+///
+/// Returning `Option` rather than guessing is the whole point: a format this
+/// table has never seen gets no plausible answer, and the present path's
+/// format selection REFUSES it up front rather than decoding it wrongly.
+pub fn rgb_offsets(fmt: vk::Format) -> Option<[usize; 3]> {
+    match fmt {
+        // B,G,R,A in memory — D3D12's `B8G8R8A8_UNORM` byte for byte, which is
+        // what lets `gpu::tonemap::selftest`'s oracle transplant unchanged.
+        vk::Format::B8G8R8A8_UNORM => Some([2, 1, 0]),
+        // R,G,B,A in memory. The name says so and it is still worth pinning
+        // here, because this is the one the surface hands us by default.
+        vk::Format::R8G8B8A8_UNORM => Some([0, 1, 2]),
+        _ => None,
+    }
+}
+
 /// Decode one texel of a presented image back to linear-ish [0,1] RGB.
 ///
 /// The formats and their unpacking are `gpu::tonemap::selftest`'s
-/// (`:194-208`), and they carry over UNCHANGED because the two APIs agree
-/// about both: Vulkan's `A2B10G10R10_UNORM_PACK32` puts R in the low ten bits
-/// exactly as D3D12's `R10G10B10A2_UNORM` does, and `B8G8R8A8_UNORM` is B,G,R,A
-/// in memory in both. Worth stating because the names suggest the opposite in
-/// one case and agreement is what a transplanted oracle depends on.
+/// (`:194-208`), and the 10-bit one carries over UNCHANGED because the two
+/// APIs agree about it: Vulkan's `A2B10G10R10_UNORM_PACK32` puts R in the low
+/// ten bits exactly as D3D12's `R10G10B10A2_UNORM` does. Worth stating because
+/// the names suggest the opposite and agreement is what a transplanted oracle
+/// depends on.
+///
+/// The 8-bit arm goes through `rgb_offsets` rather than assuming BGRA — see
+/// that function for the defect this closes.
 pub fn decode(px: &[u8], fmt: vk::Format) -> [f32; 3] {
     match fmt {
         vk::Format::A2B10G10R10_UNORM_PACK32 => {
@@ -658,7 +746,22 @@ pub fn decode(px: &[u8], fmt: vk::Format) -> [f32; 3] {
                 ((v >> 20) & 0x3ff) as f32 / 1023.0,
             ]
         }
-        _ => [px[2] as f32 / 255.0, px[1] as f32 / 255.0, px[0] as f32 / 255.0],
+        _ => match rgb_offsets(fmt) {
+            Some(o) => [
+                px[o[0]] as f32 / 255.0,
+                px[o[1]] as f32 / 255.0,
+                px[o[2]] as f32 / 255.0,
+            ],
+            // A format the table does not know. Returning a PLAUSIBLE guess is
+            // precisely the failure `rgb_offsets` exists to prevent, so return
+            // something that cannot be mistaken for a colour and that fails
+            // every comparison it reaches: NaN propagates, and `!(a <= b)` is
+            // true for it, so a tolerance check reports the failure rather
+            // than swallowing it. Unreachable in practice — the present path
+            // refuses such a format at negotiation — which is why this is a
+            // sentinel and not an error path.
+            None => [f32::NAN; 3],
+        },
     }
 }
 
@@ -670,6 +773,12 @@ pub fn decode(px: &[u8], fmt: vk::Format) -> [f32; 3] {
 /// compares RGB only. So "alpha is at maximum everywhere" answers a question
 /// no colour comparison can — did the draw actually cover this pixel — and it
 /// costs nothing, the bytes already being read back.
+///
+/// Deliberately NOT routed through `rgb_offsets`: alpha sits at byte 3 in both
+/// 8-bit orders that function distinguishes, so the catch-all here is correct
+/// for exactly the formats the present path admits, and a lookup would suggest
+/// a variation that does not exist. The RGB triple is where the orders differ
+/// and that is where the table is consulted.
 pub fn decode_alpha(px: &[u8], fmt: vk::Format) -> f32 {
     match fmt {
         vk::Format::A2B10G10R10_UNORM_PACK32 => {

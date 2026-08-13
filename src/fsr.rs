@@ -529,6 +529,165 @@ pub fn stage_depth(
     });
 }
 
+// ---------------------------------------------------------------------------
+// The DENOISER guides: normal, roughness, the two albedos, specular hit
+// distance. Only one consumer today — `mtl::mfxdn`, Apple's
+// MTLFXTemporalDenoisedScaler — but they live here beside the trio for the
+// reason the trio does: the subject is a WIRE, and a wire belongs where the
+// gate can reach it on every platform. `--check-fsr` runs the self-test below
+// on Windows and Linux too.
+//
+// NONE OF THESE INTRODUCES AN ENCODING CONVENTION, and that is the design
+// rather than a happy accident. Every one is a bit copy or a lane extract, so
+// there is no polarity, no range remap and no quantization to get wrong — the
+// f16 narrowing already happened at `GBufs::write`, and re-encoding here would
+// only add rounding (`stage_mvec`'s stated reason, applied four more times).
+// The one genuinely open question on this path is the normal SPACE, which is a
+// property of what the SHADER wrote, not of these loops; it rides
+// `FR_MFXDN_NORMALS` at the driver.
+// ---------------------------------------------------------------------------
+
+/// World-space shading normal -> RGBA16F. A BIT COPY of `GBufs::normal_rough`'s
+/// xyz, which is already the destination's layout.
+///
+/// ALPHA IS ZEROED RATHER THAN COPIED. The source's w lane carries roughness —
+/// it is one interleaved plane on our side — and MetalFX documents nothing
+/// about what, if anything, it reads from the normal texture's alpha. Passing
+/// roughness through would make the plane carry a second quantity by accident;
+/// zeroing makes it carry exactly what its name claims. Roughness reaches the
+/// scaler through `stage_roughness` below, which is where it is asked for.
+pub fn stage_normal(
+    dst: &mut [u8],
+    pitch: usize,
+    normal_rough: &[AtomicU16],
+    rw: usize,
+    rh: usize,
+) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 8, std::mem::align_of::<f16>());
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [[f16; 4]] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            let i = (y * rw + x) * 4;
+            p[0] = f16::from_bits(normal_rough[i].load(Relaxed));
+            p[1] = f16::from_bits(normal_rough[i + 1].load(Relaxed));
+            p[2] = f16::from_bits(normal_rough[i + 2].load(Relaxed));
+            p[3] = f16::from_bits(0);
+        }
+    });
+}
+
+/// The VIEW-SPACE arm of `stage_normal`, for `FR_MFXDN_NORMALS=view`.
+///
+/// A SECOND FUNCTION rather than a `Option<Mat4>` parameter on the first, and
+/// that is the same ratchet argument `mtl::planes`' header makes about `Trio`:
+/// these are two different WIRES, not one wire with a mode, and the shipping
+/// path must not acquire a branch to host a diagnostic. `stage_normal` stays
+/// exactly as cheap and exactly as obviously a bit copy as it was.
+///
+/// The transform is the rotation part alone — a normal is a direction, so the
+/// translation column is dropped. `world_to_view` is rigid (orthonormal basis +
+/// translation, `dlss::cam_matrices`), so its inverse-transpose rotation IS its
+/// rotation and no adjugate is needed; a non-rigid view matrix would need one,
+/// which is why this is stated rather than left to be inferred from the code.
+///
+/// Alpha is zeroed, as in `stage_normal` — same reason, same plane.
+pub fn stage_normal_view(
+    dst: &mut [u8],
+    pitch: usize,
+    normal_rough: &[AtomicU16],
+    rw: usize,
+    rh: usize,
+    world_to_view: glam::Mat4,
+) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 8, std::mem::align_of::<f16>());
+    let r = glam::Mat3A::from_mat4(world_to_view);
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [[f16; 4]] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            let i = (y * rw + x) * 4;
+            let ld = |k: usize| f16::from_bits(normal_rough[i + k].load(Relaxed)).to_f32();
+            let n = r * Vec3A::new(ld(0), ld(1), ld(2));
+            p[0] = f16_sat(n.x);
+            p[1] = f16_sat(n.y);
+            p[2] = f16_sat(n.z);
+            p[3] = f16::from_bits(0);
+        }
+    });
+}
+
+/// Roughness -> R16F, extracted from `GBufs::normal_rough`'s w lane.
+///
+/// A strided read rather than a memcpy because the source is interleaved with
+/// the normal (one 4-component plane, `kBufferTypeNormalRoughness`'s layout);
+/// the VALUE still crosses unchanged, so this is the lane-extract flavour of
+/// the same bit-copy discipline.
+pub fn stage_roughness(
+    dst: &mut [u8],
+    pitch: usize,
+    normal_rough: &[AtomicU16],
+    rw: usize,
+    rh: usize,
+) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 2, std::mem::align_of::<f16>());
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [f16] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            *p = f16::from_bits(normal_rough[(y * rw + x) * 4 + 3].load(Relaxed));
+        }
+    });
+}
+
+/// A 3-component linear albedo (`GBufs::diff_alb` or `spec_alb`) -> RGBA16F.
+///
+/// ONE FUNCTION FOR BOTH because they are the same wire — diffuse albedo and
+/// specular F0 differ in what they MEAN, not in how they are carried, and a
+/// second copy would be a second place for the alpha rule to drift. Alpha is
+/// exactly 0, `stage_color`'s precedent.
+///
+/// Linear, not sqrt-encoded: the FSR wire's `sqrt_encode8` exists to buy
+/// precision in an 8-bit UNORM plane, and this one is f16, which has the
+/// precision already. Sqrt here would be an encode with no decoder.
+pub fn stage_albedo(dst: &mut [u8], pitch: usize, alb: &[AtomicU16], rw: usize, rh: usize) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 8, std::mem::align_of::<f16>());
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [[f16; 4]] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            let i = (y * rw + x) * 3;
+            p[0] = f16::from_bits(alb[i].load(Relaxed));
+            p[1] = f16::from_bits(alb[i + 1].load(Relaxed));
+            p[2] = f16::from_bits(alb[i + 2].load(Relaxed));
+            p[3] = f16::from_bits(0);
+        }
+    });
+}
+
+/// Specular hit distance -> R16F. A BIT COPY of `GBufs::spec_hit_t`.
+///
+/// The plane's own conventions travel with it and are NOT normalized here:
+/// `far` when the reflection ray missed, exactly 0 when no reflection was
+/// traced (`dlss::GPixel::spec_hit_t`). That 0 is load-bearing — it is how a
+/// diffuse pixel says "there is no reflection here" rather than "the reflection
+/// is at the camera" — so any future remap has to preserve it deliberately.
+pub fn stage_hit_dist(dst: &mut [u8], pitch: usize, hit: &[AtomicU16], rw: usize, rh: usize) {
+    use rayon::prelude::*;
+    debug_check_rows(dst, pitch, rw, rh, 2, std::mem::align_of::<f16>());
+    dst.par_chunks_mut(pitch).take(rh).enumerate().for_each(|(y, row)| {
+        let px: &mut [f16] =
+            unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, rw) };
+        for (x, p) in px.iter_mut().enumerate() {
+            *p = f16::from_bits(hit[y * rw + x].load(Relaxed));
+        }
+    });
+}
+
 /// The staging gates. Pure, DLL-free, GPU-free — so they run inside
 /// `--check-fsr` on Windows and Linux as well as macOS, which is the point: a
 /// transcription drift between the two backends' uploads is caught wherever
@@ -577,20 +736,114 @@ pub fn stage_self_test() -> Result<(), String> {
             })
             .collect();
 
+        // The denoiser guides. `normal_rough` is ONE interleaved plane on our
+        // side (xyz + roughness in w), and the probe is built so that the w
+        // lane is ALWAYS positive while the x lane is ALWAYS negative. That is
+        // what gives the two checks below their teeth: a `stage_roughness` that
+        // read lane 0 would be indistinguishable from a correct one on a probe
+        // whose lanes happened to agree, and a `stage_normal` that COPIED w
+        // instead of zeroing it would pass an alpha-is-zero check on a probe
+        // whose roughness happened to be 0.
+        let nrough: Vec<AtomicU16> = (0..n * 4)
+            .map(|i| {
+                let (px, lane) = (i / 4, i % 4);
+                let v = if lane == 3 {
+                    0.125 + (px % 7) as f32 * 0.1
+                } else {
+                    lane as f32 * 0.5 - 0.5 + (px % 5) as f32 * 0.03
+                };
+                AtomicU16::new(f16::from_f32(v).to_bits())
+            })
+            .collect();
+        let alb: Vec<AtomicU16> = (0..n * 3)
+            .map(|i| AtomicU16::new(f16::from_f32((i % 13) as f32 * 0.08).to_bits()))
+            .collect();
+        // Both sentinels of `GPixel::spec_hit_t`'s own convention are present:
+        // exactly 0 (no reflection traced) and `far` (the reflection missed).
+        let hit: Vec<AtomicU16> = (0..n)
+            .map(|i| {
+                let v = match i % 5 {
+                    0 => 0.0,
+                    1 => far,
+                    _ => 0.3 + (i % 23) as f32 * 0.02,
+                };
+                AtomicU16::new(f16::from_f32(v).to_bits())
+            })
+            .collect();
+
         // Over-wide pitch and over-tall buffer: everything past the sub-rect
         // must survive, which is what `renderSize` < the allocation depends on.
         let pitch_c = rw * 8 + 16;
         let pitch_m = rw * 4 + 12;
         let pitch_d = rw * 4 + 8;
+        let pitch_n = rw * 8 + 24;
+        let pitch_r = rw * 2 + 6;
+        let pitch_a = rw * 8 + 8;
+        let pitch_h = rw * 2 + 10;
+        let pitch_v = rw * 8 + 32;
+        let pitch_i = rw * 8 + 16;
         let rows = rh + 2;
         let mut c = vec![SENTINEL; pitch_c * rows];
         let mut m = vec![SENTINEL; pitch_m * rows];
         let mut d = vec![SENTINEL; pitch_d * rows];
+        let mut nb = vec![SENTINEL; pitch_n * rows];
+        let mut rb = vec![SENTINEL; pitch_r * rows];
+        let mut ab = vec![SENTINEL; pitch_a * rows];
+        let mut hb = vec![SENTINEL; pitch_h * rows];
+        let mut vb = vec![SENTINEL; pitch_v * rows];
+        let mut ib = vec![SENTINEL; pitch_i * rows];
         stage_color(&mut c, pitch_c, &accum, rw, rh);
         stage_mvec(&mut m, pitch_m, &mvec, rw, rh);
         stage_depth(&mut d, pitch_d, &depth, rw, rh, near, far);
+        stage_normal(&mut nb, pitch_n, &nrough, rw, rh);
+        stage_roughness(&mut rb, pitch_r, &nrough, rw, rh);
+        stage_albedo(&mut ab, pitch_a, &alb, rw, rh);
+        stage_hit_dist(&mut hb, pitch_h, &hit, rw, rh);
+
+        // THE VIEW-SPACE ARM (`FR_MFXDN_NORMALS=view`), scored BITWISE — which
+        // it can be, because the probe rotation is an exact axis permutation.
+        //
+        // Its columns say what it does: `R*(1,0,0) = (0,0,-1)`, `R*(0,1,0) =
+        // (0,1,0)`, `R*(0,0,1) = (1,0,0)` — a 90 degree yaw, so `(x,y,z)` must
+        // come back as `(z, y, -x)`. Every coefficient is 0 or +-1, so the
+        // products and sums are EXACT in f32 and each output lane is a source
+        // lane re-encoded from a value that came out of f16 in the first place,
+        // i.e. a bit copy with a sign flip on one of them. That is what lets
+        // this be an equality rather than a tolerance, and it is why the probe
+        // rotation is a permutation and not, say, `from_rotation_y(FRAC_PI_2)`
+        // — whose cosine is -4.4e-8 rather than 0 and would turn every
+        // assertion below into a threshold nobody could calibrate.
+        //
+        // THE TRANSLATION IS LARGE AND DELIBERATE. `stage_normal_view` takes a
+        // `Mat4` and must use its ROTATION alone (a normal is a direction), so
+        // a 100-unit translation column is the teeth for that: a
+        // `Mat4 * Vec4(n, 1.0)` — the obvious way to write this wrong — lands
+        // 100 units away and blows the bit compare on every pixel. A zero
+        // translation would leave the two spellings indistinguishable.
+        let yaw90 = glam::Mat4::from_cols(
+            glam::vec4(0.0, 0.0, -1.0, 0.0),
+            glam::vec4(0.0, 1.0, 0.0, 0.0),
+            glam::vec4(1.0, 0.0, 0.0, 0.0),
+            glam::vec4(100.0, -50.0, 25.0, 1.0),
+        );
+        stage_normal_view(&mut vb, pitch_v, &nrough, rw, rh, yaw90);
+        // The IDENTITY arm, and it is the structural anchor rather than a
+        // second flavour of the same test: at `Mat4::IDENTITY` the view arm's
+        // whole transform is a no-op, so it must reproduce `stage_normal`'s
+        // output BYTE FOR BYTE — same xyz, same zeroed alpha. That pins the two
+        // functions together (the pair is what `FR_MFXDN_NORMALS` A/Bs, so a
+        // drift between them would move a measurement while both arms
+        // individually looked fine) and it pins the f16 round trip: widening a
+        // stored f16 to f32 and re-encoding it must land on the same bits.
+        stage_normal_view(&mut ib, pitch_i, &nrough, rw, rh, glam::Mat4::IDENTITY);
 
         let (mut sky_seen, mut near_seen, mut over_seen) = (false, false, 0usize);
+        // Anti-vacuity for the guides: how many pixels have a roughness lane
+        // that differs from the x lane (the lane-extract teeth), how many carry
+        // a non-zero roughness (the alpha-zero teeth), and whether both
+        // hit-distance sentinels appear.
+        let (mut lane_teeth, mut rough_nz) = (0usize, 0usize);
+        let (mut hit_zero, mut hit_far) = (false, false);
         for y in 0..rh {
             for x in 0..rw {
                 let i = y * rw + x;
@@ -693,6 +946,105 @@ pub fn stage_self_test() -> Result<(), String> {
                         ));
                     }
                 }
+                // ---- the denoiser guides, all bit compares ----
+                // normal: xyz copied, alpha ZEROED rather than carried. Both
+                // halves matter — see the probe's construction above for why
+                // neither is vacuous here.
+                let o = y * pitch_n + x * 8;
+                for k in 0..3 {
+                    let got = u16::from_le_bytes([nb[o + k * 2], nb[o + k * 2 + 1]]);
+                    let want = nrough[i * 4 + k].load(Relaxed);
+                    if got != want {
+                        return Err(format!(
+                            "stage_normal {rw}x{rh} px({x},{y}).{k}: {got:#06x} != {want:#06x} \
+                             (must be a bit copy, not a re-encode)"
+                        ));
+                    }
+                }
+                let w = nrough[i * 4 + 3].load(Relaxed);
+                if w != 0 {
+                    rough_nz += 1;
+                }
+                let alpha = u16::from_le_bytes([nb[o + 6], nb[o + 7]]);
+                if alpha != 0 {
+                    return Err(format!(
+                        "stage_normal {rw}x{rh} px({x},{y}): alpha is {alpha:#06x}, not 0 — the \
+                         source's w lane carries ROUGHNESS, and this plane must not smuggle it"
+                    ));
+                }
+                // roughness: LANE 3 of the interleaved plane, not lane 0
+                if w != nrough[i * 4].load(Relaxed) {
+                    lane_teeth += 1;
+                }
+                let o = y * pitch_r + x * 2;
+                let got = u16::from_le_bytes([rb[o], rb[o + 1]]);
+                if got != w {
+                    return Err(format!(
+                        "stage_roughness {rw}x{rh} px({x},{y}): {got:#06x} != {w:#06x} — the w \
+                         lane of normal_rough, not another lane of it"
+                    ));
+                }
+                // albedo: 3 components copied, alpha exactly 0
+                let o = y * pitch_a + x * 8;
+                for k in 0..3 {
+                    let got = u16::from_le_bytes([ab[o + k * 2], ab[o + k * 2 + 1]]);
+                    let want = alb[i * 3 + k].load(Relaxed);
+                    if got != want {
+                        return Err(format!(
+                            "stage_albedo {rw}x{rh} px({x},{y}).{k}: {got:#06x} != {want:#06x}"
+                        ));
+                    }
+                }
+                if u16::from_le_bytes([ab[o + 6], ab[o + 7]]) != 0 {
+                    return Err(format!("stage_albedo {rw}x{rh} px({x},{y}): alpha is not 0"));
+                }
+                // specular hit distance: a bit copy, sentinels included. The
+                // exact-0 case is the one worth naming — it is how a diffuse
+                // pixel says "no reflection here", and a remap that turned it
+                // into a distance would be silently wrong.
+                let o = y * pitch_h + x * 2;
+                let got = u16::from_le_bytes([hb[o], hb[o + 1]]);
+                let want = hit[i].load(Relaxed);
+                if got != want {
+                    return Err(format!(
+                        "stage_hit_dist {rw}x{rh} px({x},{y}): {got:#06x} != {want:#06x}"
+                    ));
+                }
+                let hv = f16::from_bits(want).to_f32();
+                if hv == 0.0 {
+                    hit_zero = true;
+                }
+                if hv == far {
+                    hit_far = true;
+                }
+                // ---- the view-space arm ----
+                // Identity first: byte-for-byte `stage_normal`, alpha included.
+                let (o, on) = (y * pitch_i + x * 8, y * pitch_n + x * 8);
+                if ib[o..o + 8] != nb[on..on + 8] {
+                    return Err(format!(
+                        "stage_normal_view {rw}x{rh} px({x},{y}) at Mat4::IDENTITY: \
+                         {:02x?} != stage_normal's {:02x?} — the two arms must agree exactly \
+                         when the transform is a no-op, or FR_MFXDN_NORMALS is A/Bing two \
+                         differences at once",
+                        &ib[o..o + 8],
+                        &nb[on..on + 8]
+                    ));
+                }
+                // Then the permutation: (x,y,z) -> (z, y, -x), bitwise, with
+                // the sign flip spelled as an XOR because the probe's x lane is
+                // never zero (so there is no +-0.0 case to argue about).
+                let o = y * pitch_v + x * 8;
+                let src = |k: usize| nrough[i * 4 + k].load(Relaxed);
+                for (k, want) in [src(2), src(1), src(0) ^ 0x8000, 0].into_iter().enumerate() {
+                    let got = u16::from_le_bytes([vb[o + k * 2], vb[o + k * 2 + 1]]);
+                    if got != want {
+                        return Err(format!(
+                            "stage_normal_view {rw}x{rh} px({x},{y}).{k}: {got:#06x} != \
+                             {want:#06x} — the 90 degree yaw must send (x,y,z) to (z,y,-x) \
+                             with the translation column dropped and alpha zeroed"
+                        ));
+                    }
+                }
             }
         }
         if !sky_seen {
@@ -711,6 +1063,30 @@ pub fn stage_self_test() -> Result<(), String> {
                     .into(),
             );
         }
+        // The guides' own anti-vacuity. `lane_teeth` must be EVERY pixel, not
+        // merely some: the lane-extract compare is only a real test at pixels
+        // where the two lanes disagree, so a probe that agreed anywhere would
+        // leave `stage_roughness` unscored exactly there.
+        if lane_teeth != n {
+            return Err(format!(
+                "stage_self_test: the roughness lane equals the x lane at {} of {n} probe \
+                 pixels — `stage_roughness` reading the wrong lane would pass there",
+                n - lane_teeth
+            ));
+        }
+        if rough_nz == 0 {
+            return Err(
+                "stage_self_test: every probe roughness is 0 — `stage_normal` copying the w \
+                 lane into alpha would be indistinguishable from zeroing it"
+                    .into(),
+            );
+        }
+        if !hit_zero || !hit_far {
+            return Err(format!(
+                "stage_self_test: the hit-distance probe is missing a sentinel (zero {hit_zero}, \
+                 far {hit_far}) — both carry meaning and neither is scored without one"
+            ));
+        }
 
         // The sub-rect discipline: pitch padding and the rows past `rh` are
         // never touched, so one allocation at the range max can serve every
@@ -719,6 +1095,12 @@ pub fn stage_self_test() -> Result<(), String> {
             ("color", &c, pitch_c, 8usize),
             ("mvec", &m, pitch_m, 4),
             ("depth", &d, pitch_d, 4),
+            ("normal", &nb, pitch_n, 8),
+            ("roughness", &rb, pitch_r, 2),
+            ("albedo", &ab, pitch_a, 8),
+            ("hit_dist", &hb, pitch_h, 2),
+            ("normal-view", &vb, pitch_v, 8),
+            ("normal-view-identity", &ib, pitch_i, 8),
         ] {
             for y in 0..rows {
                 let tail = if y < rh { rw * bpp } else { 0 };
