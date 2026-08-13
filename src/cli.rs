@@ -231,9 +231,10 @@ pub struct Opts {
     /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
     pub adaptive: bool,
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
-    /// window (default `xess::DEFAULT_LOCK_SCALE` = native 100%;
-    /// `--lock-res dynamic` -> None = the step-wise dynamic-resolution
-    /// controller). CLI-only, no runtime toggle — T prints the locked note.
+    /// window (default `xess::DEFAULT_LOCK_SCALE` = 0.75 — the `ultra-quality`
+    /// preset, i.e. 0.5625x-pixels; `--lock-res dynamic` -> None = the
+    /// step-wise dynamic-resolution controller). CLI-only, no runtime toggle —
+    /// T prints the locked note.
     /// ONE scale for every render mode: the CPU tracer, `--gpu` and `--dxr`
     /// all trace at it, so F/SPACE cycling arms never moves the render res.
     /// (The GPU arms used to default to native 100% through a second
@@ -557,12 +558,13 @@ pub struct Opts {
     /// no-op on flat-shaded geometry (n_s == n_g).
     pub amb_bump: bool,
     /// `--rtgi-bounces N` (`shade::set_rtgi_bounces`): the GI ladder, as a
-    /// BOUNCE BUDGET. DEFAULT `shade::DEFAULT_BOUNCES` = 2.0 — TWO real
-    /// bounces, the user's feel-test call, at a measured cost that const
-    /// records. `1` is one cosine-sampled gather per pixel per frame replacing
-    /// the ambient term, shaded at the hemi BOUNCE_Q policy and integrated by
-    /// the temporal denoisers / accumulation — the renderer this field used to
-    /// spell as a bool, and the lever for a session that wants the time back.
+    /// BOUNCE BUDGET. DEFAULT `shade::DEFAULT_BOUNCES` = 1.5 — one real bounce
+    /// plus a second rouletted at p=0.5, the user's call, at a measured cost
+    /// that const records. `1` is one cosine-sampled gather per pixel per
+    /// frame replacing the ambient term, shaded at the hemi BOUNCE_Q policy
+    /// and integrated by the temporal denoisers / accumulation — the renderer
+    /// this field used to spell as a bool, and the lever for a session that
+    /// wants the time back.
     ///
     /// The five canonical rungs are 0 | 0.5 | 1 | 1.5 | 2. `0` is the flat
     /// `SH sky irradiance × AO` ambient, bit-identical to the pre-RTGI
@@ -2303,12 +2305,12 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     Some(s) => match xess::lock_scale(s) {
                         Some(r) => Some(r),
                         None => {
-                            eprintln!("--lock-res needs quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
+                            eprintln!("--lock-res needs ultra-quality|quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
                             std::process::exit(2);
                         }
                     },
                     None => {
-                        eprintln!("--lock-res needs quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
+                        eprintln!("--lock-res needs ultra-quality|quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
                         std::process::exit(2);
                     }
                 };
@@ -2895,7 +2897,7 @@ pub fn usage() {
                 eprintln!("                maps + detail bump read flat under sky light again; a no-op on");
                 eprintln!("                flat-shaded geometry)");
                 eprintln!("  --rtgi-bounces N  the GI ladder, as a BOUNCE BUDGET. Rungs 0 | 0.5 | 1 | 1.5 | 2");
-                eprintln!("                (any N in 0..=2 parses; DEFAULT 2 = two real bounces. It costs: 1 -> 2");
+                eprintln!("                (any N in 0..=2 parses; DEFAULT 1.5. It costs: 1 -> 2");
                 eprintln!("                is +11% CPU frame and +28-37% of the GPU leaf region, so --rtgi-bounces 1");
                 eprintln!("                — one gather as the ambient term — is the lever for the time back).");
                 eprintln!("                A HALF rung buys the rung above at a fraction of its rays:");
@@ -2903,7 +2905,7 @@ pub fn usage() {
                 eprintln!("                is rouletted over it at that probability, which is UNBIASED for the");
                 eprintln!("                rung above rather than an average of the two — so the temporal");
                 eprintln!("                denoisers converge it to the upper rung's image. Scale it per GPU");
-                eprintln!("                and resolution; 1.5 is the interesting one on a heavy scene");
+                eprintln!("                and resolution; 1.5 is the default for exactly that reason");
                 eprintln!("  --no-rtgi     real-time GI off — an alias for --rtgi-bounces 0: the ambient tier");
                 eprintln!("                reverts to flat SH-sky x AO (the pre-RTGI renderer bit-exactly).");
                 eprintln!("                --rtgi spells rung 1; all three compose, later flags winning");
@@ -2960,8 +2962,9 @@ pub fn usage() {
                 eprintln!("                --dxr traces from the TLAS root, so there it is plain supersampling).");
                 eprintln!("                They average into ONE per-pixel value — a ~1/N-variance frame for the");
                 eprintln!("                upscaler/denoiser. Pinned to 1 on hemisphere-bounce (H) frames");
-                eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
-                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default native (100%)");
+                eprintln!("  --lock-res    DLSS/XeSS render res: ultra-quality|quality|balanced|performance|");
+                eprintln!("                ultra-performance|native, a ratio in (0, 1], or dynamic (the step-wise");
+                eprintln!("                DRS controller); default ultra-quality (0.75, so 0.5625x the pixels)");
                 eprintln!("  --hdr | --no-hdr  10-bit swapchain with the curve picked by the display probe");
                 eprintln!("                (the default) | the legacy 8-bit SDR swapchain (A/B lever, and the");
                 eprintln!("                frame-generation wrap-failure fallback)");
@@ -3132,7 +3135,7 @@ pub fn self_test() -> Result<(), String> {
         "--no-amb-bump",
         "--no-rtgi",
         "--rtgi-bounces",
-        "1.5",
+        "0.5",
         "--no-auto-exposure",
         "--no-autoexp-spike-guard",
         "--autoexp-spike-strength",
@@ -3241,7 +3244,11 @@ pub fn self_test() -> Result<(), String> {
         ("detail_ao_strength", o.detail_ao_strength == 0.5),
         ("detail_untex_scale", o.detail_untex_scale == 0.25),
         ("amb_bump", !o.amb_bump),
-        ("rtgi_bounces", o.rtgi_bounces == 1.5),
+        // 0.5, NOT the shipping rung: this pin proves the parser WROTE the
+        // field, so it must name a rung the default cannot supply. It said
+        // 1.5 until 2026-08-13, when 1.5 became the default and the check
+        // would have gone vacuous — move it again if the default lands here.
+        ("rtgi_bounces", o.rtgi_bounces == 0.5),
         // Default ON: "moved" means KILLED (the argv passes --no-auto-exposure).
         ("autoexp", !o.autoexp),
         ("exposure_bias", o.exposure_bias == 1.5),
@@ -3344,6 +3351,32 @@ pub fn self_test() -> Result<(), String> {
             }
         }
         _ => return Err("autoexp_mode's menu row is no longer a Cycle".into()),
+    }
+    // Same tripwire for the render-res lock. The menu row names a PRESET and
+    // the default is a SCALE, so the two can only be compared through
+    // `lock_scale` — the consumer the CLI, the settings file and the menu all
+    // go through. A flip that moved xess::DEFAULT_LOCK_SCALE alone (or that
+    // renamed the preset sitting on it) would leave the row labelling some
+    // other option "(default)" and, before 2026-08-13's ultra-quality entry
+    // existed, offering no option that reached the boot scale at all.
+    // Equality is exact because 0.75 is a power-of-two fraction; a default on
+    // an inexact ratio like "balanced" would need a tolerance here.
+    let lrow = crate::settings::menu_items()
+        .iter()
+        .find(|i| i.id == "lock_res")
+        .ok_or("settings.rs has no lock_res row")?;
+    match lrow.control {
+        crate::settings::Control::Cycle { options, default_ix } => {
+            let named = options.get(default_ix).copied();
+            let got = named.and_then(crate::xess::lock_scale);
+            if got != defaults().lock_scale {
+                return Err(format!(
+                    "settings.rs's lock_res default is {named:?} -> {got:?}, cli.rs's scale is {:?}",
+                    defaults().lock_scale
+                ));
+            }
+        }
+        _ => return Err("lock_res' menu row is no longer a Cycle".into()),
     }
     if parse_argv(&["--no-aniso", "--aniso", "8"]).opts.aniso != 8 {
         return Err("--no-aniso --aniso 8 must land on 8".into());

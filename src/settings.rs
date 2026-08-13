@@ -117,8 +117,9 @@ opt_fields! {
     pub struct Renderer {
         /// "cpu" | "gpu" | "dxr" (--cpu / --gpu / --dxr; sets mode_explicit)
         pub mode: String,
-        /// --lock-res: quality|balanced|performance|ultra-performance|native|
-        /// dynamic or a ratio in (0,1] as a string (restart-tier)
+        /// --lock-res: ultra-quality|quality|balanced|performance|
+        /// ultra-performance|native|dynamic or a ratio in (0,1] as a string
+        /// (restart-tier; the default is "ultra-quality" = 0.75)
         pub lock_res: String,
         /// --spp 1..=128 (live: U cycles)
         pub spp: u32,
@@ -1451,7 +1452,12 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("hybrid", "hybrid tracer (R)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
             item!("dynamic", "dynamic res (T, CPU mode)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
             item!("height_on", "relief rendering (V, armed only)", "Renderer", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
-            item!("lock_res", "render res lock", "Renderer", Restart, Cycle { options: &["quality", "balanced", "performance", "ultra-performance", "native", "dynamic"], default_ix: 4 }, acc_str!(renderer.lock_res)),
+            // Ordered by descending scale, so ± walks the quality ladder the
+            // way the names read; "ultra-quality" (0.75) leads because it is
+            // the shipping default, and `default_ix` must keep naming it —
+            // `cli::self_test` resolves this option through xess::lock_scale
+            // and fails if it stops matching xess::DEFAULT_LOCK_SCALE.
+            item!("lock_res", "render res lock", "Renderer", Restart, Cycle { options: &["ultra-quality", "quality", "balanced", "performance", "ultra-performance", "native", "dynamic"], default_ix: 0 }, acc_str!(renderer.lock_res)),
             item!("heightfield", "arm heightfield relief", "Renderer", Restart, Toggle { default: false }, acc_bool!(renderer.heightfield)),
             // ── Upscaler
             item!("chain", "upscaler chain start", "Upscaler", Restart, Cycle { options: &["auto", "dlss", "fsr4", "fsr3", "xess", "none"], default_ix: 0 }, acc_str!(upscaler.chain)),
@@ -1774,7 +1780,7 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         },
         "lock_res" => |o: &Opts| match o.lock_scale {
             None => "dynamic".into(),
-            Some(s) => ["quality", "balanced", "performance", "ultra-performance", "native"]
+            Some(s) => ["ultra-quality", "quality", "balanced", "performance", "ultra-performance", "native"]
                 .iter()
                 .find(|n| crate::xess::lock_scale(n) == Some(s))
                 .map(|n| n.to_string())
@@ -2322,8 +2328,10 @@ pub fn self_test() -> Result<(), String> {
         parse_bounce(b).ok_or_else(|| format!("bounce vocab '{b}' rejected"))?;
     }
     // lock_res / bc7_quality delegate to their real consumers — pin that the
-    // menu's option lists stay inside what those accept.
-    for l in ["quality", "balanced", "performance", "ultra-performance", "native", "0.75"] {
+    // menu's option lists stay inside what those accept. The trailing "0.75"
+    // is not a menu option: it pins the BARE-RATIO spelling a hand-written
+    // settings file may still carry for the same scale as "ultra-quality".
+    for l in ["ultra-quality", "quality", "balanced", "performance", "ultra-performance", "native", "0.75"] {
         crate::xess::lock_scale(l).ok_or_else(|| format!("lock_res vocab '{l}' rejected"))?;
     }
     for q in ["ultrafast", "fast", "basic", "slow"] {

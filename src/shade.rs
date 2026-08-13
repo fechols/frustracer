@@ -75,18 +75,24 @@ pub struct Quality {
 
 /// THE SHIPPING RUNG — the ONE place the GI ladder's default lives.
 ///
-/// 2.0 since 2026-08-12 (the user's feel-test: "a pretty big perf hit, but it
-/// looks AMAZING"), i.e. TWO real bounces on every session that does not say
-/// otherwise. It was 1.0 for the ladder's first day, which is the renderer the
-/// bool this replaced used to spell; `--rtgi-bounces 1` is that arm and is
-/// still what the `rtgi-ab` gate scores against hemi's one-bounce fb.gi.
+/// 1.5 since 2026-08-13 (the user's call — the ladder's third default): ONE
+/// real bounce plus a second rouletted at p=0.5 over the SH×AO control
+/// variate, which is unbiased for rung 2 rather than an average of 1 and 2 —
+/// so the temporal denoisers converge a still frame to the two-bounce image
+/// while a moving one pays about half the second bounce's rays. HISTORY: 1.0
+/// for the ladder's first day (the renderer the bool this replaced used to
+/// spell, and still what the `rtgi-ab` gate scores against hemi's one-bounce
+/// fb.gi), then 2.0 from 2026-08-12 (the feel-test: "a pretty big perf hit,
+/// but it looks AMAZING").
 ///
 /// COSTED, and accepted rather than discovered — 1 -> 2 measured CPU 51.61 ->
 /// 57.41 ms (--spin path 120f procedural), GPU leaf 0.292 -> 0.374 on a 4090
 /// and 0.423 -> 0.579 on san-miguel-low-poly (+28%/+37% of the leaf region,
-/// ~4% of GPU frame span on the light scene). `--rtgi-bounces 1` is the lever
-/// for a session that wants the time back, and 1.5 buys most of the look for
-/// 62% of the increment on a heavy scene.
+/// ~4% of GPU frame span on the light scene). This rung buys most of that
+/// look for 62% of the increment on a heavy scene; `--rtgi-bounces 2` is the
+/// full arm and `1` the lever for a session that wants the rest of the time
+/// back. NOTE the numbers above were recorded while 2.0 shipped, so any
+/// "flagless default" measurement dated before 2026-08-13 carries rung 2.
 ///
 /// It is a CONST rather than the codebase's usual triplicated literal because
 /// the default was reaching four sites (this static, `cli::defaults`, main's
@@ -95,7 +101,7 @@ pub struct Quality {
 /// announcing the default. `settings.rs`'s `Cycle` row still carries its own
 /// `default_ix` (it indexes strings, not floats) and `cli::self_test` pins the
 /// two against each other.
-pub const DEFAULT_BOUNCES: f32 = 2.0;
+pub const DEFAULT_BOUNCES: f32 = 1.5;
 
 /// Session lever for real-time GI (the `scene::amb_bump` lever shape): the
 /// BOUNCE BUDGET `--rtgi-bounces N`, defaulting to `DEFAULT_BOUNCES` and 0.0

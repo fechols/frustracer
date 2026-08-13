@@ -455,7 +455,7 @@ fn main() {
     }
     if opts.nppd && !no_xess_explicit && !no_upscale && (opts.chain.dlss || opts.chain.fsr4) {
         // The default NPPD experience is the XeSS composition: trace at the
-        // --lock-res scale (default native 100%), NPPD denoises at that
+        // --lock-res scale (default 0.75), NPPD denoises at that
         // render res, XeSS upscales to the window. Standalone window-res
         // NPPD remains the automatic fallback when the XeSS DLL is missing,
         // or explicitly via --nppd --no-xess.
@@ -4822,7 +4822,7 @@ fn locked_render_res(
 fn lock_dynamic_note(arm: &str, res: (usize, usize)) {
     eprintln!(
         "{arm}: dynamic render res is unsupported on this path (no DRS); locking at {}x{} (the \
-         native default scale)",
+         default scale)",
         res.0, res.1
     );
 }
@@ -23901,6 +23901,7 @@ fn run_check_xess(
     {
         let mut pass = true;
         for (a, want) in [
+            ("ultra-quality", Some(0.75f32)),
             ("quality", Some(2.0f32 / 3.0)),
             ("balanced", Some(0.58)),
             ("performance", Some(0.5)),
@@ -29671,8 +29672,8 @@ fn run_spin_gpu(
     // 400 frames — two thirds of a lap, starting mid-path.
     let frames = spin_lap_frames(frames, frames_explicit, warmup, moving, arm);
     // Trace res = an EXPLICIT `--lock-res`, else NATIVE — deliberately NOT
-    // tied to the interactive default (which happens to be native again since
-    // 2026-08-08, but was quality 2/3 for two windows): this is a benchmark and
+    // tied to the interactive default (0.75 since 2026-08-13; native before
+    // that, and quality 2/3 for two windows earlier): this is a benchmark and
     // every GPU `--spin` number on record was taken at native 1080p; a
     // default that moved under it would make those non-reproducible and
     // ~2.25x flattering at 2/3 (a LINEAR scale). Same rule the vendor mode
@@ -34170,19 +34171,20 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // change if that trade ever reads the other way; make it on these
     // numbers, not the table above.
     //
-    // RES-BASIS DEBT, RE-CLOSED (2026-07-26 quality -> 2026-07-31 native ->
-    // 2026-08-08 quality -> native again the same day, the user's call —
-    // fourth move): the flagless default is `--lock-res native` (100%,
-    // xess::DEFAULT_LOCK_SCALE), which IS the resolution the numbers above
-    // were taken at, so the caveat this paragraph used to carry is resolved
-    // again. It re-opens if the default ever moves sub-native once more: the
-    // arms don't scale together (`trace::depth_full` is 6 at 1920 AND 1280,
-    // so the wavefront's ladder is res-independent while leaf/sky and all of
+    // RES-BASIS DEBT, RE-OPENED 2026-08-13 (2026-07-26 quality -> 2026-07-31
+    // native -> 2026-08-08 quality -> native again the same day -> 0.75 now,
+    // the user's call — fifth move): every number above was taken at NATIVE
+    // 1080p, and the flagless default is no longer native
+    // (xess::DEFAULT_LOCK_SCALE = 0.75, i.e. 0.5625x-pixels), so this table
+    // no longer describes the resolution a flagless session runs at. The arms
+    // don't scale together (`trace::depth_full` is 6 at 1920 AND 1280, so the
+    // wavefront's ladder is res-independent while leaf/sky and all of
     // `dxr-rays` are per-pixel), and hand-scaling the decomposition suggested
     // the moving margin would invert (~2.75 vs ~1.90) — arithmetic that was
-    // never measured; re-measure at the new scale before revisiting the
-    // Intel entry if that happens. The feature grounds (H/R/C/O, >=spp-3,
-    // the replay win at rest) are untouched by resolution either way.
+    // never measured. RE-MEASURE at 0.75 before revisiting the Intel entry;
+    // `--lock-res native` still spells the arm these numbers describe, so the
+    // comparison is reproducible. The feature grounds (H/R/C/O, >=spp-3, the
+    // replay win at rest) are untouched by resolution either way.
     //
     // 2026-08-01 RE-MEASURE — the 0.92x producing-frame parity above is
     // RETIRED. It predates the (32,256) leaf frontier, the G-buffer pack
@@ -35063,7 +35065,7 @@ fn session(
     // change, not a scene change: the res-step block below does NOT reset
     // (no dlss_reset, no prev drop; history survives via the extent tags).
     // A degenerate reported range (min == max) means the driver offers no
-    // DRS — fixed res, no controller. --lock-res (default native = 100%)
+    // DRS — fixed res, no controller. --lock-res (default 0.75)
     // pins a fixed res inside the range instead; `--lock-res dynamic` opts
     // back into the controller.
     let dlss_range = gpu.rr_res_range();
@@ -35131,7 +35133,7 @@ fn session(
                 "ON (step-wise; history survives steps)".to_string()
             } else if opts.gpu {
                 // The CPU renderer never runs under --gpu, so its lock (the
-                // native default) is not this session's render res — the
+                // 0.75 default) is not this session's render res — the
                 // gpu: line below states the tracer's own locked one.
                 "LOCKED under --gpu, see the gpu: line".to_string()
             } else if opts.lock_scale.is_some() {
@@ -35167,7 +35169,7 @@ fn session(
     // grid no longer matches.
     let mut xess_on = p0.map_or(gpu.xess_ready(), |p| p.xess_on && gpu.xess_ready());
     let xess_range = gpu.xess_res_range(); // (optimal, min, max)
-    // --lock-res (default native): one fixed render res for the whole
+    // --lock-res (default 0.75): one fixed render res for the whole
     // session — the ScaleCtl/StepLimiter pair is never built/consulted.
     // quantize_res clamps the requested scale into the SDK range.
     let xess_lock = opts.lock_scale.and_then(|r| {
@@ -35181,7 +35183,7 @@ fn session(
         })
     });
     let mut xess_ctl = xess_range.filter(|_| xess_lock.is_none()).map(|(_, min, max)| {
-        // Start where the default lock would sit (native, clamped into the
+        // Start where the default lock would sit (0.75, clamped into the
         // range), not the SDK's "optimal" — with the ULTRA_PERFORMANCE init
         // that widens the range, optimal is the 1/3-scale floor and would
         // open blurry. The controller corrects from here either way
@@ -35287,7 +35289,7 @@ fn session(
     // BLAS/TLAS, and — in upscaler sessions — the feed wiring). The session
     // sub-mode mirrors the CPU defaults: DLSS-RR when supported, XeSS with
     // --xess, plain with --no-dlss. The render resolution is LOCKED for the
-    // session (from --lock-res, default native = 100%, quantized into the
+    // session (from --lock-res, default 0.75, quantized into the
     // upscaler's range) — the tracer's buffers are sized to it once; there
     // is no DRS on the GPU path. Any init failure falls back to the CPU
     // renderer with the reason on stderr.
@@ -35691,7 +35693,7 @@ fn session(
     // contract — DxrGpu's buffers are sized once, no DRS), window-res when
     // plain. Computed once so the eager --dxr init and the lazy F init
     // build the pipeline at the same res. The scale is the GPU-mode one
-    // (native by default); `--lock-res dynamic` can't be honored here, so it
+    // (0.75 by default); `--lock-res dynamic` can't be honored here, so it
     // falls back to that same default.
     let dxr_quin_avail = gpu.quin_planned();
     let dxr_lock = opts.lock_scale.unwrap_or(xess::DEFAULT_LOCK_SCALE);
