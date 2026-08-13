@@ -1,6 +1,6 @@
 # Exposure, camera feel, and session levers
 
-Temporal-reuse A/B levers, bloom, auto-exposure and its spike guard, `--move-ease` keyboard flight, `--gpu-debug` and the crash handler. `--move-ease`/`--no-move-ease` (3728-3850) sit here for contiguity.
+Temporal-reuse A/B levers, bloom, auto-exposure and its spike guard, `--move-ease` keyboard flight, `--gpu-debug` and the crash handler. `--move-ease`/`--no-move-ease` sit here for contiguity.
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 

@@ -1,6 +1,6 @@
 # Sky, lighting, and clouds
 
-`--tod`, fireflies, emissive lights, the volumetric cloud layer, `--cloud-shadow`, `--sky-lod`. Also holds `--no-audio` (659-696 of the original), which sits in this run for contiguity rather than topic.
+`--tod`, fireflies, emissive lights, the volumetric cloud layer, `--cloud-shadow`, `--sky-lod`. Also holds `--no-audio`, which sits in this run for contiguity rather than topic.
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 

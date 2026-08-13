@@ -1,6 +1,6 @@
 # Intel Arc / Xe2 (Battlemage): what the hardware actually offers
 
-The `## Intel Arc / Xe2` section: what the vendor extensions do and do not offer, the zero-LDS rule for RT kernels, the thread-sorting-unit findings, and the register-cliff and DispatchRays-regime campaigns.
+The `## Intel Arc / Xe2` section: what the vendor extensions do and do not offer, the zero-LDS rule for RT kernels, the thread-sorting-unit findings, and the register-cliff campaigns.
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 

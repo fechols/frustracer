@@ -32,10 +32,30 @@ cargo run --release -- --rtgi-bounces 1.5  # THE GI LADDER (2026-08-12) — real
                                       # --no-rtgi is an alias for 0 and --rtgi for 1, all three
                                       # composing under ONE later-flags-win rule (cli::self_test
                                       # pins the 11-case table). Settings row:
-                                      # Effects/rtgi_bounces, a Cycle over the five rungs (restart
-                                      # tier — both GPU blocks are compile defines; the old `rtgi`
-                                      # bool key is simply unknown to the new schema and ignored,
-                                      # the hdr10 precedent).
+                                      # Renderer/rtgi_bounces — beside `bounce`, the still-frame
+                                      # hemi tier that TAKES PRECEDENCE over it, because the two
+                                      # are one decision and the precedence is invisible with the
+                                      # pair on different pages (and a bounce budget is not an
+                                      # "effect" in the sense bloom and fireflies are) — a
+                                      # StepF { 0, 2, step 0.5 } whose
+                                      # `default` READS `shade::DEFAULT_BOUNCES` (restart tier —
+                                      # both GPU blocks are compile defines). A stepper rather
+                                      # than a Cycle because the budget genuinely is a continuum
+                                      # the parser takes anywhere in [0,2] and the step quantizes
+                                      # it to the rungs; five unrelated strings was the tail
+                                      # wagging the dog. STEP 0.5 IS LOAD-BEARING: a power of two,
+                                      # so every stop is exactly representable in f32 and the
+                                      # stepper lands on them BITWISE — main's lever line
+                                      # (`!= DEFAULT_BOUNCES`) and rtgi_corr_p's rung split are
+                                      # both float-equality tests, and a 0.1-style step would
+                                      # accumulate to 0.30000001 and announce a departure from a
+                                      # value the user had just selected as the default.
+                                      # cli::self_test WALKS the (min, max, step) tuple and
+                                      # requires exactly [0, 0.5, 1, 1.5, 2], each parseable by
+                                      # the CLI (teeth: step 0.25 fails with the walk printed).
+                                      # The old `rtgi` bool key, and the String this field briefly
+                                      # was, are both simply unknown to the schema and ignored —
+                                      # deliberately unmigrated, the hdr10 precedent.
                                       # THE FLIP'S OWN PROOF, and the shape to reuse for any
                                       # default move: `--check --rtgi-bounces 1` reproduced the
                                       # PRE-FLIP check.png and check_gi.png BIT-FOR-BIT, so the

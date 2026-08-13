@@ -1,67 +1,44 @@
-# CLAUDE_Historical.md — the design notebook and campaign archive
+# CLAUDE_Historical.md — the design notebook, indexed
 
-**This file is NOT auto-loaded. Read it on demand, and grep it rather than reading it whole.**
+**This file is NOT auto-loaded.** It is *reference*, not contract — the rules an editor must
+not break live in `CLAUDE.md` at the repository root.
 
-This is what `CLAUDE.md` used to be. It was demoted on 2026-08-12 at 1,325,401 bytes /
-10,738 lines / ~152,000 words — roughly a third of a million tokens loaded into every
-session before any work started, which had stopped being merely expensive and become a
-functional breakage: the file alone exceeded a 200K-context subagent's entire window, so
-spawning one in this repo failed outright with "Prompt is too long · ~335,452 tokens
-(limit 200,000)".
+This was the project's whole `CLAUDE.md` until 2026-08-12, at 1.33 MB / 10,738 lines — roughly
+a third of a million tokens loaded into every session before any work started. That had
+stopped being merely expensive and become a functional breakage: the file alone exceeded a
+200K-context subagent's entire window, so spawning one in this repo failed outright.
 
-Nothing here is obsolete — it is the reasoning behind every default, the measurement
-behind every constant, the bug each gate was written for, and the record of what was tried
-and rejected so it is not re-derived. It is simply *reference* rather than *contract*.
-`CLAUDE.md` now carries the contract; this carries the evidence.
+What remains here is the **index and the cross-cutting sections**. The `## Commands` block
+below keeps every one of its 122 entries — each as its command line plus a pointer to the file
+under `docs/history/` that holds its story. The campaign records themselves (measurements,
+what was tried and rejected, which bug each gate was written for) are in those 15 files;
+`docs/history/README.md` indexes them and maps gate-ID prefixes to the suites that own them.
 
-## How to search it
+## How to search
 
 ```
-grep -n '^## ' CLAUDE_Historical.md                      # the 23 section headings, live line numbers
-grep -n '^cargo run --release -- --fsr' CLAUDE_Historical.md   # a flag's entry
-grep -n 'CACHE_VERSION' CLAUDE_Historical.md             # a topic, anywhere
+grep -rn 'CACHE_VERSION' docs/history/ CLAUDE_Historical.md   # a topic, anywhere
+grep -n  -- '--check-vk' CLAUDE_Historical.md                 # which file holds a flag
+grep -rn -- '--check-vk' docs/history/                        # that flag's full story
+grep -n  '^## ' CLAUDE_Historical.md                          # the sections kept here
 ```
 
-Structure: after this header the body opens with a ~9,700-line fenced block — 120 entries
-keyed by CLI flag, each with an inline comment body averaging ~80 lines (the longest are
-`--check-vk` at ~2,275 lines, `--nrd` ~1,223, `--frd` ~499, `--fg` ~471). That block is 69%
-of the file. The 21 prose `##` sections follow it. Prose sections use one physical line per
-paragraph, so line counts badly understate them — a single line can be 7 KB.
+The notebook refers to itself almost entirely **by name** — `the sky_sh precedent`, `the
+spp_defs idiom`, `the --fsr4 doctrine` — rather than by position, which is what made splitting
+it safe: those tokens stay greppable wherever they now live.
 
-## Contents
+## What is still in this file
 
-| section | approx |
-|---|---|
-| What this is | 1 KB |
-| **Commands** — the flag-keyed encyclopedia, 120 entries | **920 KB** |
-| HUD, pause menu, and persisted settings (Slint software renderer) | 9 KB |
-| HDR display output (ONE 10-bit swapchain — PQ or gamma by the display probe) | 12 KB |
-| The upscaler chain (always-on temporal upscaling) | 3 KB |
-| Real scenes (textures + alpha cutout + classified PBR materials) | 37 KB |
-| Mip-mapping + trilinear + 16× anisotropic (all three renderers) | 8 KB |
-| Heightfield relief rendering (V — inward-only displacement at the intersectors) | 6 KB |
-| Big scenes (tiling, scene cache, 100M+ triangles) | 6 KB |
-| DLSS Ray Reconstruction (raw NGX) | 8 KB |
-| OIDN (Intel Open Image Denoise) | 5 KB |
-| XeSS-SR (Intel XeSS Super Resolution) | 9 KB |
-| NPPD (Neural Partitioning Pyramids) | 9 KB |
-| GPU-resident tracing (--gpu) | 29 KB |
-| DXR pipeline (--dxr / F) | 19 KB |
-| Crash handling (src/crash.rs) | 9 KB |
-| Profiling | 40 KB |
-| Intel Arc / Xe2 (Battlemage): what the hardware actually offers | 37 KB |
-| Cinematic capture (`--cinematic`): the offline beauty path | 16 KB |
-| FSR (AMD ffx-api): Ray Regeneration + FSR4, and FSR 3.1 upscale-only | 16 KB |
-| Registered consensus (--quinlight): fusing every upscaler at once | 11 KB |
-| **Correctness invariants (the bug class to guard)** | **43 KB** |
-| Architecture notes | 17 KB |
+`## Commands` (the flag index), then the cross-cutting prose sections — the HUD and pause
+menu, HDR output, the upscaler chain, real scenes, mip-mapping, heightfield relief, big
+scenes, the DLSS/OIDN/XeSS/NPPD/FSR notes, GPU-resident tracing, the DXR pipeline, crash
+handling, cinematic capture, registered consensus, **`## Correctness invariants (the bug class
+to guard)`**, and **`## Architecture notes`**. The last two are the ones to read first.
 
-Keyed by heading text, not line number: this header shifted every line, and future edits
-will shift them again. `grep -n '^## '` regenerates the live numbers.
+Extracted verbatim: reassembling every `docs/history/` file's body in document order
+reproduces this file's pre-split SHA-256 exactly. Nothing was rewritten.
 
 ---
-
-*Everything below this line is the archive verbatim, byte for byte as it stood at the rename.*
 
 # CLAUDE.md
 
@@ -340,11 +317,100 @@ The first on-screen UI: a **HUD** — compass + clock + a **render-mode pill** (
 
 **ESC pause menu.** ESC opens (ESC in settings backs out; on the main page it closes); while open: the **flycam thread pauses** (it reads raw OS key state, so typing in a text field would otherwise fly the camera — the session-rebuild pause gate reused; paused ticks keep the dt clock so closing never teleports), SDL events route to Slint instead of the toggle handler (`input::Input::poll(menu)` — `hud/events.rs` translates pointer/wheel/TextInput/nav keys; toggle keys structurally can't fire; quit/resize/display/F11 keep their edges), SDL text input runs for the menu's text fields, and the frame loop **skips tracing entirely**: `GpuContext::present_again()` re-presents the last frame + overlay (the `present_hold` contract generalized — every tonemap source rests in PIXEL_SHADER_RESOURCE; `last_present` records what to re-run) at ~140 Hz, no history advances, no accumulation, so closing the menu needs ZERO resets. A live menu edit falls through to ONE normal frame so its key handler runs and the user sees the change behind the menu; a TOD set likewise (`FlyCam::set_tod` write-through → the existing `sun_moved` path; it also takes the clock from the world-mode attractors, like a manual scrub).
 
-**Settings rows are a declarative table** (`settings::menu_items()` — id/label/group/tier/control + get/set accessors over the JSON schema; `GROUPS` = Display/Renderer/Upscaler/Effects/Scene/Advanced). **Live-tier rows apply through SYNTHESIZED `Edges` fields** — the exact key-handler code paths, so reset semantics cannot drift from the keys (mode=SPACE, spp=U, bounce=H, quality=1-3, G/X/K/N/M/J/R/T/O/B/V all ride their edges; `settings::MenuFx` is the mapping) — plus direct atomics for the keyless levers: bloom (display-stage, NO reset), clouds/fireflies/firefly-count (`frame = 0`, histories kept — the TOD-scrub precedent), TOD, HUD visibility. **Restart-tier rows** (chain wiring, lock-res, HDR/vsync, adapter, scene/world, BVH knobs, load-time levers, aniso, A/B levers, SDK paths — everything decided at GpuContext::new/scene load) edit the file only and badge "restart". **Every menu edit auto-saves; keyboard toggles deliberately never persist** (a key press is experimentation, a menu click is a preference).
+**Settings rows are a declarative table** (`settings::menu_items()` — id/label/group/tier/control + get/set accessors over the JSON schema; `GROUPS` = Display/Renderer/Upscaler/Effects/Scene/Advanced) — so a new row needs NO Slint work: `ui.rs` draws its control off the `row.control` STRING (`toggle`/`cycle`/`cyclefwd`/`step`/`text`), never off an id. **The list has a SCROLLBAR, and the reason is worth keeping**: the panel is a fixed ~16 rows and does not grow with the window, while Effects is 32, so the rows past the fold were both invisible and UNADVERTISED — which reads as "the menu does not have that setting" rather than "scroll down" (found by rendering the page with `--cinematic-hud settings:Effects`, which is the cheap way to look at this UI at all). It draws only while `flick.viewport-height > flick.height`, so short groups stay clean; the thumb is proportional with a 24px floor, and its travel denominator is guarded because the binding still evaluates on the frame the `if` turns it off. Plain Rectangles by necessity — the software renderer silently ignores `drop-shadow-*`. Scrolling itself always worked (Flickable drag + the keyboard cursor pulling itself into view); only the affordance was missing. **Live-tier rows apply through SYNTHESIZED `Edges` fields** — the exact key-handler code paths, so reset semantics cannot drift from the keys (mode=SPACE, spp=U, bounce=H, quality=1-3, G/X/K/N/M/J/R/T/O/B/V all ride their edges; `settings::MenuFx` is the mapping) — plus direct atomics for the keyless levers: bloom (display-stage, NO reset), clouds/fireflies/firefly-count (`frame = 0`, histories kept — the TOD-scrub precedent), TOD, HUD visibility. **Restart-tier rows** (chain wiring, lock-res, HDR/vsync, adapter, scene/world, BVH knobs, load-time levers, aniso, A/B levers, SDK paths — everything decided at GpuContext::new/scene load) edit the file only and badge "restart". **Every menu edit auto-saves; keyboard toggles deliberately never persist** (a key press is experimentation, a menu click is a preference).
 
 **The settings file** (`frustracer-settings.json` next to the exe, `src/settings.rs`): all-`Option` sparse serde schema — `None` = never set, only deliberate choices serialize; enum-ish fields carry the CLI's own strings. Loads at the top of `main()` and applies BEFORE the arg parse, so precedence reads **compiled defaults < settings file < CLI flags** — and since the CLI moved to `src/cli.rs` that is a DATA FLOW rather than the ordering accident it used to be: `apply_to_opts` and the parse loop both write `Opts` FIELDS, `main`'s lever block is the single place any of them reaches a process global (see the CLI bullet in Architecture notes). Headless runs (`--check*`, `--*-dump`, `--spin*`) and `--no-settings` ignore the file with one loud line — the gates stay a pure function of the command line. Corrupt/BOM-prefixed files are a loud line + defaults, never a panic; invalid field values warn and fall back per-field; the file's scene choice applies only when the CLI named no scene source (never an exclusivity error against a flag). `settings::self_test` (in `--check`) pins the serde round-trip/sparseness/forward-compat, every enum vocabulary against its real consumer (`xess::lock_scale`, `bc7::Quality::parse`, the `parse_*` mirrors of the CLI arms), the menu descriptor's invariants (unique ids, known groups, cycle options its consumers accept, restart-Toggle round-trip), and the headless predicate.
 
 Known-accepts: P screenshots and `--check` PNGs contain NO HUD (they read pre-composite sources — deliberate); the HUD has no MVs (upscalers see it post-upscale, so nothing to absorb); a menu-open hold re-presents one frame (converging stills freeze, like the existing holds); glow-through: `PrintWindow` captures of the flip-model swapchain can show a stale pre-menu buffer (capture quirk, not a compositing bug — the CPU buffer dump is ground truth). Structurally `--check`-safe: everything hangs off `GpuContext`/`Hud`, which only exist in the interactive window; headless paths never construct either. Touch `src/hud/`, `src/gpu/hud.rs`, `hud.hlsl`, `src/settings.rs`, `src/cli.rs`, `input.rs`, `flycam.rs`'s set_tod/manual_tod, or the menu block in `session()` → run `--check` (settings + cli self-tests + the untouched-gates proof), then the interactive smoke: HUD in every arm, ESC menu open/close with a held W (camera must stay frozen), a live row click (applies + `frustracer-settings.json` updates), a restart row (badge + file), relaunch picks the file up, `--spp 2` on the CLI overrides a file `spp`.
+
+## Loading screen (the boot stays interactive and the bar reaches 100%)
+
+The window, `GpuContext` and the Slint HUD come up FIRST; the scene loads on a
+`scene-load` worker while the main thread runs a ~30 Hz loop presenting a
+HUD-styled progress page (`src/progress.rs` is the publish-only atomic sink,
+`Hud::loading_frame` the raster, `CpuPresent::blit` the present). That covered
+the CPU load and stopped dead at the GPU upload: `run_window` drew ONE frozen
+frame, then the eager tracer init ran inside `session()` with no `inp.poll` and
+no present until the first live frame. **MEASURED (THE WORLD, 4090): a 16 s
+window with no message pump, of which Windows' own `IsHungAppWindow` flagged
+5 s as "Not Responding"** — the bar the user saw at "50%" was an indeterminate
+marquee stopped mid-sweep.
+
+**THE SEAM IS `Submit`.** Presenting needs `&mut GpuContext` — the one funnel
+(`fullscreen_to_backbuffer`) owns the FG handshake and the SDR/Sdr10/HDR10
+encodings, and a second present path would have to reproduce both — while the
+upload holds `&mut self.d3d`, a FIELD of that context, so no callback handed
+down from `ensure_scene_gpu` can ever reach the rest of it. But every blocking
+thing the upload does goes through `sub: &mut dyn d3d12::Submit`, so
+`gpu::PumpSubmit` is a submitter that OWNS the whole context and repaints
+between submits, and `GpuContext::upload_scene_core` (called once from
+`run_window`, with `&mut self` FREE — which is the whole point of hoisting it
+out of the session) drives it. `ensure_scene_gpu` is untouched and simply
+finds the core cached. `gpu::LoadUi` is the other half: everything the repaint
+needs that the GPU side must not know about (the Slint HUD, the SDL pump),
+supplied by main.rs's `LoadScreen` and handed the context per call. Interleaving
+a present with `run_once` on the one queue is not new — the mid-session SPACE/F
+switch already uploads a scene between two presented frames.
+
+**AND THE UPLOAD ITSELF WAS ROUND-TRIP-BOUND.** `D3d::run_once` drains the queue
+before it borrows slot 0's allocator AND again after, and the upload called it
+once per ring chunk and once per (texture, mip) band — ~3500 calls on a
+313-texture world, ~7000 `WaitForSingleObject(INFINITE)`. The Vulkan backend
+already rejects that shape (`vk::stage`: one submit per ring fill, "not one per
+(texture, mip)"). `trace::Batch` gives the ring a CURSOR and accumulates the
+copies, flushing at `BATCH_BYTES` (32 MiB) — **the invariant is unchanged, only
+where it is enforced**: staged bytes must not be overwritten before the GPU has
+read them, and the rewind now happens at a flush, which waits, instead of after
+every chunk. Reservations are 512-aligned (`CopyTextureRegion`'s
+`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`, and the BC7 root SRV's 16, in one
+rule). Flush boundaries are a pure function of the scene's sizes — NEVER a
+clock — so the submit structure is deterministic and every uploaded byte is
+identical. **CALLER RULE: anything that submits or reads back outside the batch
+(the `FR_SPLIT_AUDIT` readbacks, the AS builds) must `flush` first.** The
+chunk-BLAS build and compaction loops batch too (`AS_BATCH` = 64), because
+nothing can present during ONE submit — a submit boundary is a strictly
+stronger barrier than the shared-scratch UAV barrier it replaces.
+
+MEASURED (THE WORLD, 4090, warm): upload span **7.7 → 5.9 s**, BC7 **1091 →
+558 ms**, blas-split **2512 → 1782 ms**, with the outputs byte-identical (same
+MB, same 3981 chunks, same compacted sizes). The page repaints **68 times
+during the upload where it previously repainted zero**, and `IsHungAppWindow`
+reads **0 hung samples against the baseline's 15-20, reproducibly**. The one
+span left without a repaint is `DxrGpu::new` (2.0 s warm; up to ~8 s on a COLD
+D3DSCache, which would ghost) — it takes no submitter, and the fix if it ever
+matters is a pump hook between its several `dxc.compile` calls.
+
+Progress is ONE monotonic unit space (`trace::upload_units` — staged MiB plus a
+triangle-derived weight for the AS build), so `progress::detail` renames the
+sub-step ("geometry" → "textures (BC7)" → "acceleration structures") WITHOUT
+`phase()` resetting the bar, and `progress::tick_n` ticks whole MiB per flush
+against a running remainder. **The denominator is a cost MODEL, and the
+endpoint is asserted rather than trusted**: `upload_units` must count the
+`--blas-split` arm's own re-streamed index set (12 B + 4 B per triangle — 527
+MiB on THE WORLD, MEASURED as exactly the gap between a 7767-unit estimate and
+the bar's real 8294-unit end before it was counted, and 8293 vs 8294 after),
+while the arms it CANNOT see from there — `--no-blas-split` never ticking the
+AS share it reserved, the wavefront ticking a software-tree upload nobody
+reserved — are closed once by `progress::finish_phase()` at the end of the
+upload. An accounting identity every arm has to maintain is the fragile way to
+get 100%; clamping the overshoot and asserting the endpoint is the robust one.
+The page now stays up INTO the session and
+`session()` clears it at the "init is done" line, pumping `load_step!` at each
+coarse boundary in between (it detects a first entry from `Hud::is_loading()`,
+so it needs no new parameter).
+
+**Headless is untouched by construction** — every `progress::` call early-outs
+on `ACTIVE` and only `run_window` calls `activate()` — but this DID touch
+`src/gpu/trace.rs`, which the original loading-screen commit deliberately left
+alone as its "provably unaffected" argument. That claim is retired: re-run the
+suites rather than reasoning about them. Touch `progress.rs` / `LoadUi` /
+`PumpSubmit` / `upload_scene_core` / `Batch` / the AS batch loops / `load_tick`
+→ `--check` (+ byte-compare BOTH goldens — they come off the CPU path, so any
+movement means a capture edit leaked into shading), `--check-gpu` and
+`--check-dxr` on procedural + `san-miguel-low-poly` + `--tile 2`, the
+`--no-bc7` / `--bc7-cpu` / `--no-blas-split` arms, `--check-gpu --gpu-debug`
+(GBV is the ring-cursor's real gate), and the `IsHungAppWindow` probe on a
+world boot.
 
 ## HDR display output (ONE 10-bit swapchain — PQ or gamma by the display probe)
 
@@ -405,7 +471,7 @@ Game-like benchmark scenes come from the McGuire Computer Graphics Archive (http
 
 **glTF 2.0 scenes** (`src/gltf_loader.rs`; `.gltf`/`.glb` on the positional arg — same CLI slot as OBJ, so exclusivity/default camera/structural-skip/`--tile`/the scene cache all compose): materials carry REAL PBR data, so `matclass` is bypassed — baseColor/metallic/roughness factors + normal/metallicRoughness (roughness=G, metallic=B, one shared map)/emissive textures map straight onto the extended `Material`; KHR_materials_transmission → `transmission` (NO albedo lift — glTF baseColor is authored for tinting, unlike San Miguel's dark exporter Kd), KHR_materials_emissive_strength multiplies, sheen reads the raw KHR_materials_sheen JSON (no crate feature exists in gltf 1.4), KHR_materials_ior is logged (GLASS_IOR fixed), unlit → matte, Blend → Mask + note. The three glTF-vs-OBJ traps, all deliberate: **NO V flip** (glTF UVs are top-left origin — the convention our texels land in after the OBJ path's load-time flip), **no glass albedo lift**, and **OPAQUE materials must not cutout** (spec ignores their baseColor alpha; `alpha_masked` is cleared unless a MASK/BLEND material references the texture — junk JPG alpha would punch holes in walls). Node graph is FLATTENED (transforms baked; normals by inverse-transpose; negative-determinant nodes flip winding so geometric face normals keep agreeing); authored TANGENTs are ignored (one tangent source: shade.rs's on-the-fly derivation); COLOR_0/TEXCOORD_1/occlusionTexture/KHR_lights_punctual ignored (the engine's one sky — scattering dome + sun disc — is the lighting model); images decode through the texture.rs rayon pipeline (only slot-referenced images; GLB buffer views, external files, and base64 data URIs); external BUFFERS resolve through `gltf_loader::resolve_buffers` with the OBJ path's `.zst` sibling fallback — committed scenes carry `.bin.zst` (raw vertex/index buffers zstd ~2-3×, measured Intel Sponza 133.5 → 60.7 MB; textures are already-deflated PNG/JPG and stay as-is), a plain `.bin` still loads verbatim, and the sibling fallback is pinned by a `self_test` case. `gltf_loader::self_test` (run by `--check`, download-free — a GLB assembled in code) pins node flattening, the mirrored-winding flip, u16 index widening, the welded-normal fallback, and the factor mapping; real-scene gates are download-optional like san-miguel (Khronos glTF-Sample-Assets DamagedHelmet/Sponza, Intel Sponza, Bistro — .gitattributes already LFS-tracks `scenes/**/*.glb|bin|gltf|jpg|jpeg`). One `gltf:` summary line prints prim/tri/material/texture counts + everything skipped.
 
-**BC7 scene textures** (ON BY DEFAULT; `--no-bc7` kills, `--bc7-cpu` = the ispc A/B arm; `src/bc7.rs` owns the mode/predicate + the CPU arm over the `intel_tex_2` crate — prebuilt ISPC binaries, an ordinary static dep like `image`, so every `--check*` stays DLL-free): block-compresses the OPAQUE scene textures on upload, **GPU upload only** — the CPU samplers keep the exact RGBA8 texels, so the feature moves ONLY the statistical GPU-vs-CPU gates (measured San Miguel/Sponza/Bistro: albedo A/B 0.0001–0.0004 vs the 0.02 limit, radiance ≤ 0.007%) while class-mismatch/`t_viol`/alpha-rejections stay **bit-identical** — the carve-out proof. **The DEFAULT arm is a GPU compute encoder** (`Bc7Mode::Gpu(Fast)`; `shaders/bc7enc.hlsl` with two hosts — `src/gpu/bc7gpu.rs` at fxc cs_5_0, the bloom no-DXC precedent, so it exists before any tracer kernel and works in both Submit harnesses; `src/vk/bc7.rs` at DXC cs_6_0, where DXC is the only compiler there is. The kernel is shared, and the ONE thing the second host cost it is a byte-offset window — `src_off`/`dst_off`, which D3D12 passes as 0 because it slides root SRV/UAV virtual addresses instead. `Quality::effort` lives in `src/bc7.rs` for the same reason: one kernel, one table), dispatched per band inside `SceneGpu::new_uploaded`: the ring stages the RGBA8 source rows, the kernel (one thread per 4×4 block) writes `block_pitch`-strided blocks into a reused UAV buffer, `CopyTextureRegion` lands them in the committed BC7 mip — blocks never touch the CPU. Encoder shape: mode-6 (single-subset 7.7.7.7+P) PCA fit — covariance power iteration seeded from the largest-diagonal COLUMN, never a fixed vector ((1,1,1) is exactly perpendicular to an anti-correlated axis and collapsed red↔green blocks to near-solid, the measured max-198-LSB class) — plus 2 least-squares refinement rounds, plus a **mode-1 two-subset arm** (64 spec partitions ranked by 2-means SSE — an UPPER-bound predictor: rank with it, never prune — top-N full-fitted, lower-SSE mode wins): mode-6-only measured 26.4 dB worst on San Miguel's patterned plate vs ispc's 33.0 — the gap was the second subset, not the fit. `--bc7-quality` maps to effort tiers: ultrafast = mode-6 no-refit (26.3 dB), fast = + conditional mode-1 (top-4, only when mode-6 SSE > ~2.5 LSB RMS — 32.0 dB), basic/slow = mode-1 always at top-8/16 (32.5/32.8). MEASURED at `fast`: SM-lp 117 ms, Bistro 229 ms (2.1 Gtexel/s), Intel Sponza **282 ms at 3.8 Gtexel/s vs the ispc arm's ~20 s** (rates count every encoded level, mips included) — the 70× that made default-on affordable; there is still deliberately **no BC7 disk cache**. Determinism: the GPU arm claims per-(device, driver) only (per-block-independent kernel, no atomics) and NOTHING depends on more — no disk cache, and M11 runs the session's own encoder in-session; the CPU arm keeps its full determinism pin. Fallback ladder: `Bc7Enc::new` failure = LOUD line + uncompressed RGBA8 for the upload (never an implicit CPU-encode stall); in `--check-gpu` the same failure is a suite FAIL. `bc7::should_compress = !alpha_masked && !h2n && !n2h && 4-aligned dims`, all arms load-bearing: **alpha-masked cutout textures must stay RGBA8** — `alpha_nearest < 128`/`alpha_cutout` is a hard binary threshold on one texel, BC7 alpha lines reach only 4/8/16 levels per block (an authored 128 CANNOT be encoded and snaps across — a *visibility* divergence, and San Miguel's masks are antialiased), and the predicate mirrors `mat_cutout`'s (`trace.rs`) so the id set `.Load` can reach is exactly the RGBA8 set — their agreement IS the soundness argument (the GPU kernel excludes alpha by construction too: mode 6 pins alpha endpoints, mode 1 carries none — the ispc `opaque_*` twin); the 4-align arm is the D3D spec ("a block-compressed texture must be created as a multiple of size 4 in all dimensions" — odd dims measured working on the dev NVIDIA driver, but that is tolerance, not contract; free where it matters: Bistro/Sponza are 100% aligned, San Miguel keeps its odd-dim 63% of opaque MB as RGBA8). Mixed BC7+RGBA8 in the one `texs[]` table needs zero shader changes (SRV format reads back off the resource; the `_SRGB`/`_UNORM` role split carries over; the GPU arm's copy-out and the CPU arm's block-row staging both speak `d3d12::footprint_block`). Gating: `bc7::self_test` (in `--check`) pins the predicate/block math/CPU-arm determinism/`Bc7Mode` flag algebra; **every `--check-gpu` runs the `bc7-gpu` structural gate** (synthetic, fires even on the untextured procedural scene: an all-even flat color must round-trip the hardware decoder BIT-EXACT — representable exactly via e0 == e1, so any loss is wiring; every flat block byte-identical to block 0, the stride catch; a gradient ramp ≥ 30 dB at every effort tier; and a two-CLUSTER block whose small max error proves the mode-1 arm fired with partition/anchor tables + packing the hardware decoder agrees with); **M11** (armed + compressible textures) encodes with the session's arm, uploads as `BC7_UNORM`, `.Load`-decodes back (BC7 *decode* is spec-bit-exact) and per-texel diffs vs the CPU texels, worst-texture RGB PSNR ≥ 25 dB (a WIRING gate: pitch/footprint/format errors land ~10–20 dB; worst honest measured at `fast`: gpu 32.0 / cpu 33.0 on SM-lp, Bistro 41.9, Intel Sponza 37.4; `FR_BC7_DUMP=1` prints per-texture PSNRs). **On Vulkan the same two arms run** (`src/vk/bc7.rs` + the three per-level arms in `src/vk/textures.rs`), gated by `--check-vk`'s V10 — the `bc7-gpu` structural gate and M11 transplanted, teeth for teeth, with both probes encoding at a NON-ZERO and DIFFERENT src/dst window so the one thing the second host added is actually scored. See the M3j block in the `--check-vk` entry for the differences (no banding, a uniform buffer instead of root constants, tight block rows) and for what V10 catches that the render gates provably do not (a kernel ignoring `src_off` leaves the radiance A/B at 1.132%, inside its 2% bar, while V10 reads 20.7 dB). Touch bc7.rs, bc7gpu.rs, vk/bc7.rs, bc7enc.hlsl, the trace.rs texture upload loop, `vk/textures.rs`, or `footprint_block` → run `--check` plus `san-miguel-low-poly.obj --check-gpu` and `--check-dxr` (defaults armed), `--check-gpu --bc7-cpu` (the ispc arm), and `--check-gpu --no-bc7` (the RGBA8 baseline); on Linux `--check-vk` on a textured scene in all three arms, and `--check-spirv` (the kernel and the decode probe are both in that corpus).
+**BC7 scene textures** (ON BY DEFAULT; `--no-bc7` kills, `--bc7-cpu` = the ispc A/B arm; `src/bc7.rs` owns the mode/predicate + the CPU arm over the `intel_tex_2` crate — prebuilt ISPC binaries, an ordinary static dep like `image`, so every `--check*` stays DLL-free): block-compresses the OPAQUE scene textures on upload, **GPU upload only** — the CPU samplers keep the exact RGBA8 texels, so the feature moves ONLY the statistical GPU-vs-CPU gates (measured San Miguel/Sponza/Bistro: albedo A/B 0.0001–0.0004 vs the 0.02 limit, radiance ≤ 0.007%) while class-mismatch/`t_viol`/alpha-rejections stay **bit-identical** — the carve-out proof. **The DEFAULT arm is a GPU compute encoder** (`Bc7Mode::Gpu(Fast)`; `shaders/bc7enc.hlsl` with two hosts — `src/gpu/bc7gpu.rs` at fxc cs_5_0, the bloom no-DXC precedent, so it exists before any tracer kernel and works in both Submit harnesses; `src/vk/bc7.rs` at DXC cs_6_0, where DXC is the only compiler there is. The kernel is shared, and the ONE thing the second host cost it is a byte-offset window — `src_off`/`dst_off`, which D3D12 passes as 0 because it slides root SRV/UAV virtual addresses instead. `Quality::effort` lives in `src/bc7.rs` for the same reason: one kernel, one table), dispatched per band inside `SceneGpu::new_uploaded`: the ring stages the RGBA8 source rows, the kernel (one thread per 4×4 block) writes `block_pitch`-strided blocks into a reused UAV buffer, `CopyTextureRegion` lands them in the committed BC7 mip — blocks never touch the CPU. Encoder shape: mode-6 (single-subset 7.7.7.7+P) PCA fit — covariance power iteration seeded from the largest-diagonal COLUMN, never a fixed vector ((1,1,1) is exactly perpendicular to an anti-correlated axis and collapsed red↔green blocks to near-solid, the measured max-198-LSB class) — plus 2 least-squares refinement rounds, plus a **mode-1 two-subset arm** (64 spec partitions ranked by 2-means SSE — an UPPER-bound predictor: rank with it, never prune — top-N full-fitted, lower-SSE mode wins): mode-6-only measured 26.4 dB worst on San Miguel's patterned plate vs ispc's 33.0 — the gap was the second subset, not the fit. `--bc7-quality` maps to effort tiers: ultrafast = mode-6 no-refit (26.3 dB), fast = + conditional mode-1 (top-4, only when mode-6 SSE > ~2.5 LSB RMS — 32.0 dB), basic/slow = mode-1 always at top-8/16 (32.5/32.8). MEASURED at `fast`: SM-lp 117 ms, Bistro 229 ms (2.1 Gtexel/s), Intel Sponza **282 ms at 3.8 Gtexel/s vs the ispc arm's ~20 s** (rates count every encoded level, mips included) — the 70× that made default-on affordable; there is still deliberately **no BC7 disk cache**. Those rates PREDATE the batched staging ring (2026-08-12 — see "Loading screen"): each band's encode + copy-out was its own BLOCKING submit, so they measured round trips more than the kernel. Identical blocks, ~2× the throughput — THE WORLD's 306 BC7 textures read **1091 → 558 ms (859 → 1680 Mtexel/s)** on a 4090. Note the two hosts' offset story is unchanged in KIND and no longer degenerate: D3D12 still passes the kernel's `src_off`/`dst_off` as 0 and slides the root SRV virtual address instead — by a real per-band offset now that the ring has a cursor. Determinism: the GPU arm claims per-(device, driver) only (per-block-independent kernel, no atomics) and NOTHING depends on more — no disk cache, and M11 runs the session's own encoder in-session; the CPU arm keeps its full determinism pin. Fallback ladder: `Bc7Enc::new` failure = LOUD line + uncompressed RGBA8 for the upload (never an implicit CPU-encode stall); in `--check-gpu` the same failure is a suite FAIL. `bc7::should_compress = !alpha_masked && !h2n && !n2h && 4-aligned dims`, all arms load-bearing: **alpha-masked cutout textures must stay RGBA8** — `alpha_nearest < 128`/`alpha_cutout` is a hard binary threshold on one texel, BC7 alpha lines reach only 4/8/16 levels per block (an authored 128 CANNOT be encoded and snaps across — a *visibility* divergence, and San Miguel's masks are antialiased), and the predicate mirrors `mat_cutout`'s (`trace.rs`) so the id set `.Load` can reach is exactly the RGBA8 set — their agreement IS the soundness argument (the GPU kernel excludes alpha by construction too: mode 6 pins alpha endpoints, mode 1 carries none — the ispc `opaque_*` twin); the 4-align arm is the D3D spec ("a block-compressed texture must be created as a multiple of size 4 in all dimensions" — odd dims measured working on the dev NVIDIA driver, but that is tolerance, not contract; free where it matters: Bistro/Sponza are 100% aligned, San Miguel keeps its odd-dim 63% of opaque MB as RGBA8). Mixed BC7+RGBA8 in the one `texs[]` table needs zero shader changes (SRV format reads back off the resource; the `_SRGB`/`_UNORM` role split carries over; the GPU arm's copy-out and the CPU arm's block-row staging both speak `d3d12::footprint_block`). Gating: `bc7::self_test` (in `--check`) pins the predicate/block math/CPU-arm determinism/`Bc7Mode` flag algebra; **every `--check-gpu` runs the `bc7-gpu` structural gate** (synthetic, fires even on the untextured procedural scene: an all-even flat color must round-trip the hardware decoder BIT-EXACT — representable exactly via e0 == e1, so any loss is wiring; every flat block byte-identical to block 0, the stride catch; a gradient ramp ≥ 30 dB at every effort tier; and a two-CLUSTER block whose small max error proves the mode-1 arm fired with partition/anchor tables + packing the hardware decoder agrees with); **M11** (armed + compressible textures) encodes with the session's arm, uploads as `BC7_UNORM`, `.Load`-decodes back (BC7 *decode* is spec-bit-exact) and per-texel diffs vs the CPU texels, worst-texture RGB PSNR ≥ 25 dB (a WIRING gate: pitch/footprint/format errors land ~10–20 dB; worst honest measured at `fast`: gpu 32.0 / cpu 33.0 on SM-lp, Bistro 41.9, Intel Sponza 37.4; `FR_BC7_DUMP=1` prints per-texture PSNRs). **On Vulkan the same two arms run** (`src/vk/bc7.rs` + the three per-level arms in `src/vk/textures.rs`), gated by `--check-vk`'s V10 — the `bc7-gpu` structural gate and M11 transplanted, teeth for teeth, with both probes encoding at a NON-ZERO and DIFFERENT src/dst window so the one thing the second host added is actually scored. See the M3j block in the `--check-vk` entry for the differences (no banding, a uniform buffer instead of root constants, tight block rows) and for what V10 catches that the render gates provably do not (a kernel ignoring `src_off` leaves the radiance A/B at 1.132%, inside its 2% bar, while V10 reads 20.7 dB). Touch bc7.rs, bc7gpu.rs, vk/bc7.rs, bc7enc.hlsl, the trace.rs texture upload loop, `vk/textures.rs`, or `footprint_block` → run `--check` plus `san-miguel-low-poly.obj --check-gpu` and `--check-dxr` (defaults armed), `--check-gpu --bc7-cpu` (the ispc arm), and `--check-gpu --no-bc7` (the RGBA8 baseline); on Linux `--check-vk` on a textured scene in all three arms, and `--check-spirv` (the kernel and the decode probe are both in that corpus).
 
 ## Mip-mapping + trilinear + 16× anisotropic (all three renderers)
 

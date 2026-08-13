@@ -1,6 +1,6 @@
 # Upscalers and frame generation
 
-Scene levers (`--stress`, `--tile`, `--no-bc7`), the always-on upscaler chain, OIDN, XeSS, FSR/FSR4/FSR3, and all three frame-generation legs (ffx FI, raw-NGX DLSS-G, XeSS-FG).
+Scene levers (`--stress`, `--tile`, `--no-bc7`), the gate basics, the always-on upscaler chain, OIDN, XeSS, FSR/FSR4/FSR3, and all three frame-generation legs (ffx FI, raw-NGX DLSS-G, XeSS-FG).
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 
@@ -27,7 +27,14 @@ cargo run --release -- model.obj --no-bc7  # A/B lever: upload scene textures as
                                         # fast, SM-lp 117 ms / Bistro 229 ms (2.1 Gtexel/s) /
                                         # Intel Sponza 282 ms (3.8 Gtexel/s; rates count every
                                         # encoded level, mips incl.) vs the ispc CPU
-                                        # arm's 0.8 / 9 / 20 s. --bc7-cpu keeps that ispc arm as
+                                        # arm's 0.8 / 9 / 20 s. THOSE FIGURES PREDATE THE BATCHED
+                                        # STAGING RING (2026-08-12 — the loading-screen pump; see
+                                        # "Loading screen" below): the bands' encode+copy-out pairs
+                                        # used to be one BLOCKING submit each, so the rate was
+                                        # round-trip-bound rather than kernel-bound. Same blocks,
+                                        # ~2x the throughput — THE WORLD's 306 BC7 textures read
+                                        # 1091 -> 558 ms (859 -> 1680 Mtexel/s, 4090).
+                                        # --bc7-cpu keeps that ispc arm as
                                         # the A/B lever + independent cross-check (M11 worst on
                                         # SM-lp: cpu 33.0 dB vs gpu 32.0); --bc7-quality
                                         # ultrafast|fast|basic|slow = GPU effort tiers (0 = mode-6
