@@ -8411,6 +8411,170 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # optional here: `mod vk` is cfg(unix), so a new gate function
                                       # needs `#[cfg(unix)]` and nothing else on this box catches
                                       # its absence
+                                      # B6b RUNG 1 — THE WINDOW (2026-08-12; src/vk/present.rs +
+                                      # run_window_vk). The one thing a Linux user could not do:
+                                      # main.rs's fall-through exited 2 with "the interactive window
+                                      # requires Windows". A bare `frustracer` now opens an SDL3
+                                      # window, builds a swapchain over its surface, and presents
+                                      # THE WORLD. NOT A GATE — an interactive window cannot be
+                                      # gated headlessly and this does not pretend otherwise; what
+                                      # IS gated is the extension union (below) and V0..V19 unmoved.
+                                      # SDL3 RATHER THAN A NEW WINDOWING CRATE: the Windows session
+                                      # already runs on it, so this is one windowing library in the
+                                      # tree instead of two, and the crate carries exactly the two
+                                      # things the handoff needs — `vulkan_instance_extensions`
+                                      # names the platform surface extension itself (so `src/vk/`
+                                      # mentions no xlib/xcb/wayland) and its `ash` feature is
+                                      # `use-ash-v0-38`, an EXACT match for our ash, so
+                                      # `vulkan_create_surface` returns our own `vk::SurfaceKHR`
+                                      # with no transmute. SCOPED TO `cfg(all(unix, not(macos)))` in
+                                      # Cargo.toml, NOT the `cfg(unix)` block beside ash: that block
+                                      # already applies on macOS, so putting it there would make
+                                      # every macOS build — CI included — compile SDL3 from source
+                                      # for a presenter that platform has no tracer to feed.
+                                      # MEASURED: SDL3 3.4.12 builds from source in 55 s (the source
+                                      # was already in the cargo registry; cmake 4.2.3 clears its
+                                      # 3.16 floor) and links STATICALLY — 3787 SDL symbols in the
+                                      # binary, nothing added to NEEDED.
+                                      # THREE SEAMS, all pre-existing and consumed rather than
+                                      # invented: `Passes::record_to` (rung 2's (img, view, w, h)
+                                      # generalization, written for exactly this caller because a
+                                      # swapchain image owns no DeviceMemory), `run_present` (the
+                                      # semaphore submit shape, until now used only by V19), and
+                                      # `Swapchain::build`, which `from_surface` shares with `new`.
+                                      # THE ONE SEMANTIC ADDITION is `enum Refusal { Env, Err }`:
+                                      # `new` is a GATE's constructor, so an environment fact is a
+                                      # SKIP; `from_surface` is a WINDOW's, so the identical fact is
+                                      # a refusal that names itself and exits 2 (the --fsr4
+                                      # being-told doctrine). One body, two duties, and a bare
+                                      # Option could express only the first.
+                                      # `CineVk::output_frame` SPLIT into `render_frame` (the GPU
+                                      # half, ending at the FFX output IMAGE) + one `read_output` —
+                                      # a factoring, never a parallel loop, so the capture arm and
+                                      # the presenter share ONE sub-frame loop and therefore ONE
+                                      # `cinematic::Temporal` (the prev-camera/reset/jitter/replay
+                                      # contract B5c extracted). The window inherits for free the
+                                      # property that a PARKED camera replays its terminal quadtree.
+                                      # TWO FRAME INDICES, and they are different questions:
+                                      # `segment_at` CLAMPS u rather than wrapping, so the POSE
+                                      # index must wrap or the camera parks at the end of the lap
+                                      # forever; `render_frame`'s must NOT, because its only use is
+                                      # the frame-0 warm-up (JITTER_PHASE - samples extra passes)
+                                      # and a wrapped one would re-run 71 passes every lap. Known-
+                                      # accept: the cloud/firefly clocks ride the wrapped index too
+                                      # (`cine_frame_state` couples them to the pose, right for a
+                                      # capture), so the sky snaps at the lap seam — a 60 s lap is
+                                      # what makes that rare rather than rhythmic.
+                                      # THE REAL SURFACE NEGOTIATES A FORMAT THE HEADLESS ONE NEVER
+                                      # OFFERS, which is the sharpest argument that rung 1 is not
+                                      # redundant with V19: the compositor here hands back
+                                      # A2B10G10R10_UNORM_PACK32 (10-bit) where V19's headless
+                                      # surface reports R8G8B8A8_UNORM. `decodable` already admitted
+                                      # it (display::decode unpacks it arithmetically rather than by
+                                      # byte offset, which is why it is listed there and not in
+                                      # rgb_offsets), so the window presents 10-bit and
+                                      # ToneParams::SDR on a UNORM wire IS the Sdr10 arm.
+                                      # NO RESIZE, AND THE WINDOW SAYS SO THREE WAYS. It is built
+                                      # WITHOUT `.resizable()` (rung 1 sizes the swapchain, the
+                                      # tracer and the display pipelines once, so the capability
+                                      # would be a lie); `swapchain::Lost` splits
+                                      # ERROR_OUT_OF_DATE_KHR out of the error string as `Stale`;
+                                      # and the loop treats `Frame::Stale` as a CLEAN QUIT with a
+                                      # sentence at exit 0. Each covers what the others cannot: a
+                                      # compositor resizes whatever it likes whatever the window
+                                      # asked for, and SUBOPTIMAL_KHR (a SUCCESS code, still
+                                      # ignored) is a different answer from OUT_OF_DATE. MEASURED on
+                                      # RADV under XWayland — resizing 1280x720 -> 320x240 reports
+                                      # SUBOPTIMAL and keeps presenting at ~105 fps while the
+                                      # COMPOSITOR SCALES, i.e. a stretched image, the exact failure
+                                      # the FFX-extent check six lines up refuses; a driver
+                                      # reporting the other answer is equally conformant and used to
+                                      # end the session with a raw
+                                      # `vkQueuePresentKHR: ERROR_OUT_OF_DATE_KHR` at exit 2.
+                                      # Dropping `.resizable()` is what makes the WM refuse the
+                                      # forced resize outright (verified: geometry holds at
+                                      # 1280x720 through `xdotool windowsize 640 480`).
+                                      # THE FSR3 RUNTIME FAILURE IS A REFUSAL, NOT AN `expect`:
+                                      # `fsr3::built()` is a COMPILE-time fact while
+                                      # `CineVk::build` degrades loudly to `up: None` when the
+                                      # context cannot be created, which the capture answers by
+                                      # accumulating and the window cannot (presenting a CPU image
+                                      # means a readback and re-upload every frame). Reachable
+                                      # through this tree's own documented lever —
+                                      # FR_VK_PRESENT_SOFTWARE=1 walks a software device past the
+                                      # swapchain stand-down and lands there — and it panicked at
+                                      # exit 101 with an internal-invariant string until 2026-08-12.
+                                      # `CineVk::build`'s line lost its consequence clause with the
+                                      # fix ("fsr3: unavailable (..) — no reconstruction arm"): it
+                                      # said "accumulation fallback", which was true for the capture
+                                      # and a lie one line before the window aborted — the same
+                                      # two-callers staleness the `nrd:` lines were fixed for.
+                                      # MEASURED (Radeon 8060S, 1280x720, THE WORLD 34.4M tris, NRD
+                                      # armed): ~60 fps vblank-locked, falling to ~47 across the
+                                      # denser islands, p99 within ~4 ms of p50 — a steady cadence,
+                                      # no hitching. That is the PACING measurement rung 2 owed. It
+                                      # is CPU wall-clock BETWEEN PRESENTS and says nothing about
+                                      # where GPU time goes, which needs a vkCmdWriteTimestamp
+                                      # instrument this backend still has no peer of
+                                      # (gpu/gputime.rs). `Pacing`'s period starts at the FIRST
+                                      # PRESENT, not at construction: a `Pacing` is built before a
+                                      # ~13 s world load, so a clock started in `new` is already
+                                      # expired when frame 1 lands and the first report is one
+                                      # interval wearing three hats (mean == p50 == p99 `over 1
+                                      # frame(s)` — what the window printed until 2026-08-12).
+                                      # TEETH FIRED, BOTH: a software device refuses with exit 2 and
+                                      # its own sentence (lavapipe segfaults INSIDE
+                                      # vkCreateSwapchainKHR, so the stand-down is before the call —
+                                      # and the swapchain is built BEFORE the scene load, so the
+                                      # refusal arrives in milliseconds rather than after a 13 s
+                                      # world boot); and a pipeline whose format disagrees with the
+                                      # negotiated surface format is named ONLY by the validation
+                                      # layer (VUID-vkCmdDraw-dynamicRenderingUnusedAttachments-08910,
+                                      # 10x) while the UNVALIDATED run presents happily for 100 s,
+                                      # because RADV honours the view's format — the sharpest
+                                      # argument in this file for running the layer armed.
+                                      # FINDING, PRE-EXISTING AND NOT THIS SLICE'S: the world's BLAS
+                                      # build makes TWO single allocations over
+                                      # maxMemoryAllocationSize (5.46 GB and 4.54 GB against a
+                                      # 4.29 GB limit), which the layer reports as ERRORS. It works
+                                      # on RADV/UMA and is spec-fragile elsewhere. NO GATE COULD SEE
+                                      # IT: --check-vk never loads the world, and run_cinematic_vk
+                                      # constructs VkHeadless::new(false) — validation OFF — so a
+                                      # windowed world run under FR_VK_VALIDATION=1 is the first
+                                      # time the two ever met. Chunking the arena is its own slice.
+                                      # A SECOND PRE-EXISTING ONE, and it is a hole in the
+                                      # INSTRUMENT rather than in the renderer: on a software device
+                                      # --check-vk prints `validation clean` and then TEN
+                                      # `VkBuffer ... has not been destroyed` errors at
+                                      # vkDestroyDevice. Both facts are true — the gate's accounting
+                                      # window closes at its verdict, and teardown is after it — so
+                                      # a leak on a FAILURE path (FFX allocates, then
+                                      # frshim_fsr3vk_create fails, which is why V11/V13/V19 all
+                                      # skip there) is invisible to the gate that is otherwise this
+                                      # backend's strictest. Attributable by construction rather
+                                      # than by bisect: V19 SKIPS on llvmpipe, so not one line of
+                                      # the swapchain path runs in that arm. Widening the window to
+                                      # cover teardown is its own slice.
+                                      # GATED: `union_instance_exts` (pure — empty-extra reproduces
+                                      # the pre-B6b list name-for-name AND in order, which is the
+                                      # regression claim behind "V0..V18 unmoved"; the real SDL case
+                                      # dedups VK_KHR_surface, which IS in the base on every box
+                                      # that runs V19; order-independence as a SET and deliberately
+                                      # NOT as a vector, since first-seen order is load-bearing)
+                                      # inside device::self_test, which is V0 AND is now also called
+                                      # from --check as `vk-device`, because CI's check-linux job
+                                      # runs --check and not --check-vk. Validation is default OFF
+                                      # here and default ON in the gate: this is the one Vulkan path
+                                      # that runs a continuous loop.
+                                      # Touch src/vk/present.rs / run_window_vk /
+                                      # Swapchain::from_surface + Refusal / Swapchain::acquire +
+                                      # present + Lost / Vk::new's extension
+                                      # union / CineVk::render_frame -> run --check (+ BOTH goldens
+                                      # byte-compared: this touches no shading path, and on Linux
+                                      # --check OVERWRITES them), cargo test, --check-vk on
+                                      # procedural + san-miguel-low-poly + both FR_VK_RES parities +
+                                      # --sw-rays + llvmpipe, --check-spirv/-fsr/-nrd,
+                                      # tools/win-cross-check.sh, and the window itself
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

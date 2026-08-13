@@ -172,6 +172,38 @@ windows = { version = "0.62", features = [
 libloading = "0.8"
 ash = "0.38"
 
+# The Linux window (src/vk/present.rs, B6b rung 1). The SAME crate the Windows
+# block builds, at the same version and the same `build-from-source-static`
+# linkage, so there is one SDL3 in this tree rather than two configurations of
+# one.
+#
+# NOT IN THE `cfg(unix)` BLOCK ABOVE, and the block's own neighbour comment is
+# why: `cfg(unix)` already applies on macOS, so putting it there would make
+# every macOS build — including the CI job, which is a bare clone — compile SDL3
+# from source for a presenter that platform does not have and is not getting
+# (there is no Metal tracer and no Metal presentation stage). The cfg spelled
+# here is `run_cinematic_vk`'s own, which is the existing statement of "the
+# Vulkan backend, on the platform that drives it".
+#
+# THE FEATURE SET IS TWO NAMES AND BOTH ARE LOAD-BEARING. `ash` is
+# `sdl3-sys/use-ash-v0-38`, an EXACT match for our `ash = "0.38"` above, which
+# makes `Window::vulkan_create_surface` hand back an `ash::vk::SurfaceKHR`
+# rather than a raw integer — a typed handoff with no transmute at the one
+# place this tree crosses from a windowing library into its own backend.
+# `build-from-source-static` matches Windows rather than taking the system
+# library: `sdl3-sys` is `0.6.7+SDL-3.4.12` and the system SDL3 on the
+# development box is 3.4.2, so `use-pkg-config` is an ABI skew that fails at
+# link time on any symbol added between them. It stays the documented escape if
+# the source build is ever the wrong trade, with that caveat attached.
+#
+# DELIBERATELY NOT `raw-window-handle`, which the Windows block does carry: that
+# exists for `sdl_hwnd`, and `vulkan_create_surface` is what replaces it here —
+# SDL names the platform surface extension itself, so `src/vk/` needs no
+# xlib/xcb/wayland code at all. Cargo does not unify features across two target
+# tables, so the Windows block is untouched by this.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+sdl3 = { version = "0.18", features = ["build-from-source-static", "ash"] }
+
 # The Metal backend (src/mtl/) — FSR3 upscaling, headless and gated. Generated
 # Objective-C bindings, not a framework: objc2 brings no allocator, no render
 # graph and no policy, exactly as `ash` brings none for Vulkan.

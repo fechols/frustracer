@@ -513,12 +513,59 @@ fn cstr(bytes: &[c_char]) -> String {
     unsafe { CStr::from_ptr(bytes.as_ptr()) }.to_string_lossy().into_owned()
 }
 
+/// Merge this backend's own instance extensions with a windowing library's,
+/// keeping FIRST-SEEN order and dropping duplicates.
+///
+/// THE DUPLICATE IS THE POINT, not a defensive flourish: on Linux SDL asks for
+/// `VK_KHR_surface` + `VK_KHR_wayland_surface` (or the xlib/xcb pair), and
+/// `VK_KHR_surface` is already in `base` whenever the headless pair is
+/// available — which is every box that can run V19. So a naive concatenation
+/// names it twice on the very configuration this exists to serve.
+///
+/// FIRST-SEEN ORDER rather than sorted, because that is what makes the
+/// empty-`extra` result IDENTICAL to the list the pre-B6b code built by hand —
+/// same names, same order — which is the whole basis for believing V0..V18 are
+/// unmoved by this. A sort would be equally correct to Vulkan and would destroy
+/// that argument.
+///
+/// Pure, so it is the one thing about the window a headless gate can assert
+/// (`device_self_test`).
+pub fn union_instance_exts(base: &[String], extra: &[String]) -> Vec<CString> {
+    let mut names: Vec<&str> = Vec::with_capacity(base.len() + extra.len());
+    for n in base.iter().chain(extra.iter()) {
+        if !names.contains(&n.as_str()) {
+            names.push(n);
+        }
+    }
+    // A NUL inside an extension name cannot come from the loader (it hands back
+    // C strings) but CAN come from a windowing library's Rust wrapper, and
+    // `CString::new` is the only place that is knowable. Dropping it is right:
+    // the name is unusable either way, and the alternative — panicking inside
+    // instance creation — turns a malformed string into a crash.
+    names.into_iter().filter_map(|n| CString::new(n).ok()).collect()
+}
+
 impl Vk {
     /// Bring up loader, instance and device. `validation` arms
     /// `VK_LAYER_KHRONOS_validation` + `VK_EXT_debug_utils`; a request that
     /// cannot be honoured is LOUD and continues unvalidated, since a silently
     /// unarmed validation run is worse than an honestly unarmed one.
-    pub fn new(validation: bool) -> Result<Vk, VkError> {
+    /// `extra` is the instance extensions a WINDOWING library says it needs —
+    /// empty for every headless path, SDL's list for the presenter.
+    ///
+    /// A PARAMETER HERE, and a sibling constructor one level up on
+    /// `VkHeadless`, which looks inconsistent and is not: `VkHeadless::new` is
+    /// called from every gate in `--check-vk` and from the cinematic arm, so
+    /// leaving those TEXTUALLY unchanged is what keeps "V0..V18 are unmoved by
+    /// B6b" a claim about one code path rather than about twenty edits. `Vk`
+    /// itself has exactly one caller — `VkHeadless` — so giving it a
+    /// no-argument sibling too would have bought nothing and left a function
+    /// nothing calls.
+    ///
+    /// `&[String]` because that is what `SDL_Vulkan_GetInstanceExtensions`
+    /// hands back through its Rust wrapper. It is UNIONED, never appended —
+    /// see `union_instance_exts`.
+    pub fn new(validation: bool, extra: &[String]) -> Result<Vk, VkError> {
         let entry = unsafe { ash::Entry::load() }.map_err(|e| {
             VkError::absent(format!("no Vulkan loader ({e}) — install the Vulkan ICD loader"))
         })?;
@@ -531,7 +578,11 @@ impl Vk {
 
         let want_layer = CString::new("VK_LAYER_KHRONOS_validation").unwrap();
         let mut layers: Vec<*const c_char> = Vec::new();
-        let mut exts: Vec<*const c_char> = Vec::new();
+        // NAMES, not pointers, until the union has run. The pre-B6b code pushed
+        // `NAME.as_ptr()` straight in, which is fine for `'static` names and
+        // impossible for SDL's, whose `CString`s have to be owned by something
+        // that outlives `vkCreateInstance`.
+        let mut base: Vec<String> = Vec::new();
         let mut armed = false;
         if validation {
             let have = unsafe { entry.enumerate_instance_layer_properties() }
@@ -539,7 +590,7 @@ impl Vk {
             let found = have.iter().any(|l| cstr(&l.layer_name) == "VK_LAYER_KHRONOS_validation");
             if found {
                 layers.push(want_layer.as_ptr());
-                exts.push(ash::ext::debug_utils::NAME.as_ptr());
+                base.push(ash::ext::debug_utils::NAME.to_string_lossy().into_owned());
                 armed = true;
             } else {
                 eprintln!(
@@ -571,9 +622,20 @@ impl Vk {
         let headless_surface =
             have_inst(ash::khr::surface::NAME) && have_inst(ash::ext::headless_surface::NAME);
         if headless_surface {
-            exts.push(ash::khr::surface::NAME.as_ptr());
-            exts.push(ash::ext::headless_surface::NAME.as_ptr());
+            base.push(ash::khr::surface::NAME.to_string_lossy().into_owned());
+            base.push(ash::ext::headless_surface::NAME.to_string_lossy().into_owned());
         }
+
+        // THE UNION, and with an empty `extra` it reproduces the list the three
+        // pushes above used to build directly — same names, same order — which
+        // is the basis for expecting every V0..V18 figure to be unmoved.
+        //
+        // The owned `CString`s must outlive `create_instance`, which is why
+        // they are bound here rather than materialised inside the builder
+        // chain: `enabled_extension_names` borrows POINTERS, and a temporary
+        // would be dropped at the end of the statement that built it.
+        let ext_owned = union_instance_exts(&base, extra);
+        let exts: Vec<*const c_char> = ext_owned.iter().map(|c| c.as_ptr()).collect();
 
         let ici = vk::InstanceCreateInfo::default()
             .application_info(&app)
@@ -1274,5 +1336,69 @@ pub fn self_test() -> Result<(), String> {
     if mem_type_index(&mp, 0, dl) != None {
         return Err("mem_type_index matched under an empty mask".into());
     }
+
+    // THE INSTANCE-EXTENSION UNION (B6b rung 1) — the one thing about the
+    // window a headless gate can assert, so it is asserted here rather than
+    // left to a human opening one.
+    let surf = ash::khr::surface::NAME.to_string_lossy().into_owned();
+    let hless = ash::ext::headless_surface::NAME.to_string_lossy().into_owned();
+    let base = vec![surf.clone(), hless.clone()];
+
+    // EMPTY EXTRA IS THE REGRESSION CLAIM: every headless path takes this arm,
+    // so if it does not reproduce the pre-B6b list NAME FOR NAME AND IN ORDER,
+    // then V0..V18 are being asked to pass on a different instance than the one
+    // that set their figures.
+    let none = union_instance_exts(&base, &[]);
+    if none.len() != 2 || none[0].to_string_lossy() != surf || none[1].to_string_lossy() != hless {
+        return Err(format!("empty-extra union changed the base list: {none:?}"));
+    }
+
+    // THE REAL CASE, and the reason dedup exists at all: SDL on Linux asks for
+    // VK_KHR_surface plus one platform extension, and VK_KHR_surface is
+    // ALREADY in the base on every box that can run V19. A concatenation would
+    // name it twice.
+    let sdl = vec![surf.clone(), "VK_KHR_wayland_surface".to_string()];
+    let u = union_instance_exts(&base, &sdl);
+    let names: Vec<String> = u.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+    if names != vec![surf.clone(), hless.clone(), "VK_KHR_wayland_surface".to_string()] {
+        return Err(format!("union did not dedup VK_KHR_surface or lost order: {names:?}"));
+    }
+    // Stated as a property too, so a future rewrite that happens to satisfy the
+    // literal above still has to be duplicate-free.
+    for (i, n) in names.iter().enumerate() {
+        if names[..i].contains(n) {
+            return Err(format!("union emitted a duplicate: {n}"));
+        }
+    }
+
+    // ORDER-INDEPENDENT AS A SET: the same names arriving in a different order
+    // must produce the same SET (a driver is free to list them either way).
+    // Deliberately NOT "the same vector" — first-seen order is what makes the
+    // empty-extra arm above reproduce the old list, so the sequence genuinely
+    // does depend on the input order and claiming otherwise would be false.
+    let swapped = union_instance_exts(&base, &[sdl[1].clone(), sdl[0].clone()]);
+    let mut a: Vec<String> = swapped.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+    let mut b = names.clone();
+    a.sort();
+    b.sort();
+    if a != b {
+        return Err(format!("union is not order-independent as a set: {a:?} vs {b:?}"));
+    }
+
+    // A base with no surface pair (a box where the headless extensions are
+    // absent) must still take SDL's, or a window would come up with no way to
+    // make a surface.
+    let bare = union_instance_exts(&[], &sdl);
+    if bare.len() != 2 {
+        return Err(format!("union dropped SDL's names against an empty base: {bare:?}"));
+    }
+
+    // An embedded NUL is dropped rather than panicking inside instance
+    // creation — see `union_instance_exts`.
+    let nul = union_instance_exts(&base, &["VK_KHR_bad\0name".to_string()]);
+    if nul.len() != 2 {
+        return Err(format!("union kept a name containing a NUL: {nul:?}"));
+    }
+
     Ok(())
 }

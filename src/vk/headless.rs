@@ -40,7 +40,20 @@ impl VkHeadless {
     /// The error carries `absent` (see `device::VkError`): a box with no
     /// Vulkan is a SKIP, a lever that named nothing is a FAIL.
     pub fn new(validation: bool) -> Result<VkHeadless, VkError> {
-        let vk = Vk::new(validation)?;
+        Self::new_with_exts(validation, &[])
+    }
+
+    /// `new`, plus instance extensions a windowing library says it needs — the
+    /// presenter's constructor. See `Vk::new`, which took the same thing as a
+    /// PARAMETER, for why this one is a sibling instead: `VkHeadless::new` has
+    /// twenty-odd gate call sites and leaving them textually unchanged is what
+    /// keeps "V0..V18 are unmoved by B6b" a claim about one code path.
+    ///
+    /// Everything below the instance is IDENTICAL: the pool, the one command
+    /// buffer and the one fence are what `run` and `run_present` both rest on,
+    /// and a window changes none of them.
+    pub fn new_with_exts(validation: bool, extra: &[String]) -> Result<VkHeadless, VkError> {
+        let vk = Vk::new(validation, extra)?;
         let pci = vk::CommandPoolCreateInfo::default()
             .queue_family_index(vk.qfam)
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
