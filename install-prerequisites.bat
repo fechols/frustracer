@@ -425,12 +425,24 @@ set "FAILED=1"
 exit /b 0
 
 rem :nrd_stale <builddir> — drop a build tree configured from ANOTHER checkout.
-rem  See the shared-cache note in :do_nrd. NO cache at all is the left-alone
-rem  case (nothing configured yet, or an interrupted configure — cmake handles
-rem  both on its own), and so is a cache naming THIS source, so an incremental
-rem  rebuild in one checkout still costs nothing. A cache we cannot read falls
-rem  through to the wipe deliberately: a tree whose provenance is unreadable is
-rem  not one to build in.
+rem  THE CACHE IS PER-USER, THE BUILD TREE IS PER-SOURCE-PATH. %CACHE% is one
+rem  %TEMP% dir shared by every checkout on the box, which is right for the
+rem  download components (a version-pinned zip is the same zip whoever fetches
+rem  it) and wrong for the one that COMPILES: a CMake build tree BAKES IN the
+rem  absolute source dir as CMAKE_HOME_DIRECTORY, so the second checkout to
+rem  configure into %CACHE%\nrd-build hits "does not match the source used to
+rem  generate cache" — a hard stop rather than a rebuild, and not one the
+rem  script's own "see the cmake log" can hint at.
+rem  Deliberately ONE shared build dir plus a wipe rather than a dir per
+rem  checkout: the copy step installs into each checkout's own SDKs\NRD\bin and
+rem  the already-installed early-out then keeps that clone from ever
+rem  rebuilding, so each still builds exactly ONCE and %TEMP% does not grow a
+rem  build tree per clone.
+rem  NO cache at all is the left-alone case (nothing configured yet, or an
+rem  interrupted configure — cmake handles both on its own), and so is a cache
+rem  naming THIS source, so an incremental rebuild in one checkout still costs
+rem  nothing. A cache we cannot read falls through to the wipe deliberately: a
+rem  tree whose provenance is unreadable is not one to build in.
 rem  THE REMOVAL IS VERIFIED because a silent failure here lands right back in
 rem  the opaque "does not match the source used to generate cache" this guard
 rem  exists to prevent — and the usual cause (something holding the tree open)
