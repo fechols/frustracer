@@ -424,6 +424,20 @@ pub struct Vk {
     pub mem: vk::PhysicalDeviceMemoryProperties,
     pub info: DeviceInfo,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+
+    /// `VK_KHR_surface` + `VK_EXT_headless_surface` were both present and are
+    /// both ENABLED on this instance.
+    ///
+    /// An INSTANCE fact, which is why it lives here and not on `DeviceInfo`:
+    /// the two extensions are properties of the loader/ICD set rather than of
+    /// the physical device that got picked, and conflating them would make a
+    /// present-path SKIP read as a device limitation.
+    ///
+    /// The display gate's SKIP predicate is this AND `info.swapchain` AND
+    /// `info.graphics_queue` — three independent environment facts, each of
+    /// which is a legitimate reason a box cannot run the present path and none
+    /// of which is a defect.
+    pub headless_surface: bool,
 }
 
 /// Why bring-up failed, split by what the caller should DO about it.
@@ -535,6 +549,32 @@ impl Vk {
             }
         }
 
+        // THE SURFACE PAIR, for the display stage's present path — the only
+        // thing this backend has ever asked the INSTANCE for beyond validation.
+        //
+        // ENABLED WHEN PRESENT, the rule every device extension here follows,
+        // and what makes it safe to do unconditionally rather than behind some
+        // "this is a display session" flag is that both are pure API SURFACE:
+        // they add entry points and change nothing about a device, a queue, a
+        // descriptor or a dispatch. That inertness is not asserted — it is what
+        // V0-V18 measure, every figure of which must be unmoved with these
+        // enabled (V19 is the CONSUMER, so it is not part of that claim).
+        //
+        // BOTH OR NEITHER. `VK_EXT_headless_surface` is specified in terms of
+        // `VK_KHR_surface` and its entry point is meaningless without it, so
+        // enabling one alone would be a half-armed state whose only expression
+        // is a null proc-addr much later, at a call site with no idea why.
+        let inst_exts = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map_err(|e| format!("enumerate_instance_extension_properties: {e}"))?;
+        let have_inst =
+            |n: &CStr| inst_exts.iter().any(|e| cstr(&e.extension_name) == n.to_string_lossy());
+        let headless_surface =
+            have_inst(ash::khr::surface::NAME) && have_inst(ash::ext::headless_surface::NAME);
+        if headless_surface {
+            exts.push(ash::khr::surface::NAME.as_ptr());
+            exts.push(ash::ext::headless_surface::NAME.as_ptr());
+        }
+
         let ici = vk::InstanceCreateInfo::default()
             .application_info(&app)
             .enabled_layer_names(&layers)
@@ -566,7 +606,7 @@ impl Vk {
             None
         };
 
-        match Self::open_device(entry, instance, debug) {
+        match Self::open_device(entry, instance, debug, headless_surface) {
             Ok(v) => Ok(v),
             Err(e) => Err(e),
         }
@@ -576,6 +616,11 @@ impl Vk {
         entry: ash::Entry,
         instance: ash::Instance,
         debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+        // An INSTANCE fact decided by `new`, PASSED rather than re-derived:
+        // re-enumerating here would be a second answer to a question already
+        // answered, and the two could disagree the moment the enable becomes
+        // conditional on anything.
+        headless_surface: bool,
     ) -> Result<Vk, VkError> {
         let phys_all = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| format!("vkEnumeratePhysicalDevices: {e}"))?;
@@ -749,6 +794,25 @@ impl Vk {
             fcd = fcd.compute_derivative_group_quads(true);
         }
 
+        // THE SWAPCHAIN, for the display stage rather than for anything the
+        // gates below it need — and the only device extension here with no
+        // feature struct at all, since `VK_KHR_swapchain` is pure API surface.
+        //
+        // ENABLED WHEN PRESENT, like every extension above it and emphatically
+        // NOT in the `reject` chain: every stage but the present one runs with
+        // no surface whatsoever, so refusing a device over it would trade a
+        // working headless backend for a feature exactly one gate reads. That
+        // is the same argument `dynamic_rendering`'s field doc makes, and it is
+        // what keeps a software ICD — which is what CI runs on — a first-class
+        // target rather than a degraded one.
+        //
+        // `info.swapchain` has been probed since the first display commit and
+        // read by NOTHING until now; this is the line that makes it a fact with
+        // a consumer instead of a field.
+        if info.swapchain {
+            exts.push(ash::khr::swapchain::NAME.as_ptr());
+        }
+
         // The CORE features this backend enables, all ENABLED-WHEN-PRESENT and
         // none required, because each one's absence lands on a shipping arm
         // rather than on a degradation invented here: `--aniso 1` is the
@@ -788,7 +852,7 @@ impl Vk {
         let queue = unsafe { device.get_device_queue(qfam, 0) };
         let mem = unsafe { instance.get_physical_device_memory_properties(phys) };
 
-        Ok(Vk { entry, instance, phys, device, queue, qfam, mem, info, debug })
+        Ok(Vk { entry, instance, phys, device, queue, qfam, mem, info, debug, headless_surface })
     }
 
     /// Everything the pick and the loud line need, plus the reason this device
@@ -1046,10 +1110,17 @@ impl Vk {
         // What the display stage needs, reported as a FACT on the same line as
         // everything else — a device that cannot draw should say so once at
         // open rather than at the first `vkCmdDraw`.
-        let disp = match (i.dynamic_rendering && i.graphics_queue, i.swapchain) {
-            (true, true) => "display-capable",
-            (true, false) => "draw, no swapchain",
-            (false, _) => "no draw",
+        // The display verdict, and it takes THREE facts because they fail
+        // independently: a device can draw but have no swapchain extension, and
+        // it can have both while the INSTANCE lacks the surface pair (a
+        // loader/ICD property, not a device one). Reporting "display-capable"
+        // on any of those would make a later SKIP look like a defect.
+        let disp = match (i.dynamic_rendering && i.graphics_queue, i.swapchain, self.headless_surface)
+        {
+            (true, true, true) => "display-capable",
+            (true, true, false) => "draw+swapchain, no headless surface",
+            (true, false, _) => "draw, no swapchain",
+            (false, _, _) => "no draw",
         };
         format!(
             "vk: {} ({} {}, {}) — Vulkan {}.{}.{}, subgroup {} [{}..{}]{}, {}, {disp}",

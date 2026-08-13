@@ -14794,6 +14794,15 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V19: the same pipeline, into a SWAPCHAIN image. ----
+    //
+    // Beside V18 rather than inside it: it owns a surface and a swapchain and
+    // stands down on three independent environment facts, none of which should
+    // be able to take the offscreen arm with it.
+    if !run_check_vk_present(&hg, &sp) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
@@ -15162,6 +15171,385 @@ fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
         ok = false;
     }
     ok
+}
+
+/// V19 — the same pipeline, into a SWAPCHAIN image, and presented.
+///
+/// V18 proves this backend can rasterise and that its tone curve matches
+/// `tone::map`. It says nothing about PRESENTATION, which is a different
+/// resource class (images the presentation engine owns, in layouts nothing
+/// else here enters) reached through a different API. This is that path, run
+/// against `VK_EXT_headless_surface` so it needs no window and therefore runs
+/// on a CI box with no GPU.
+///
+/// THE CLAIM IS A BYTE IDENTITY AT THE NEGOTIATED FORMAT: the same `Passes`
+/// drawing into a swapchain image must produce the same bytes as into an
+/// offscreen image of that same format. That is deliberately not V18's fixed
+/// sdr wire — it decouples from format negotiation entirely, so it stays an
+/// EXACT comparison rather than a tolerance, which is the strongest shape
+/// available and the one V14 and V17 already use.
+///
+/// THE IDENTITY ALONE IS VACUOUS, and that is not a hypothetical: `record_to`
+/// opens its rendering block with `LOAD_OP_CLEAR`, so deleting the draw gives
+/// BOTH targets the same zeros and the byte comparison PASSES. Three
+/// independent arms close it, each answering a question the identity cannot:
+///
+/// - the CPU oracle (V18's `tone::map` comparison, at this format's own
+///   tolerance) — proves the bytes are the real image rather than a clear;
+/// - alpha at maximum — both display pixel shaders write 1.0 unconditionally
+///   while the oracle compares RGB only, so this is a free per-pixel coverage
+///   witness that a clear (which writes 0) cannot fake;
+/// - a `0xEE` sentinel flooded into the acquired image before the draw.
+///
+/// THE SENTINEL SEPARATES THREE OUTCOMES, not the usual two, and it is free:
+/// the pattern means everything ran; the CLEAR colour means the render pass
+/// ran and the draw did not; the SENTINEL SURVIVING means the draw went to a
+/// DIFFERENT image than the one that was flooded and copied — a real failure
+/// mode once an index is threaded through flood, render, copy and present, and
+/// one that garbage-looking output would otherwise be blamed for. It is
+/// written by a draw-less `LOAD_OP_CLEAR` rather than `vkCmdClearColorImage`
+/// deliberately: the latter needs `TRANSFER_DST` usage, which the offscreen
+/// twin does not carry, so using it would put a DIFFERENCE between the two
+/// images whose equality this whole gate asserts.
+///
+/// THE PRESENT IS PROVED BY EXHAUSTION. Nothing scans out, so `VK_SUCCESS` out
+/// of `vkQueuePresentKHR` is a statement about a function call and not about a
+/// frame going anywhere. So the gate runs ONE MORE CYCLE THAN THERE ARE
+/// IMAGES: the last acquire can only succeed if the presentation engine
+/// RELEASED an image this gate presented, and `ACQUIRE_TIMEOUT_NS` is finite
+/// precisely so a present that did nothing reports a failure instead of
+/// hanging. The acquire ORDER is printed and never asserted — the spec
+/// constrains none of it.
+///
+/// SKIPs (exit 0, `true`) on three independent environment facts, each an
+/// honest reason a box cannot present rather than a defect: no surface pair on
+/// the instance, no `VK_KHR_swapchain` on the device, no graphics queue in the
+/// family the pick chose. `vk::swapchain::skip_reason` names which.
+#[cfg(unix)]
+fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use ash::vk as avk;
+    use vk::display;
+    use vk::swapchain::Swapchain;
+
+    let ve0 = vk::device::validation_errors();
+    let vkd = &hg.vk;
+
+    // V18's fixture, and it transplants with no resize logic because the
+    // headless surface reports `currentExtent = 0xFFFFFFFF` (measured on both
+    // ICDs here), i.e. the swapchain picks its own size.
+    const TW: u32 = 64;
+    const TH: u32 = 32;
+    let n = (TW * TH) as usize;
+
+    let sc = match Swapchain::new(hg, TW, TH) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("check-vk: SKIP V19 ({})", vk::swapchain::skip_reason(hg));
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 swapchain: {e}");
+            return false;
+        }
+    };
+
+    let mut ok = true;
+    println!(
+        "check-vk: V19 headless surface: {:?} {}x{}, {} image(s), FIFO",
+        sc.fmt,
+        sc.w,
+        sc.h,
+        sc.image_count()
+    );
+
+    // The tolerance is a property of the NEGOTIATED wire, so derive it rather
+    // than assuming V18's sdr one — the surface's own preference here is
+    // 8-bit, but a 10-bit surface must be scored at ten bits.
+    let tol = if sc.fmt == avk::Format::A2B10G10R10_UNORM_PACK32 {
+        1.0 / 1023.0 + 1e-4
+    } else {
+        1.0 / 255.0 + 1e-6
+    };
+
+    // V18's ramp, verbatim: the same geometric span with the same two pinned
+    // low entries, so the oracle arm below is that gate's comparison rather
+    // than a second one that could drift from it.
+    const RAMP_LO: f32 = 1e-3;
+    const RAMP_HI: f32 = 6e4;
+    let span = (n - 3) as f32;
+    let radiance = |i: usize| -> f32 {
+        match i {
+            0 => 0.0,
+            1 => 1.0,
+            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+        }
+    };
+    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
+
+    let cleanup = |sc: &Swapchain| sc.destroy(vkd);
+
+    let src = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        avk::Format::R16G16B16A16_SFLOAT,
+        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 source image: {e}");
+            cleanup(&sc);
+            return false;
+        }
+    };
+
+    // ONE `Passes`, at the swapchain's own format, used for BOTH targets. That
+    // is what makes the identity a statement about the TARGET rather than
+    // about two pipelines that happen to agree.
+    let passes = match display::Passes::new(hg, sp, sc.fmt) {
+        Ok(p) => {
+            p.bind_source(vkd, src.view);
+            p
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 display passes ({:?}): {e}", sc.fmt);
+            src.destroy(vkd);
+            cleanup(&sc);
+            return false;
+        }
+    };
+
+    let params = display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
+
+    let fin = |ok: bool| -> bool {
+        passes.destroy(vkd);
+        src.destroy(vkd);
+        cleanup(&sc);
+        ok
+    };
+
+    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
+        eprintln!("check-vk: FAIL V19 ramp upload: {e}");
+        return fin(false);
+    }
+    if let Err(e) = passes.set_params(vkd, params) {
+        eprintln!("check-vk: FAIL V19 params: {e}");
+        return fin(false);
+    }
+
+    // ---- The offscreen reference, rendered once. ----
+    let off = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        sc.fmt,
+        avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 offscreen image: {e}");
+            return fin(false);
+        }
+    };
+    let want = {
+        let r = hg
+            .run(|d, cmd| passes.record(d, cmd, &off, true))
+            .and_then(|_| display::read_target(hg, &off, 4));
+        off.destroy(vkd);
+        match r {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 offscreen render: {e}");
+                return fin(false);
+            }
+        }
+    };
+
+    // The sentinel, as a float clear and as the byte it must land on. 238/255
+    // round-trips EXACTLY through an 8-bit UNORM, so a surviving texel is
+    // unambiguous rather than approximately unambiguous.
+    const SENTINEL: f32 = 238.0 / 255.0;
+
+    // A staging buffer for the copy-before-present, reused across cycles.
+    let stage = match vkd.buffer((n * 4) as u64, avk::BufferUsageFlags::TRANSFER_DST, true) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V19 staging buffer: {e}");
+            return fin(false);
+        }
+    };
+
+    // ---- The cycles. ONE MORE THAN THERE ARE IMAGES. ----
+    let cycles = sc.image_count() + 1;
+    let mut order = Vec::with_capacity(cycles);
+    let mut identity_bad = 0usize;
+    let mut oracle_worst = 0.0f32;
+    let mut alpha_bad = 0usize;
+    let mut sentinel_alive = 0usize;
+    let mut clear_alive = 0usize;
+
+    for cycle in 0..cycles {
+        let idx = match sc.acquire() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 cycle {cycle}: {e}");
+                ok = false;
+                break;
+            }
+        };
+        order.push(idx);
+
+        let (wait, stages) = sc.wait_pair();
+        let signal = sc.signal(idx);
+        let rec = hg.run_present(&wait, &stages, &signal, |d, cmd| {
+            // Flood, then draw. `record_to`'s opening barrier is FROM
+            // UNDEFINED, which discards — so on the correct path the sentinel
+            // is gone by construction and the readback shows the image. It
+            // survives only if the draw went somewhere else, which is exactly
+            // the outcome it is here to name.
+            sc.clear_to(d, cmd, idx, [SENTINEL, SENTINEL, SENTINEL, SENTINEL]);
+            passes.record_to(d, cmd, sc.images[idx], sc.view(idx), sc.w, sc.h, true);
+            // Copy BEFORE presenting: ownership returns to the presentation
+            // engine at present, so this is the last moment the bytes are
+            // readable at all.
+            unsafe {
+                let region = avk::BufferImageCopy::default()
+                    .image_subresource(
+                        avk::ImageSubresourceLayers::default()
+                            .aspect_mask(avk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(avk::Extent3D { width: sc.w, height: sc.h, depth: 1 });
+                d.cmd_copy_image_to_buffer(
+                    cmd,
+                    sc.images[idx],
+                    avk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    stage.buf,
+                    &[region],
+                );
+            }
+            sc.to_present_layout(d, cmd, idx);
+        });
+        if let Err(e) = rec {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} submit: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = sc.present(vkd, idx) {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} present: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = hg.wait_submit() {
+            eprintln!("check-vk: FAIL V19 cycle {cycle} wait: {e}");
+            ok = false;
+            break;
+        }
+
+        let got = match vkd.read(&stage, n * 4) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V19 cycle {cycle} readback: {e}");
+                ok = false;
+                break;
+            }
+        };
+
+        for i in 0..n {
+            let px = &got[i * 4..i * 4 + 4];
+            if px != &want[i * 4..i * 4 + 4] {
+                identity_bad += 1;
+            }
+            let have = display::decode(px, sc.fmt);
+            let q = |v: f32| half::f16::from_f32(v).to_f32();
+            let c = glam::Vec3A::new(q(ramp[i * 3]), q(ramp[i * 3 + 1]), q(ramp[i * 3 + 2]));
+            let w = tone::map(c, tone::ToneParams::SDR);
+            for ch in 0..3 {
+                let d = (have[ch] - w[ch]).abs() / (1.0f32).max(w[ch].abs());
+                oracle_worst = oracle_worst.max(d);
+            }
+            if display::decode_alpha(px, sc.fmt) < 1.0 {
+                alpha_bad += 1;
+            }
+            // The three-way classification. Both comparisons are on DECODED
+            // values so a 10-bit surface reads the same way an 8-bit one does.
+            if have.iter().all(|v| (v - SENTINEL).abs() < 2.0 / 255.0) {
+                sentinel_alive += 1;
+            } else if have.iter().all(|v| *v < 1.0 / 255.0) {
+                clear_alive += 1;
+            }
+        }
+    }
+
+    vkd.free_buffer(&stage);
+
+    if ok {
+        if identity_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 swapchain vs offscreen — {identity_bad} texel(s) of \
+                 {} differ. Same pipeline, same format, two targets: this is the present \
+                 path's own claim.",
+                n * cycles
+            );
+            ok = false;
+        }
+        if sentinel_alive > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 {sentinel_alive} texel(s) still carry the 0xEE sentinel — \
+                 the draw went to a DIFFERENT image than the one flooded and copied"
+            );
+            ok = false;
+        } else if clear_alive == n * cycles {
+            eprintln!(
+                "check-vk: FAIL V19 every texel is the clear colour — the render pass ran and \
+                 the DRAW did not"
+            );
+            ok = false;
+        }
+        if oracle_worst > tol {
+            eprintln!(
+                "check-vk: FAIL V19 presented image vs tone::map — worst {oracle_worst:.2e} > \
+                 {tol:.2e}. The byte identity alone cannot see this: two targets that were \
+                 BOTH wrong agree."
+            );
+            ok = false;
+        }
+        if alpha_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL V19 {alpha_bad} texel(s) with alpha below maximum — the draw \
+                 did not cover them"
+            );
+            ok = false;
+        }
+        if ok {
+            println!(
+                "check-vk: V19 present path: {cycles} cycle(s) over {} image(s) — swapchain vs \
+                 offscreen byte-identical over {} texel(s) | oracle worst {oracle_worst:.2e} \
+                 (limit {tol:.2e}) | alpha full | sentinel survivors 0",
+                sc.image_count(),
+                n * cycles
+            );
+            println!(
+                "check-vk: V19   acquire order {order:?} — reported, never asserted (the spec \
+                 constrains none of it); the LAST acquire succeeding is the proof the engine \
+                 released an image this gate presented"
+            );
+        }
+    }
+
+    // The device must be idle before the swapchain and its semaphores go: a
+    // presented image is still referenced by the presentation engine, and the
+    // last submit's semaphore is still in flight.
+    unsafe {
+        let _ = vkd.device.device_wait_idle();
+    }
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!("check-vk: FAIL V19 {ve} validation error(s) in the present path");
+        ok = false;
+    }
+    fin(ok)
 }
 
 /// V10 — the BC7 encoder, scored through the hardware decoder.
@@ -16315,7 +16703,37 @@ fn run_check_vk_render(
     let mut sum_c = [0.0f64; 3];
     let mut sum_g = [0.0f64; 3];
     let mut sum_abs = 0.0f64;
+    // NON-FINITE AND NEGATIVE ARE DIFFERENT FAILURES, and this gate counted
+    // them as one — the D3D12 suites' own correction (`check-dxr`'s radiance
+    // A/B, which carries the full argument) applied to the backend that never
+    // got it. A NaN or Inf is always a defect. A negative sample is not: the
+    // GI ladder's stochastic rungs estimate the ambient as
+    // `tail + (G - tail)/p`, an UNBIASED estimator of a non-negative quantity,
+    // and such an estimator may legitimately sample below zero — exactly when
+    // `G < tail*(1 - p)`. Conflated, a real NaN and the ladder's honest tail
+    // read identically, which is how this stage went red on a healthy tree.
+    //
+    // MEASURED HERE by sweeping the ladder, and the shape is the attribution:
+    //
+    //     rung   0    0.5    1     1.5    2
+    //     p      0    0.5    0     0.5    1.0
+    //     neg    0    453    0     11     5      (of 1.44M channels)
+    //
+    // The two DETERMINISTIC rungs read EXACTLY ZERO and every rung with a live
+    // correction reads non-zero, so `rtgi_corr_p > 0` is not a vacuous arming
+    // predicate — it is the line the data falls on. The count drops as p rises
+    // (the estimator's tail narrows), and 0.5 beats 1.5 at the same p because
+    // its correction sits at LEVEL 0, where `tail` is the primary surface's own
+    // ambient rather than a bounce's. Rung 2's residual 5 at p = 1.0 is fp
+    // cancellation in `tail + (G - tail)`, which is not exactly `G`.
+    //
+    // AND THE OLD `continue` DROPPED THE NEGATIVE TAIL FROM THE MEAN, which is
+    // worse than the miscount: clamping or excluding the low samples BIASES
+    // the statistic upward, and not biasing the mean is the one property the
+    // ladder exists to have. Negatives are now counted AND accumulated;
+    // only non-finites are skipped, and for a different reason (see below).
     let mut nonfinite = 0usize;
+    let mut negative = 0usize;
     // SPLIT BY WHAT THE PRIMARY RAY HIT, because the two populations fail for
     // different reasons and a single number cannot tell them apart: sky is the
     // dome + disc + the cloud caches with no material in sight, geometry is
@@ -16328,9 +16746,16 @@ fn run_check_vk_render(
     for i in 0..px * 3 {
         let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
         let g = gpu_a.get(i).copied().unwrap_or(f32::NAN) * inv;
-        if !g.is_finite() || g < 0.0 {
+        if !g.is_finite() {
             nonfinite += 1;
+            // SKIPPED FROM THE SUMS, unlike a negative: one NaN makes every
+            // statistic below it NaN, so a gate that kept it would report
+            // nothing about the 1.44M samples that are fine. The count is the
+            // assertion; the mean is for attribution.
             continue;
+        }
+        if g < 0.0 {
+            negative += 1;
         }
         sum_c[i % 3] += f64::from(c);
         sum_g[i % 3] += f64::from(g);
@@ -16368,7 +16793,7 @@ fn run_check_vk_render(
     }
     println!(
         "check-vk: V6 radiance A/B over {frames} frames: per-channel mean rel diff {:.3}% | \
-         mean abs px diff {:.4} | non-finite {nonfinite}",
+         mean abs px diff {:.4} | non-finite {nonfinite} | negative {negative}",
         mean_rel * 100.0,
         sum_abs / (px * 3) as f64
     );
@@ -16383,7 +16808,25 @@ fn run_check_vk_render(
         (hit_g - hit_c) / hit_c.max(1e-9) * 100.0
     );
     if nonfinite > 0 {
-        fail(&mut ok, format!("{nonfinite} non-finite/negative GPU channels"));
+        fail(&mut ok, format!("{nonfinite} non-finite GPU channels"));
+    }
+    // A stochastic rung may sample negative (see above); no other configuration
+    // may, and even an armed one only in the tail. The bound is on HOW MANY
+    // rather than on whether — 0.1% of samples, which is orders above anything
+    // the ladder produces and still catches a sign error, since that would flip
+    // a POPULATION rather than a fringe. `rtgi_corr_p` is the ONE derivation
+    // both the compile define and the runtime bit read, so this arms exactly
+    // when the correction does.
+    let neg_ok =
+        crate::gfx::frame::rtgi_corr_p(shade::rtgi_bounces()) > 0.0 && negative <= px * 3 / 1000;
+    if negative > 0 && !neg_ok {
+        fail(
+            &mut ok,
+            format!(
+                "{negative} negative GPU channels — legitimate only in a stochastic GI \
+                 rung's tail (--rtgi-bounces with a fractional part, or rung 2)"
+            ),
+        );
     }
     // Anti-vacuity: a pair of all-black images agrees perfectly.
     if sum_c.iter().sum::<f64>() <= 0.0 || sum_g.iter().sum::<f64>() <= 0.0 {

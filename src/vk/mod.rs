@@ -34,5 +34,6 @@ pub mod scene;
 // under `vk/` would have made the Metal gate import the Vulkan backend.
 pub(crate) use crate::spirv;
 pub mod stage;
+pub mod swapchain;
 pub mod textures;
 pub mod tracer;
