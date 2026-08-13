@@ -278,12 +278,16 @@ opt_fields! {
         pub detail_untex_scale: f32,
         /// --no-amb-bump inverse (restart)
         pub amb_bump: bool,
-        /// --rtgi-bounces N, as the ladder's own vocabulary (restart: both
-        /// GPU blocks are compile defines, so a live change in a session built
-        /// without them would silently diverge CPU vs GPU). Renamed from the
-        /// `rtgi` bool it replaced, so an older file's key is simply unknown
-        /// and ignored — deliberately unmigrated, the hdr10 precedent.
-        pub rtgi_bounces: String,
+        /// --rtgi-bounces N (restart: both GPU blocks are compile defines, so
+        /// a live change in a session built without them would silently
+        /// diverge CPU vs GPU). A FLOAT, not the rung's spelling: the budget
+        /// genuinely is a continuum the parser accepts anywhere in [0,2], and
+        /// a `StepF` row quantizes it to the five rungs by construction, so
+        /// modelling it as five unrelated strings was the tail wagging the
+        /// dog. Renamed from the `rtgi` bool it replaced and re-typed from the
+        /// String it briefly was, so either older key is simply unknown and
+        /// ignored — deliberately unmigrated, the hdr10 precedent.
+        pub rtgi_bounces: f32,
         /// --no-water inverse (restart: keys the scene cache)
         pub water: bool,
         /// --no-foliage-sway inverse (restart: read at scene load / SceneGpu
@@ -1193,10 +1197,13 @@ fn apply_with(
     if let Some(v) = e.amb_bump {
         opts.amb_bump = v;
     }
-    if let Some(v) = e.rtgi_bounces.as_deref() {
-        match v.parse::<f32>() {
-            Ok(n) if (0.0..=2.0).contains(&n) => opts.rtgi_bounces = n,
-            _ => warn("effects.rtgi_bounces", v),
+    if let Some(k) = e.rtgi_bounces {
+        // The CLI's own range, and NaN falls out of it (the `contains` test is
+        // false for NaN) exactly as it does at the parse arm.
+        if k.is_finite() && (0.0..=2.0).contains(&k) {
+            opts.rtgi_bounces = k;
+        } else {
+            warn("effects.rtgi_bounces", &k.to_string());
         }
     }
     if let Some(v) = e.water {
@@ -1474,7 +1481,16 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("detail_ao_strength", "detail AO strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.125, default: 0.125 }, acc_f32!(effects.detail_ao_strength)),
             item!("detail_untex_scale", "detail on untextured (scale)", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 1.0 }, acc_f32!(effects.detail_untex_scale)),
             item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
-            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, Cycle { options: &["0", "0.5", "1", "1.5", "2"], default_ix: 4 }, acc_str!(effects.rtgi_bounces)),
+            // STEP 0.5 IS LOAD-BEARING, not a taste call: it is a power of two,
+            // so all five stops (0, 0.5, 1, 1.5, 2) are exactly representable in
+            // f32 and the stepper lands on them BITWISE. Two live float-equality
+            // tests depend on that — main's lever line (`!= DEFAULT_BOUNCES`,
+            // which decides whether a departure is announced) and
+            // `gfx::frame::rtgi_corr_p`'s rung split. A 0.1-style step would
+            // accumulate to 0.30000001 and announce a departure from a value the
+            // user had just selected as the default. The default reads the ONE
+            // const, so this row cannot drift from the renderer's own answer.
+            item!("rtgi_bounces", "real-time GI bounces", "Effects", Restart, StepF { min: 0.0, max: 2.0, step: 0.5, default: crate::shade::DEFAULT_BOUNCES }, acc_f32!(effects.rtgi_bounces)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
             item!("foliage_sway", "foliage sway", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.foliage_sway)),
             item!("foliage_amp", "foliage sway amplitude", "Effects", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 1.0 }, acc_f32!(effects.foliage_amp)),
