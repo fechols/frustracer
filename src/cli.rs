@@ -805,6 +805,15 @@ pub struct Cli {
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
+    /// `--check-msl`: take that same corpus one generator further — SPIR-V ->
+    /// MSL (spirv-cross) -> AIR -> `.metallib` (`xcrun metal`). The first rung
+    /// of a Metal tracer, and macOS-only because the Apple tools are.
+    ///
+    /// It compiles and nothing else: no device, no binding, no dispatch. What
+    /// reaches a metallib and what refuses IS the product — the shape M2a
+    /// (`--check-spirv`) had for the Vulkan port, where it found the one
+    /// blocker nobody predicted.
+    pub check_msl: bool,
     /// `--check-vk`: bring up a real Vulkan device, run the indirect-dispatch
     /// smoke chain on it, probe the compiled subgroup width at every group
     /// width the tracer dispatches, bind every tracer kernel against the
@@ -1100,6 +1109,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_fsr3 = false;
     let mut check_metalfx = false;
     let mut check_spirv = false;
+    let mut check_msl = false;
     let mut check_vk = false;
     let mut no_xess_explicit = false;
     let mut fsr_forced = false;
@@ -1161,6 +1171,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--check-fsr3" => check_fsr3 = true,
             "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
+            "--check-msl" => check_msl = true,
             "--check-vk" => check_vk = true,
             "--nrd" => {
                 opts.nrd = true;
@@ -2490,6 +2501,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_msl,
         check_vk,
         check_gpu,
         check_dxr,
@@ -2674,6 +2686,10 @@ pub fn usage() {
                 eprintln!("  --check-spirv headless (unix): assemble the shipping kernel corpus and compile every");
                 eprintln!("                unit to SPIR-V for the Vulkan backend, then spirv-val each module —");
                 eprintln!("                needs SDKs/dxc-linux (install-prerequisites.sh dxc); no GPU");
+                eprintln!("  --check-msl   headless (macOS): the same corpus one generator further — SPIR-V ->");
+                eprintln!("                MSL (spirv-cross) -> .metallib (xcrun metal). The first rung of a Metal");
+                eprintln!("                tracer: it compiles and nothing else, so what refuses IS the product.");
+                eprintln!("                Needs SDKs/dxc-macos + spirv-cross + the Metal toolchain; no GPU");
                 eprintln!("  --check-vk    headless (unix): bring up a real Vulkan device and run the indirect-");
                 eprintln!("                dispatch smoke chain on it (constants, storage buffers, a GPU-written");
                 eprintln!("                counter turned into dispatch args, vkCmdDispatchIndirect consuming");
@@ -3367,33 +3383,46 @@ pub fn self_test() -> Result<(), String> {
             return Err(format!("{argv:?} resolved rtgi-bounces {got}, want {want}"));
         }
     }
-    // The settings row's default must agree with the CLI's, for the
-    // autoexp_mode tripwire's reason: a flip that moved cli.rs and shade.rs but
-    // forgot settings.rs leaves a settings FILE silently re-selecting another
-    // rung on every launch that has one.
+    // The menu row must offer EXACTLY the ladder and nothing else. It is a
+    // StepF rather than a Cycle because the budget is a genuine continuum the
+    // parser accepts anywhere in [0,2] and the stepper quantizes it — so what
+    // is worth pinning is no longer "the strings agree" but the three numbers
+    // that GENERATE the rungs, plus the CLI accepting every stop they produce.
     let rrow = crate::settings::menu_items()
         .iter()
         .find(|i| i.id == "rtgi_bounces")
         .ok_or("settings.rs has no rtgi_bounces row")?;
     match rrow.control {
-        crate::settings::Control::Cycle { options, default_ix } => {
-            if options.get(default_ix).copied() != Some(defaults().rtgi_bounces.to_string().as_str())
-            {
+        crate::settings::Control::StepF { min, max, step, default } => {
+            if default != defaults().rtgi_bounces {
                 return Err(format!(
-                    "settings.rs's rtgi_bounces default is {:?}, cli.rs's is {}",
-                    options.get(default_ix),
+                    "settings.rs's rtgi_bounces default is {default}, cli.rs's is {}",
                     defaults().rtgi_bounces
                 ));
             }
-            // Every rung the menu offers must be a rung the parser accepts.
-            for o in options {
-                let got = parse_argv(&["--rtgi-bounces", o]).opts.rtgi_bounces;
-                if got.to_string() != *o {
-                    return Err(format!("settings rung {o:?} parsed as {got}"));
+            // Walk the stepper the way the menu does and require the five
+            // rungs EXACTLY — bitwise, which is the property step 0.5 (a power
+            // of two) buys and a 0.1-style step would not: main's lever line
+            // and `rtgi_corr_p` both compare these values for float equality.
+            let mut stops = Vec::new();
+            let mut v = min;
+            while v <= max + step * 0.5 && stops.len() < 16 {
+                stops.push(v);
+                v += step;
+            }
+            if stops != vec![0.0f32, 0.5, 1.0, 1.5, 2.0] {
+                return Err(format!("the rtgi_bounces stepper walks {stops:?}, not the five rungs"));
+            }
+            // ...and every stop it can reach must be a rung the parser accepts,
+            // so the menu can never select a value the command line rejects.
+            for s in stops {
+                let got = parse_argv(&["--rtgi-bounces", &s.to_string()]).opts.rtgi_bounces;
+                if got != s {
+                    return Err(format!("settings stop {s} parsed as {got}"));
                 }
             }
         }
-        _ => return Err("rtgi_bounces' menu row is no longer a Cycle".into()),
+        _ => return Err("rtgi_bounces' menu row is no longer a StepF".into()),
     }
     if parse_argv(&["--dual-gpu", "3", "--no-dual-gpu"]).opts.dual_gpu.is_some() {
         return Err("--dual-gpu 3 --no-dual-gpu must disarm".into());

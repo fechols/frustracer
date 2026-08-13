@@ -521,7 +521,7 @@ slint::slint! {
                             clicked => { root.menu-action("back"); }
                         }
                     }
-                    Rectangle {
+                    listbox := Rectangle {
                         // (leading "0b" would lex as a Rust binary literal
                         // inside the slint! macro — keep hex colors off 0b/0x)
                         background: #0d1018c0;
@@ -545,6 +545,9 @@ slint::slint! {
                                 }
                             }
                             rowscol := VerticalLayout {
+                                // The right padding clears the scrollbar gutter
+                                // below (track at width-9, 4px wide), so a row
+                                // never runs under the thumb.
                                 padding: 10px;
                                 spacing: 2px;
                                 for row[i] in root.rows : Rectangle {
@@ -637,6 +640,42 @@ slint::slint! {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        // THE SCROLL AFFORDANCE. Effects is 32 rows in a panel
+                        // that shows ~16 and does not grow with the window, and
+                        // nothing on screen said so: the list always scrolled
+                        // (Flickable drag, plus the keyboard cursor pulling
+                        // itself into view above), but a row past the fold was
+                        // both invisible and UNADVERTISED, which reads as "the
+                        // menu does not have that setting".
+                        //
+                        // Shown only while the content actually overflows, so
+                        // the short groups stay clean and no group pays for a
+                        // permanent gutter mark. Plain Rectangles by necessity:
+                        // the software renderer silently ignores drop-shadow-*.
+                        if flick.viewport-height > flick.height : Rectangle {
+                            x: listbox.width - 9px;
+                            y: 6px;
+                            width: 4px;
+                            height: listbox.height - 12px;
+                            border-radius: 2px;
+                            background: #ffffff14;
+                            Rectangle {
+                                width: 100%;
+                                border-radius: 2px;
+                                background: #ffffff50;
+                                // Proportional, floored so a very long group
+                                // still shows a legible mark rather than a dot.
+                                height: max(24px,
+                                    parent.height * (flick.height / flick.viewport-height));
+                                // 0 at the top, full travel at the bottom. The
+                                // denominator is guarded rather than assumed
+                                // positive: this binding is still evaluated on
+                                // the frame the `if` above turns the bar off.
+                                y: (parent.height - self.height)
+                                    * (-flick.viewport-y
+                                        / max(1px, flick.viewport-height - flick.height));
                             }
                         }
                     }

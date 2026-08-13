@@ -78,6 +78,11 @@ rem  elsewhere, and there the submodule is still where %~dp0 says. Defined HERE
 rem  rather than inside :do_nrd so the summary row and :nrd_source cannot end up
 rem  testing two different paths.
 set "NRD_SRC=%~dp0SDKs\NRD-src"
+rem  The same path as CMake writes it (forward slashes), which is the form
+rem  :nrd_stale matches CMAKE_HOME_DIRECTORY against. Derived HERE, beside what
+rem  it derives from and by the reasoning directly above: a second spelling of
+rem  NRD_SRC computed at the point of use is exactly how the two drift apart.
+set "NRD_SRC_FWD=%NRD_SRC:\=/%"
 
 rem --- tools ---------------------------------------------------------------
 rem  Absolute System32 paths on purpose, NOT bare names: a PATH with Git for
@@ -347,6 +352,7 @@ if not defined FORCE if exist "%SDKS%\NRD\bin\NRD.dll" (
     echo     [.] standard NRD.dll present — building only the perf variant
     goto :nrd_perf
 )
+call :nrd_stale "%CACHE%\nrd-build" || exit /b 0
 echo     [+] configuring NRD %NRD_TAG% ^(cmake log: %CACHE%\nrd-cmake.log^)
 "%CMAKE%" -S "%NRD_SRC%" -B "%CACHE%\nrd-build" -A x64 -DNRD_STATIC_LIBRARY=OFF -DNRD_NRI=OFF -DNRD_EMBEDS_DXIL_SHADERS=ON -DNRD_EMBEDS_DXBC_SHADERS=OFF -DNRD_EMBEDS_SPIRV_SHADERS=OFF -DNRD_NORMAL_ENCODING=2 -DNRD_ROUGHNESS_ENCODING=1 %DXCARG% > "%CACHE%\nrd-cmake.log" 2>&1
 if errorlevel 1 (
@@ -380,6 +386,7 @@ rem  The --nrd-perf variant: same pins, REBLUR_PERFORMANCE_MODE=ON, its own
 rem  build dir. The configure here is what rewrites the shared source tree's
 rem  NRDConfig.hlsli to the perf define (see the sequencing contract above).
 if not defined FORCE if exist "%SDKS%\NRD\bin\perf\NRD.dll" exit /b 0
+call :nrd_stale "%CACHE%\nrd-build-perf" || exit /b 0
 echo     [+] configuring NRD %NRD_TAG% perf variant ^(cmake log: %CACHE%\nrd-cmake-perf.log^)
 "%CMAKE%" -S "%NRD_SRC%" -B "%CACHE%\nrd-build-perf" -A x64 -DNRD_STATIC_LIBRARY=OFF -DNRD_NRI=OFF -DNRD_EMBEDS_DXIL_SHADERS=ON -DNRD_EMBEDS_DXBC_SHADERS=OFF -DNRD_EMBEDS_SPIRV_SHADERS=OFF -DNRD_NORMAL_ENCODING=2 -DNRD_ROUGHNESS_ENCODING=1 -DREBLUR_PERFORMANCE_MODE=ON %DXCARG% > "%CACHE%\nrd-cmake-perf.log" 2>&1
 if errorlevel 1 (
@@ -415,6 +422,53 @@ echo     [x] nrd needs CMake ^(3.22...3.30^) + Visual Studio 2022 C++ tools:
 echo         NVIDIA ships no prebuilt NRD binaries, so it must compile locally,
 echo         and the build now REQUIRES the result ^(NRD is the default denoiser^).
 set "FAILED=1"
+exit /b 0
+
+rem :nrd_stale <builddir> — drop a build tree configured from ANOTHER checkout.
+rem  THE CACHE IS PER-USER, THE BUILD TREE IS PER-SOURCE-PATH. %CACHE% is one
+rem  %TEMP% dir shared by every checkout on the box, which is right for the
+rem  download components (a version-pinned zip is the same zip whoever fetches
+rem  it) and wrong for the one that COMPILES: a CMake build tree BAKES IN the
+rem  absolute source dir as CMAKE_HOME_DIRECTORY, so the second checkout to
+rem  configure into %CACHE%\nrd-build hits "does not match the source used to
+rem  generate cache" — a hard stop rather than a rebuild, and not one the
+rem  script's own "see the cmake log" can hint at.
+rem  Deliberately ONE shared build dir plus a wipe rather than a dir per
+rem  checkout: the copy step installs into each checkout's own SDKs\NRD\bin and
+rem  the already-installed early-out then keeps that clone from ever
+rem  rebuilding, so each still builds exactly ONCE and %TEMP% does not grow a
+rem  build tree per clone.
+rem  NO cache at all is the left-alone case (nothing configured yet, or an
+rem  interrupted configure — cmake handles both on its own), and so is a cache
+rem  naming THIS source, so an incremental rebuild in one checkout still costs
+rem  nothing. A cache we cannot read falls through to the wipe deliberately: a
+rem  tree whose provenance is unreadable is not one to build in.
+rem  THE REMOVAL IS VERIFIED because a silent failure here lands right back in
+rem  the opaque "does not match the source used to generate cache" this guard
+rem  exists to prevent — and the usual cause (something holding the tree open)
+rem  is one the user must act on and cannot guess from "see the cmake log".
+:nrd_stale
+if not exist "%~1\CMakeCache.txt" exit /b 0
+rem  /x is WHOLE-LINE, not substring: without it a cache naming a path that has
+rem  ours as a strict prefix reads as ours and the stale tree survives. Not
+rem  reachable while the submodule dir is fixed at NRD-src, but the exact form
+rem  costs nothing and matches the .sh twin's grep -qxF.
+rem  Stderr is discarded: an UNREADABLE cache reports through the wipe path
+rem  below, whose message is the actionable one, and a raw FINDSTR error ahead
+rem  of it reads like a fault in this script rather than a locked file.
+findstr /i /x /c:"CMAKE_HOME_DIRECTORY:INTERNAL=%NRD_SRC_FWD%" "%~1\CMakeCache.txt" >nul 2>nul && exit /b 0
+echo     [.] dropping stale cmake tree ^(configured from another checkout^): %~1
+rmdir /s /q "%~1" 2>nul
+rem  Test the CACHE, not the directory: a partial removal that took CMakeCache
+rem  with it still lets cmake configure from scratch, which is all we need.
+if exist "%~1\CMakeCache.txt" (
+    echo     [x] nrd: could not remove the stale cmake tree
+    echo         %~1
+    echo         close whatever is holding it open ^(an IDE, a scanner, a stray
+    echo         MSBuild^) or delete it by hand, then re-run.
+    set "FAILED=1"
+    exit /b 1
+)
 exit /b 0
 
 rem :nrd_source — ensure SDKs\NRD-src (the NRD source submodule) is checked out.

@@ -179,7 +179,7 @@ everything else on that line really is optional.
 
 | | |
 |---|---|
-| **OS** | **Windows 10/11, x64** for the renderer proper — the interactive window, both D3D12 backends (compute-wavefront and DXR), DLSS, XeSS, NRD and frame generation. **Linux** runs a **Vulkan** backend **in a window**: the wavefront quadtree, the hemisphere bounce tiers, structure replay, BC7, `--blas-split`, FSR 3.1 upscaling and NRD denoising all run and are gated by `--check-vk`, and a bare `frustracer` now opens a real swapchain over an SDL3 surface and presents THE WORLD — tonemapped by the same `tonemap.hlsl` D3D12 presents through, scored against the shared `tone::map` on all three wires. It is the FIRST rung: the camera flies a canned orbit and there is no input, no resize and no HUD yet (measured on a Radeon 8060S at 1280x720: ~60 fps vblank-locked, falling to ~47 across the denser islands, p99 within ~4 ms of p50). On **macOS** (13.0+ — the MetalFX framework is linked unconditionally) the Metal work is four consumers of one CPU-rendered G-buffer: FSR 3.1 through a hand-written Metal `FfxInterface` (`--check-fsr3`, needs the FidelityFX SDK source at build time), Apple's MetalFX temporal scaler, its temporal **denoised** scaler, and its frame interpolator (`--check-metalfx`, needs nothing — it runs on a bare clone; the last two want macOS 26.0+ and skip loudly below it). The two upscalers cross-check each other on byte-identical inputs, and the denoiser is the one arm here that can score QUALITY rather than wiring — a denoiser's claim has a direction. `--cinematic` reconstructs through it, so a macOS capture is denoised and antialiased rather than raw accumulation: measured 3.0x less high-frequency content at the same sample budget. There is still no Metal tracer and no presentation stage, so there is no window. The DLL-free suite (`--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-spirv`) runs on all three; `--check-nrd`'s instance gate is real on Windows and Linux and skips on macOS, which has no NRD consumer. |
+| **OS** | **Windows 10/11, x64** for the renderer proper — the interactive window, both D3D12 backends (compute-wavefront and DXR), DLSS, XeSS, NRD and frame generation. **Linux** runs a **Vulkan** backend **in a window**: the wavefront quadtree, the hemisphere bounce tiers, structure replay, BC7, `--blas-split`, FSR 3.1 upscaling and NRD denoising all run and are gated by `--check-vk`, and a bare `frustracer` now opens a real swapchain over an SDL3 surface and presents THE WORLD — tonemapped by the same `tonemap.hlsl` D3D12 presents through, scored against the shared `tone::map` on all three wires. It is the FIRST rung: the camera flies a canned orbit and there is no input, no resize and no HUD yet (measured on a Radeon 8060S at 1280x720: ~60 fps vblank-locked, falling to ~47 across the denser islands, p99 within ~4 ms of p50). On **macOS** (13.0+ — the MetalFX framework is linked unconditionally) the Metal work is four consumers of one CPU-rendered G-buffer: FSR 3.1 through a hand-written Metal `FfxInterface` (`--check-fsr3`, needs the FidelityFX SDK source at build time), Apple's MetalFX temporal scaler, its temporal **denoised** scaler, and its frame interpolator (`--check-metalfx`, needs nothing — it runs on a bare clone; the last two want macOS 26.0+ and skip loudly below it). The two upscalers cross-check each other on byte-identical inputs, and the denoiser is the one arm here that can score QUALITY rather than wiring — a denoiser's claim has a direction. `--cinematic` reconstructs through it, so a macOS capture is denoised and antialiased rather than raw accumulation: measured 3.0x less high-frequency content at the same sample budget. The Metal **tracer** has begun at its toolchain end: `--check-msl` takes the same shipping corpus `--check-spirv` compiles and carries it one generator further — SPIR-V to MSL to `.metallib` — and **65 of 78 modules get there**, including every ray-shooting kernel of the wavefront tracer *with hardware ray tracing intact*, which retired the assumption that a Metal tracer would need a software BVH walk. Of the 13 that do not, 5 are the DXR pipeline shape (raygen/closest-hit/miss, which Metal has no analogue for and this port does not need) and 8 are one upstream spirv-cross scoping bug. Nothing is bound or dispatched yet, so there is still no Metal tracer and no presentation stage, and therefore no window. The DLL-free suite (`--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-spirv`) runs on all three; `--check-nrd`'s instance gate is real on Windows and Linux and skips on macOS, which has no NRD consumer. |
 | **Toolchain** | Rust (stable) + a C++ toolchain — `build.rs` compiles a few small C++ shims (MSVC build tools & the Windows SDK on Windows; clang or GCC elsewhere). **CMake**, because SDL3 and NRD both build from source. |
 | **git-lfs** | Only if you want the scenes. `git lfs install` once per clone, or you get pointer files. |
 | **GPU** | D3D12 feature level 12_0. NVIDIA/AMD start in DXR when available; Intel RT 1.1 adapters start in the compute-wavefront tracer. `--cpu` selects the CPU tracer explicitly. |
@@ -893,18 +893,30 @@ and extract to `scenes/intel-sponza/` if you want to reproduce those numbers.
 The manual is over. What follows is the engineering write-up: how it works,
 what was measured, and what was tried and removed.
 
-## The developer's notebook — `CLAUDE.md`
+## The developer's notebook
 
-`CLAUDE.md` at the repository root is the real design document — around 400 KB
-of it, organised by subsystem. It records *why* each decision was made, what
-was measured, and what was tried and thrown away, and it is written for
-whoever, or whatever, edits the code next.
+The real design document records *why* each decision was made, what was
+measured, and what was tried and thrown away, and it is written for whoever, or
+whatever, edits the code next. It lives in three places.
 
-It is too large to browse blind. The useful entry points are `## Commands` (the
-complete flag reference, with the reasoning behind each default), `##
-Correctness invariants (the bug class to guard)` (the rules that must not
-break), and `## Architecture notes` (the module map). Each subsystem then has
-its own section.
+`CLAUDE.md` at the repository root is the **working contract** — about 20 KB,
+and the only part loaded automatically. It carries what an editor must not get
+wrong: the soundness counters that must read exactly zero, the one-sky rule, the
+discipline every new feature follows, and an index of the ~220 flags.
+
+`docs/history/` is the **campaign archive** — about 900 KB across 15 files, one
+per subsystem, from `denoisers.md` through `vulkan-backend.md`. This is the
+measurement record: what each number was, on which hardware, and which bug the
+gate was written to catch. `docs/history/README.md` indexes it.
+
+`CLAUDE_Historical.md` is the notebook those files were extracted from, now a
+~336 KB index. Its `## Commands` block lists every flag with a pointer to the
+file holding its story, and it still carries the cross-cutting sections —
+`## Correctness invariants (the bug class to guard)` (the rules that must not
+break) and `## Architecture notes` (the module map).
+
+It was one 1.33 MB file until 2026-08-12. The split was mechanical and
+byte-exact: reassembling the pieces reproduces the original file's checksum.
 
 ## Why a BVH for the scene?
 

@@ -9,11 +9,12 @@
 //! shared byte-for-byte with the D3D12 backend rather than mirrored.
 //!
 //! THE HLSL IS NOT PORTED, AND THAT IS MEASURED, NOT HOPED FOR. `src/shaders/`
-//! is one corpus with two code generators: the same concatenated source that
-//! `gpu/dxc.rs` compiles to DXIL, `vk/spirv.rs` compiles to SPIR-V with a
-//! fixed flag set and zero edits to any `.hlsl`. See that module's header for
-//! the flag set, the register-space -> descriptor-set mapping it implies, and
-//! the measurement.
+//! is one corpus with THREE code generators now: the same concatenated source
+//! that `gpu/dxc.rs` compiles to DXIL, `crate::spirv` compiles to SPIR-V with a
+//! fixed flag set and zero edits to any `.hlsl` — and `mtl::msl` carries that
+//! SPIR-V on to `.metallib` through spirv-cross. See `crate::spirv`'s header
+//! for the flag set, the register-space -> descriptor-set mapping it implies,
+//! and the measurement.
 
 pub mod bc7;
 pub mod device;
@@ -30,7 +31,14 @@ pub mod nrd;
 pub mod present;
 pub mod reflect;
 pub mod scene;
-pub mod spirv;
+// `spirv` MOVED OUT of this backend (it is `crate::spirv` now) and is
+// re-exported here so every `vk::spirv::…` call site is untouched — the
+// items-move-rather-than-being-copied rule `gfx/mod.rs` states, applied to a
+// module that was misfiled rather than shared. It names no `ash` type and
+// never did: it is the corpus's second CODE GENERATOR, and since the Metal
+// backend's `--check-msl` consumes the same SPIR-V it produces, leaving it
+// under `vk/` would have made the Metal gate import the Vulkan backend.
+pub(crate) use crate::spirv;
 pub mod stage;
 pub mod swapchain;
 pub mod textures;

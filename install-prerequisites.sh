@@ -485,7 +485,7 @@ do_dxc() {
 #
 # NOT a hard failure when the toolchain is missing, unlike do_nrd's: nothing in
 # a macOS build LINKS this, it is dlopen'd by --check-spirv/--check-vk alone
-# (src/vk/spirv.rs), so its absence costs two gates rather than a tree that no
+# (src/spirv.rs), so its absence costs two gates rather than a tree that no
 # longer compiles.
 do_dxc_macos() {
     if skip "$SDKS/dxc-macos/lib/libdxcompiler.dylib" "dxc (macos, SPIR-V)"; then
@@ -821,6 +821,41 @@ do_nrd() {
     local dxcarg=()
     [[ -x $SDKS/dxc-linux/bin/dxc ]] && dxcarg=(-DSHADERMAKE_DXC_VK_PATH="$SDKS/dxc-linux/bin/dxc")
 
+    # THE CACHE IS PER-USER, THE BUILD TREE IS PER-SOURCE-PATH. $CACHE is one
+    # /tmp dir shared by every checkout on the box, but a CMake build tree BAKES
+    # IN the absolute source dir, so a second checkout configuring into the same
+    # nrd-build dies with "does not match the source used to generate cache" — a
+    # hard stop rather than a rebuild, and one the "see $clog" pointer below
+    # cannot hint at. Drop a tree whose cache names a DIFFERENT source; leave a
+    # matching one alone so an incremental rebuild still costs nothing, and
+    # leave a MISSING cache to cmake (nothing configured yet, or an interrupted
+    # configure). Deliberately one shared build dir plus a wipe rather than a
+    # per-checkout dir: the copy step below installs into each checkout's own
+    # SDKs/NRD/bin, and the already-installed short-circuit above then keeps
+    # each clone from ever rebuilding, so $TMPDIR does not grow a build tree per
+    # clone. The removal is VERIFIED — a silent failure lands straight back in
+    # that same opaque cmake error. Exact-line match (-x -F), so no other
+    # checkout's path can pass by being a prefix of this one.
+    _nrd_stale() {
+        local build="$1"
+        [[ -e $build/CMakeCache.txt ]] || return 0
+        # 2>/dev/null: an UNREADABLE cache reports through the wipe path below,
+        # whose message is the actionable one.
+        if grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$src" "$build/CMakeCache.txt" 2>/dev/null; then
+            return 0
+        fi
+        echo "    [.] nrd: dropping stale cmake tree (configured from another checkout)"
+        echo "        $build"
+        rm -rf "$build"
+        # Test the CACHE, not the directory: a partial removal that took
+        # CMakeCache with it still lets cmake configure from scratch.
+        if [[ -e $build/CMakeCache.txt ]]; then
+            echo "    [x] nrd: could not remove $build — delete it by hand, then re-run"
+            fail
+            return 1
+        fi
+    }
+
     # One arm = configure -> build -> copy, UNBROKEN, and never a build without
     # its own configure immediately before it. Three outputs are shared across
     # the two build trees — the generated Shaders/NRDConfig.hlsli, _Shaders/
@@ -831,6 +866,7 @@ do_nrd() {
         local tag="$1" build="$2" dest="$3"
         shift 3
         local clog="$CACHE/nrd-cmake-$tag.log" blog="$CACHE/nrd-build-$tag.log"
+        _nrd_stale "$build" || return 1
         echo "    [>] nrd: cmake configure ($tag)"
         cmake -S "$src" -B "$build" \
             -DCMAKE_BUILD_TYPE=Release \
