@@ -219,6 +219,38 @@ jobs:
       - name: Build NRD
         run: ./install-prerequisites.sh nrd
 
+      # SDL3's Linux build dependencies, and THE JOB WAS RED FOR TWO DAYS
+      # WITHOUT THEM. 2a2379c put `sdl3` with `build-from-source-static` in the
+      # `cfg(all(unix, not(macos)))` table for the Linux window (B6b rung 1), so
+      # every Linux build now compiles SDL from source — and SDL's CMake HARD
+      # ERRORS at macros.cmake:415 when it finds neither X11 nor Wayland
+      # development libraries ("Most likely, this is not wanted"). The runner
+      # image ships neither. Both Linux jobs died in the sdl3-sys build script,
+      # BEFORE rustc reached one line of this crate, from 2026-08-13 onward.
+      #
+      # THE PACKAGES ARE THE POINT, NOT `-DSDL_UNIX_CONSOLE_BUILD=ON`. SDL
+      # documents that escape for builds that genuinely want no windows, and no
+      # gate in this job opens one — but taking it would compile a configuration
+      # nobody ships and leave the windowing half of `src/vk/present.rs` guarded
+      # by a build that could not have windowed anyway. That is the vacuity this
+      # file's check-vulkan note already argues against; a green badge would
+      # stop meaning what it says the moment a window-adjacent gate lands.
+      # These give SDL the same `x11 wayland` video drivers a developer box has,
+      # so CI builds the SDL that ships.
+      #
+      # LOCKSTEP WITH check-vulkan's identical step — both jobs compile the same
+      # crate graph, so a package added there belongs here too. Audio and
+      # joystick deps are deliberately absent: SDL warns and disables those
+      # backends (it already configured past a missing ALSA), and nothing
+      # headless plays a sound.
+      - name: SDL3 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev
+
       - name: Build
         run: cargo build --profile quick
 
@@ -391,6 +423,21 @@ jobs:
 
       - name: Build NRD
         run: ./install-prerequisites.sh nrd
+
+      # IDENTICAL TO check-linux's step, and LOCKSTEP WITH IT — see that job for
+      # why SDL's CMake hard-errors without these and why the console-build
+      # escape is the wrong fix. This job compiles the same crate graph and died
+      # in the same place, so it needs the same packages. Kept as its own step
+      # rather than folded into the Vulkan tooling below so the two jobs' lists
+      # can be diffed against each other by eye; the price is one extra
+      # `apt-get update`, which is seconds.
+      - name: SDL3 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev
 
       # spirv-val comes from APT, NOT from `install-prerequisites.sh spirv`, and
       # the difference matters for CI specifically: that component has no pin BY
