@@ -656,6 +656,12 @@ pub struct Opts {
     pub heightfield: bool,
     /// `--no-bloom` clears (`bloom::set_enabled`) — a display-stage lever.
     pub bloom: bool,
+    /// `--bloom-kernel box|wide` — the glare pyramid's downsample kernel.
+    /// `Wide13` is the default: the `Box` arm is not shift-invariant, so a
+    /// moving highlight's halo jumps between grid cells instead of sliding,
+    /// which reads as flicker. `--bloom-kernel box` restores the pre-fix
+    /// renderer and is the A/B lever. Measured with `--bloom-lab`.
+    pub bloom_kernel: bloom::DownKernel,
     /// `--no-clouds` clears (`clouds::set_enabled`).
     pub clouds: bool,
     /// `--cloud-shadow N` in 2..=64; 0 = `--no-cloud-shadow`
@@ -871,6 +877,12 @@ pub struct Cli {
     pub frd_lab_frames: u32,
     /// Render resolution override (default 960x540 in the runner).
     pub frd_lab_res: Option<(u32, u32)>,
+    /// `--bloom-lab`: `None` = not asked for, `Some(kind)` = the arm (`wobble`).
+    /// A headless dev INSTRUMENT (the `--frd-lab` class, not a gate): it needs
+    /// no scene, no BVH and no GPU, so it is dispatched BEFORE the scene load
+    /// and always exits 0. Measures how much the glare pyramid's output moves
+    /// when the light merely translates — see `bloom::lab`.
+    pub bloom_lab: Option<String>,
     /// World mode: `None` = the default (flagless interactive boots the world),
     /// `Some(true)` = explicit `--world` (exclusivity ERRORS rather than
     /// silently resolving), `Some(false)` = `--no-world`. Later flags win.
@@ -1041,6 +1053,7 @@ pub fn defaults() -> Opts {
         coincident_cull: true,
         heightfield: false,
         bloom: true,
+        bloom_kernel: bloom::DownKernel::Wide13,
         clouds: true,
         cloud_shadow: 16,
         sky_lod: 4,
@@ -1131,6 +1144,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut frd_lab_speed = 4.0f32;
     let mut frd_lab_frames = 24u32;
     let mut frd_lab_res: Option<(u32, u32)> = None;
+    let mut bloom_lab: Option<String> = None;
     let mut world_flag: Option<bool> = None;
     let mut helped = false;
     let mut notes: Vec<String> = Vec::new();
@@ -1632,6 +1646,17 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // guide and every radiance gate are untouched either way, and the
             // off path keeps the original alloc-free tonemap loop verbatim.
             "--no-bloom" => opts.bloom = false,
+            "--bloom-kernel" => {
+                let v = args.next().unwrap_or_default();
+                opts.bloom_kernel = match v.as_str() {
+                    "box" => bloom::DownKernel::Box,
+                    "wide" => bloom::DownKernel::Wide13,
+                    _ => {
+                        eprintln!("--bloom-kernel must be box | wide (got '{v}')");
+                        std::process::exit(2);
+                    }
+                };
+            }
             // A/B kill lever for the volumetric cloud layer (default ON).
             // Same "session constant before scene load" pattern: off takes
             // guarded early returns everywhere — bit-identical to the
@@ -2044,6 +2069,26 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     _ => None,
                 };
                 frd_lab = Some(sel.unwrap_or_else(|| "strafe".to_string()));
+            }
+            // --bloom-lab takes an OPTIONAL arm, the same vocabulary-keyed peek
+            // --frd-lab uses: a token that looks like a scene path is never
+            // consumed, and a consumed token must be a KNOWN arm (an unknown one
+            // exits 2 rather than reaching the OBJ loader as a phantom scene).
+            "--bloom-lab" => {
+                let looks_path =
+                    |v: &str| v.contains('.') || v.contains('/') || v.contains('\\');
+                let sel = match args.peek().map(String::as_str) {
+                    Some(v) if !v.starts_with("--") && !looks_path(v) => {
+                        let v = args.next().unwrap();
+                        if !matches!(v.as_str(), "wobble") {
+                            eprintln!("--bloom-lab kind must be wobble (got '{v}')");
+                            std::process::exit(2);
+                        }
+                        Some(v)
+                    }
+                    _ => None,
+                };
+                bloom_lab = Some(sel.unwrap_or_else(|| "wobble".to_string()));
             }
             "--frd-lab-speed" => {
                 frd_lab_speed = args
@@ -2523,6 +2568,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         frd_lab_speed,
         frd_lab_frames,
         frd_lab_res,
+        bloom_lab,
         world_flag,
         helped,
         notes,
@@ -2554,6 +2600,15 @@ pub fn usage() {
                 eprintln!("    --frd-lab-speed P   surface screen speed at center depth, px/frame (default 4)");
                 eprintln!("    --frd-lab-frames N  motion frames (default 24)");
                 eprintln!("    --frd-lab-res WxH   render resolution (default 960x540)");
+                eprintln!("  --bloom-kernel box|wide  glare downsample kernel (default wide): `box` is the");
+                eprintln!("                pre-fix 2x2 whose halo JUMPS between grid cells as a light moves");
+                eprintln!("                (the A/B lever); `wide` is five overlapping boxes, which slides");
+                eprintln!("  --bloom-lab [wobble]  headless glare shift-variance probe (dev instrument):");
+                eprintln!("                no scene, no GPU. Translates a synthetic light by whole");
+                eprintln!("                pixels and reports how much the halo reshapes (l1_tone),");
+                eprintln!("                pulses (peak_tone) and slides (centroid_swing) per octave.");
+                eprintln!("                Prints a NULL control (must be 0) and a PREDICTION control");
+                eprintln!("                against the closed form 2^(i+1)-1 px");
                 eprintln!("  --qa [port]   live AI QA control socket on 127.0.0.1 (default 4599):");
                 eprintln!("                line-in/JSON-line-out verbs driving the interactive session —");
                 eprintln!("                pos | tp | look | tod | drive | key | screenshot | sync | quit.");
@@ -3147,6 +3202,8 @@ pub fn self_test() -> Result<(), String> {
         "--no-coincident-cull",
         "--heightfield",
         "--no-bloom",
+        "--bloom-kernel",
+        "box",
         "--no-clouds",
         "--no-cloud-shadow",
         "--no-sky-lod",
@@ -3255,6 +3312,10 @@ pub fn self_test() -> Result<(), String> {
         ("coincident_cull", !o.coincident_cull),
         ("heightfield", o.heightfield),
         ("bloom", !o.bloom),
+        // Default is Wide13, so "moved" means the argv asked for the OLD box
+        // kernel — the A/B lever, and the arm the anti-flicker gate scores
+        // against.
+        ("bloom_kernel", o.bloom_kernel == bloom::DownKernel::Box),
         ("clouds", !o.clouds),
         ("cloud_shadow", o.cloud_shadow == 0),
         ("sky_lod", o.sky_lod == 1),
@@ -3609,6 +3670,21 @@ pub fn self_test() -> Result<(), String> {
     if loud.opts.bloom {
         return Err("a CLI flag must not disturb settings fields it does not name".into());
     }
+    // --bloom-kernel: both spellings reach Opts, and the DEFAULT is the fixed
+    // (wide) kernel. Pinning the default here is what stops a silent revert to
+    // the shift-variant box kernel — the bug this lever exists for would come
+    // straight back and every other gate would stay green.
+    if defaults().bloom_kernel != bloom::DownKernel::Wide13 {
+        return Err("--bloom-kernel must default to wide (the shift-invariant kernel)".into());
+    }
+    if parse_argv(&["--bloom-kernel", "box"]).opts.bloom_kernel != bloom::DownKernel::Box {
+        return Err("--bloom-kernel box did not reach Opts".into());
+    }
+    if parse_argv(&["--bloom-kernel", "box", "--bloom-kernel", "wide"]).opts.bloom_kernel
+        != bloom::DownKernel::Wide13
+    {
+        return Err("the later --bloom-kernel must win".into());
+    }
 
     // ---- 5. the selectors reach Cli ---------------------------------------
     let c = parse_argv(&[
@@ -3710,6 +3786,22 @@ pub fn self_test() -> Result<(), String> {
     let fl2 = parse_argv(&["--frd-lab", "model.obj"]);
     if fl2.frd_lab.as_deref() != Some("strafe") || fl2.obj.as_deref() != Some("model.obj") {
         return Err("--frd-lab must default to strafe and never swallow a scene path".into());
+    }
+    // --bloom-lab: the same optional-arm contract. A bare flag arms the default
+    // arm, an explicit arm reaches Cli, and a scene path is never swallowed —
+    // the trap the vocabulary-keyed peek exists for.
+    if parse_argv(&["--bloom-lab"]).bloom_lab.as_deref() != Some("wobble") {
+        return Err("bare --bloom-lab must arm the wobble arm".into());
+    }
+    if parse_argv(&["--bloom-lab", "wobble"]).bloom_lab.as_deref() != Some("wobble") {
+        return Err("--bloom-lab wobble did not reach Cli".into());
+    }
+    let bl = parse_argv(&["--bloom-lab", "model.obj"]);
+    if bl.bloom_lab.as_deref() != Some("wobble") || bl.obj.as_deref() != Some("model.obj") {
+        return Err("--bloom-lab must default to wobble and never swallow a scene path".into());
+    }
+    if parse_argv(&["--check"]).bloom_lab.is_some() {
+        return Err("--bloom-lab must not arm itself".into());
     }
     // --qa's optional port: bare = the default, digits = explicit, a scene
     // path is never swallowed (not all-digits).

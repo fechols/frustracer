@@ -44,8 +44,16 @@ struct Params {
     src_w: u32,
     src_h: u32,
     weight: f32,
-    _pad: [f32; 3],
+    /// `BLOOM_FLAG_*` — the RUNTIME half of each compile arm (see
+    /// `bloom::kernel_defs`). Takes one of the three spare pad DWORDs, so the
+    /// root-constant count stays 8 and `float2 _pad` still lands at byte 24,
+    /// which does not straddle the 16-byte row.
+    flags: u32,
+    _pad: [f32; 2],
 }
+
+/// Mirror of `BLOOM_FLAG_WIDE` in bloom.hlsl.
+const FLAG_WIDE: u32 = 1;
 
 impl BloomGpu {
     pub fn new(device: &ID3D12Device, w: u32, h: u32) -> Result<BloomGpu> {
@@ -140,8 +148,14 @@ impl BloomGpu {
         }
         .map_err(|e| format!("bloom: CreateRootSignature: {e}"))?;
 
-        let cs_down = compile(BLOOM_HLSL, s!("cs_down"), s!("cs_5_0"), "bloom cs_down")?;
-        let cs_up = compile(BLOOM_HLSL, s!("cs_up"), s!("cs_5_0"), "bloom cs_up")?;
+        // The kernel arm is baked into the PSO here, so `--bloom-kernel box`
+        // produces a shader with none of the wide path in it. That is also why
+        // the arm is a startup choice: flipping it live would leave this PSO
+        // stale, and a lever that silently does nothing is worse than one that
+        // asks for a restart.
+        let src = format!("{}{}", crate::bloom::kernel_defs(), BLOOM_HLSL);
+        let cs_down = compile(&src, s!("cs_down"), s!("cs_5_0"), "bloom cs_down")?;
+        let cs_up = compile(&src, s!("cs_up"), s!("cs_5_0"), "bloom cs_up")?;
         let pso = |cs: &ID3DBlob, what: &str| -> Result<ID3D12PipelineState> {
             let d = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: unsafe { std::mem::transmute_copy(&root_sig) },
@@ -377,20 +391,29 @@ impl BloomGpu {
         // Downsample. Every level starts in UNORDERED_ACCESS and ends as an SRV
         // for the next lap. `weight` pre-scales ONLY the coarsest level (it seeds
         // the upsample recurrence — see bloom.hlsl).
+        let wide = crate::bloom::down_kernel() == crate::bloom::DownKernel::Wide13;
         for i in 0..LEVELS {
             let (dw, dh, res) = &self.levels[i];
             let src_desc = if i == 0 { self.gpu(src_slot) } else { self.gpu((i - 1) * 2) };
+            // The BOX arm taps in NORMALIZED uv derived from the destination and
+            // never reads src_size — the source's dims are genuinely not its
+            // business (which is what lets level 0 take a source of any size), so
+            // it is still passed zeros and its constants are bit-identical to the
+            // pre-lever renderer. The WIDE arm offsets by one SOURCE texel and
+            // therefore does need them; that is the one path that reads these.
+            let (sw, sh) = match (wide, i) {
+                (false, _) => (0, 0),
+                (true, 0) => (self.w, self.h),
+                (true, _) => (self.levels[i - 1].0, self.levels[i - 1].1),
+            };
             let p = Params {
                 dst_w: *dw,
                 dst_h: *dh,
-                // cs_down taps in NORMALIZED uv derived from the destination, so
-                // it never reads src_size — the source's dims are genuinely not
-                // its business (which is what lets level 0 take a source of any
-                // size). Only cs_up needs them, for its tent's texel spacing.
-                src_w: 0,
-                src_h: 0,
+                src_w: sw,
+                src_h: sh,
                 weight: if i == last { wts[last] } else { 1.0 },
-                _pad: [0.0; 3],
+                flags: if wide { FLAG_WIDE } else { 0 },
+                _pad: [0.0; 2],
             };
             unsafe {
                 list.SetComputeRootDescriptorTable(0, src_desc);
@@ -425,7 +448,10 @@ impl BloomGpu {
                 src_w: sw,
                 src_h: sh,
                 weight: wts[i],
-                _pad: [0.0; 3],
+                // cs_up's tent is unchanged by the kernel arm — the lever is a
+                // DOWNSAMPLE property. Zero here, not `wide`, on purpose.
+                flags: 0,
+                _pad: [0.0; 2],
             };
             unsafe {
                 list.SetComputeRootDescriptorTable(0, self.gpu((i + 1) * 2));
@@ -527,11 +553,8 @@ pub fn self_test_gpu(hg: &mut super::trace::HeadlessGpu) -> Result<()> {
         }
     }
 
-    // CPU reference: run the real pyramid and keep its halo.
-    let mut cpu = crate::bloom::Bloom::new(W, H);
-    let mut out = vec![0.0f32; W * H * 3];
-    cpu.apply(&src, &mut out);
-    let (hw, hh, cpu_halo) = cpu.halo();
+    // (The CPU reference is built per ARM inside the loop below — the kernel is
+    // a lever now, and each arm has to be scored against its own reference.)
 
     // GPU source: an RGBA16F texture holding the same image, in the state the
     // pyramid's compute dispatches require.
@@ -593,93 +616,156 @@ pub fn self_test_gpu(hg: &mut super::trace::HeadlessGpu) -> Result<()> {
         )]);
     })?;
 
-    // Run the real pyramid, through the real entry points.
-    let gpu = BloomGpu::new(&hg.device, W as u32, H as u32)?;
-    gpu.create_source_srv(&hg.device, &tex, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
-    hg.run(|list| gpu.record(list, 0))?;
+    // Run the real pyramid, through the real entry points — ONCE PER KERNEL ARM.
+    // `bloom::kernel_defs` bakes the arm into the downsample PSO, so each arm
+    // needs its own BloomGpu; that is also what makes the discrimination check
+    // at the end meaningful rather than a shader compared with itself.
+    let restore = crate::bloom::down_kernel();
+    let outcome = (|| -> Result<()> {
+        let mut halos: Vec<(&str, Vec<[f32; 3]>)> = Vec::new();
+        for (name, k) in
+            [("box", crate::bloom::DownKernel::Box), ("wide13", crate::bloom::DownKernel::Wide13)]
+        {
+            crate::bloom::set_down_kernel(k);
 
-    // Read level 0 back. `record` leaves it in PIXEL_SHADER_RESOURCE.
-    let (gw, gh, lvl0) = gpu.level0();
-    if gw as usize != hw || gh as usize != hh {
-        return Err(format!(
-            "bloom gate: halo dims disagree — gpu {gw}x{gh}, cpu {hw}x{hh}"
-        ));
-    }
-    let gpitch = d3d12::aligned_pitch(gw as usize * bpp);
-    let rb = ReadbackBuffer::new(&hg.device, gpitch * gh as usize)?;
-    let gfp = d3d12::footprint(DXGI_FORMAT_R16G16B16A16_FLOAT, gw, gh, bpp, 0);
-    hg.run(|list| unsafe {
-        list.ResourceBarrier(&[d3d12::transition(
-            lvl0,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-        )]);
-        list.CopyTextureRegion(
-            &d3d12::loc_footprint(&rb.resource, gfp),
-            0,
-            0,
-            0,
-            &d3d12::loc_subresource(lvl0),
-            None,
-        );
-        list.ResourceBarrier(&[d3d12::transition(
-            lvl0,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        )]);
-    })?;
-    let mut ptr = std::ptr::null_mut();
-    unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }.map_err(|e| format!("Map: {e}"))?;
-    let bytes =
-        unsafe { std::slice::from_raw_parts(ptr as *const u8, gpitch * gh as usize) }.to_vec();
-    unsafe { rb.resource.Unmap(0, None) };
+            // CPU reference for THIS arm — the port is what is on trial, not the
+            // kernel, so each arm is scored against its own reference.
+            let mut cpu = crate::bloom::Bloom::new(W, H);
+            let mut out = vec![0.0f32; W * H * 3];
+            cpu.apply(&src, &mut out);
+            let (hw, hh, cpu_halo) = cpu.halo();
 
-    // Score. Relative per channel, against the CPU's own magnitude — the halo
-    // spans ~4 orders of magnitude between the core and the far tail, so an
-    // absolute bound would be meaningless at one end or the other.
-    let (mut sum_rel, mut worst, mut n, mut peak) = (0.0f64, 0.0f32, 0usize, 0.0f32);
-    for y in 0..gh as usize {
-        for x in 0..gw as usize {
-            let off = y * gpitch + x * bpp;
-            let g = [0usize, 1, 2].map(|k| {
-                let b = [bytes[off + k * 2], bytes[off + k * 2 + 1]];
-                half::f16::from_bits(u16::from_le_bytes(b)).to_f32()
-            });
-            let c = cpu_halo[y * gw as usize + x];
-            let c = [c.x, c.y, c.z];
+            let gpu = BloomGpu::new(&hg.device, W as u32, H as u32)?;
+            gpu.create_source_srv(&hg.device, &tex, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
+            hg.run(|list| gpu.record(list, 0))?;
+
+            // Read level 0 back. `record` leaves it in PIXEL_SHADER_RESOURCE.
+            let (gw, gh, lvl0) = gpu.level0();
+            if gw as usize != hw || gh as usize != hh {
+                return Err(format!(
+                    "bloom gate [{name}]: halo dims disagree — gpu {gw}x{gh}, cpu {hw}x{hh}"
+                ));
+            }
+            let gpitch = d3d12::aligned_pitch(gw as usize * bpp);
+            let rb = ReadbackBuffer::new(&hg.device, gpitch * gh as usize)?;
+            let gfp = d3d12::footprint(DXGI_FORMAT_R16G16B16A16_FLOAT, gw, gh, bpp, 0);
+            hg.run(|list| unsafe {
+                list.ResourceBarrier(&[d3d12::transition(
+                    lvl0,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyTextureRegion(
+                    &d3d12::loc_footprint(&rb.resource, gfp),
+                    0,
+                    0,
+                    0,
+                    &d3d12::loc_subresource(lvl0),
+                    None,
+                );
+                list.ResourceBarrier(&[d3d12::transition(
+                    lvl0,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            })?;
+            let mut ptr = std::ptr::null_mut();
+            unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }
+                .map_err(|e| format!("Map: {e}"))?;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(ptr as *const u8, gpitch * gh as usize)
+            }
+            .to_vec();
+            unsafe { rb.resource.Unmap(0, None) };
+
+            // Score. Relative per channel, against the CPU's own magnitude — the
+            // halo spans ~4 orders of magnitude between the core and the far
+            // tail, so an absolute bound would be meaningless at one end or the
+            // other.
+            let (mut sum_rel, mut worst, mut n, mut peak) = (0.0f64, 0.0f32, 0usize, 0.0f32);
+            let mut vals: Vec<[f32; 3]> = Vec::with_capacity(gw as usize * gh as usize);
+            for y in 0..gh as usize {
+                for x in 0..gw as usize {
+                    let off = y * gpitch + x * bpp;
+                    let g = [0usize, 1, 2].map(|k| {
+                        let b = [bytes[off + k * 2], bytes[off + k * 2 + 1]];
+                        half::f16::from_bits(u16::from_le_bytes(b)).to_f32()
+                    });
+                    vals.push(g);
+                    let c = cpu_halo[y * gw as usize + x];
+                    let c = [c.x, c.y, c.z];
+                    for k in 0..3 {
+                        peak = peak.max(c[k]);
+                        // Skip channels too dim for f16 to resolve: below ~1e-3
+                        // the storage quantum IS the value, and a "relative"
+                        // error there measures f16, not the port.
+                        if c[k] < 1e-3 {
+                            continue;
+                        }
+                        let rel = ((g[k] - c[k]) / c[k]).abs();
+                        sum_rel += rel as f64;
+                        worst = worst.max(rel);
+                        n += 1;
+                    }
+                }
+            }
+            if n == 0 || peak <= 0.0 {
+                return Err(format!(
+                    "bloom gate [{name}]: the CPU halo is empty — the probe never bloomed"
+                ));
+            }
+            let mean_rel = (sum_rel / n as f64) as f32;
+            // A wrong weight/barrier/slot/pitch moves the halo by tens of percent
+            // or more; f16 accumulation through 6 octaves of hardware bilinear
+            // costs well under one. Never widen these to make a failing port pass.
+            if mean_rel > 0.02 || worst > 0.10 {
+                return Err(format!(
+                    "bloom gate [{name}]: GPU halo vs CPU — mean rel {:.4} (limit 0.02), \
+                     worst {:.4} (limit 0.10) over {n} channels",
+                    mean_rel, worst
+                ));
+            }
+            eprintln!(
+                "check-gpu: bloom pyramid vs CPU [{name}] ({gw}x{gh} halo): mean rel {:.4} | \
+                 worst {:.4} | peak {:.1} | {n} channels scored",
+                mean_rel, worst, peak
+            );
+            halos.push((name, vals));
+        }
+
+        // ANTI-VACUITY: the two arms must actually PRODUCE DIFFERENT HALOS.
+        //
+        // Without this, a compile define that never reached the shader — or a CB
+        // bit that was never set — would leave both arms running the identical
+        // box kernel, and the loop above would score each against its own CPU
+        // reference and pass with flying colours while proving nothing. That is
+        // the probe-reach trap, and it has fired repeatedly in this tree. Cost is
+        // one pass over a 128x64 halo.
+        let (a, b) = (&halos[0].1, &halos[1].1);
+        let mut arm_worst = 0.0f32;
+        for (p, q) in a.iter().zip(b.iter()) {
             for k in 0..3 {
-                peak = peak.max(c[k]);
-                // Skip channels too dim for f16 to resolve: below ~1e-3 the
-                // storage quantum IS the value, and a "relative" error there
-                // measures f16, not the port.
-                if c[k] < 1e-3 {
+                if p[k] < 1e-3 {
                     continue;
                 }
-                let rel = ((g[k] - c[k]) / c[k]).abs();
-                sum_rel += rel as f64;
-                worst = worst.max(rel);
-                n += 1;
+                arm_worst = arm_worst.max(((q[k] - p[k]) / p[k]).abs());
             }
         }
-    }
-    if n == 0 || peak <= 0.0 {
-        return Err("bloom gate: the CPU halo is empty — the probe image never bloomed".into());
-    }
-    let mean_rel = (sum_rel / n as f64) as f32;
-    // A wrong weight/barrier/slot/pitch moves the halo by tens of percent or
-    // more; f16 accumulation through 6 octaves of hardware bilinear costs well
-    // under one. Never widen these to make a failing port pass.
-    if mean_rel > 0.02 || worst > 0.10 {
-        return Err(format!(
-            "bloom gate: GPU halo vs CPU — mean rel {:.4} (limit 0.02), worst {:.4} \
-             (limit 0.10) over {n} channels",
-            mean_rel, worst
-        ));
-    }
-    eprintln!(
-        "check-gpu: bloom pyramid vs CPU ({gw}x{gh} halo): mean rel {:.4} | worst {:.4} | \
-         peak {:.1} | {n} channels scored",
-        mean_rel, worst, peak
-    );
-    Ok(())
+        if arm_worst <= 0.10 {
+            return Err(format!(
+                "M13 IS VACUOUS: the box and wide13 halos differ by at most {arm_worst:.4}, \
+                 which is inside the very tolerance each arm is scored to. The kernel arm is \
+                 not reaching the GPU — check that bloom::kernel_defs reached the compile and \
+                 that FLAG_WIDE reached the constants. Do NOT relax this; the two kernels are \
+                 genuinely different filters and must read as such"
+            ));
+        }
+        eprintln!(
+            "check-gpu: bloom arm discrimination: box vs wide13 worst rel {arm_worst:.3} \
+             (must exceed 0.10 — proves the arm reaches the shader)"
+        );
+        Ok(())
+    })();
+    crate::bloom::set_down_kernel(restore);
+    outcome
 }

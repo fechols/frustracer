@@ -388,6 +388,7 @@ fn main() {
         frd_lab_speed,
         frd_lab_frames,
         frd_lab_res,
+        bloom_lab,
         mut world_flag,
         ..
     } = parsed;
@@ -811,6 +812,9 @@ fn main() {
     bvh::set_height_armed(opts.heightfield);
     bvh::set_height_on(opts.heightfield);
     bloom::set_enabled(opts.bloom);
+    // Before any BloomGpu is built: `kernel_defs` bakes this choice into the
+    // downsample PSO, so it has to be settled before the first compile.
+    bloom::set_down_kernel(opts.bloom_kernel);
     clouds::set_enabled(opts.clouds);
     fireflies::set_enabled(opts.fireflies);
     // set_count is what CLAMPS to the CB row cap; the parse only noted it.
@@ -1087,6 +1091,18 @@ fn main() {
     if cinematic.as_deref() == Some("list") {
         cinematic::print_catalogue();
         std::process::exit(0);
+    }
+    // --bloom-lab is closed-form over synthetic images: no scene, no BVH, no
+    // GPU, no DXC. Answer it HERE, before the scene load, for the same reason
+    // `--cinematic list` is answered here — loading a world to convolve a
+    // 512x512 fixture would be pure waste, and keeping it scene-free is what
+    // lets it run on every platform in about a second.
+    if let Some(kind) = &bloom_lab {
+        if spin.is_some() || check_requested || cinematic.is_some() || frd_lab.is_some() {
+            eprintln!("--bloom-lab is exclusive with --spin, --check*, --cinematic and --frd-lab");
+            std::process::exit(2);
+        }
+        std::process::exit(bloom::lab(kind));
     }
     // NOTE the deliberate absence of `cinematic` from both the exclusivity list
     // above and the conjunction below: that absence IS how --cinematic gets the

@@ -265,7 +265,7 @@ spells the opposite; A/B levers are generally bit-identical when off.
 
 **Lighting & sky** — `--rtgi-bounces 0..2` / `--rtgi` / `--no-rtgi` · `--emissive-lights [N]`
 `--el-cluster grid|som` · `--fireflies N` · `--no-clouds` `--cloud-shadow N` `--sky-lod K` ·
-`--no-amb-bump` `--no-spec-aa` · `--no-bloom` · `--auto-exposure` `--autoexp-mode
+`--no-amb-bump` `--no-spec-aa` · `--no-bloom` `--bloom-kernel box|wide` · `--auto-exposure` `--autoexp-mode
 lights|tonemap` `--exposure-bias EV` `--autoexp-spike-guard` / `-strength`
 
 **Materials & texturing** — `--no-mips` `--aniso N` `--no-slope-mips` · `--no-bc7`
@@ -288,7 +288,7 @@ lights|tonemap` `--exposure-bias EV` `--autoexp-spike-guard` / `-strength`
 **Headless modes** — the 14 `--check*` gates · `--spin still|path` + `--spin-frames|-warmup|
 -hybrid|-plain` · `--cinematic <preset>` + the `--cinematic-*` family (res/fps/frames/samples/
 island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `--frd-lab-*` ·
-`--qa [port]`
+`--bloom-lab [wobble]` (glare shift-variance probe; scene-free, GPU-free) · `--qa [port]`
 
 **Diagnostics** — `--gpu-debug` (debug layer + GBV) · `--gpu-timing` · `--pix-markers` ·
 `--waveviz [chs]` · `--no-crash-handler` · `--dlss-dump` `--xess-dump` `--oidn-dump`
