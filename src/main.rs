@@ -4904,6 +4904,33 @@ fn dn_kind(opts: &Opts) -> Option<gpu::DnKind<'_>> {
     }
 }
 
+/// Fold a possible device removal into a gate's own verdict.
+///
+/// A failure that coincides with the device going away is ambiguous, so ask
+/// the device why (see `HeadlessGpu::removal` for the mapping and the
+/// reasoning). A healthy device leaves `gate_code` untouched, so this is safe
+/// to wrap around any failure path: it can only speak when the device is
+/// actually gone.
+///
+/// Exit 2 is not a new convention here — `run_check_gpu` already answers 2 for
+/// a missing DXC and for a device that never opened. This extends the same
+/// answer to a device that opened and then vanished for a reason that was not
+/// ours.
+#[cfg(windows)]
+fn removal_verdict(hg: &gpu::trace::HeadlessGpu, gate_code: i32) -> i32 {
+    match hg.removal() {
+        None => gate_code,
+        Some((hr, why, code)) => {
+            eprintln!(
+                "check-gpu: device removed — {why}, HRESULT 0x{:08X} → exit {code} ({})",
+                hr as u32,
+                if code == 2 { "ENVIRONMENT, not a gate failure" } else { "GATE FAILURE" }
+            );
+            code
+        }
+    }
+}
+
 /// Headless GPU-tracer gate suite (M1: toolchain + dispatch plumbing).
 /// Unlike --check/--check-dlss/--check-xess this needs real hardware: a
 /// D3D12 device with RT tier 1.1 and the DXC DLL drop. Exit codes: 0 = all
@@ -7315,28 +7342,45 @@ fn run_check_gpu(
             };
             tg.write_cb(0, &p);
             if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, true)) {
-                eprintln!("check-gpu: FAIL spp wavefront dispatch: {e}");
-                return 1;
+                eprintln!("check-gpu: FAIL spp wavefront dispatch (spp={spp} probe={probe}): {e}");
+                return removal_verdict(&hg, 1);
             }
             let (wt4, wa4) =
                 match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
                     (Ok(a), Ok(b)) => (a, b),
-                    _ => {
-                        eprintln!("check-gpu: FAIL spp wavefront readback");
-                        return 1;
+                    // Name WHICH plane failed, at WHICH probe, and why. The two
+                    // dispatch arms either side of this one already print `{e}`;
+                    // swallowing it here cost a full rerun to learn anything, and
+                    // the probe list ends with the heaviest (spp=MAX_SPP) point,
+                    // so the identifying detail is exactly what got dropped.
+                    (t, a) => {
+                        let e = |r: Result<Vec<f32>, String>| r.err().unwrap_or_else(|| "ok".into());
+                        eprintln!(
+                            "check-gpu: FAIL spp wavefront readback (spp={spp} probe={probe}) — \
+                             tbuf: {} | accum: {}",
+                            e(t),
+                            e(a)
+                        );
+                        return removal_verdict(&hg, 1);
                     }
                 };
             tg.write_cb(0, &p);
             if let Err(e) = hg.run(|l| tg.record_reference(l, 0)) {
-                eprintln!("check-gpu: FAIL spp reference dispatch: {e}");
-                return 1;
+                eprintln!("check-gpu: FAIL spp reference dispatch (spp={spp} probe={probe}): {e}");
+                return removal_verdict(&hg, 1);
             }
             let (rt4, ra4) =
                 match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
                     (Ok(a), Ok(b)) => (a, b),
-                    _ => {
-                        eprintln!("check-gpu: FAIL spp reference readback");
-                        return 1;
+                    (t, a) => {
+                        let e = |r: Result<Vec<f32>, String>| r.err().unwrap_or_else(|| "ok".into());
+                        eprintln!(
+                            "check-gpu: FAIL spp reference readback (spp={spp} probe={probe}) — \
+                             tbuf: {} | accum: {}",
+                            e(t),
+                            e(a)
+                        );
+                        return removal_verdict(&hg, 1);
                     }
                 };
             // Same rules as the spp=1 wavefront/reference gate above, and for
