@@ -5,7 +5,8 @@
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 
 ```
-cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (unix; src/spirv.rs
+cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (any OS with a DXC drop;
+                                      # unix-only until 2026-08-14; src/spirv.rs
                                       # + run_check_spirv in main.rs, 2026-08-10 — the Vulkan port's M2a).
                                       # NOTE the module MOVED out of `src/vk/` on 2026-08-12 (it names
                                       # no `ash` type and never did — it is the corpus's second CODE
@@ -148,11 +149,19 @@ cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (un
                                       # libdxcompiler.so is dlopen'd and DxcCreateInstance resolved by
                                       # symbol, the LoadLibraryExW+GetProcAddress policy spelled
                                       # portably, so every other --check* stays DLL-free.
-                                      # unix-only for ONE reason: DXC's WinAdapter typedefs LPCWSTR as
-                                      # `const wchar_t*`, 4 bytes here against Windows' 2, so the
-                                      # argument array is UTF-32. Vulkan-on-Windows needs that cfg, the
-                                      # library name, and the module/dep cfg lifted — nothing else; the
-                                      # vtables, CLSIDs, flags and binding scheme are already neutral
+                                      # WAS unix-only for ONE reason: DXC's WinAdapter typedefs LPCWSTR
+                                      # as `const wchar_t*`, 4 bytes there against Windows' 2, so the
+                                      # argument array is UTF-32 off Windows and UTF-16 on it. Both arms
+                                      # landed 2026-08-14 (the browser port's Stage 0a): WChar, wide(),
+                                      # LIB_NAME and default_dir carry two lines each and NOTHING else
+                                      # does — the vtables, CLSIDs, flags and binding scheme were always
+                                      # neutral, extern "C" is already right on x86_64 Windows (there is
+                                      # only one calling convention there), and no dxil.dll is needed
+                                      # because SPIR-V has no signing step. Measured on Windows the day
+                                      # it landed: 47 units -> 80 modules, 37 -> 68 under --sw-rays.
+                                      # `src/vk/reflect.rs` hoisted to `src/reflect.rs` in the same
+                                      # change and for the same reason — S0 is device-free and now runs
+                                      # where `vk/` does not build; `vk::reflect` re-exports it.
 cargo run --release -- --check-msl    # THE METAL SHADER TOOLCHAIN, gated (macOS; src/mtl/msl.rs +
                                       # run_check_msl in main.rs, 2026-08-12 — the Metal port's C1, and
                                       # the first rung of a Metal TRACER rather than another consumer

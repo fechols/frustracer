@@ -92,7 +92,7 @@ of NVIDIA's NRD entry names.
 | `--check-gpu` | real GPU + DXC | the wavefront tracer — **not in CI** |
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
 | `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V19 |
-| `--check-spirv` | unix + DXC/spirv-val | the whole shader corpus → SPIR-V |
+| `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
 | `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |

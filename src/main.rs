@@ -154,13 +154,25 @@ mod sh;
 // sky call site in the renderer.
 mod sky;
 mod sphcell;
+// What a compiled SPIR-V module ASKS FOR, read back out of its own words. Not
+// under `vk/` (where it lived until the SPIR-V arm reached Windows) for exactly
+// the reason `spirv` below is not: it names no `ash` type, and its third
+// consumer — `--check-spirv`'s device-free S0 — must run where `vk/` does not
+// build. `vk::reflect` re-exports it, so every existing call site is unchanged.
+#[cfg(any(unix, windows))]
+mod reflect;
 // HLSL -> SPIR-V: the corpus's SECOND code generator, beside `gpu/dxc.rs`'s
 // DXIL. Not under `vk/` (where it lived until `--check-msl` arrived) because
-// it names no backend type and now has two consumers — Vulkan eats the SPIR-V
-// directly, Metal eats it through spirv-cross. `vk::spirv` re-exports it, so
-// every existing call site is unchanged. unix-only for the one reason its
-// header gives: DXC's `LPCWSTR` is a 4-byte `wchar_t` off Windows.
-#[cfg(unix)]
+// it names no backend type and now has THREE consumers — Vulkan eats the
+// SPIR-V directly, Metal eats it through spirv-cross, and `--check-spirv` gates
+// the corpus with no backend at all. `vk::spirv` re-exports it, so every
+// existing call site is unchanged.
+//
+// NO LONGER unix-only: DXC's `LPCWSTR` is a 4-byte `wchar_t` off Windows and a
+// 2-byte one on it, and both arms now exist. The cfg spelled here is "a
+// platform with a DXC drop and a dynamic loader" — which is what a wasm target
+// will fail, deliberately and by name, rather than by a link error.
+#[cfg(any(unix, windows))]
 mod spirv;
 mod stats;
 mod prof;
@@ -1353,22 +1365,13 @@ fn main() {
         }
     }
     if check_spirv {
-        #[cfg(unix)]
-        {
-            let code = run_check_spirv(&scene);
-            std::process::exit(code);
-        }
-        #[cfg(not(unix))]
-        {
-            // Said, not silently skipped: the SPIR-V path is one `wchar_t`
-            // width and one library name away from working here — see the
-            // header in src/spirv.rs.
-            eprintln!(
-                "--check-spirv is unix-only today (the corpus's SPIR-V \
-                 compiler); see src/spirv.rs for what the Windows arm needs"
-            );
-            std::process::exit(2);
-        }
+        // No platform cfg any more: this gate's subject is the CORPUS, not a
+        // backend, and it now runs wherever a DXC drop does. Running it beside
+        // `gpu/dxc.rs` on Windows is the point — a front-end divergence between
+        // the tree's two code generators becomes a same-box comparison instead
+        // of a cross-CI one.
+        let code = run_check_spirv(&scene);
+        std::process::exit(code);
     }
     if check_msl {
         #[cfg(target_os = "macos")]
@@ -14114,7 +14117,6 @@ fn run_check_gpu(
 /// `--no-ftree`, `--heightfield`, the `FR_*` family): they are read through
 /// `OnceLock`s, so one process is one configuration. Re-run the gate under
 /// them — the same rule `tools/dump-hlsl.ps1` states for the same reason.
-#[cfg(unix)]
 /// Every compute entry point an assembled unit declares: a `[numthreads(...)]`
 /// attribute followed by the function it decorates.
 ///
@@ -14123,7 +14125,7 @@ fn run_check_gpu(
 /// than it thinks. Deliberately narrow: it must not match the many ordinary
 /// `void foo(` helpers these units paste in, which are not entry points and
 /// fail to compile as one.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn compute_entries(src: &str) -> Vec<String> {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
@@ -14150,7 +14152,7 @@ fn compute_entries(src: &str) -> Vec<String> {
 }
 
 /// A compile unit: how to target it, and how to find its entry points.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum Shape {
     /// Compute: entries scanned out of the assembled source.
     Compute(&'static str),
@@ -14171,7 +14173,7 @@ enum Shape {
 ///
 /// `Err` is the vendor-arm anti-vacuity failure, which belongs here rather
 /// than in either caller because it is a property of the ASSEMBLY.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, String> {
     use gfx::shaders as sh;
     use gfx::vocab::Vendor;
@@ -14309,7 +14311,7 @@ fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, St
 /// The (entry, target) jobs a unit yields, or `Err` if a compute unit yields
 /// none — anti-vacuity shared by both gates, because a unit that compiled
 /// nothing reads exactly like a unit that compiled cleanly.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn corpus_jobs(name: &str, src: &str, shape: &Shape) -> Result<Vec<(String, String)>, String> {
     use gfx::shaders as sh;
     Ok(match shape {
@@ -14333,7 +14335,12 @@ fn corpus_jobs(name: &str, src: &str, shape: &Shape) -> Result<Vec<(String, Stri
     })
 }
 
-#[cfg(unix)]
+// `any(unix, windows)`, not `unix`: the corpus's SPIR-V arm reached Windows
+// once `crate::spirv` grew its 2-byte-`wchar_t` half, and this gate's subject
+// was never the Vulkan backend — it is the corpus. The cfg names what it
+// actually needs (a DXC drop and a dynamic loader), so a wasm target fails it
+// by name rather than at link time. Same cfg on the four helpers above.
+#[cfg(any(unix, windows))]
 fn run_check_spirv(scene: &scene::Scene) -> i32 {
     let mut ok = true;
 
@@ -14352,9 +14359,14 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // The reflector is pure SPIR-V and belongs to the same stage: it reads
     // what a module DECLARES, which is the half of the descriptor story
     // `spirv-val` cannot see (it validates a module, and knows nothing about
-    // the layout that module will be bound against). It IS Vulkan-owned,
-    // unlike the compiler above — the descriptor-set layout it feeds is.
-    match vk::reflect::self_test() {
+    // the layout that module will be bound against).
+    //
+    // `crate::reflect`, not `vk::reflect`, and this line is why: S0 is a
+    // device-free gate that now runs on Windows, where `vk/` does not build at
+    // all. It was never Vulkan-owned — what is Vulkan-owned is `vk::layout`,
+    // the one place `DescKind` meets an `ash` type. The `vk::reflect`
+    // re-export stays for the backend's own call sites.
+    match crate::reflect::self_test() {
         Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
         Err(e) => {
             eprintln!("check-spirv: FAIL S0 reflect: {e}");

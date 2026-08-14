@@ -29,7 +29,11 @@ pub mod nrd;
 // that platform has no tracer to feed.
 #[cfg(not(target_os = "macos"))]
 pub mod present;
-pub mod reflect;
+// `reflect` MOVED OUT for the same reason `spirv` below did, and is re-exported
+// on the same terms: it names no `ash` type, its consumers are Vulkan, Metal
+// AND the device-free `--check-spirv` S0, and that last one now runs on Windows
+// where this backend does not exist. See `crate::reflect`'s header.
+pub(crate) use crate::reflect;
 pub mod scene;
 // `spirv` MOVED OUT of this backend (it is `crate::spirv` now) and is
 // re-exported here so every `vk::spirv::…` call site is untouched — the
