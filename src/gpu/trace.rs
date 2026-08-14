@@ -542,7 +542,7 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
     .map_err(|e| format!("CreateRootSignature(compute): {e}"))
 }
 
-/// Dispatch-only command signature: ExecuteIndirect over one 12-byte
+/// Dispatch-only command signature: ExecuteIndirect over one `ARG_STRIDE`
 /// (x, y, z) record IS D3D12's DispatchIndirect. Null root signature —
 /// no root-argument changes ride the indirect stream.
 pub fn create_dispatch_signature(device: &ID3D12Device) -> Result<ID3D12CommandSignature> {
@@ -551,7 +551,7 @@ pub fn create_dispatch_signature(device: &ID3D12Device) -> Result<ID3D12CommandS
         ..Default::default()
     };
     let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: 12,
+        ByteStride: ARG_STRIDE as u32,
         NumArgumentDescs: 1,
         pArgumentDescs: &arg,
         NodeMask: 0,
@@ -1132,7 +1132,7 @@ pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
     let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let counters = committed_buffer(&hg.device, 8, uaf, ua)?;
-    let args = committed_buffer(&hg.device, 12, uaf, ua)?;
+    let args = committed_buffer(&hg.device, ARG_STRIDE, uaf, ua)?;
     let outbuf = committed_buffer(&hg.device, FILL_N as u64 * 4, uaf, ua)?;
 
     hg.run(|list| unsafe {
@@ -1165,7 +1165,7 @@ pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
             return Err(format!("smoke: outbuf[{i}] = {got:#x}, expected {want:#x}"));
         }
     }
-    let a = hg.read_buffer(&args, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, 12)?;
+    let a = hg.read_buffer(&args, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, ARG_STRIDE as usize)?;
     let groups: Vec<u32> =
         a.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     let want = [FILL_N.div_ceil(64), 1, 1];
@@ -4021,7 +4021,7 @@ impl TraceGpu {
         // Unconditional — 20 bytes buys a lever-independent buffer shape (an
         // FR_WIDTH session and a plain one bind identical resources).
         let counters = committed_buffer(device, CTR_TOTAL as u64 * 4, uaf, ua)?;
-        let args = committed_buffer(device, 16 * 12, uaf, ua)?;
+        let args = committed_buffer(device, 16 * ARG_STRIDE, uaf, ua)?;
         let qa = committed_buffer(device, cap_tile * 24, uaf, ua)?;
         let qb = committed_buffer(device, cap_tile * 24, uaf, ua)?;
         let qleaf = committed_buffer(device, cap_leaf * LEAF_REC_BYTES, uaf, ua)?;
@@ -4979,7 +4979,7 @@ impl TraceGpu {
                     &self.pso_level
                 });
                 self.push(list, [in_ctr, out_ctr, 0, 0]);
-                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, d as u64 * 12, None, 0);
+                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, d as u64 * ARG_STRIDE, None, 0);
                 self.args_to_uav(list);
             }
 
@@ -5059,13 +5059,27 @@ impl TraceGpu {
                 // overlapped `leaf`; `leaf` is honest — its end timestamp
                 // is bottom-of-pipe at the leaf EI's drain.
                 let _e = super::pix::scope(list, c"leaf");
-                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
+                list.ExecuteIndirect(
+                    &self.cmd_sig,
+                    1,
+                    &self.args,
+                    ARG_LEAF as u64 * ARG_STRIDE,
+                    None,
+                    0,
+                );
             }
             list.SetPipelineState(&self.pso_sky);
             self.push(list, [CTR_SKY, 0, 0, 0]);
             {
                 let _e = super::pix::scope(list, c"sky");
-                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_SKY as u64 * 12, None, 0);
+                list.ExecuteIndirect(
+                    &self.cmd_sig,
+                    1,
+                    &self.args,
+                    ARG_SKY as u64 * ARG_STRIDE,
+                    None,
+                    0,
+                );
             }
             self.args_to_uav(list);
         }
@@ -5270,7 +5284,14 @@ impl TraceGpu {
                 );
                 list.SetPipelineState(&self.pso_hemi_root);
                 self.push(list, [base, CTR_HEMI_A, 0, 0]);
-                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_HEMI_ROOT as u64 * 12, None, 0);
+                list.ExecuteIndirect(
+                    &self.cmd_sig,
+                    1,
+                    &self.args,
+                    ARG_HEMI_ROOT as u64 * ARG_STRIDE,
+                    None,
+                    0,
+                );
                 self.args_to_uav(list);
 
                 for l in 0..levels {
@@ -5295,7 +5316,14 @@ impl TraceGpu {
                     );
                     list.SetPipelineState(&self.pso_hemi_cell);
                     self.push(list, [in_ctr, out_ctr, 0, 0]);
-                    list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_HEMI_CELL as u64 * 12, None, 0);
+                    list.ExecuteIndirect(
+                        &self.cmd_sig,
+                        1,
+                        &self.args,
+                        ARG_HEMI_CELL as u64 * ARG_STRIDE,
+                        None,
+                        0,
+                    );
                     self.args_to_uav(list);
                 }
 
@@ -5307,7 +5335,14 @@ impl TraceGpu {
                 self.args_to_indirect(list);
                 list.SetPipelineState(&self.pso_hemi_leaf);
                 self.push(list, [0, 0, 0, 0]);
-                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_HEMI_LEAF as u64 * 12, None, 0);
+                list.ExecuteIndirect(
+                    &self.cmd_sig,
+                    1,
+                    &self.args,
+                    ARG_HEMI_LEAF as u64 * ARG_STRIDE,
+                    None,
+                    0,
+                );
                 self.args_to_uav(list);
             }
         }

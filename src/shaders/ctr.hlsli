@@ -93,11 +93,17 @@ RWStructuredBuffer<uint>  args     : register(u4);
 //
 // THE STRIDE HAS TEETH, AND NOT WHERE YOU WOULD LOOK FOR THEM. Compiling this
 // with `slot * 4u` — precisely the mistake a 16-byte-strided `vec3<u32>` would
-// bake in — fails --check-gpu with 56 FAILs and exit 1. But the M1 dispatch
-// plumbing gate, the one that exists to read an indirect record back and
-// compare it, STILL PASSES: smoke.hlsl only ever writes slot 0, and 0*3 == 0*4.
-// The tooth is the wavefront's multi-slot use, so do not read a green smoke
-// test as cover for a change to this function.
+// bake in — fails --check-gpu with 56 FAILs and exit 1. But BOTH dispatch
+// plumbing gates, the two whose whole job is to write an indirect record, read
+// it back and compare, STILL PASS: D3D12's M1 and Vulkan's V3 both drive
+// smoke.hlsl, which pastes nothing (so it never compiles this function at all)
+// and writes slot 0 only, where 0*3 == 0*4. Do not read either as cover for a
+// change here.
+//
+// What DOES catch it: --check-gpu, which CI does not run, and --check-vk's
+// V7/V8 — the real wavefront ladder, multi-slot, which CI does run on
+// llvmpipe. Plus shaders.rs's args_stride gate, which pins the word index
+// below against ARG_STRIDE under plain `cargo test` on every CI job.
 void args_write(uint slot, uint3 g) {
     args[slot * 3u + 0u] = g.x;
     args[slot * 3u + 1u] = g.y;
