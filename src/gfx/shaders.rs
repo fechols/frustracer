@@ -3465,11 +3465,20 @@ void check_empty_cell(float3 o, float3 a, float3 b, float3 c, float t_lim) {
 mod mtlbind_probe_shader_source_tests {
     use crate::spirv::{SHIFT_B, SHIFT_S, SHIFT_T, SHIFT_U};
 
-    /// The three `space1` declarations `mtlbind.hlsl` copies verbatim from
+    /// The three scene-texture declarations `mtlbind.hlsl` copies verbatim from
     /// `trace_common.hlsli`'s RP_SCENE_TEX table. Byte-identical is the claim,
     /// so they are written here as bytes rather than as a pattern.
-    const SPACE1_DECLS: [&str; 3] = [
-        "Texture2D<float4>        texs[]     : register(t10, space1);",
+    ///
+    /// `texs[]` IS IN A DIFFERENT SPACE FROM THE SAMPLERS, and that is the
+    /// single most load-bearing byte in this array. It is the corpus's only
+    /// unbounded array, and a Metal argument buffer cannot hold one beside
+    /// anything else — spirv-cross drops whatever shares the set and
+    /// reinterpret_casts the array's storage in its place, which compiles and
+    /// reads the wrong descriptor. Folding it back into space1 to tidy the
+    /// table would silently break 19 modules on Metal and nothing anywhere
+    /// else. `trace_common.hlsli` carries the full rule.
+    const SCENE_TEX_DECLS: [&str; 3] = [
+        "Texture2D<float4>        texs[]     : register(t0, space2);",
         "SamplerState             samp_lin   : register(s0, space1);",
         "SamplerState             samp_aniso : register(s1, space1);",
     ];
@@ -3481,25 +3490,57 @@ mod mtlbind_probe_shader_source_tests {
     /// rather than just asserting the probe contains some `texs[]` — is what
     /// makes a change to either one a failure.
     ///
-    /// The unbounded `texs[]` is the whole subject of C3's set-1 half: it is
-    /// the tier-2 argument-buffer feature, the thing `count == 0` means in
+    /// The unbounded `texs[]` is the whole subject of C3's second-set half: it
+    /// is the tier-2 argument-buffer feature, the thing `count == 0` means in
     /// `vk::reflect`, and the one member whose host-side layout spirv-cross
     /// does not fully describe. Losing its exact spelling loses the milestone.
     #[test]
-    fn mtlbind_space1_matches_trace_common() {
-        for decl in SPACE1_DECLS {
+    fn mtlbind_scene_tex_matches_trace_common() {
+        for decl in SCENE_TEX_DECLS {
             assert!(
                 super::TRACE_COMMON_HLSLI.contains(decl),
                 "trace_common.hlsli no longer declares `{decl}` — if the scene-texture \
-                 table changed on purpose, copy the new line into mtlbind.hlsl's space1 \
-                 block and update SPACE1_DECLS. Do NOT relax this to a pattern: the \
-                 probe's job is to be byte-identical to what the tracer declares."
+                 table changed on purpose, copy the new line into mtlbind.hlsl and update \
+                 SCENE_TEX_DECLS. Do NOT relax this to a pattern: the probe's job is to be \
+                 byte-identical to what the tracer declares."
             );
             assert!(
                 super::MTLBIND_HLSL.contains(decl),
-                "mtlbind.hlsl's space1 block drifted from trace_common.hlsli: `{decl}` \
-                 is missing. The C3 probe stands in for the real RP_SCENE_TEX table and \
-                 stops standing for anything the moment it declares something else."
+                "mtlbind.hlsl drifted from trace_common.hlsli: `{decl}` is missing. The C3 \
+                 probe stands in for the real RP_SCENE_TEX table and stops standing for \
+                 anything the moment it declares something else."
+            );
+        }
+    }
+
+    /// The array and the samplers must be in DIFFERENT spaces, in both files.
+    ///
+    /// Separate from the byte-identity pin above on purpose. That one fails if
+    /// either file drifts from the other; this one fails if they drift TOGETHER
+    /// — a single edit that folded `texs[]` back beside the samplers would keep
+    /// them byte-identical and still break 19 modules on Metal, silently, on a
+    /// gate the editor most likely cannot run. The property is the split, so it
+    /// needs its own assertion.
+    #[test]
+    fn unbounded_array_is_alone_in_its_space() {
+        for (name, src) in
+            [("trace_common.hlsli", super::TRACE_COMMON_HLSLI), ("mtlbind.hlsl", super::MTLBIND_HLSL)]
+        {
+            let arr = declarations(src, Some("space2"));
+            assert_eq!(
+                arr.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+                vec!["texs[]"],
+                "{name}: space2 must hold `texs[]` and NOTHING else. A Metal argument \
+                 buffer cannot express an unsized array beside another resource — \
+                 spirv-cross drops the neighbour and reinterpret_casts the array's \
+                 storage in its place, which compiles and reads the wrong descriptor. \
+                 See trace_common.hlsli's declaration for the full rule."
+            );
+            assert!(
+                declarations(src, Some("space1")).iter().any(|&(n, _)| n == "samp_lin"),
+                "{name}: `samp_lin` left space1, so this test no longer proves the array \
+                 and the samplers are separated — it would pass on a file that put both \
+                 in space2 together"
             );
         }
     }
@@ -3614,17 +3655,19 @@ mod mtlbind_probe_shader_source_tests {
     /// silently dropped `space1` would make the pin above look complete while
     /// covering half the probe.
     #[test]
-    fn mtlbind_space1_block_is_reachable_and_unbounded() {
+    fn mtlbind_higher_sets_are_reachable_and_unbounded() {
         let set1 = declarations(super::MTLBIND_HLSL, Some("space1"));
         assert_eq!(
             set1.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
-            vec!["texs[]", "samp_lin", "samp_aniso", "set1_out"],
+            vec!["samp_lin", "samp_aniso", "set1_out"],
             "mtlbind.hlsl's space1 block changed shape"
         );
         // `texs[]` keeps its brackets through the parse, which is the only
         // textual trace of the unbounded array — `vk::reflect` reports it as
         // `count == 0` and K7 asserts that, but this is the cheap half and it
-        // runs on boxes with no Metal.
-        assert_eq!(set1[0], ("texs[]", SHIFT_T + 10));
+        // runs on boxes with no Metal. `t0` of a fresh space, not `t10`:
+        // register numbering restarts, which is why `gpu::trace::TEX_TABLE_BUFS`
+        // stopped doubling as the array's base register.
+        assert_eq!(declarations(super::MTLBIND_HLSL, Some("space2")).as_slice(), [("texs[]", SHIFT_T)]);
     }
 }

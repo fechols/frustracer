@@ -1935,7 +1935,22 @@ uint tri_of(uint inst, uint prim) { return prim; }
 // maps — Texture::srgb), carrying the FULL CPU-generated mip chain (built in
 // texture.rs::build_mips, uploaded verbatim — CPU-trilinear parity: both
 // samplers read identical texels at identical ray-cone lods).
-Texture2D<float4>        texs[]     : register(t10, space1);
+//
+// ALONE IN space2, AND THAT IS LOAD-BEARING. It is the corpus's only unbounded
+// array, and Metal argument buffers cannot express one beside anything else:
+// an array consumes one [[id]] PER ELEMENT (SPIRV-Cross README), so an unsized
+// one cannot reserve what it will consume and whatever shares its set collides.
+// spirv-cross then resolves the collision by DROPPING the loser and
+// reinterpret_casting this array's storage in its place — deliberately, per its
+// PR #2292 — which compiles, reaches AIR, and reads texture descriptors as a
+// sampler. It cost `samp_lin` in 19 modules before C3's probe read the
+// generated code; `mtl::msl::overlap_check` now refuses it outright.
+// The other backends were never affected and neither one had to change:
+// D3D12 permits a differently-spaced range inside the same descriptor table
+// (gpu/trace.rs::create_root_signature), and Vulkan derives its layouts from
+// reflection and finds this array by KIND rather than by set
+// (vk::layout, vk::tracer::bind_textures). Nothing else may join space2.
+Texture2D<float4>        texs[]     : register(t0, space2);
 // Static: trilinear, repeat wrap — texture.rs::sample_trilinear in hardware
 // (sRGB decode per texel via the SRGB SRV format, texel centers at i + 0.5;
 // every sample passes an explicit ray-cone lod to SampleLevel, and lod <= 0

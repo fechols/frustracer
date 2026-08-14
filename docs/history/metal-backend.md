@@ -835,16 +835,20 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # built for -- one argument buffer, at [[buffer(1)]]. C2's
                                       # `const BUFFER_INDEX: usize = 0` fails here and nowhere else in
                                       # the corpus, and so does a scan written as a dense 0..n loop.
-                                      # THE DEFECT, AND IT IS A SILENT MISCOMPILE. spirv-cross cannot
+                                      # THE FINDING, AND IT IS NOT A BUG -- though it was recorded as
+                                      # one first, and the correction is below. spirv-cross cannot
                                       # lay out a descriptor set holding an unsized array ALONGSIDE
                                       # anything else. It assigns two members the same [[id]], drops
                                       # one behind an "// Overlapping binding:" comment, and rewrites
                                       # that member's uses as a reinterpret_cast of the survivor's
                                       # storage. It COMPILES. It reaches AIR. It reads texture
-                                      # descriptor bytes as a sampler. On leaf and reference -- the
-                                      # shipping tracer kernels, both already counted among --check-msl
-                                      # 75/80 PASSES -- the casualty is samp_lin, the trilinear sampler
-                                      # every colour / normal / rough-metal read goes through:
+                                      # descriptor bytes as a sampler. The casualty is samp_lin, the
+                                      # trilinear sampler every colour / normal / rough-metal read goes
+                                      # through, and the blast radius was NINETEEN MODULES -- leaf,
+                                      # leaf_fb, reference and hemi_leaf across every vendor and sway arm,
+                                      # every one of them counted as a --check-msl PASS. Two were found by
+                                      # reading the generated code; the other seventeen only by writing the
+                                      # detector, which is the argument for writing it:
                                       #     spvDescriptor<texture2d<float>> texs [[id(4)]][1] /* unsized array hack */;
                                       #     // Overlapping binding: sampler samp_lin [[id(4)]];
                                       #     sampler samp_aniso [[id(5)]];
@@ -859,9 +863,47 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # correctly, no overlap anywhere:
                                       #     struct spvDescriptorSetBuffer1 { sampler samp_lin [[id(0)]]; sampler samp_aniso [[id(1)]]; ... };
                                       #     struct spvDescriptorSetBuffer2 { spvDescriptor<texture2d<float>> texs [[id(0)]][1]; };
-                                      # That is a change to trace_common.hlsli's RP_SCENE_TEX table --
-                                      # shared corpus, D3D12 root signature and the Vulkan layout, not
-                                      # a Metal-local fix -- so it is recorded here and NOT taken.
+                                      # TAKEN, after the framing above was corrected. It is NOT a tool bug:
+                                      # SPIRV-Cross PR #2292 ("MSL: Add support for overlapping bindings",
+                                      # merged 2024) added the drop-and-cast deliberately, and the README
+                                      # states the rule it follows -- "arrays of resources consume multiple
+                                      # ids, where Vulkan does not... This can be worked around either from
+                                      # shader authoring stage or remapping bindings as needed to avoid the
+                                      # overlap." An unsized array cannot reserve the ids it will consume,
+                                      # so its setmate collides. There is no fix to wait for and nothing to
+                                      # report; the installed 1.4.357.0 is already brew's current stable.
+                                      # WHY BOUNDING THE ARRAY LOST, since it is the obvious alternative and
+                                      # it is smaller: both existing backends deliberately chose scene-exact,
+                                      # UNCAPPED sizing -- gpu/trace.rs's range is NumDescriptors u32::MAX
+                                      # with the heap slice cut at init, and vk/tracer.rs sizes the layout to
+                                      # scene.textures.len(). A fixed N forces a global texture cap plus
+                                      # N - textures.len() null-descriptor padding into two working backends
+                                      # to accommodate a third that does not exist yet. A scene-derived N is
+                                      # worse: it makes shader SOURCE vary with texture count, so every asset
+                                      # edit is a fresh compile and corpus_units' source-hash dedupe stops
+                                      # meaning anything. The space move keeps both backends' design intact.
+                                      # AND IT COST THEM NOTHING, which is the part worth carrying: VULKAN
+                                      # NEEDED NO CODE CHANGE AT ALL. vk::layout::Layouts::build is generic
+                                      # over sets and derived from reflection, and vk::tracer::bind_textures
+                                      # finds the array BY KIND across every set -- find(SampledImage &&
+                                      # count == 0) -- then binds into self.sets[set]. The derived-layout
+                                      # decision (this file's own M3a argument) paid for itself here. D3D12
+                                      # is one descriptor range: RegisterSpace 2 and BaseShaderRegister 0,
+                                      # since numbering restarts per space. One table may span two spaces,
+                                      # and OffsetInDescriptorsFromTableStart is a HEAP fact rather than a
+                                      # register one, so the heap slice, its sizing and write_scene_descriptors
+                                      # are all untouched. TEX_TABLE_BUFS stops doubling as the array's base
+                                      # register and goes back to one meaning. Metal is one CROSS_ARGS flag,
+                                      # --msl-device-argument-buffer 2, derived from UNBOUNDED_ARRAY_SET.
+                                      # THE GATE LEARNED TO SEE IT: msl::overlap_check refuses either marker
+                                      # (the struct comment and the cast, INDEPENDENTLY -- a dropped member
+                                      # that is never used emits only the first). Teeth both ways, and the
+                                      # full revert is the honest arm: reverting the shaders ALONE fails 19
+                                      # modules on "Runtime sized variables must be in device storage
+                                      # argument buffers" -- loud, but that is CROSS_ARGS catching it, not
+                                      # the detector. Reverting the shaders AND the flag reproduces the
+                                      # original and fires the detector on all 19. A revert test that moves
+                                      # only half the fix proves the wrong half.
                                       # THE PROBE-REACH TRAP FIRED ON THE VERY MEASUREMENT THAT FOUND
                                       # THE FIX, exactly as FR_ABL's does. The first run of the
                                       # own-set experiment grepped 0 "Overlapping binding" lines and
@@ -876,7 +918,12 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # and 1 and 2 are byte-identical -- the check is >= Tier2, so
                                       # CROSS_ARGS's literal 2 is undocumented spelling and not a bug.
                                       # It is the only value that was ever exercised by texs[]-carrying
-                                      # modules, which is why they reached AIR at all.
+                                      # modules, which is why they reached AIR at all. The SET the companion
+                                      # --msl-device-argument-buffer names moved 1 -> 2 with the array; it is
+                                      # derived from UNBOUNDED_ARRAY_SET rather than written twice, because a
+                                      # literal left behind would not have failed loudly -- spirv-cross throws
+                                      # "Runtime sized variables must be in device storage argument buffers",
+                                      # which reads as a capability problem rather than as a stale constant.
                                       # CPU-ONLY TEETH, since --check-mtl needs a Metal device and is
                                       # not in CI: gfx/shaders.rs pins the probe's space1 block
                                       # BYTE-IDENTICAL to trace_common.hlsli's and pins its set-0

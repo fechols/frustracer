@@ -80,16 +80,22 @@
 //! touching the gap, which is itself the check that the probe added coverage
 //! and not exceptions.
 //!
-//! AND "REACHES AIR" IS NOT "IS CORRECT", which C3 had to learn the hard way.
-//! `leaf` and `reference` are two of the 78, and both are MISCOMPILED:
-//! spirv-cross cannot lay out a descriptor set holding an unsized array
-//! beside anything else, so it drops `samp_lin` behind an `// Overlapping
-//! binding:` comment and reinterpret_casts the texture array's storage in its
-//! place. This gate cannot see that — nothing here executes a kernel — and
-//! saying so is the point: `--check-msl` is a COMPILE gate, `--check-mtl` is
-//! where a map is proven, and the distance between them is exactly the
-//! failure class C3's probe exists to occupy. See `docs/history/
-//! metal-backend.md`'s C3 record.
+//! AND "REACHES AIR" IS NOT "IS CORRECT", which C3 learned the hard way and
+//! which `overlap_check` now covers. For eight months 19 of these modules —
+//! `leaf`, `leaf_fb`, `reference`, `hemi_leaf` across every vendor and sway
+//! arm — were counted as PASSES while `samp_lin` was not bound at all:
+//! spirv-cross cannot lay out a descriptor set holding an unsized array beside
+//! anything else, so it dropped the sampler behind an `// Overlapping binding:`
+//! comment and reinterpret_cast the texture array's storage in its place. That
+//! COMPILES. Nothing in a compile gate can see it.
+//!
+//! Two things came out of that and both are load-bearing. `texs[]` now lives
+//! ALONE in `space2` (`trace_common.hlsli` carries the rule), and
+//! `overlap_check` refuses the pattern outright, so the gate can no longer
+//! count a silently-wrong module. The general lesson is the one worth keeping:
+//! `--check-msl` asks "did it compile" and `--check-mtl` asks "is it bound",
+//! and the distance between those two questions is exactly where this hid.
+//! See `docs/history/metal-backend.md`'s C3 record.
 //!
 //! # The spirv-cross scoping defect, and how it was retired (C3)
 //!
@@ -170,14 +176,71 @@ pub const CROSS_ARGS: &[&str] = &[
     "--msl-argument-buffer-tier",
     "2",
     "--msl-device-argument-buffer",
-    "1",
+    "2",
 ];
+
+/// spirv-cross's announcement that it dropped an argument-buffer member.
+const OVERLAP_MARK: &str = "// Overlapping binding:";
+/// The cast it emits in the dropped member's place. Named separately because
+/// the two can appear apart: the comment is emitted at the struct, the cast at
+/// each use, and a member that is dropped but never used produces only the
+/// first. Either one alone is the failure.
+const OVERLAP_CAST: &str = "reinterpret_cast<const device sampler";
+
+/// Refuse generated MSL in which spirv-cross resolved an argument-buffer id
+/// collision by DROPPING a member and casting another in its place.
+///
+/// THIS IS NOT A TOOL BUG, and the message has to say so or the next reader
+/// will go looking for one. SPIRV-Cross PR #2292 ("MSL: Add support for
+/// overlapping bindings") added the behaviour deliberately, and the README
+/// states the rule it follows: *"arrays of resources consume multiple ids,
+/// where Vulkan does not… This can be worked around either from shader
+/// authoring stage or remapping bindings as needed to avoid the overlap."* An
+/// UNSIZED array cannot reserve the ids it will consume, so whatever shares its
+/// set collides, and the overlapping-bindings feature resolves the collision by
+/// reinterpret_cast. The output COMPILES and reaches AIR reading texture
+/// descriptor bytes as a sampler.
+///
+/// WHICH IS WHY THIS EXISTS AT ALL. `--check-msl` asks "did it compile", and
+/// for eight months the answer for `leaf` and `reference` was yes while
+/// `samp_lin` — the trilinear sampler every colour / normal / rough-metal read
+/// goes through — was not bound at all. A gate that counts a miscompile as a
+/// pass is the vacuity class this suite is built to rule out, and the C3 probe
+/// found it only because a human read the generated code.
+///
+/// Kept a free function over `&str` rather than a method so the pure `self_test`
+/// can exercise it with no spirv-cross, no device and no macOS.
+pub fn overlap_check(msl: &str) -> Result<(), String> {
+    let hit = msl.lines().find(|l| l.contains(OVERLAP_MARK) || l.contains(OVERLAP_CAST));
+    let Some(line) = hit else { return Ok(()) };
+    Err(format!(
+        "spirv-cross dropped an argument-buffer member to resolve an [[id]] \
+         collision: `{}`. This is DELIBERATE (SPIRV-Cross PR #2292) and not a \
+         bug to report: an unsized descriptor array consumes ids it cannot \
+         reserve, so anything sharing its descriptor set collides and is \
+         replaced by a reinterpret_cast of the array's storage — which compiles, \
+         reaches AIR, and reads the wrong descriptor. The fix is at the shader \
+         authoring stage, which the tool's own README names: give the unsized \
+         array its own register space, alone. Do NOT silence this by relaxing \
+         the check.",
+        line.trim()
+    ))
+}
 
 /// The descriptor set `--msl-device-argument-buffer` names, as a derivation
 /// rather than a literal: `texs[]` is the corpus's one unbounded array, it
-/// lives in `space1`, and the register space IS the descriptor set under the
+/// lives in `space2`, and the register space IS the descriptor set under the
 /// `-fvk-*-shift` scheme. `self_test` pins that the arg set carries this.
-pub const UNBOUNDED_ARRAY_SET: u32 = 1;
+///
+/// IT NAMES ONE SET, WHICH IS THE WHOLE REASON THIS IS DERIVED. The flag is
+/// per-set and repeatable, and `texs[]` moved from space1 to space2 the day C3
+/// found it could not share a set (`trace_common.hlsli` carries the rule). A
+/// literal `1` left behind would not have failed loudly — spirv-cross throws
+/// "Runtime sized variables must be in device storage argument buffers", which
+/// reads as a capability problem rather than as a stale constant. The gate's
+/// FIRST run of that experiment counted zero overlaps in that exception's
+/// output and read it as clean; see the archive.
+pub const UNBOUNDED_ARRAY_SET: u32 = 2;
 
 /// What a unit is expected to do, and why.
 ///
@@ -333,7 +396,10 @@ impl Msl {
                 first.strip_prefix("SPIRV-Cross threw an exception: ").unwrap_or(first)
             ));
         }
-        String::from_utf8(out.stdout).map_err(|e| format!("spirv-cross emitted non-UTF-8: {e}"))
+        let msl = String::from_utf8(out.stdout)
+            .map_err(|e| format!("spirv-cross emitted non-UTF-8: {e}"))?;
+        overlap_check(&msl)?;
+        Ok(msl)
     }
 
     /// MSL -> AIR -> `.metallib`, returning the library bytes.
@@ -478,6 +544,56 @@ pub fn self_test() -> Result<(), String> {
                  space{UNBOUNDED_ARRAY_SET} so the set must be {want}"
             ))
         }
+    }
+
+    // `overlap_check` both ways, on VERBATIM spirv-cross output rather than on
+    // a paraphrase — a detector tested against a string this file also wrote is
+    // testing its own spelling. The positive case is the shipping `leaf`
+    // set-1 struct as it was emitted before `texs[]` moved to its own space;
+    // the negative is the same struct after.
+    const DROPPED: &str = "\
+struct spvDescriptorSetBuffer1
+{
+    device type_StructuredBuffer_uint* chunk_base [[id(3)]];
+    spvDescriptor<texture2d<float>> texs [[id(4)]][1] /* unsized array hack */;
+    // Overlapping binding: sampler samp_lin [[id(4)]];
+    sampler samp_aniso [[id(5)]];
+};
+    const device auto &samp_lin = reinterpret_cast<const device sampler &>(spvDescriptorSet1.texs);";
+    const CLEAN: &str = "\
+struct spvDescriptorSetBuffer1
+{
+    device type_StructuredBuffer_uint* chunk_base [[id(3)]];
+    sampler samp_lin [[id(4)]];
+    sampler samp_aniso [[id(5)]];
+};
+struct spvDescriptorSetBuffer2
+{
+    spvDescriptor<texture2d<float>> texs [[id(0)]][1] /* unsized array hack */;
+};";
+    match overlap_check(DROPPED) {
+        Err(e) if e.contains("samp_lin") => {}
+        Err(e) => return Err(format!("overlap_check fired but did not name the member: {e}")),
+        Ok(()) => {
+            return Err("overlap_check PASSED the dropped-member MSL — the marker it \
+                        scans for no longer matches what spirv-cross emits, so the \
+                        check is silent on the exact failure it was written for"
+                .into())
+        }
+    }
+    // The two markers must be independently sufficient: a dropped member that
+    // is never USED emits the comment and no cast, and a check that demanded
+    // both would miss it.
+    for (only, what) in [(OVERLAP_MARK, "the struct comment"), (OVERLAP_CAST, "the cast")] {
+        if overlap_check(&format!("    {only} sampler x [[id(0)]];")).is_ok() {
+            return Err(format!("overlap_check needs BOTH markers — {what} alone is silent"));
+        }
+    }
+    if let Err(e) = overlap_check(CLEAN) {
+        return Err(format!(
+            "overlap_check rejected MSL with the array in its OWN set, which is the \
+             arrangement the corpus now uses — it would fail every run: {e}"
+        ));
     }
 
     // The classification. Both non-Metallib arms must be reachable, or the

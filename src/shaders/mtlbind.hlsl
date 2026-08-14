@@ -49,19 +49,25 @@
 //    and touching the corpus's `texs[]` now trips a CPU-only test rather than
 //    nothing.
 //
-// WHAT IT FOUND, FIRST RUN. Property 3 is why this mattered: spirv-cross
-// MISCOMPILES any descriptor set holding an unsized array alongside anything
+// WHAT IT FOUND, FIRST RUN — and property 3 is why it mattered. spirv-cross
+// cannot lay out a descriptor set holding an unsized array alongside anything
 // else. It drops one member with an `// Overlapping binding:` comment and
-// rewrites its uses as a `reinterpret_cast` of the array's storage — it
-// COMPILES, reaches AIR, and reads texture descriptor bytes as a sampler. In
-// the shipping corpus the casualty is `samp_lin`, the trilinear sampler every
-// colour/normal/rough-metal read goes through. Measured on `leaf`, `reference`
-// and both probe kernels; no ordering inside one set avoids it (array first
-// drops the next member, array last or middle drops the array); the array
-// ALONE in its own set is clean. `docs/history/metal-backend.md` carries the
-// verbatim output and the arrangement that works. Nothing here is a
-// workaround yet — the fix moves `texs[]` to its own space and that is a
-// shared-corpus decision, not a Metal one.
+// rewrites its uses as a `reinterpret_cast` of the array's storage: it
+// COMPILES, reaches AIR, and reads texture descriptor bytes as a sampler. The
+// casualty was `samp_lin` — the trilinear sampler every colour/normal/
+// rough-metal read goes through — in 19 modules across `leaf`, `leaf_fb`,
+// `reference` and `hemi_leaf`, all of which `--check-msl` had been counting as
+// PASSES. No ordering inside one set avoids it (array first drops the next
+// member, array last or middle drops the array); the array ALONE in its own set
+// is clean.
+//
+// IT IS NOT A TOOL BUG: SPIRV-Cross PR #2292 added the behaviour deliberately,
+// and its README states the rule — an array consumes one id per ELEMENT, so an
+// unsized one cannot reserve them. The fix was taken at the shader-authoring
+// stage the README names: `texs[]` is alone in space2, here and in
+// trace_common.hlsli, and `mtl::msl::overlap_check` refuses the pattern so it
+// cannot come back quietly. `docs/history/metal-backend.md` carries the
+// verbatim output, the arrangements that fail, and why bounding the array lost.
 
 // ---- set 0 -----------------------------------------------------------------
 // Declared t, s, s, u ON PURPOSE. See property 1 above; do not sort.
@@ -70,14 +76,17 @@ SamplerState             samp_clamp  : register(s0);  // nearest + clamp
 SamplerState             samp_repeat : register(s1);  // nearest + repeat
 RWStructuredBuffer<uint> outbuf      : register(u0);
 
-// ---- set 1 -----------------------------------------------------------------
-// The next three lines are trace_common.hlsli's, verbatim. Property 3.
-Texture2D<float4>        texs[]     : register(t10, space1);
+// ---- sets 1 and 2 ----------------------------------------------------------
+// The next three lines are trace_common.hlsli's, verbatim. Property 3 — and
+// the SPLIT is the thing being copied, not just the declarations: `texs[]` is
+// alone in space2 because an unsized array cannot share a Metal argument
+// buffer, which is what this probe found. See trace_common.hlsli for the rule.
+Texture2D<float4>        texs[]     : register(t0, space2);
 SamplerState             samp_lin   : register(s0, space1);
 SamplerState             samp_aniso : register(s1, space1);
 // NOT from trace_common — the real table is read-only, but `cs_set1` has to
-// have somewhere to write that is not set 0, or it would reference both sets
-// and stop proving that its one argument buffer lands at [[buffer(1)]].
+// have somewhere to write that is not set 0, or it would reference set 0 and
+// stop proving that a kernel's argument buffers are found rather than assumed.
 RWStructuredBuffer<uint> set1_out   : register(u0, space1);
 
 // The texel payload is `0xC30000 | i`, and it is the HOST's constant, stated
@@ -122,12 +131,15 @@ void cs_arr(uint3 id : SV_DispatchThreadID)
     outbuf[TEX_N + 1] = (uint)texs[1].SampleLevel(samp_aniso, float2(0.5, 0.5), 0).x;
 }
 
-// ---- set 1 only ------------------------------------------------------------
-// References nothing in space0, so this kernel's ONE argument buffer must be
-// bound at [[buffer(1)]]. C2's `const BUFFER_INDEX: usize = 0` fails here and
-// nowhere else in the corpus — and so does a replacement written as a dense
-// 0..n loop over the buffers a kernel happens to have. The index has to come
-// out of reflection.
+// ---- no set 0 --------------------------------------------------------------
+// References nothing in space0, so this kernel's argument buffers land at
+// [[buffer(1)]] and [[buffer(2)]] and there is NOTHING at index 0. C2's
+// `const BUFFER_INDEX: usize = 0` fails here and nowhere else in the corpus —
+// and so does a replacement written as a dense 0..n loop over the buffers a
+// kernel happens to have. The index has to come out of reflection.
+//
+// It read one buffer at [[buffer(1)]] until `texs[]` moved to its own space;
+// two non-contiguous-from-zero indices is the same property, proven harder.
 [numthreads(1, 1, 1)]
 void cs_set1(uint3 id : SV_DispatchThreadID)
 {
