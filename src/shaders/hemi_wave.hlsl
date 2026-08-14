@@ -14,9 +14,16 @@
 // a dynamically indexed local array becomes an `internal constant [18 x float]`
 // global plus a load per component in DXIL, while the switch folds to `phi`s and
 // touches no memory at all (measured on SDKs/dxc-macos, `-T cs_6_5 -HV 2021
-// -O3 -Fc`). `cs_hemi_cell` is measured at 240 VGPR / 6-of-16 waves
-// (docs/history/profiling.md) — the regime where `leaf-fb`'s +24 VGPRs cost a
-// whole wave slot — so the free form is the one to spell.
+// -O3 -Fc`). Confirmed to survive to RDNA4: `internal constant` is 0 and scratch
+// stays 640 B in both arms (RGA 2.14.2, gfx1201 — docs/history/profiling.md).
+//
+// THE OCCUPANCY WORRY THIS WAS WRITTEN AGAINST TURNED OUT NOT TO EXIST, and the
+// note is here so nobody re-derives it: profiling.md's `hemi_cell 240 VGPR /
+// 6-of-16` row is STALE. Re-read on the current tree, `cs_hemi_cell` allocates
+// 96 VGPRs — 1536/96 = 16 of 16 waves/SIMD, the cap — and `cs_hemi_root` 80.
+// Neither is VGPR-limited, and the before/after of this change moves nothing in
+// any arm. The switch form is still the right spelling (it is free), but it is
+// not load-bearing for occupancy the way the first draft of this comment said.
 float3 check_dir_w(uint i) {
     switch (i) {
         case 0:  return float3(1, 1, 1);
@@ -46,9 +53,16 @@ void check_empty_cell(float3 o, float3 a, float3 b, float3 c, float t_lim) {
     // program D3D12 and Vulkan actually ship. `cargo test`'s hemi-wave source pin
     // is what keeps a well-meaning revert to `[unroll]` from landing.
     //
-    // It also costs the two backends that were already fine strictly less work:
-    // `cs_hemi_root` drops from ~24 inlined `RayQuery` bodies to 4 (this loop
-    // sits inside a 4-octant `for`), `cs_hemi_cell` from 6 to 1.
+    // WHAT IT COSTS THE TWO BACKENDS THAT WERE ALREADY FINE: measured, nothing.
+    // In DXIL it does what you would expect — `dx.op.allocateRayQuery` 7 -> 2,
+    // and THAT is the layer spirv-cross consumes, which is why the Metal fix
+    // works. It does NOT survive to RDNA4 machine code: `image_bvh*_intersect_ray`
+    // sites stay 6 and 12 in BOTH arms, because the AMD backend re-rolls or
+    // re-unrolls to its own taste regardless of the attribute. An HLSL loop
+    // attribute is a statement to the FRONT end; do not infer a machine-code
+    // shape from it. VGPR/waves/scratch are unmoved on both the procedural and
+    // san-miguel-lp arms; the ISA delta is scheduling (+8 s_nop, ±2 VALU, zero
+    // new memory ops).
     [loop] for (uint i = 0; i < 6; ++i) {
         float3 W = check_dir_w(i);
         float3 d = normalize(a * W.x + b * W.y + c * W.z);

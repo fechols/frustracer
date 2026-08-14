@@ -69,10 +69,47 @@
 //!
 //! # What compiles, measured
 //!
-//! **65 of 78 modules reach AIR under one uniform recipe**, no per-unit
-//! conditionals. The 13 that do not are exactly two classes, and `Expect`
-//! below names both — see its doc for why a gate that merely skipped them
-//! would be worse than useless.
+//! **75 of 80 modules reach AIR under one uniform recipe**, no per-unit
+//! conditionals. The 5 that do not are one class — `dxr-lib`, `Expect::
+//! NoAnalogue` — and `Expect`'s doc says why a gate that merely skipped them
+//! would be worse than useless. 80 − 75 = 5 is the whole remaining gap, so the
+//! count is self-checking against that class's size.
+//!
+//! # The spirv-cross scoping defect, and how it was retired (C3)
+//!
+//! Until C3 a second class, `Expect::ToolDefect`, held exactly one unit. The
+//! record is kept here because the variant is gone:
+//!
+//! `hemi_wave.hlsl::check_empty_cell` called `occluded_q` six times under
+//! `[unroll]`. Each call declares its own `RayQuery`, but SPIR-V requires every
+//! `OpVariable` in a function's FIRST block, so the six unrolled bodies shared
+//! one function-scope variable — and spirv-cross then declared it inside a
+//! `do{}while(false)` and referenced it after that block closed, giving `use of
+//! undeclared identifier '_194'`. **Eight modules.** It needed the OPAQUE
+//! `occluded_q` (`rt.hlsli`'s `#else` arm), so it was configuration-dependent —
+//! which is why the class was REPORTED rather than required:
+//!
+//! * procedural scene, hardware rays: 8 modules failed (67/80)
+//! * a scene arming `ALPHA_CUTOUT`/`TRANS_SHADOW` (san-miguel): the
+//!   candidate-loop arm is structured differently and compiled (75/80)
+//! * `--sw-rays`: `rt_sw.hlsli` has no `RayQuery`, so nothing to mis-scope (63/68)
+//!
+//! MEASURED IDENTICAL on spirv-cross 1.4.350.1 and 1.4.357.0 — not a stale-tool
+//! artifact. The fix is `[loop]` for `[unroll]` plus a `switch`-returning weight
+//! helper, shipped in the SHARED corpus (a per-backend arm would mean this gate
+//! stops covering the program D3D12 and Vulkan actually ship). The procedural
+//! arm then lands on 75/80 — **exactly san-miguel's existing number**, which is
+//! the check that it changed what it meant to and nothing else.
+//!
+//! It cost the two backends that were already fine nothing, and the way that was
+//! established is worth carrying: in DXIL `dx.op.allocateRayQuery` goes 7 → 2 —
+//! the layer spirv-cross consumes, and why this works at all — but on RDNA4 the
+//! `image_bvh*_intersect_ray` sites stay 6 and 12 in BOTH arms, because the AMD
+//! backend re-rolls to its own taste regardless of the attribute. **An HLSL loop
+//! attribute is a statement to the FRONT end.** VGPR/waves/scratch unmoved; see
+//! `docs/history/profiling.md`. `cargo test`'s rolled-grid pin is what keeps a
+//! revert to `[unroll]` — which reads faster and looks better — from landing
+//! green on the two platforms that cannot run `--check-msl`.
 //!
 //! # The finding that overturned the plan: hardware ray tracing WORKS
 //!
@@ -131,18 +168,18 @@ pub const UNBOUNDED_ARRAY_SET: u32 = 1;
 /// A gate that only checked "did the expected-to-work units work" would go
 /// green while the known-failing list silently rotted — a workaround could
 /// land, or spirv-cross could fix the bug, and nothing would say so. So the
-/// two failing classes carry teeth against staleness as well; **what differs
-/// is how hard, and the asymmetry is deliberate rather than an oversight.**
+/// failing class carries teeth against staleness as well.
 ///
 /// * `NoAnalogue` is a CAPABILITY claim, so it is hard in BOTH directions: it
 ///   must still be reached, and one compiling is a FAIL with an instruction in
 ///   it. Metal either has an analogue for a DXIL ray-tracing library or it
 ///   does not, and that answer cannot vary with the scene.
-/// * `ToolDefect` is a BUG-PRESENCE claim, which is a property of the
-///   configuration and the tool version — so it is REPORTED, never required.
-///   Demanding it fire would fail the gate on exactly the configurations where
-///   the corpus does BETTER; see the variant's own doc for the three measured
-///   arms.
+///
+/// **There were two failing classes, and `ToolDefect` was RETIRED in C3 rather
+/// than left with no members** — an unreachable variant makes the sentence above
+/// false, which is the staleness this enum exists to prevent. It held exactly
+/// one unit, `hemi_wave`, and the finding is kept in the module header rather
+/// than deleted with the code.
 ///
 /// Read `run_check_msl`'s M5 block with this: the verdict is per class, and
 /// the only unconditional failure is an `Expect::Metallib` unit that refused.
@@ -158,39 +195,6 @@ pub enum Expect {
     /// nothing, because what is being ported is the wavefront tracer, and the
     /// wavefront's own ray-shooting kernels compile WITH hardware ray tracing.
     NoAnalogue,
-    /// An upstream spirv-cross scoping defect, not a corpus problem.
-    ///
-    /// `hemi_wave.hlsl::check_empty_cell` calls `occluded_q` six times under
-    /// `[unroll]`. Each call declares its own `RayQuery`, but SPIR-V requires
-    /// every `OpVariable` in a function's FIRST block, so the six unrolled
-    /// bodies share one function-scope variable — and spirv-cross then
-    /// declares it inside a `do{}while(false)` block and references it after
-    /// that block closes, giving `use of undeclared identifier '_194'`.
-    ///
-    /// IT IS CONFIGURATION-DEPENDENT, and that is why this class is REPORTED
-    /// rather than required (see `run_check_msl`'s verdict). The defect needs
-    /// the OPAQUE `occluded_q` — `rt.hlsli`'s `#else` arm — so:
-    ///
-    /// * procedural scene, hardware rays: 8 modules fail (65/78)
-    /// * a scene arming `ALPHA_CUTOUT`/`TRANS_SHADOW` (san-miguel): the
-    ///   candidate-loop arm is structured differently and compiles (73/78)
-    /// * `--sw-rays`: `rt_sw.hlsli` has no `RayQuery` at all, so there is no
-    ///   function-scope query variable to mis-scope (61/66)
-    ///
-    /// A bug's PRESENCE is a property of the configuration and the tool
-    /// version, unlike `NoAnalogue`'s capability claim — so demanding that it
-    /// still reproduce would make the gate fail on exactly the scenes where
-    /// the corpus does BETTER.
-    ///
-    /// MEASURED IDENTICAL on spirv-cross 1.4.350.1 and 1.4.357.0, so it is not
-    /// a stale-tool artifact. A workaround is measured and NOT shipped:
-    /// `[loop]` instead of `[unroll]` takes the corpus to 73/78. It is a
-    /// codegen change to a path D3D12 and Vulkan both compile and neither is
-    /// verifiable from a macOS box, for code that only runs under a verify
-    /// probe — so it belongs to the milestone that needs `hemi_wave` to
-    /// actually RUN, with those two suites re-run, rather than to a gate whose
-    /// product is a measurement.
-    ToolDefect,
 }
 
 /// Classify a unit by the name `--check-spirv` gives it (`hemi_wave[Nvidia]`,
@@ -201,7 +205,6 @@ pub fn expect_of(unit: &str) -> Expect {
     let base = unit.split('[').next().unwrap_or(unit);
     match base {
         "dxr-lib" => Expect::NoAnalogue,
-        "hemi_wave" => Expect::ToolDefect,
         _ => Expect::Metallib,
     }
 }
@@ -466,8 +469,14 @@ pub fn self_test() -> Result<(), String> {
     let cases: [(&str, Expect); 6] = [
         ("dxr-lib[0]", Expect::NoAnalogue),
         ("dxr-lib[3]", Expect::NoAnalogue),
-        ("hemi_wave[Nvidia]", Expect::ToolDefect),
-        ("hemi_wave[Amd+sway]", Expect::ToolDefect),
+        // POSITIVE pins, and they are the retired class's replacement. Under
+        // `ToolDefect` a regression was merely REPORTED; as `Metallib` a revert
+        // to `[unroll]` — or a spirv-cross change that reintroduces the
+        // mis-scope — is a hard `FAIL M4` on every arm. Both vendor spellings,
+        // because `expect_of` prefix-matches and a change to that split would
+        // otherwise reclassify one arm silently.
+        ("hemi_wave[Nvidia]", Expect::Metallib),
+        ("hemi_wave[Amd+sway]", Expect::Metallib),
         ("leaf[Nvidia]", Expect::Metallib),
         ("bloom", Expect::Metallib),
     ];

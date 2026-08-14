@@ -14566,8 +14566,7 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
     // Per-class tallies. Both halves are kept for each, because "how many of
     // this class failed" and "how many compiled anyway" are different facts
     // and the verdict below treats the two classes ASYMMETRICALLY.
-    let (mut no_analogue, mut tool_defect) = (0usize, 0usize);
-    let mut defect_ok = 0usize;
+    let mut no_analogue = 0usize;
     let mut surprises: Vec<String> = Vec::new();
     let mut list: Vec<String> = Vec::new();
     for (name, src, shape) in &units {
@@ -14618,22 +14617,11 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
                          did; move it to Metallib and record what changed"
                     ));
                 }
-                (Ok(n), Expect::ToolDefect) => {
-                    // SOFT, and deliberately: a codegen bug's presence is a
-                    // property of the configuration and the tool version. This
-                    // very unit compiles on an ALPHA_CUTOUT scene and under
-                    // --sw-rays. Failing here would fail the gate on exactly
-                    // the configurations where the corpus does BETTER.
-                    lib_ok += 1;
-                    lib_bytes += n;
-                    defect_ok += 1;
-                }
                 (Err(e), Expect::Metallib) => {
                     eprintln!("check-msl: FAIL M4 {what}: {e}");
                     ok = false;
                 }
                 (Err(_), Expect::NoAnalogue) => no_analogue += 1,
-                (Err(_), Expect::ToolDefect) => tool_defect += 1,
             }
         }
     }
@@ -14678,23 +14666,15 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
          {lib_ok} metallib ({lib_bytes} B)",
         units.len()
     );
+    // ONE expected-failure class since C3 retired `ToolDefect`. The count is
+    // self-checking against the total: everything that is not `dxr-lib` must
+    // reach a metallib, so `spv - lib_ok` and `no_analogue` are the same number
+    // and a divergence means a unit failed silently in a class that no longer
+    // exists.
     println!(
         "check-msl: M5 expected failures — {no_analogue} DXR-library (no Metal analogue), \
-         {tool_defect} spirv-cross scoping defect (see mtl::msl::Expect)"
+         see mtl::msl::Expect"
     );
-    // Say when the defect did not reproduce, rather than leaving a silent
-    // zero: that zero is a real difference between configurations (the opaque
-    // `occluded_q` arm is what trips it), and reading it as "the gate covered
-    // everything" is the mistake this line exists to prevent.
-    if tool_defect == 0 && defect_ok > 0 {
-        println!(
-            "check-msl: M5 NOTE the spirv-cross scoping defect did NOT reproduce in \
-             this configuration — {defect_ok} ToolDefect-classified module(s) compiled. \
-             That is expected on an ALPHA_CUTOUT/TRANS_SHADOW scene and under \
-             --sw-rays; the procedural scene with hardware rays is the arm that \
-             reproduces it."
-        );
-    }
     if std::env::var_os("FR_MSL_LIST").is_some() {
         for l in &list {
             println!("check-msl:   {l}");
