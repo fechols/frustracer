@@ -10,9 +10,9 @@
 //! `--msl-decoration-binding` deliberately off — spirv-cross moves every
 //! resource inside a per-descriptor-set struct as `[[id(n)]]`. **Those ids are
 //! not the SPIR-V bindings.** They are dense, sequential, and assigned in
-//! ascending binding order over *only the resources that entry point
-//! references*. MEASURED on `smoke.hlsl`, whose three kernels share one file and
-//! disagree with each other:
+//! **DECLARATION** order — the module's `OpVariable` stream — over *only the
+//! resources that entry point references*. MEASURED on `smoke.hlsl`, whose three
+//! kernels share one file and disagree with each other:
 //!
 //! ```text
 //!            [[id(0)]]              [[id(1)]]
@@ -31,6 +31,24 @@
 //! (This corrects the measurement recorded at `msl.rs:38-47`. That
 //! `[[id(0)]] [[id(1000)]] [[id(2000)]] [[id(3000)]]` layout is what you get
 //! when `--msl-decoration-binding` IS passed. It is not the shipping arg set.)
+//!
+//! **C2 SAID "ASCENDING BINDING ORDER" AND IT WAS WRONG — corrected in C3.**
+//! The table above is consistent with BOTH rules, because `smoke.hlsl` declares
+//! `b1`, `u0`, `u1`, `u2` in that order: declaration order and binding order
+//! coincide, and it was the only unit C2 bound. Measured on an FFX module whose
+//! twelve resources are dense `[[id(0..11)]]`, cross-read with `spirv-dis`:
+//!
+//! ```text
+//!   [[id]]   0   1   2   3   4   5   6     7   8   9  10  11
+//!   binding  12  8   3   9  10   5  1001   7  11   2   0   1
+//! ```
+//!
+//! Under the old rule `[[id(0)]]` would have to be binding 0. It is binding 12,
+//! and binding 0 sits at `[[id(10)]]`. **Every unit that declares a `t` before a
+//! `u` disagrees**, since `SHIFT_T` < `SHIFT_U` — so the old pin fired on correct
+//! code the moment the subject stopped being `smoke.hlsl`. `reflect::Desc::decl`
+//! carries the order the `(set, binding)` sort destroys; `cross_check` is its
+//! only consumer.
 //!
 //! # Two derivations, cross-checked — the M2c lesson in Metal's idiom
 //!
@@ -492,19 +510,33 @@ pub fn cross_check(metal: &ArgMap, spv: &[reflect::Desc]) -> Vec<String> {
     }
 
     // THE PIN THAT MAKES THE MEASUREMENT A CLAIM. spirv-cross assigns ids
-    // densely, in ascending binding order, over the referenced resources only.
-    // This does not hardcode an id — the map is still read off the function —
-    // it asserts the RULE the map was measured to follow, so a change in
-    // spirv-cross's assignment is a loud finding instead of a silently
+    // densely, in **DECLARATION** order — the module's `OpVariable` stream —
+    // over the referenced resources only. This does not hardcode an id (the map
+    // is still read off the function); it asserts the RULE, so a change in
+    // spirv-cross's assignment is a loud finding rather than a silently
     // different binding.
-    let mut by_binding: Vec<(u32, &str)> =
-        spv.iter().map(|d| (d.binding, d.name.as_str())).collect();
-    by_binding.sort();
-    for (want_id, (_, name)) in by_binding.iter().enumerate() {
+    //
+    // C2 SAID "ASCENDING BINDING ORDER" AND THAT WAS WRONG. It passed because
+    // `smoke.hlsl` declares b1, u0, u1, u2 — declaration order and binding order
+    // coincide there by accident, and it is the only unit C2 bound. Measured on
+    // FFX (one module, ids dense 0..11, cross-read with spirv-dis):
+    //
+    //   [[id]]   0   1   2   3   4   5   6     7   8   9  10  11
+    //   binding  12  8   3   9  10   5  1001   7  11   2   0   1
+    //
+    // Under the old rule `[[id(0)]]` would have to be binding 0; it is binding
+    // 12, and binding 0 sits at `[[id(10)]]`. Any unit whose declaration order
+    // disagrees with its binding order — which is every unit that declares a
+    // `t` before a `u`, since SHIFT_T < SHIFT_U — fired the old pin on CORRECT
+    // code. `reflect::Desc::decl` exists to carry the order the `(set, binding)`
+    // sort destroys.
+    let mut by_decl: Vec<(u32, &str)> = spv.iter().map(|d| (d.decl, d.name.as_str())).collect();
+    by_decl.sort();
+    for (want_id, (_, name)) in by_decl.iter().enumerate() {
         if let Some(s) = metal.slot(name) {
             if s.id as usize != want_id {
                 bad.push(format!(
-                    "`{name}` is at [[id({})]]; ascending-binding order puts it at {want_id} — \
+                    "`{name}` is at [[id({})]]; declaration order puts it at {want_id} — \
                      spirv-cross's id assignment changed, so the pin must be re-measured \
                      (do NOT patch it with a constant)",
                     s.id
@@ -527,16 +559,20 @@ pub fn self_test() -> Result<(), String> {
         ],
         encoded_len: 16,
     };
-    let desc = |name: &str, binding: u32| reflect::Desc {
+    let desc = |name: &str, binding: u32, decl: u32| reflect::Desc {
         set: 0,
         binding,
         kind: DescKind::StorageBuffer,
         count: 1,
         name: name.into(),
+        decl,
     };
+    // `smoke.hlsl` declares `counters` (u0) before `args` (u1), so here
+    // declaration order and binding order AGREE. That agreement is exactly why
+    // C2 could measure the id rule wrong and still pass — see `cross_check`.
     let spv = vec![
-        desc("counters", crate::spirv::binding_of(Reg::U, 0)),
-        desc("args", crate::spirv::binding_of(Reg::U, 1)),
+        desc("counters", crate::spirv::binding_of(Reg::U, 0), 0),
+        desc("args", crate::spirv::binding_of(Reg::U, 1), 1),
     ];
     let bad = cross_check(&map, &spv);
     if !bad.is_empty() {
@@ -552,15 +588,54 @@ pub fn self_test() -> Result<(), String> {
         return Err("cross_check accepted a member with no SPIR-V descriptor".into());
     }
 
-    // The ids no longer follow ascending binding order. This is the pin that
-    // turns the measurement into a claim, and it is the one a future
-    // spirv-cross could break.
+    // The ids no longer follow declaration order. This is the pin that turns the
+    // measurement into a claim, and it is the one a future spirv-cross could
+    // break.
     let mut swapped = map.clone();
     swapped.slots[0].id = 1;
     swapped.slots[1].id = 0;
     let bad = cross_check(&swapped, &spv);
     if !bad.iter().any(|b| b.contains("id assignment changed")) {
-        return Err(format!("cross_check accepted ids out of binding order: {bad:?}"));
+        return Err(format!("cross_check accepted ids out of declaration order: {bad:?}"));
+    }
+
+    // THE TOOTH FOR THE CORRECTION ITSELF, and it is the one case the old rule
+    // got wrong rather than merely stated oddly. Declare the resources in the
+    // order u1, u0 — so declaration order and binding order DISAGREE — and give
+    // the ids in declaration order, which is what spirv-cross actually emits.
+    // The corrected pin must ACCEPT this; the old ascending-binding pin rejected
+    // it, and that is the whole bug.
+    let mut rev = vec![
+        desc("args", crate::spirv::binding_of(Reg::U, 1), 0),
+        desc("counters", crate::spirv::binding_of(Reg::U, 0), 1),
+    ];
+    let rev_map = ArgMap {
+        buffer_index: 0,
+        slots: vec![
+            Slot { id: 0, name: "args".into(), offset: 0 },
+            Slot { id: 1, name: "counters".into(), offset: 8 },
+        ],
+        encoded_len: 16,
+    };
+    let bad = cross_check(&rev_map, &rev);
+    if !bad.is_empty() {
+        return Err(format!(
+            "cross_check REJECTED declaration-ordered ids whose bindings descend — this is \
+             exactly the case the C2 ascending-binding pin got wrong, so a failure here means \
+             the correction was reverted: {bad:?}"
+        ));
+    }
+    // …and it must still bite when the ids disagree with declaration order on
+    // that same disagreeing layout, or the acceptance above proves nothing.
+    rev.swap(0, 1);
+    rev[0].decl = 0;
+    rev[1].decl = 1;
+    let bad = cross_check(&rev_map, &rev);
+    if !bad.iter().any(|b| b.contains("id assignment changed")) {
+        return Err(format!(
+            "cross_check accepted ids that contradict declaration order on a layout whose \
+             bindings descend — the corrected pin is vacuous: {bad:?}"
+        ));
     }
 
     // A member from another descriptor set riding this buffer.

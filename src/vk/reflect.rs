@@ -141,6 +141,21 @@ pub struct Desc {
     /// ("t7 is `tlas` in one unit and `sw_tri` in another") rather than a pair
     /// of numbers.
     pub name: String,
+    /// This descriptor's ordinal in the module's **`OpVariable` stream** — the
+    /// order the variables are DECLARED in, which the `(set, binding)` sort
+    /// below deliberately destroys.
+    ///
+    /// NOT debug-only, and it is here because a Metal consumer cannot do its
+    /// job without it. spirv-cross assigns argument-buffer `[[id(n)]]` densely
+    /// **in declaration order**, not in binding order — measured on FFX, where
+    /// `[[id(0)]]` is binding 12 and binding 0 lands at `[[id(10)]]`. Nothing
+    /// on the Vulkan side reads this; `mtl::bind::cross_check` is the consumer,
+    /// and without it the second derivation cannot express the rule at all.
+    ///
+    /// It is the ordinal over DESCRIPTORS, not over all variables: the pass
+    /// below skips every variable lacking both decorations, and those are not
+    /// resources spirv-cross would number.
+    pub decl: u32,
 }
 
 /// The union of what a set of modules declares — i.e. the pipeline layout the
@@ -483,14 +498,22 @@ pub fn reflect(words: &[u32]) -> Result<Vec<Desc>, String> {
             }
         };
 
+        // `vars` was filled in `OP_VARIABLE` order by pass 1 and this loop walks
+        // it in that order, so `out.len()` IS the declaration ordinal — taken
+        // BEFORE the push, and before the sort below throws the order away.
+        let decl = out.len() as u32;
         out.push(Desc {
             set,
             binding,
             kind,
             count,
             name: name_of.get(&id).cloned().unwrap_or_default(),
+            decl,
         });
     }
+    // Sorted by (set, binding) because every Vulkan consumer wants layout order.
+    // `decl` is what survives it — see its doc: the Metal argument-buffer id
+    // rule is declaration-ordered, and this sort is exactly what would hide it.
     out.sort_by_key(|d| (d.set, d.binding));
     Ok(out)
 }
@@ -634,6 +657,7 @@ pub fn self_test() -> Result<(), String> {
         kind: DescKind::StorageImage,
         count: 1,
         name: "hdr".into(),
+        decl: 0,
     }];
     if map.add("c", &clash).is_empty() {
         return Err("a type conflict at one slot went unreported".into());
@@ -649,6 +673,7 @@ pub fn self_test() -> Result<(), String> {
             kind: DescKind::StorageBuffer,
             count: 1,
             name: "wrong".into(),
+            decl: 0,
         }],
     );
     if bad.class_violations().is_empty() {
