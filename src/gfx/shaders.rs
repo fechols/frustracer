@@ -3314,3 +3314,131 @@ mod nrd_clean_room_tests {
         );
     }
 }
+
+/// `hemi_wave.hlsl`'s verify oracle carries one ordering statement that no
+/// CPU-only gate can reach and that only ONE backend's toolchain punishes —
+/// see `check_empty_cells_ray_grid_stays_rolled` for why it lives here rather
+/// than behind a Metal define.
+#[cfg(test)]
+mod hemi_verify_shader_source_tests {
+    /// Drops prose, keeps code, on the same line. Duplicated per test module
+    /// in this file by convention — the alternative is a shared helper that
+    /// every module's assertions then depend on in lockstep.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The brace-balanced body of the first function whose signature line
+    /// contains `sig`. Scoping an assertion to ONE function is what keeps it
+    /// honest here: `hemi_wave.hlsl` carries other `[unroll]` loops that are
+    /// correct (the 4-octant `hemi_add3` fan, for one), so a file-wide
+    /// `contains` would confidently answer about the wrong loop.
+    fn fn_body(src: &str, sig: &str) -> String {
+        let at = src.find(sig).unwrap_or_else(|| panic!("no function matching `{sig}`"));
+        let open = at + src[at..].find('{').expect("function has no body");
+        let mut depth = 0i32;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in `{sig}`");
+    }
+
+    /// `check_empty_cell`'s 6-direction grid must stay ROLLED, and the reason
+    /// is a tool defect rather than taste. Each `occluded_q` declares its own
+    /// `RayQuery`; SPIR-V requires every `OpVariable` in a function's FIRST
+    /// block, so six unrolled bodies share one function-scope variable —
+    /// spirv-cross then declares it inside a `do{}while(false)` and references
+    /// it after that block closes, emitting `use of undeclared identifier`.
+    /// Eight modules were lost to it (`--check-msl` 67/80 → 75/80).
+    ///
+    /// THE SYMPTOM IS METAL-ONLY BUT THE PIN IS NOT, which is the whole point
+    /// of putting it here. `--check-msl` is macOS-gated and not in CI, so on
+    /// Windows and Linux a well-meaning revert to `[unroll]` — the form that
+    /// reads faster and looks obviously better — would land green and break a
+    /// backend the author cannot run. `cargo test` runs everywhere.
+    ///
+    /// AND IT IS NOT AN OCCUPANCY TRADE, so nobody should revert it for one:
+    /// measured on RDNA4 (gfx1201, RGA 2.14.2, `-HV 2021 -O3`), `cs_hemi_cell`
+    /// is 89/96 VGPR before AND after on the default scene and 89/96 → 87/88
+    /// on san-miguel, `cs_hemi_root` 77/80 and 75/80 unmoved, LDS 4096 and
+    /// scratch 640 B identical in every arm — 16 of 16 waves/SIMD throughout,
+    /// i.e. the kernel is not VGPR-limited and the `[loop]` costs nothing.
+    /// (`docs/history/profiling.md` carries the table and the DXIL-vs-ISA
+    /// split behind it.)
+    #[test]
+    fn check_empty_cells_ray_grid_stays_rolled() {
+        let body = fn_body(&code_only(super::HEMI_WAVE_HLSL), "void check_empty_cell(");
+        assert!(
+            body.contains("[loop]"),
+            "check_empty_cell's 6-direction grid lost its `[loop]` — six unrolled \
+             RayQuery bodies share one SPIR-V function-scope OpVariable and \
+             spirv-cross scopes it into a do{{}}while(false), costing 8 modules \
+             under --check-msl. See this test's doc comment."
+        );
+        assert!(
+            !body.contains("[unroll]"),
+            "check_empty_cell carries an `[unroll]` again — the RayQuery grid must \
+             stay rolled (see this test's doc comment); if a DIFFERENT loop was \
+             added to this function, scope the pin rather than deleting it."
+        );
+        // The weights must stay a CALL, not a local array. Under `[unroll]` the
+        // two were identical (a literal index folds the array away); under
+        // `[loop]` a dynamically indexed local array becomes an `internal
+        // constant [18 x float]` global plus a load per component, where the
+        // switch folds to phis and touches no memory at all.
+        assert!(
+            body.contains("check_dir_w("),
+            "the grid weights are no longer read through `check_dir_w` — a locally \
+             indexed array under `[loop]` reintroduces a constant global and a \
+             per-component load that the switch form provably avoids."
+        );
+        assert!(
+            !body.contains("float3 W[6]"),
+            "the `const float3 W[6]` local array is back; see above."
+        );
+    }
+
+    /// TEETH, and the stripper is the load-bearing half. `check_empty_cell`'s
+    /// own prose explains why `[loop]` replaced `[unroll]`, so BOTH tokens
+    /// appear in that function's comments — a pin written against the raw text
+    /// passes on the reverted file and proves exactly nothing. This is the
+    /// vacuity class every gate in this tree is required to rule out.
+    #[test]
+    fn hemi_wave_loop_pin_has_teeth() {
+        const REVERTED: &str = "\
+void check_empty_cell(float3 o, float3 a, float3 b, float3 c, float t_lim) {
+    // [loop], NOT [unroll] — prose that must not satisfy the pin, and
+    // check_dir_w named here so the weights assertion is exercised too.
+    const float3 W[6] = { float3(1, 1, 1), float3(1, 3, 3) };
+    [unroll] for (uint i = 0; i < 6; ++i) {
+        if (occluded_q(o, normalize(a * W[i].x), 0.0, tmax)) { }
+    }
+}";
+        let reverted = fn_body(&code_only(REVERTED), "void check_empty_cell(");
+        // Every assertion the pin makes must FAIL on the reverted form.
+        assert!(!reverted.contains("[loop]"), "the comment stripper let `[loop]` prose through");
+        assert!(reverted.contains("[unroll]"), "the planted revert lost its `[unroll]`");
+        assert!(!reverted.contains("check_dir_w("), "the stripper let `check_dir_w` prose through");
+        assert!(reverted.contains("float3 W[6]"), "the planted revert lost its local array");
+        // And the stripper must not GUT the shipping function — an empty
+        // haystack would satisfy the two negative assertions above for free.
+        let live = fn_body(&code_only(super::HEMI_WAVE_HLSL), "void check_empty_cell(");
+        assert!(
+            live.contains("occluded_q(") && live.contains("CTR_V_FALSE_EMPTY"),
+            "code_only over-stripped hemi_wave: the live check_empty_cell body no \
+             longer carries the ray call and the counter it bumps"
+        );
+    }
+}
