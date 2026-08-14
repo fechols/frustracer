@@ -85,9 +85,11 @@ mod hemi;
 mod gpu;
 #[cfg(windows)]
 mod input;
-// 500 Hz wall-clock input integrator thread (keyboard/mouse/XInput -> the
-// shared camera); Win32-only by nature, like the window it serves.
-#[cfg(windows)]
+// 500 Hz wall-clock input integrator thread (keyboard/mouse/pad -> the shared
+// camera). NOT platform-gated since B6b rung 2: the integrator is one
+// implementation both windows run, and only its two SOURCES are cfg'd — which
+// is what lets `--check` gate the math on every platform, including the one
+// that cannot compile the Windows half.
 mod flycam;
 // Slint-software-rendered HUD (compass/clock/keymap) + pause menu, dirty-rect
 // composited over every present arm by gpu/hud.rs.
@@ -122,8 +124,11 @@ mod pad;
 // Zero-cost + never activated on any headless path (the gates stay a pure
 // function of the command line).
 mod progress;
-// The live AI QA control socket (--qa): TCP transport + reply encoding; the
-// verb dispatch lives in session()'s drain (it needs the session locals).
+// The live AI QA control socket (--qa): TCP transport + reply encoding. The
+// verb dispatch is the CALLER's, because it needs that loop's locals — there
+// are two since B6b rung 2, session()'s drain on D3D12 and window_frames()'s
+// on Vulkan, and the Vulkan one answers a deliberate SUBSET (it names the rung
+// that owns each verb it lacks). The attribute is macOS's, which has neither.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod qa;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -26728,35 +26733,53 @@ fn run_cinematic_cpu(
 /// THE TRACER IS CACHED BY RESOLUTION and not rebuilt per shot: constructing
 /// one compiles the whole kernel corpus through DXC, which is ~20 s, and the
 /// `islands` preset is seven shots at one resolution.
-/// THE WINDOW — B6b rung 1, and the one thing a Linux user could not do.
+/// THE WINDOW — B6b rung 2, and the camera is yours.
 ///
-/// Everything headless works here: twenty `--check-vk` stages, the media mode,
-/// six suites. `main` used to end this path with *"the interactive window
-/// requires Windows"* and exit 2. This opens one.
+/// Rung 1 opened a window and flew `cinematic::pose_at` on a 60 s lap, with
+/// ESC as the only key that did anything. This adds INPUT: WASD/QE and the
+/// arrows, mouse-drag look, the Ctrl/Shift slow chord, the `,`/`.` time-of-day
+/// scrub, and a gamepad — all of it the SAME 500 Hz integrator the Windows
+/// session flies, over a second `flycam::Source`.
 ///
-/// WHAT IT IS AND IS NOT. A window opens, the Vulkan tracer's output reaches a
-/// real compositor through the same `tonemap.hlsl` D3D12 presents through, and
-/// the present cadence is reported. The camera flies `cinematic::pose_at`;
-/// there is NO input, no resize, no HUD, no audio, no `--qa` — those are rung 2,
-/// and the split is what keeps the surface work from landing underneath an
-/// untested threading inversion (SDL's event entry points are main-thread-only
-/// and Wayland has no off-thread keyboard state, so rung 2 has a three-thread
-/// shape this rung deliberately does not need).
+/// THREE THREADS, AND THE SPLIT IS FORCED. `SDL_PumpEvents` may only be called
+/// from the thread that made the window, and Wayland exposes no off-thread
+/// keyboard state — so `GetAsyncKeyState`'s trick (sample the OS from the
+/// integrator, which is what makes displacement independent of frame time on
+/// Windows) has no portable equivalent. Something has to pump at input rate,
+/// and the thread that renders cannot: a frame here is 16–21 ms. So:
+///
+///   * MAIN pumps SDL into a `flycam::Mirror` and does nothing else,
+///   * RENDER owns every Vulkan object, loads the scene, and presents,
+///   * FLYCAM integrates at 500 Hz from the mirror.
+///
+/// `Win` is not `Send` and stays on the main thread; `ash` handles are, and
+/// Vulkan has no thread affinity, so presenting off-thread is legal. A free
+/// consequence, and a real one: the window stays PUMPED through the ~13 s
+/// world boot instead of being marked unresponsive. There is no loading screen
+/// behind it yet — that is the HUD rung — but it is alive.
+///
+/// `FR_VK_PUMP_INLINE=1` keeps the single-threaded shape (pump once per frame,
+/// same mirror, same integrator). It is arm B of the input-age measurement —
+/// the one that says whether the split bought anything — and the fallback if a
+/// driver dislikes an off-thread present. Default off, and it says so.
 ///
 /// IT REUSES THE CAPTURE ARM RATHER THAN PARALLELING IT. `CineVk` already is
 /// the frame driver — tracer, upscaler, denoiser, the free-running Halton
-/// `seq`, and `cinematic::Temporal`, which is the hard-won prev-camera / reset /
-/// jitter / replay contract B5c extracted precisely so two loops could share it.
-/// The only thing it lacked was a way to stop before the CPU readback, which is
-/// what `render_frame` is. So the interactive loop inherits, for free, the
-/// property that a PARKED camera replays its terminal quadtree (`Temporal`
-/// derives `replay` from basis bit-equality) — the same win D3D12 measures at
-/// −43% of frame span.
+/// `seq`, and `cinematic::Temporal`, which is the hard-won prev-camera / reset
+/// / jitter / replay contract B5c extracted precisely so two loops could share
+/// it. So the interactive loop still inherits, for free, the property that a
+/// PARKED camera replays its terminal quadtree (`Temporal` derives `replay`
+/// from basis bit-equality) — the same win D3D12 measures at −43% of frame
+/// span, and now reachable by holding still rather than by waiting for a lap.
+///
+/// WHAT IS STILL NOT HERE, each deferred for a reason rather than forgotten:
+/// resize (a rebuild of the tracer, the display pipelines and the FSR3 context
+/// at a new extent — its own rung), the HUD and pause menu (they need a
+/// `vk/hud.rs` peer of `gpu/hud.rs`), audio, `--qa`, and the toggle edges
+/// (`input.rs`'s `Edges`, which answer to a menu this backend has no peer of).
 ///
 /// THE SCENE IS THE WORLD, because `req` already says so: a bare invocation
-/// sets `world_wanted`, and nothing about this path changes it. So the first
-/// look at this backend is the seven-island ring on its day-sweep, which is
-/// also the first time the world reaches an interactive Vulkan path at all.
+/// sets `world_wanted`, and nothing about this path changes it.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
     // THE WINDOW OPENS BEFORE THE SCENE LOADS, and that ordering is a
@@ -26780,7 +26803,6 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
     eprintln!("vk: window on {}{}", hg.vk.info.name, if validate { " (validated)" } else { "" });
 
     let surface = win.surface(&hg.vk)?;
-    let sp = vk::spirv::Spirv::load(&vk::spirv::default_dir())?;
 
     // FSR3 IS REQUIRED HERE, and refusing is better than the alternative: the
     // accumulation arm produces a CPU image, so presenting it would mean a
@@ -26795,49 +26817,117 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
         );
     }
 
-    // THE SWAPCHAIN BEFORE THE SCENE, and the ordering is the point: every way
-    // presenting can be refused — no `VK_KHR_swapchain`, no graphics bit on the
-    // picked family, a surface this queue cannot present to, a format nothing
-    // here can decode, a software device — is knowable in milliseconds, and a
-    // world boot is ~13 s. Building it after the load would make the answer to
-    // "can this box show a window" arrive a quarter of a minute late, which for
-    // a refusal is the same wart as printing nothing while loading.
-    //
     // The window's PIXEL size, not the size asked for: a HiDPI compositor may
     // hand back something else, and the swapchain, the tracer and the display
-    // pipelines all have to agree on ONE number.
+    // pipelines all have to agree on ONE number. Read HERE because `Win` never
+    // leaves this thread.
     let (ww, wh) = win.size();
-    let mut pres = vk::present::Presenter::new(&hg, &sp, surface, ww, wh)?;
-    let (rw, rh) = (pres.sc.w as usize, pres.sc.h as usize);
 
+    // The pump's output and the integrator's input. Created HERE, before
+    // either thread exists, because both of them borrow it.
+    let mirror = std::sync::Arc::new(flycam::Mirror::new());
+    let quit = std::sync::atomic::AtomicBool::new(false);
+
+    // ARM B: one thread, pumping once per frame. Same mirror, same integrator,
+    // same everything below — the ONLY difference is who pumps and how often,
+    // which is exactly what makes the input-age numbers comparable.
+    if std::env::var("FR_VK_PUMP_INLINE").is_ok_and(|v| v != "0") {
+        eprintln!(
+            "vk: FR_VK_PUMP_INLINE=1 — pumping on the render thread, so input is sampled once \
+             per frame instead of every 2 ms"
+        );
+        return window_frames(&hg, surface, (ww, wh), req, opts, &mirror, &quit, Some(&mut win));
+    }
+
+    std::thread::scope(|s| {
+        let (hgr, mr, qr) = (&hg, &mirror, &quit);
+        let render = s
+            .spawn(move || {
+                let r = window_frames(hgr, surface, (ww, wh), req, opts, mr, qr, None);
+                // However the frame loop ends — quit, error, or a stale
+                // surface — the pump has to stop waiting for it.
+                qr.store(true, std::sync::atomic::Ordering::Relaxed);
+                r
+            });
+        // THE PUMP LOOP, and it does nothing else. 1 ms is half the
+        // integrator's tick, so the mirror is never more than a tick stale for
+        // a reason this loop controls — and `poll_iter` returns immediately
+        // when the queue is empty, so the sleep is what keeps a thread that
+        // has nothing to do from spinning a core.
+        //
+        // `is_finished` IS THE PANIC ARM, and without it the handler below is
+        // unreachable in exactly the case it names: `qr.store` runs AFTER
+        // `window_frames` returns, so an unwind skips it, the flag never
+        // rises, and this loop pumps a frozen window forever without ever
+        // reaching the join. The crash hook reports and returns (release does
+        // not set `panic = "abort"`), so the symptom was a full crash report
+        // followed by a session that would not die.
+        while !quit.load(std::sync::atomic::Ordering::Relaxed) && !render.is_finished() {
+            if !win.pump(&mirror) {
+                quit.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        render.join().unwrap_or_else(|_| Err("the render thread panicked".into()))
+    })
+}
+
+/// The frame loop, and everything it owns. Runs on the render thread — or on
+/// the main one under `FR_VK_PUMP_INLINE`, which is what `pump` is for.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn window_frames(
+    hg: &vk::headless::VkHeadless,
+    surface: ash::vk::SurfaceKHR,
+    win_size: (u32, u32),
+    req: SceneRequest,
+    opts: &Opts,
+    mirror: &std::sync::Arc<flycam::Mirror>,
+    quit: &std::sync::atomic::AtomicBool,
+    mut pump: Option<&mut vk::present::Win>,
+) -> Result<i32, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // THE SHADER CORPUS AND THE SWAPCHAIN LAND HERE, NOT ON THE MAIN THREAD,
+    // and it is `Spirv` that decides: it owns a DXC COM object behind a raw
+    // pointer, so it is neither Send nor Sync and cannot be built on one
+    // thread and used on another. `Presenter::new` needs it, so the swapchain
+    // follows it across.
+    //
+    // THE ORDERING SURVIVES THE MOVE, which is the thing that mattered: every
+    // way presenting can be refused — no `VK_KHR_swapchain`, no graphics bit
+    // on the picked family, a surface this queue cannot present to, a format
+    // nothing here can decode, a software device — is still decided BEFORE the
+    // ~13 s scene load, so a refusal still arrives in milliseconds. It now
+    // travels back through this function's `Result` and the join instead of
+    // out of `main` directly.
+    let sp = vk::spirv::Spirv::load(&vk::spirv::default_dir())?;
+    let mut presenter =
+        vk::present::Presenter::new(hg, &sp, surface, win_size.0, win_size.1)?;
+    let pres = &mut presenter;
+    let sp = &sp;
+
+    let (rw, rh) = (pres.sc.w as usize, pres.sc.h as usize);
     let LoadedScene { mut scene, bvh, cam0, world_info } = load_scene(&req);
     let attractors: Vec<world::TodAttractor> = match (world_info.as_ref(), opts.tod) {
         (Some(w), None) => world::attractors(w),
         _ => Vec::new(),
     };
 
-    let vs = vk::scene::VkScene::new(&hg, &scene, &bvh)?;
-    let vt = vk::textures::VkTextures::new(&hg, &sp, &scene, opts.bc7)?;
+    let vs = vk::scene::VkScene::new(hg, &scene, &bvh)?;
+    let vt = vk::textures::VkTextures::new(hg, sp, &scene, opts.bc7)?;
     let want_dn = opts.nrd;
     let mut cv =
-        CineVk::build(&hg, &sp, &scene, &vs, &vt, &bvh, rw, rh, true, want_dn, opts)?;
+        CineVk::build(hg, sp, &scene, &vs, &vt, &bvh, rw, rh, true, want_dn, opts)?;
     // THE SIZES MUST AGREE, and the failure mode is why this is checked rather
     // than assumed: `tonemap.hlsl` samples its source by UV, so an FFX output
     // of a different extent than the swapchain would STRETCH — a wrong image
     // that still looks like a picture, which is the shape this backend refuses
-    // formats over. They agree by construction here (the tracer and the
-    // upscaler are built at the swapchain's own negotiated extent), so this
-    // costs one comparison and catches a future edit that separates them.
-    // A REFUSAL, NOT AN `expect`. `fsr3::built()` above is a COMPILE-time fact;
-    // `CineVk::build` can still fail to create the context at RUN time and
-    // degrades loudly to `None` — which the capture arm answers by
-    // accumulating and the window cannot. Reachable, and not exotically:
-    // `FR_VK_PRESENT_SOFTWARE=1` gets a software device past the swapchain
-    // stand-down and lands exactly here (lavapipe fails
-    // `ffxFsr3UpscalerContextCreate` outright), as can a driver fault or an OOM
-    // on a real GPU. It panicked with an internal-invariant string and exit
-    // 101 until this; the doctrine everywhere else in this tree is a named
-    // refusal at exit 2.
+    // formats over.
+    // A REFUSAL, NOT AN `expect`. `fsr3::built()` at the call site is a
+    // COMPILE-time fact; `CineVk::build` can still fail to create the context
+    // at RUN time and degrades loudly to `None` — which the capture arm
+    // answers by accumulating and the window cannot.
     let up = cv.up.as_ref().ok_or_else(|| {
         format!(
             "FidelityFX is compiled in but {} could not create an FSR3 context — see the \
@@ -26857,19 +26947,12 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
     }
     pres.bind_source(&hg.vk, up.output_view());
 
-    // ONE SHOT, flown on a loop, resolved through `resolve_shots` rather than
-    // authored here — so the window inherits the preset's own island picking
-    // and its degradation for a non-world scene, and there is one definition of
-    // what "orbit" means. `orbit` is the right choice twice over: it is CLOSED,
-    // so the flight repeats with no seam, and it is continuously MOVING, which
-    // is what makes an interval statistic mean anything (a parked camera
-    // replays its quadtree every frame and would measure the present path
-    // alone).
-    //
-    // `samples: 1` is the interactive contract and the one real difference from
-    // a capture: the temporal model integrates across PRESENTED frames rather
-    // than across sub-frames of one. A LONG lap (60 s at 60 fps) because the
-    // clock wraps with the pose — see the loop below.
+    // ONE SHOT, still resolved through `resolve_shots` — but rung 2 takes only
+    // two things from it, and NEITHER is a pose: `samples` (the interactive
+    // contract's 1, so the temporal model integrates across PRESENTED frames
+    // rather than sub-frames of one) and `cine_quality`'s preset, which is
+    // held at rung 1's value on purpose so the pacing measurement compares
+    // against the same work. The camera is the flycam's now.
     let center = (scene.content_min + scene.content_max) * 0.5;
     let radius = ((scene.content_max - scene.content_min).length() * 0.5).max(1e-3) * 2.2;
     let cine = cinematic::CineOpts {
@@ -26883,37 +26966,344 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
         .into_iter()
         .next()
         .ok_or_else(|| "the orbit preset produced no shot".to_string())?;
-    let frames = shot.kind.frames().max(1);
     let q = cine_quality(&shot);
-    let mut prev_hour: Option<f32> = None;
+
+    // The integrator. It owns the pose and the hour from here on — the render
+    // loop only ever SNAPSHOTS, which is the one-snapshot-per-iteration rule
+    // the temporal/replay/upscaler bit-equality contracts rest on.
+    let tod0 = opts.tod.unwrap_or_else(scene::default_tod);
+    let fly = flycam::FlyCam::spawn_mirror(
+        mirror.clone(),
+        cam0,
+        tod0,
+        scene.diag,
+        attractors,
+        opts.move_ease,
+    );
+    fly.resume();
 
     eprintln!(
-        "vk: rung 1 — the camera flies a canned path and there is NO input yet; \
-         close the window or press ESC to quit"
+        "vk: WASD/arrows + QE fly, drag to look, Ctrl/Shift slow, ,/. scrub the clock — \
+         ESC or the window's X to quit"
     );
 
+    // main.rs's clock, like the Windows session's: advanced by the LAST
+    // frame's measured time rather than read from a wall clock in the
+    // renderer, and clamped so a hitch cannot jump the sky. Rung 1 rode the
+    // wrapped lap index here, which snapped the sky once a minute; a live
+    // camera has no lap, so that known-accept is retired rather than carried.
+    let mut cloud_time: f64 = 0.0;
+    let mut last_ms: f64 = 0.0;
+    let mut prev_hour = tod0;
+    scene::apply_tod(&mut scene, tod0);
+    // MONOTONIC, and it must be: `render_frame` uses it for one thing only,
+    // the frame-0 warm-up (`JITTER_PHASE - samples` extra passes), and that
+    // has to fire exactly once.
     let mut f: u32 = 0;
-    while win.pump() {
-        // TWO INDICES, and they are different questions. `cine_frame_state`
-        // derives the pose as `u = f / frames` and `segment_at` CLAMPS `u` to
-        // [0, 1] rather than wrapping, so a monotonic index would park the
-        // camera at the end of the lap forever — the pose index has to wrap.
-        // `render_frame` uses its `f` for one thing only, the frame-0 warm-up
-        // (`JITTER_PHASE - samples` extra passes, so frame 0 is not
-        // reconstructed from half a jitter phase), and that must fire ONCE:
-        // handing it the wrapped index would re-run 71 extra passes every lap,
-        // a periodic hitch once a minute.
+    let mut code = 0;
+    // THE SOCKET, and it is the reason there is no bespoke pose readout here:
+    // `--qa` already IS this project's answer to "drive it rather than ask a
+    // human to look at it", and the verbs it needs on this backend
+    // (`FlyCam::set` / `set_tod` / `drive`) are exactly what this rung added.
+    // Bind failure is loud and NON-FATAL — an armed-but-broken instrument must
+    // say so, never take the session down with it.
+    let qa_ctl: Option<(qa::QaQueue, std::sync::Arc<std::sync::atomic::AtomicBool>)> =
+        opts.qa.and_then(|port| {
+            let q: qa::QaQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let qflag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            match qa::spawn_listener(port, q.clone(), qflag.clone()) {
+                Ok(_h) => {
+                    eprintln!(
+                        "qa: control socket listening on 127.0.0.1:{port} — drive it with \
+                         `frqa` (pos | tp | look | tod | drive | drive stop | sync | quit; \
+                         key and screenshot are later rungs')"
+                    );
+                    Some((q, qflag))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "qa: bind 127.0.0.1:{port} failed ({e}) — continuing without the socket"
+                    );
+                    None
+                }
+            }
+        });
+    let mut qa_iter: u64 = 0;
+    // (target iteration, the count REQUESTED, when it was asked, its reply).
+    //
+    // THE RELATIVE COUNT IS CARRIED, not re-derived from the target, and that
+    // is not redundancy: `qa::sync_timeout` scales its leash by how many
+    // iterations were ASKED for, so handing it an absolute iteration index
+    // makes every sync's deadline grow with session age — 30 s at startup,
+    // ~17 min by iteration 10 000, and past `SYNC_MAX` the saturation pins it
+    // near three hours. The timeout exists to report a hung loop instead of
+    // blocking forever, so a leash that loosens with uptime is a guard that
+    // stops guarding a minute into the session.
+    let mut qa_pend: Vec<(u64, u64, std::time::Instant, std::sync::mpsc::SyncSender<String>)> =
+        Vec::new();
+    loop {
+        if let Some(w) = pump.as_deref_mut() {
+            if !w.pump(mirror) {
+                break;
+            }
+        }
+        if quit.load(Relaxed) {
+            break;
+        }
+        let frame_start = std::time::Instant::now();
+
+        // ONE snapshot, used for everything in this iteration.
+        let snap = fly.snapshot();
+        pres.pacing.note_pump_gap(mirror.pump_gap());
+
+        // --- the QA drain, once per iteration. It runs AFTER this iteration's
+        // snapshot was taken, so a pose write lands in the NEXT frame, not
+        // this one — `tp` -> `sync 1` -> read is what makes a scripted move
+        // repeatable, and `tp` -> read without the sync reads the pose the
+        // teleport replaced. (Moving the drain above the snapshot would not
+        // help: the verbs need a base pose to modify, so they would then be
+        // modifying the PREVIOUS iteration's.) Each pose verb re-snapshots for
+        // its own base, which is what keeps a `tp` and a `look` arriving in
+        // ONE batch from undoing each other.
         //
-        // KNOWN ACCEPT: the cloud and firefly clocks ride the wrapped index too
-        // (`cine_frame_state` couples them to the pose, which is right for a
-        // capture, where they are the same question), so the sky snaps back at
-        // the lap seam. A 60 s lap is what makes that rare rather than
-        // rhythmic; decoupling them is a change to a capture helper and belongs
-        // with rung 2's real camera, which has no lap at all.
-        let lap = f % frames;
-        let fs = cine_frame_state(&mut scene, &shot, &attractors, &cine, lap, &mut prev_hour);
+        // The transport is `qa.rs`'s; only the verb table is this backend's,
+        // and it is deliberately a SUBSET that says which rung owns each
+        // missing verb rather than answering a generic "unknown verb".
+        if let Some((qq, _)) = &qa_ctl {
+            qa_iter += 1;
+            qa_pend.retain(|(target, asked, started, reply)| {
+                if qa_iter >= *target {
+                    let ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let _ = reply.send(qa::reply_json(
+                        &[(1, format!("sync: iteration {qa_iter} reached"))],
+                        ms,
+                    ));
+                    false
+                } else if started.elapsed() > qa::sync_timeout(*asked) {
+                    let _ = reply.send(qa::err_reply(&format!(
+                        "timed out after {:.1}s waiting for loop iterations (sync)",
+                        started.elapsed().as_secs_f32()
+                    )));
+                    false
+                } else {
+                    true
+                }
+            });
+            while let Some(req) = { qq.lock().unwrap().pop_front() } {
+                let t0 = std::time::Instant::now();
+                let words: Vec<&str> = req.line.split_whitespace().collect();
+                let fin = |t: &&str| t.parse::<f32>().ok().filter(|v| v.is_finite());
+                let json = match words.as_slice() {
+                    ["pos"] => {
+                        // Fresh, like the D3D12 arm's: a `tp` earlier in THIS
+                        // batch has already been written through, and a read
+                        // that answered with the pose it replaced would make
+                        // `tp` -> `pos` report the teleport as having failed.
+                        let snap = fly.snapshot();
+                        let (tn, tmean, tmax) = fly.tick_stats();
+                        let state = serde_json::json!({
+                            "pos": [snap.cam.pos.x, snap.cam.pos.y, snap.cam.pos.z],
+                            "yaw_deg": snap.cam.yaw.to_degrees(),
+                            "pitch_deg": snap.cam.pitch.to_degrees(),
+                            "fov_y_deg": snap.cam.fov_y.to_degrees(),
+                            "tod": snap.tod,
+                            "mode": "GPU (vulkan wavefront)",
+                            // Flight speed is `diag * 0.1875` units/s, so a
+                            // driver cannot check a displacement without it.
+                            "diag": scene.diag,
+                            "upscaler": "FSR3",
+                            "window": [pres.sc.w, pres.sc.h],
+                            "render": [rw, rh],
+                            "last_ms": last_ms,
+                            "frame": f,
+                            "iter": qa_iter,
+                            // The two numbers this rung exists to move.
+                            "pump_gap_ms": mirror.pump_gap().as_secs_f64() * 1000.0,
+                            "flycam": {
+                                "ticks": tn,
+                                "mean_dt_ms": tmean,
+                                "max_dt_ms": tmax,
+                            },
+                            "mirror": {
+                                "keys": mirror.debug_state().0,
+                                "focused": mirror.debug_state().1,
+                                "drag": mirror.debug_state().2,
+                            },
+                            "pump": if pump.is_some() { "inline" } else { "threaded" },
+                        });
+                        qa::reply_json(&[(1, state.to_string())], t0.elapsed().as_secs_f64() * 1000.0)
+                    }
+                    ["tp", rest @ ..] if rest.len() == 3 || rest.len() == 5 => {
+                        let v: Vec<f32> = rest.iter().filter_map(fin).collect();
+                        if v.len() != rest.len() {
+                            qa::err_reply("tp needs finite x y z [yaw_deg pitch_deg]")
+                        } else {
+                            // A FRESH snapshot, not this iteration's `snap`.
+                            // Building the second of two pose verbs from a base
+                            // taken before the first silently undoes it, and
+                            // MEASURED it is 12 trials out of 12 — in both
+                            // drain orders (`look` reverting the position, or
+                            // `tp` reverting the yaw). The D3D12 dispatch
+                            // re-snapshots per verb for the same reason.
+                            //
+                            // IT TAKES TWO CONNECTIONS, and that is worth
+                            // writing down because the obvious guess is wrong:
+                            // `qa.rs`'s `handle_conn` blocks on the reply
+                            // before reading the client's next line, so ONE
+                            // socket can never put two verbs in a single
+                            // drain — a first attempt at this probe sent both
+                            // down one connection, saw them land in successive
+                            // iterations, and reported no effect. Two `frqa`
+                            // processes, or one driver with two sockets, is
+                            // the reachable shape.
+                            let mut cam = fly.snapshot().cam;
+                            cam.pos = glam::Vec3A::new(v[0], v[1], v[2]);
+                            if v.len() == 5 {
+                                cam.yaw = v[3].to_radians();
+                                cam.pitch = v[4].to_radians().clamp(-1.5, 1.5);
+                            }
+                            fly.set(cam);
+                            qa::info_reply(&format!(
+                                "tp {} {} {}{}",
+                                v[0],
+                                v[1],
+                                v[2],
+                                if v.len() == 5 {
+                                    format!(" yaw {} pitch {}", v[3], v[4])
+                                } else {
+                                    String::new()
+                                }
+                            ))
+                        }
+                    }
+                    ["tp", ..] => qa::err_reply("tp needs x y z [yaw_deg pitch_deg]"),
+                    ["look", y, p] => match (fin(y), fin(p)) {
+                        (Some(yd), Some(pd)) => {
+                            // Fresh, for the same-batch reason `tp` gives.
+                            let mut cam = fly.snapshot().cam;
+                            cam.yaw = yd.to_radians();
+                            cam.pitch = pd.to_radians().clamp(-1.5, 1.5);
+                            fly.set(cam);
+                            qa::info_reply(&format!("look yaw {yd} deg pitch {pd} deg"))
+                        }
+                        _ => qa::err_reply("look needs finite yaw_deg pitch_deg"),
+                    },
+                    ["tod", h] => match fin(h) {
+                        Some(hv) => {
+                            fly.set_tod(hv);
+                            qa::info_reply(&format!("tod {hv}"))
+                        }
+                        None => qa::err_reply("tod needs a finite hour"),
+                    },
+                    // `drive stop` IS THE SPELLING, because `frqa`'s own usage
+                    // line and the D3D12 dispatch both say so — a bare `drive`
+                    // was this backend's invention and made every script
+                    // written against the other window answer "unknown verb".
+                    // Both are taken now; the documented one is what the help
+                    // text quotes.
+                    ["drive", "stop"] | ["drive"] => {
+                        fly.drive(0.0, 0.0, 0.0, 0);
+                        qa::info_reply("drive cleared")
+                    }
+                    ["drive", x, y, z, n] => {
+                        match (fin(x), fin(y), fin(z), n.parse::<u32>().ok()) {
+                            // The same 1..=500_000 window the D3D12 arm
+                            // enforces (~1000 s at 500 Hz): 0 is `drive stop`
+                            // spelled confusingly, and an unbounded count is a
+                            // socket client pinning the camera for a month.
+                            (Some(dx), Some(dy), Some(dz), Some(ticks))
+                                if ticks > 0 && ticks <= 500_000 =>
+                            {
+                                if fly.drive(dx, dy, dz, ticks) {
+                                    qa::info_reply(&format!(
+                                        "drive {dx} {dy} {dz} for {ticks} tick(s) (~{:.1}s)",
+                                        ticks as f32 / 500.0
+                                    ))
+                                } else {
+                                    qa::err_reply("drive axes must be finite")
+                                }
+                            }
+                            _ => qa::err_reply(
+                                "drive needs finite axes in -1..1 and ticks 1..500000 (500 Hz), \
+                                 or `drive stop`",
+                            ),
+                        }
+                    }
+                    ["drive", ..] => qa::err_reply("drive needs x y z ticks (or `drive stop`)"),
+                    // N BOUNDED, and parsed rather than defaulted. Unbounded,
+                    // `qa_iter + n` overflows (the diamondmine BENCH_MAX rule
+                    // `qa::SYNC_MAX` exists for), and `unwrap_or(1)` turned a
+                    // typo'd `sync tw0` into a silent one-iteration wait — a
+                    // driver would read the answer and believe it had waited.
+                    ["sync", n] => match n.parse::<u64>().ok().filter(|n| *n > 0) {
+                        Some(nf) if nf <= qa::SYNC_MAX => {
+                            qa_pend.push((qa_iter + nf, nf, t0, req.reply));
+                            // The reply is the pending's, later — not now.
+                            continue;
+                        }
+                        _ => qa::err_reply(&format!(
+                            "sync needs an iteration count in 1..={}",
+                            qa::SYNC_MAX
+                        )),
+                    },
+                    ["sync"] => {
+                        qa_pend.push((qa_iter + 1, 1, t0, req.reply));
+                        continue;
+                    }
+                    ["quit"] => {
+                        quit.store(true, Relaxed);
+                        qa::info_reply("quitting")
+                    }
+                    // NAMED refusals, not a generic "unknown verb": these two
+                    // exist on Windows and their absence here is a rung, not a
+                    // typo, so the driver is told which one.
+                    ["key", ..] => qa::err_reply(
+                        "the Vulkan window has no toggle edges yet — `input.rs`'s Edges arrive \
+                         with the HUD/pause-menu rung",
+                    ),
+                    ["screenshot", ..] => qa::err_reply(
+                        "the Vulkan window has no screenshot verb yet — it wants the capture \
+                         arm's resolve+PNG path, which is its own slice",
+                    ),
+                    [] => qa::err_reply("empty request"),
+                    _ => qa::err_reply(&format!(
+                        "unknown verb {:?} — pos | tp x y z [yaw pitch] | look yaw pitch | \
+                         tod H | drive x y z ticks | drive stop | sync N | quit (key and \
+                         screenshot are later rungs')",
+                        words[0]
+                    )),
+                };
+                let _ = req.reply.send(json);
+            }
+        }
+        if snap.tod != prev_hour {
+            scene::apply_tod(&mut scene, snap.tod);
+            prev_hour = snap.tod;
+        }
+        // Foliage sway has no Vulkan arm — `vk::tracer` hard-codes
+        // `sway_armed: false` and the geometry uploads once, so nothing here
+        // ever reads a baked offset. The CLOCK is kept (at the capture arm's
+        // real-seconds rate) because that is the part a future arm needs to
+        // inherit; the BAKE is not, because `foliage::bake` is a rayon fan-out
+        // over every sway cell and its memo is keyed on the time it is handed —
+        // which advances every frame, so it would miss every frame and spend
+        // the whole scene's worth of work producing a value with no reader.
+        // Restore the call in the same commit that arms the Vulkan side.
+        let sway_time = cloud_time as f32;
+        let fs = CineFrame {
+            cam: snap.cam,
+            hour: Some(snap.tod),
+            clouds: clouds::Clouds::live(scene.diag, cloud_time as f32),
+            fireflies: fireflies::Fireflies::live(&scene, cloud_time as f32),
+            sway_time,
+        };
         cv.tg.refresh_sky(&scene);
-        cv.render_frame(&hg, &scene, &shot, &fs, f, rw, rh, q, opts)?;
+        if let Err(e) = cv.render_frame(hg, &scene, &shot, &fs, f, rw, rh, q, opts) {
+            eprintln!("window: {e}");
+            code = 1;
+            break;
+        }
         // `inv_samples` is 1.0: the reconstruction arm's output is one finished
         // image, not a sum to be averaged (that divisor belongs to the
         // accumulation arm). `ToneParams::SDR` matches the UNORM swapchain
@@ -26922,21 +27312,43 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
         // `Params`' own doc records as the structurally dead glare tap.
         let params = vk::display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
         // STALE IS A CLEAN QUIT, not an error. The surface going out of date
-        // means the swapchain has to be rebuilt, and rung 1 builds it once —
-        // the tracer, the upscaler and the display pipelines are all sized
-        // against that one extent. So this stops and SAYS SO at exit 0, rather
-        // than propagating `vkQueuePresentKHR: ERROR_OUT_OF_DATE_KHR` out of
-        // `main` as if the renderer had failed.
-        if let vk::present::Frame::Stale = pres.present(&hg, params)? {
-            eprintln!(
-                "vk: the window's surface no longer matches the swapchain (a resize?) — rung 1 \
-                 builds it once and has no rebuild path, so this stops here rather than \
-                 presenting a stretched image. Rebuilding on resize is rung 2"
-            );
-            break;
+        // means the swapchain has to be rebuilt, and rung 2 still builds it
+        // once — the tracer, the upscaler and the display pipelines are all
+        // sized against that one extent.
+        match pres.present(hg, params) {
+            Ok(vk::present::Frame::Stale) => {
+                eprintln!(
+                    "vk: the window's surface no longer matches the swapchain (a resize?) — \
+                     rebuilding on resize is rung 3, so this stops here rather than presenting \
+                     a stretched image"
+                );
+                break;
+            }
+            Ok(vk::present::Frame::Presented) => {}
+            Err(e) => {
+                eprintln!("window: {e}");
+                code = 1;
+                break;
+            }
         }
+        last_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
         f = f.wrapping_add(1);
     }
+    // The loop's LAST write to `last_ms` has no reader (the `pos` verb reads it
+    // at the top of the next iteration, and there is no next iteration), which
+    // is what `unused_assignments` fires on. Not a dead value — a value whose
+    // final store lands after its last consumer.
+    let _ = last_ms;
+
+    if let Some((_, qflag)) = &qa_ctl {
+        qflag.store(true, Relaxed);
+    }
+
+    // The integrator stops before the device does: it holds no Vulkan object,
+    // but a thread still writing the shared camera during teardown is a
+    // needless race for a reader to have to reason about.
+    drop(fly);
 
     // WAIT BEFORE TEARING DOWN. `wait_submit` waited the SUBMIT fence, but
     // `vkQueuePresentKHR` is asynchronous, so the presentation engine can still
@@ -26953,11 +27365,11 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
     // Reverse construction order, the `CineVk::destroy` rule: these types have
     // `destroy(&hg)` and no `Drop`, so a forgotten teardown is a leak the
     // validation layer reports at instance destruction.
-    cv.destroy(&hg);
+    cv.destroy(hg);
     pres.destroy(&hg.vk);
-    vt.destroy(&hg);
-    vs.destroy(&hg);
-    Ok(0)
+    vt.destroy(hg);
+    vs.destroy(hg);
+    Ok(code)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -31390,6 +31802,22 @@ fn run_check(
         }
     };
 
+    // The 500 Hz camera integrator (B6b rung 2): displacement exact in
+    // wall-clock time at two tick rates, the slow-factor rest states exact,
+    // the release-to-bitwise-zero and reversal-slew properties of the ease,
+    // the focus/pause gates, one keymap across two platforms, and the Mirror
+    // wire the Linux pump writes. PLATFORM-FREE by construction — the loop is
+    // one implementation and only its sources are cfg'd — so this runs on
+    // Windows, Linux and macOS alike, which is what makes the Windows source's
+    // math checkable from a machine that cannot compile it.
+    let flycam_ok = match flycam::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("flycam self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Foliage sway (the v0 leaf-sway prototype): the leaf-mask anchors, the
     // split's partition/routing/determinism contracts on a synthetic mask
     // over the session's real tree, the empty-mask byte-identity off arm,
@@ -34252,6 +34680,7 @@ fn run_check(
         ("dual-gpu-split", split_ok),
         ("dual-gpu-transfer", dual_ok),
         ("shadeclass", shadeclass_ok),
+        ("flycam", flycam_ok),
         ("foliage", foliage_ok),
         ("sway-mv", sway_mv_ok),
         ("reproject", reproj_ok),
@@ -35172,7 +35601,7 @@ fn run_window(
     // re-entry continuity is automatic). Sessions only snapshot. It spawns
     // PAUSED and each session resumes it once its frame loop is live.
     // TOD seeds from --tod or the default sun's own derived hour.
-    let fly = flycam::FlyCam::spawn(
+    let fly = flycam::FlyCam::spawn_win32(
         sdl_hwnd(&window).0 as isize,
         cam0,
         opts.tod.unwrap_or_else(scene::default_tod),
@@ -36613,7 +37042,12 @@ fn session(
                             c.pos = Vec3A::new(vs[0], vs[1], vs[2]);
                             if vs.len() == 5 {
                                 c.yaw = vs[3].to_radians();
-                                c.pitch = vs[4].to_radians().clamp(-1.55, 1.55);
+                                // The INTEGRATOR's clamp, not a looser one of this verb's own:
+                                // it clamps every mouse/stick look to ±1.5, so a
+                                // socket-set 1.55 held only until the next look
+                                // input snapped it back — and the two windows
+                                // answered the same verb differently.
+                                c.pitch = vs[4].to_radians().clamp(-1.5, 1.5);
                             }
                             fly.set(c);
                             qa::info_reply(&format!(
@@ -36630,7 +37064,8 @@ fn session(
                         (Some(yd), Some(pd)) => {
                             let mut c = fly.snapshot().cam;
                             c.yaw = yd.to_radians();
-                            c.pitch = pd.to_radians().clamp(-1.55, 1.55);
+                            // The integrator's ±1.5, for the reason `tp` gives.
+                            c.pitch = pd.to_radians().clamp(-1.5, 1.5);
                             fly.set(c);
                             qa::info_reply(&format!("look yaw {yd} deg pitch {pd} deg"))
                         }
