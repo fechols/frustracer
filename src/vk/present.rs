@@ -1,12 +1,12 @@
-//! The window, and the frame loop's presentation half — B6b rung 1.
+//! The window, its event pump, and the frame loop's presentation half —
+//! B6b rungs 1 (the window) and 2 (the input).
 //!
-//! WHAT THIS ADDS TO RUNG 2, which already presented. `swapchain.rs` acquires,
+//! WHAT RUNG 1 ADDED TO THE HEADLESS PRESENT PATH. `swapchain.rs` acquires,
 //! renders, presents and lets the engine recycle, all over
 //! `VK_EXT_headless_surface` — a real present path with nothing to scan out.
 //! What it could not do is the two things a surface implies: a WINDOW (so a
-//! human can look at this backend, which nobody yet has) and PACING (there is
-//! no vblank without a compositor, and rung 2's own header names measuring it
-//! as this slice's job). Everything below the surface is unchanged and
+//! human can look at this backend, which nobody had) and PACING (there is no
+//! vblank without a compositor). Everything below the surface is unchanged and
 //! unmoved — that is the whole reason the headless rung came first.
 //!
 //! SDL, NOT A NEW WINDOWING CRATE. The Windows session already runs on SDL3, so
@@ -17,20 +17,24 @@
 //! back an `ash::vk::SurfaceKHR` — our own type, no transmute at the one place
 //! this tree crosses from a windowing library into its backend.
 //!
-//! NO INPUT, DELIBERATELY, and the rung boundary is provable rather than
-//! arbitrary. The camera flies `cinematic::pose_at`, so there is a MOVING scene
-//! to measure pacing against with no input design at all; and with nothing to
-//! sample faster than the frame rate, pumping once per frame on the main thread
-//! is exactly what the Windows session does. Rung 2 introduces the
-//! main/render/flycam thread split only when input has to be decoupled from
-//! trace duration — which is a Wayland fact (no off-thread keyboard state) and
-//! an SDL fact (`SDL_PumpEvents` is main-thread-only), and neither can block
-//! this rung by being got wrong.
+//! RUNG 2 MAKES `pump` THE INPUT SOURCE, and the shape is forced rather than
+//! chosen. `SDL_PumpEvents` may only be called from the thread that made the
+//! window, and Wayland exposes no off-thread keyboard state — so the Windows
+//! trick (sample the OS from the integrator, which is what makes displacement
+//! independent of frame time there) has no portable equivalent. Something must
+//! ask the OS at input rate and the renderer cannot, so `pump` writes a
+//! `flycam::Mirror` from the MAIN thread while the frame loop runs elsewhere.
+//! MEASURED, and it is the whole purchase of the split: the pump interval is
+//! p50 1.06 / p99 1.08 ms on its own thread against p50 10.4–16.7 / p99
+//! 11.3–18.8 ms once per frame (`FR_VK_PUMP_INLINE=1`, which keeps that arm
+//! alive as arm B). That interval bounds how short a key tap can be before its
+//! down and its up land in one drain and the press is lost outright.
 //!
-//! THE QUIT PATH IS NOT INPUT. A window that cannot be closed is not a smaller
-//! feature, it is a broken one, so the pump answers `SDL_EVENT_QUIT` and ESC
-//! and nothing else. That is three lines and no policy — `input.rs`'s
-//! three-tier `Edges` and the 500 Hz integrator are rung 2's.
+//! WHAT `pump` STILL DOES NOT DO is `input.rs`'s job: the three-tier `Edges`
+//! drain (SPACE, F, H, P, F1 …) answers a pause menu this backend has no peer
+//! of yet. Continuous STATE for a 500 Hz integrator and per-FRAME EDGES for a
+//! session are two mechanisms on Windows too (`GetAsyncKeyState` beside
+//! `input.rs`), so keeping them apart here is that shape, not a fork of it.
 
 use ash::vk;
 use std::time::{Duration, Instant};
@@ -58,6 +62,16 @@ pub struct Win {
     video: sdl3::VideoSubsystem,
     window: sdl3::video::Window,
     pump: sdl3::EventPump,
+    /// The gamepad subsystem, and the one open pad if there is one. SDL
+    /// delivers axis/button events only for an OPENED device, and only while
+    /// the handle lives — so this is held rather than dropped after `open`.
+    gamepads: sdl3::GamepadSubsystem,
+    pad: Option<sdl3::gamepad::Gamepad>,
+    /// Drained into before dispatch, and REUSED: `poll_iter` borrows the pump
+    /// for the whole loop, so opening a gamepad (which needs `&mut self`)
+    /// cannot happen inside it. Cleared rather than reallocated, so a 500 Hz
+    /// pump allocates nothing in steady state.
+    evs: Vec<sdl3::event::Event>,
 }
 
 impl Win {
@@ -90,7 +104,12 @@ impl Win {
             .build()
             .map_err(|e| format!("SDL_CreateWindow: {e}"))?;
         let pump = sdl.event_pump().map_err(|e| format!("SDL_GetEventPump: {e}"))?;
-        Ok(Win { sdl, video, window, pump })
+        // The gamepad subsystem is initialized whether or not one is plugged
+        // in: SDL only reports a device ARRIVING to a subsystem that exists,
+        // so deferring this would mean a pad connected mid-session is one the
+        // session never hears about.
+        let gamepads = sdl.gamepad().map_err(|e| format!("SDL gamepad subsystem: {e}"))?;
+        Ok(Win { sdl, video, window, pump, gamepads, pad: None, evs: Vec::new() })
     }
 
     /// The instance extensions SDL needs to make a surface for this window —
@@ -128,24 +147,136 @@ impl Win {
         self.window.size_in_pixels()
     }
 
-    /// Drain the event queue. `false` means the user asked to quit.
+    /// Drain the event queue into `m`. `false` means the user asked to quit.
     ///
-    /// EVERYTHING ELSE IS DROPPED ON PURPOSE — see the module header. Note the
-    /// events still have to be DRAINED whether or not they are acted on: a
-    /// queue nothing reads grows without bound and, on some compositors, a
-    /// window that never pumps is declared unresponsive.
-    pub fn pump(&mut self) -> bool {
-        use sdl3::event::Event;
+    /// THE ONLY WRITER OF THE MIRROR, and the only thing on this thread that
+    /// may touch SDL at all — which is the whole reason rung 2 has three
+    /// threads: `SDL_PumpEvents` belongs to the thread that made the window,
+    /// and that thread must never be the one blocked in a trace. Events still
+    /// have to be DRAINED whether or not they are acted on: a queue nothing
+    /// reads grows without bound and, on some compositors, a window that never
+    /// pumps is declared unresponsive.
+    ///
+    /// WHAT IS DELIBERATELY ABSENT is the toggle-edge drain (`input.rs`'s
+    /// `Edges` — SPACE, F, H, P, F1 …). That is a per-FRAME question answered
+    /// against a pause menu this backend has no peer of yet; this is
+    /// continuous STATE for a 500 Hz integrator. Windows keeps the same two
+    /// mechanisms apart for the same reason (`input.rs` beside
+    /// `GetAsyncKeyState`), so this is that shape rather than a fork of it.
+    pub fn pump(&mut self, m: &crate::flycam::Mirror) -> bool {
+        use sdl3::event::{Event, WindowEvent};
+        use sdl3::gamepad::Axis;
         use sdl3::keyboard::Keycode;
-        for ev in self.pump.poll_iter() {
+        use sdl3::mouse::MouseButton;
+        // Taken and PUT BACK at the end of the pass (there is no early return
+        // between — that is what `quit` is for), so the allocation travels
+        // with it and a steady-state pump allocates nothing. Draining rather
+        // than consuming keeps that capacity: `into_iter` would hand it to the
+        // loop and drop it.
+        let mut evs = std::mem::take(&mut self.evs);
+        evs.clear();
+        evs.extend(self.pump.poll_iter());
+        m.pumped();
+        let mut quit = false;
+        for ev in evs.drain(..) {
             match ev {
                 Event::Quit { .. }
-                | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => return false,
+                | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => quit = true,
+
+                // REPEATS FILTERED. A held key is already down as far as the
+                // mirror is concerned, so an auto-repeat is pure noise — and
+                // the whole point of the compare-before-store inside `key` is
+                // that an idle session writes nothing.
+                Event::KeyDown { scancode: Some(sc), repeat: false, .. } => {
+                    if let Some(a) = crate::flycam::action_for_scancode(sc) {
+                        m.key(a, true);
+                    }
+                }
+                Event::KeyUp { scancode: Some(sc), .. } => {
+                    if let Some(a) = crate::flycam::action_for_scancode(sc) {
+                        m.key(a, false);
+                    }
+                }
+
+                // `xrel`/`yrel` on the ABSOLUTE cursor, deliberately NOT
+                // relative-mouse mode: Windows differences the accelerated OS
+                // cursor out of `GetCursorPos` and therefore stops at the
+                // screen edge, and this is the same quantity with the same
+                // edge behaviour. Capturing the pointer would be a different
+                // feel, which is the wrong thing for a parity rung.
+                Event::MouseMotion { xrel, yrel, .. } => m.look(xrel, yrel),
+                // A button event only reaches us when it landed on our window,
+                // so this IS `drag_may_start`'s hit-test — the compositor
+                // already did it.
+                Event::MouseButtonDown { mouse_btn: MouseButton::Left, .. } => m.set_drag(true),
+                Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => m.set_drag(false),
+
+                Event::Window { win_event: WindowEvent::FocusGained, .. } => m.set_focused(true),
+                Event::Window { win_event: WindowEvent::FocusLost, .. } => m.set_focused(false),
+
+                // A gamepad must be OPENED before SDL delivers its axes, and
+                // the handle has to be held for as long as we want them — so
+                // `pad` is a field rather than a local. First one wins, which
+                // is XInput slot 0's rule on the other side.
+                Event::ControllerDeviceAdded { which, .. } => self.open_pad(which, m),
+                Event::ControllerDeviceRemoved { which, .. } => {
+                    if self.pad.as_ref().is_some_and(|p| p.id().is_ok_and(|id| id == which)) {
+                        self.pad = None;
+                        m.pad_present(false);
+                    }
+                }
+                Event::ControllerAxisMotion { axis, value, .. } => {
+                    let i = match axis {
+                        Axis::LeftX => 0,
+                        Axis::LeftY => 1,
+                        Axis::RightX => 2,
+                        Axis::RightY => 3,
+                        Axis::TriggerLeft => 4,
+                        Axis::TriggerRight => 5,
+                    };
+                    m.pad_axis(i, value);
+                }
+                Event::ControllerButtonDown { button, .. } => pad_button(m, button, true),
+                Event::ControllerButtonUp { button, .. } => pad_button(m, button, false),
                 _ => {}
             }
         }
-        true
+        self.evs = evs;
+        !quit
     }
+
+    /// Open a newly-arrived gamepad, if we do not already have one.
+    ///
+    /// NEVER FATAL: a pad that will not open is a pad the session flies
+    /// without, and saying so once beats either a panic or silence.
+    fn open_pad(&mut self, which: u32, m: &crate::flycam::Mirror) {
+        if self.pad.is_some() {
+            return;
+        }
+        match self.gamepads.open(sdl3::joystick::JoystickId::new(which)) {
+            Ok(g) => {
+                eprintln!("vk: gamepad — {}", g.name().unwrap_or_else(|| "unnamed".into()));
+                self.pad = Some(g);
+                m.pad_present(true);
+            }
+            Err(e) => eprintln!("vk: a gamepad arrived but would not open ({e}) — flying without"),
+        }
+    }
+}
+
+/// The four pad buttons the integrator knows, in `Mirror`'s bit order.
+/// Everything else on the pad is deliberately unbound here — face buttons
+/// belong to a menu this backend has no peer of yet.
+fn pad_button(m: &crate::flycam::Mirror, b: sdl3::gamepad::Button, down: bool) {
+    use sdl3::gamepad::Button;
+    let i = match b {
+        Button::LeftShoulder => 0,
+        Button::RightShoulder => 1,
+        Button::DPadLeft => 2,
+        Button::DPadRight => 3,
+        _ => return,
+    };
+    m.pad_button(i, down);
 }
 
 /// Presented-frame interval statistics — the measurement rung 2 owed this rung.
@@ -166,6 +297,16 @@ pub struct Pacing {
     last: Option<Instant>,
     since_report: Instant,
     period: Duration,
+    /// Pump-interval samples, in ms — one per frame, from `Mirror::pump_gap`.
+    /// Empty unless the caller notes them, which the headless V19 gate does
+    /// not.
+    ///
+    /// THIS IS THE NUMBER THE THREAD SPLIT IS FOR: pumping on its own thread
+    /// makes it a millisecond, pumping on the render thread makes it a frame.
+    /// It rides the pacing report because the two are one question — a cadence
+    /// that only looks at the keyboard once per frame is not the same thing as
+    /// a cadence.
+    pump_gaps: Vec<f32>,
 }
 
 impl Pacing {
@@ -175,7 +316,14 @@ impl Pacing {
             last: None,
             since_report: Instant::now(),
             period: Duration::from_secs_f32(period_s),
+            pump_gaps: Vec::new(),
         }
+    }
+
+    /// Record the interval between the two most recent pump passes. Optional
+    /// by design: the headless gate has no pump.
+    pub fn note_pump_gap(&mut self, gap: Duration) {
+        self.pump_gaps.push(gap.as_secs_f32() * 1000.0);
     }
 
     /// Record one presented frame. Returns a report line when the period is up.
@@ -210,13 +358,24 @@ impl Pacing {
         // exactly on an integer the -1 keeps it in range.
         let pick = |q: f32| v[(((q * n as f32).ceil() as usize).max(1) - 1).min(n - 1)];
         self.since_report = now;
+        let mut a = std::mem::take(&mut self.pump_gaps);
+        let input = if a.is_empty() {
+            String::new()
+        } else {
+            a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            let m = a.len();
+            let apick =
+                |q: f32| a[(((q * m as f32).ceil() as usize).max(1) - 1).min(m - 1)];
+            format!(" | pump gap p50 {:.2} p99 {:.2} ms", apick(0.50), apick(0.99))
+        };
         Some(format!(
-            "present: {:.1} fps | interval mean {:.2} p50 {:.2} p99 {:.2} ms over {} frame(s)",
+            "present: {:.1} fps | interval mean {:.2} p50 {:.2} p99 {:.2} ms over {} frame(s){}",
             1000.0 / mean,
             mean,
             pick(0.50),
             pick(0.99),
-            n
+            n,
+            input
         ))
     }
 }

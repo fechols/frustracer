@@ -2230,6 +2230,202 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # procedural + san-miguel-low-poly + both FR_VK_RES parities +
                                       # --sw-rays + llvmpipe, --check-spirv/-fsr/-nrd,
                                       # tools/win-cross-check.sh, and the window itself
+                                      # B6b RUNG 2 — THE CAMERA (2026-08-14; src/flycam.rs split +
+                                      # Win::pump + window_frames). Rung 1's window flew `cinematic::pose_at`
+                                      # on a 60 s lap with ESC as the only key that did anything. This adds
+                                      # INPUT — WASD/arrows/QE, mouse-drag look, the Ctrl/Shift slow chord,
+                                      # the `,`/`.` clock scrub, gamepad — over the SAME 500 Hz integrator the
+                                      # Windows session flies. NOT A NEW INTEGRATOR: flycam.rs was cut at the
+                                      # seam its OS reads already sat on (a `down(vk)` closure, `poll_pad`, a
+                                      # cursor delta under a drag latch, `focused`), leaving `Raw` + `Source`
+                                      # above and not one line of the math moved.
+                                      # THREE THREADS, AND THE SPLIT IS FORCED RATHER THAN PREFERRED.
+                                      # `SDL_PumpEvents` is main-thread-only and Wayland exposes no off-thread
+                                      # keyboard state, so `GetAsyncKeyState`'s trick — sample the OS FROM the
+                                      # integrator, which is what makes displacement independent of frame time
+                                      # on Windows — has no portable equivalent. Main pumps into a
+                                      # `flycam::Mirror` of atomics, render owns every Vulkan object, flycam
+                                      # integrates at 500 Hz from the mirror. `Win` is not Send and stays put;
+                                      # `ash` handles are, and Vulkan has no thread affinity.
+                                      # `Spirv` DECIDED WHERE THE SWAPCHAIN LIVES: it owns a DXC COM object
+                                      # behind a raw pointer, so it is neither Send nor Sync, and
+                                      # `Presenter::new` needs it — both moved to the render thread. The
+                                      # fail-fast ORDERING survived the move (every way presenting can be
+                                      # refused is still decided before the ~13 s load); the refusal now
+                                      # travels back through a Result and the join.
+                                      # FREE, AND REAL: the window stays PUMPED through the world boot instead
+                                      # of being marked unresponsive for 13 s. No loading screen behind it yet
+                                      # — that is the HUD rung.
+                                      # MEASURED (Radeon 8060S / RADV / Wayland+XWayland, 1280x720, THE WORLD,
+                                      # NRD armed, release), and the arm B lever `FR_VK_PUMP_INLINE=1` is what
+                                      # makes each of these a COMPARISON rather than a number:
+                                      #   * PUMP INTERVAL — the split's whole purchase — p50 1.06 / p99 1.08 ms
+                                      #     threaded against p50 10.4-16.7 / p99 11.3-18.8 ms inline, i.e. it
+                                      #     tracks frame time exactly as predicted. That interval bounds how
+                                      #     short a key tap can be before its down and its up land in ONE drain
+                                      #     and the press is lost outright.
+                                      #   * FLYCAM TICK dt — mean 2.061-2.090 ms against a 2 ms target, worst
+                                      #     single tick 2.63-3.47 ms across every run. So the Linux integrator
+                                      #     holds its rate at NORMAL priority and needs no peer of Windows'
+                                      #     THREAD_PRIORITY_ABOVE_NORMAL. KNOWN-ACCEPT: this backend has no CPU
+                                      #     tracer arm, so rayon never saturates the box here — the starvation
+                                      #     case the Windows priority raise was written for is NOT reproduced
+                                      #     by this measurement, and the number says nothing about it.
+                                      #   * PACING — driven 60.2 fps p50 16.45 p99 18.45 ms (threaded) against
+                                      #     59.7 / 16.69 / 18.79 (inline); parked ~95.8 / 95.3 fps with replay
+                                      #     engaged. p99 within ~2 ms of p50, tighter than rung 1's ~4 ms, and
+                                      #     the two arms are within 1%: THE INVERSION COST NOTHING.
+                                      #   * DISPLACEMENT — a scripted `drive 0 0 1 500` from the origin, three
+                                      #     interleaved samples per arm: threaded 13.45/13.62/13.56, inline
+                                      #     13.75/13.81/13.48. The distributions INTERLEAVE, so there is no arm
+                                      #     effect; each sample is within 1.7% of `diag * 0.1875 * Σdt`.
+                                      #     NOT BIT-EQUAL, and the plan that predicted it would be was wrong
+                                      #     for the same reason the integrator is right: dt is MEASURED, so 500
+                                      #     ticks is an exact count and NOT an exact wall-clock span. A
+                                      #     scripted drive is repeatable in ticks, not in metres.
+                                      # THE FOCUS GATE, PROVEN ON THE LIVE WINDOW rather than argued: with a
+                                      # second X window holding focus, 1 s of held W moves the camera by
+                                      # EXACTLY 0.000000 and `pos` reports `mirror.focused=false`; refocus and
+                                      # the same second moves it 13.22. Both halves ran inside ONE harness
+                                      # invocation and are told apart by the `mirror.focused` READOUT rather
+                                      # than by the displacement, which is what makes it an attribution rather
+                                      # than a coincidence.
+                                      # THE KEYMAP, END TO END, ONE KEY AT A TIME: w/s/a/d/e/q and `,`/`.`
+                                      # each set exactly their own `ACTIONS` bit, Up and Left alias Fwd and
+                                      # Left onto the same bits as W and A, and shift/ctrl land on the slow
+                                      # pair — so `action_for_scancode` is confirmed against real SDL events
+                                      # and not only against T5's table pin.
+                                      # SYNTHETIC INPUT IS NOT AUTONOMOUS ON THIS BOX, and that is a property
+                                      # of the DESKTOP rather than of the renderer: the OS asks the user to
+                                      # approve input control per driving script, so an unapproved `xdotool`
+                                      # run delivers nothing and the window sees no key at all. It reads as a
+                                      # dead input path — `keys=0` with `focused=true`, i.e. the key never
+                                      # reached SDL, which is exactly how it is TOLD APART from the focus gate
+                                      # (`focused=false`) by the same `pos` readout. Consequence for anyone
+                                      # repeating this: `--qa` is the instrument that works unattended, and
+                                      # `xdotool` is only for confirming the SDL translation with a human
+                                      # present. The translation itself is gated without either — T5 pins
+                                      # `action_for_scancode` against SDL's own `Scancode` enum in both
+                                      # directions, on every platform.
+                                      # GATED: `flycam::self_test`, run by `--check` on EVERY platform because
+                                      # the integrator is now platform-free (only its sources are cfg'd) —
+                                      # which is what makes the WINDOWS source's math checkable from a machine
+                                      # that cannot compile it. T1 displacement exact in wall-clock time at
+                                      # two tick rates (a relative bound, not bit-equality: 500 small
+                                      # additions and 50 large ones are the same sum in exact arithmetic and
+                                      # different roundings in f32) with an in-gate anti-vacuity check that a
+                                      # fixed-dt integrator would NOT pass it; T2 the slow-factor rest states
+                                      # exact; T3a release reaches a bitwise-zero ramp, T3b a reversal slews
+                                      # through a near-stop; T4 the focus/pause gates park everything and drop
+                                      # the drag; T5 one keymap across two platforms, no key meaning two
+                                      # things, pinned against the `windows` VK constants on one side and
+                                      # against SDL's own `Scancode` enum in BOTH directions on the other; T6
+                                      # the Mirror wire, including that the look accumulator drains exactly
+                                      # once and that motion outside a drag never reaches the integrator.
+                                      # EIGHT TEETH, ALL FIRED, each by perturbing the constant it protects.
+                                      # AND ONE OF THEM CAUGHT THE GATE RATHER THAN THE CODE: T2 was written
+                                      # claiming the log2-space divisor `(-4*smooth(c) - 3*smooth(s)).exp2()`
+                                      # is what makes the rest states exact, and the arithmetic-space spelling
+                                      # `(1/16).powf(smooth(c)) * (1/8).powf(smooth(s))` PASSED IT unchanged —
+                                      # `powf` is correctly rounded at exponent 0 and 1, so both are exact at
+                                      # all four rest states, and they differ only mid-ramp (56% of a
+                                      # 1000x1000 sweep, worst relative 3.6e-7). The assertion is still worth
+                                      # having — it pins the -4/-3 EXPONENTS and the smoothstep's endpoints,
+                                      # and fires on a retune of either — but `slow_factor`'s header now
+                                      # records what it does NOT cover, because a gate is worth what it can
+                                      # fail on rather than what it looks like it covers.
+                                      # `--qa` REACHES THIS BACKEND, and it is why there is no bespoke pose
+                                      # readout here: the socket already IS this tree's answer to "drive it
+                                      # rather than ask a human to look", and the verbs it needs
+                                      # (`FlyCam::set` / `set_tod` / `drive`) are exactly what this rung added.
+                                      # `qa.rs` is transport-only and was already cross-platform; only the
+                                      # verb TABLE is this backend's, and it is a deliberate subset — pos, tp,
+                                      # look, tod, drive, sync, quit — where `key` and `screenshot` answer
+                                      # with the RUNG that owns them rather than a generic "unknown verb".
+                                      # `pos` carries `mirror` (key bits / focused / drag), `flycam` (tick
+                                      # count, mean and max dt) and `pump_gap_ms`, which is what made the
+                                      # focus-gate attribution above a read rather than a bisect.
+                                      # STILL NOT HERE, each deferred with a reason: resize (a rebuild of the
+                                      # tracer, the display pipelines and the FSR3 context at a new extent),
+                                      # the HUD and pause menu (they want a `vk/hud.rs` peer of `gpu/hud.rs`,
+                                      # and `slint` moved out of the Windows-only Cargo block), audio, the
+                                      # toggle edges, and a screenshot verb.
+                                      # Touch src/flycam.rs / flycam::Mirror + MirrorSource / Win::pump /
+                                      # window_frames / Pacing::note_pump_gap -> run --check (+ BOTH goldens
+                                      # byte-compared: this touches no shading path, and on Linux --check
+                                      # OVERWRITES them), cargo test, --check-vk on procedural +
+                                      # san-miguel-low-poly + --tile 2 + both FR_VK_RES parities + --sw-rays +
+                                      # llvmpipe, --check-spirv/-fsr/-nrd, tools/win-cross-check.sh (NOT
+                                      # optional — this rung restructures `#[cfg(windows)]` code from a
+                                      # machine that cannot compile it), and the window itself in BOTH pump
+                                      # arms
+                                      # B6b RUNG 2, THE REVIEW PASS (2026-08-14). Six defects and five drifts, found
+                                      # by reading the rung's own diff rather than by a gate — worth recording because
+                                      # four of them are the shapes this file already warns about, reappearing in new
+                                      # code.
+                                      # TWO GUARDS THAT COULD NOT FIRE. (a) The `sync` deadline was computed from the
+                                      # ABSOLUTE target iteration instead of the count asked for, and `qa::sync_timeout`
+                                      # scales by its argument — so a `sync 1` got a 30 s leash at startup, ~17 min by
+                                      # iteration 10 000, and past SYNC_MAX's saturation ~2h47m. The branch whose whole
+                                      # job is to report a hung loop stopped guarding a minute into every session. The
+                                      # relative count is carried alongside the target now, which is why the tuple is a
+                                      # 4-tuple. (b) `run_window_vk` stored its quit flag AFTER `window_frames`
+                                      # returned, inside the spawned closure — so a render-thread panic unwound past it,
+                                      # the pump loop spun on a flag that would never rise, and `join`'s
+                                      # "the render thread panicked" arm was unreachable in exactly the case it names.
+                                      # The crash hook reports and returns (release does not set panic=abort), so the
+                                      # symptom was a full crash report followed by a session that would not die.
+                                      # `&& !render.is_finished()` is the fix.
+                                      # SUB-PIXEL MOUSE MOTION WAS BEING DELETED. sdl3's `MouseMotion.xrel`/`yrel` are
+                                      # f32 and Wayland means it — pointer motion is wl_fixed (1/256 px) DIVIDED by the
+                                      # output scale — but `Mirror::look` accumulated `dx as i32`, so every event with
+                                      # |delta| < 1 became nothing. On a fractional-scale output, or a high-poll-rate
+                                      # mouse moved slowly, that is EVERY event and drag-look is simply dead. Windows
+                                      # differences the integer GetCursorPos and so has nothing to lose, which is why
+                                      # the port inherited a truncation that costs it nothing and costs Linux the
+                                      # feature. Fixed-point at LOOK_FIXED = 256 (Wayland's own denominator, so scale 1
+                                      # round-trips exactly); T6 now asserts four 0.25 px events sum to exactly 1 px,
+                                      # and that assertion fails on the old spelling.
+                                      # FOCUS LOSS DID NOT PARK HELD INPUT. The mirror kept its key bits and its last
+                                      # stick deflection across a focus loss, trusting SDL's synthesized key-ups to
+                                      # clear them — and SDL does, but the Windows source cannot hold a stale key AT
+                                      # ALL (it reads live OS state), so this was a Linux-only way to fly the camera on
+                                      # the way back from an alt-tab with nothing pressed. `set_focused(false)` now
+                                      # clears keys, pad buttons and pad axes, keeping PAD_PRESENT (nothing
+                                      # re-announces a device that never left).
+                                      # THE PROBE-REACH TRAP, AGAIN, and this time on the way to confirming a fix. The
+                                      # `tp`/`look` verbs both built their base pose from the loop iteration's ONE
+                                      # snapshot, so two pose verbs landing in one drain undid each other — the D3D12
+                                      # dispatch re-snapshots per verb and this one did not. The first probe sent `tp`
+                                      # then `look` down ONE socket, saw the pre-fix build pass, and would have reported
+                                      # the finding as unreproducible. It was the probe: `qa.rs`'s `handle_conn` blocks
+                                      # on the reply before reading the client's next line, so a single connection can
+                                      # never put two verbs in one drain. Two concurrent connections: 12/12 clobbered
+                                      # before the fix, 0/12 after, in BOTH drain orders (`look` reverting the position
+                                      # 10 times, `tp` reverting the yaw twice). A probe that cannot reach its target
+                                      # answers confidently about nothing — FR_ABL's lesson, in a socket.
+                                      # PARITY DRIFT, five of it, all in verbs a driver script would hit: `drive stop`
+                                      # (frqa's own documented spelling, and D3D12's) answered "unknown verb" here;
+                                      # `drive`'s tick count was unbounded where D3D12 requires 1..=500000; `sync abc`
+                                      # silently meant `sync 1`; `sync N` was unbounded (the diamondmine BENCH_MAX rule,
+                                      # unlearned); and the two windows clamped a socket-set pitch differently (±1.5
+                                      # here, ±1.55 there). The integrator clamps every mouse/stick look to ±1.5, so
+                                      # D3D12's looser bound held only until the next look input snapped it back — both
+                                      # are ±1.5 now.
+                                      # AND ONE PIECE OF PURE WASTE: `foliage::bake` ran every frame on the render
+                                      # thread, a rayon fan-out over every sway cell, memoized on a time that advances
+                                      # every frame so the memo never hit — while `vk::tracer` hard-codes
+                                      # `sway_armed: false` and the geometry uploads once, so nothing could read the
+                                      # result. The clock is kept, the bake is not, and the comment says to restore it
+                                      # in the same commit that arms the Vulkan side.
+                                      # Verified: the full rung-2 run-list re-run green (cargo test 27, --check PASSED
+                                      # with both goldens byte-identical, --check-vk on procedural + san-miguel-low-poly
+                                      # + --tile 2 + --sw-rays + FR_VK_RES=1 + llvmpipe, --check-spirv/-fsr/-nrd,
+                                      # tools/win-cross-check.sh), plus the three new T6 teeth perturbed one at a time
+                                      # to prove each fires, and the socket driven live for every changed verb.
+                                      # SEPARATELY CONFIRMED, and not ours: `FR_VK_PRESENT_SOFTWARE=1` on lavapipe still
+                                      # segfaults inside vkCreateSwapchainKHR, exactly as swapchain.rs's stand-down
+                                      # records. Mesa has not fixed it; V19's escape stays recorded rather than applied.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
