@@ -238,18 +238,43 @@ jobs:
       # These give SDL the same `x11 wayland` video drivers a developer box has,
       # so CI builds the SDL that ships.
       #
+      # THE LIST COMES FROM THE PINNED SOURCE, NOT FROM A GUESS — a first pass
+      # here reasoned about which X11 extensions a headless runner could
+      # plausibly need, shipped without libXss, and bought one more red run for
+      # it. `sdlchecks.cmake` in sdl3-src-3.4.12 calls SDL_missing_dependency()
+      # NINE times, all inside CheckX11, and every one of them is a hard stop
+      # once X11 is enabled: XCURSOR, XDBE, XINPUT, XFIXES, XSYNC, XRANDR,
+      # XSCRNSAVER, XSHAPE, XTEST. Four of those headers (sync.h, shape.h,
+      # Xdbe.h, Xext.h) ship in libxext-dev; scrnsaver.h and XTest.h are
+      # libxss-dev and libxtst-dev, which is the pair that was missing.
+      # Relevance was the wrong question to ask: SDL's list is not about what
+      # this job exercises, it is about what CheckX11 refuses to configure
+      # without.
+      #
+      # libegl-dev IS FOR COVERAGE, NOT FOR THE BUILD. CheckWayland's
+      # pkg_check_modules spec is `wayland-client>=1.18 wayland-egl
+      # wayland-cursor egl xkbcommon>=0.5.0`, and nothing else here provides
+      # egl.pc — without it Wayland does not hard-fail, it silently switches
+      # OFF, and X11 alone satisfies macros.cmake:415 so the build goes green
+      # having tested none of the Wayland path e717263 exists for ("the three
+      # threads Wayland forces"). A green badge over a disabled backend is the
+      # vacuity again, one layer down. libdecor is a WARNING rather than a
+      # dependency and is here to match a developer box, not to pass anything.
+      # wayland-scanner arrives as a libwayland-dev Depends (verified in the
+      # run log: libwayland-bin unpacks even under --no-install-recommends).
+      #
       # LOCKSTEP WITH check-vulkan's identical step — both jobs compile the same
       # crate graph, so a package added there belongs here too. Audio and
-      # joystick deps are deliberately absent: SDL warns and disables those
-      # backends (it already configured past a missing ALSA), and nothing
-      # headless plays a sound.
+      # joystick deps are deliberately absent, and that one IS safe to reason
+      # about: SDL only warns and disables those backends, as the same log shows
+      # it already doing for a missing ALSA.
       - name: SDL3 build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxkbcommon-dev \
-            libwayland-dev wayland-protocols libdecor-0-dev
+            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev libegl-dev
 
       - name: Build
         run: cargo build --profile quick
@@ -436,8 +461,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxkbcommon-dev \
-            libwayland-dev wayland-protocols libdecor-0-dev
+            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev libegl-dev
 
       # spirv-val comes from APT, NOT from `install-prerequisites.sh spirv`, and
       # the difference matters for CI specifically: that component has no pin BY
