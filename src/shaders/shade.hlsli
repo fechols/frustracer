@@ -1631,6 +1631,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             emis *= scene_light_gain();
             total += tput * emis;
             if (in_refl) prim.ind_s += tput * emis;
+            // FLAG_EMIS_DEMOD's capture: the PRIMARY hit's emission only —
+            // depth 0 and not inside a reflection, i.e. exactly the term that
+            // lands in the camera lap's `total` at tput 1. A reflected or
+            // refracted emitter stays in RR's colour, which is correct: its
+            // radiance is already attenuated by the chain and its guides do
+            // describe the mirror it arrives through.
+            if (depth == 0u && !in_refl) prim.emis += emis;
         }
 
         // Continuation bookkeeping: at most one of the two branches below

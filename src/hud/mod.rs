@@ -189,6 +189,14 @@ pub struct Hud {
     graph: Rc<slint::VecModel<ui::FpsBar>>,
     last_fps_txt: String,
     last_ms_txt: String,
+    /// `--cam-readout`: the pose plate is armed. OFF by default, and the only
+    /// thing that reaches its Slint properties — an unarmed session cannot
+    /// dirty a pixel of it.
+    cam_on: bool,
+    /// Its four last-pushed strings, value-guarded like every other readout
+    /// here: a PARKED camera re-formats the same text and writes nothing, so
+    /// the plate costs zero raster while the pilot lines up a screenshot.
+    last_cam: [String; 4],
     /// Last time the camera was moving (drives the keymap panel's fade).
     last_move: Option<Instant>,
     /// Last camera OR time-of-day activity (drives the compass/clock fade).
@@ -304,6 +312,8 @@ impl Hud {
             graph,
             last_fps_txt: String::new(),
             last_ms_txt: String::new(),
+            cam_on: false,
+            last_cam: [const { String::new() }; 4],
             last_move: None,
             last_active: Some(Instant::now()), // show once at boot, then fade
             menu_open: false,
@@ -606,6 +616,72 @@ impl Hud {
         self.force_full = true;
     }
 
+    /// `--cam-readout`: arm the pose plate. Separate from `new` because the
+    /// two construction sites (loading screen, session) would otherwise both
+    /// have to thread a diagnostic flag they have no other use for.
+    pub fn set_cam_readout(&mut self, on: bool) {
+        self.cam_on = on;
+        self.ui.set_cam_on(on);
+    }
+
+    /// Format and push the pose plate. `ev` is the aperture in STOPS as the
+    /// session holds it (`autoexp`'s eased EV) — the plate reports the scale
+    /// and the arm alongside the pose because the aperture's behaviour is a
+    /// function of the whole frame's content, so a pose without its lighting
+    /// regime does not reproduce anything.
+    ///
+    /// The QUATERNION convention, stated because a bare 4-tuple is unusable
+    /// without it: the camera basis is X = right, Y = up, Z = forward (the
+    /// same right-handed basis `Camera::basis` builds), and this is that
+    /// rotation. `Camera` itself stores yaw/pitch, so the quaternion is
+    /// DERIVED and always roll-free — it cannot express a roll the camera
+    /// cannot have.
+    fn push_cam(&mut self, cam: &Camera, tod: f32, ev: f32) {
+        use glam::{Mat3, Quat, Vec3, Vec3A};
+        let p = cam.pos;
+        let f = cam.forward();
+        let r = f.cross(Vec3A::Y).normalize();
+        let u = r.cross(f);
+        let q: Quat =
+            Quat::from_mat3(&Mat3::from_cols(Vec3::from(r), Vec3::from(u), Vec3::from(f)));
+        // A paste-ready `--cam`: eye + a target one unit down the forward
+        // ray. `Camera::look_at` re-derives yaw/pitch from exactly that
+        // difference, so the round trip is the pose, not an approximation.
+        let t = p + f;
+        let lines = [
+            format!("pos   {:.3}  {:.3}  {:.3}", p.x, p.y, p.z),
+            format!("quat  {:.4}  {:.4}  {:.4}  {:.4}", q.x, q.y, q.z, q.w),
+            format!(
+                "tod {:05.2}   ev {:+.3}  scale {:.2}x  ({})",
+                tod.rem_euclid(24.0),
+                crate::autoexp::ev_total(ev),
+                crate::autoexp::exposure(ev),
+                crate::autoexp::mode().as_str()
+            ),
+            format!(
+                "--cam {:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+                p.x, p.y, p.z, t.x, t.y, t.z
+            ),
+        ];
+        // Value-guarded, per line (the push_graph_rows discipline).
+        if lines[0] != self.last_cam[0] {
+            self.ui.set_cam_pos(lines[0].as_str().into());
+            self.last_cam[0] = lines[0].clone();
+        }
+        if lines[1] != self.last_cam[1] {
+            self.ui.set_cam_quat(lines[1].as_str().into());
+            self.last_cam[1] = lines[1].clone();
+        }
+        if lines[2] != self.last_cam[2] {
+            self.ui.set_cam_exp(lines[2].as_str().into());
+            self.last_cam[2] = lines[2].clone();
+        }
+        if lines[3] != self.last_cam[3] {
+            self.ui.set_cam_flag(lines[3].as_str().into());
+            self.last_cam[3] = lines[3].clone();
+        }
+    }
+
     /// Mirror the FPS ring + readouts into the Slint properties, per row and
     /// guarded by value, so an unchanged row/string dirties nothing (the
     /// wake resync would otherwise repaint a frozen graph for free).
@@ -658,7 +734,15 @@ impl Hud {
         mode: &'static str,
         last_ms: f32,
         fg_mult: f32,
+        aexp_ev: f32,
     ) -> Option<HudFrame> {
+        // --cam-readout, before the quantized readouts below: this one is
+        // DELIBERATELY unquantized (a pose is what it is) and is the only
+        // thing here that a parked camera still updates, because its aperture
+        // line keeps moving while the controller eases.
+        if self.cam_on {
+            self.push_cam(cam, tod, aexp_ev);
+        }
         // Compass heading: the camera's forward projected to the ground
         // plane; north = +Z, east = +X (the sun-arc azimuth convention),
         // quantized to whole degrees so a still camera dirties nothing.
@@ -875,7 +959,7 @@ impl Hud {
         let t0 = Instant::now();
         let mut quiet = 0;
         while quiet < 2 && t0.elapsed() < std::time::Duration::from_secs(2) {
-            match self.frame(cam, tod, true, true, mode, 1000.0 / 60.0, 1.0) {
+            match self.frame(cam, tod, true, true, mode, 1000.0 / 60.0, 1.0, 0.0) {
                 Some(_) => quiet = 0,
                 None => quiet += 1,
             }
@@ -889,7 +973,7 @@ impl Hud {
         while t1.elapsed().as_secs_f32() < fill_secs {
             // ~55-70 fps, gently varying: a believable trace.
             let ms = 15.5 + 2.5 * (i as f32 * 0.21).sin() + 1.0 * (i as f32 * 0.07).cos();
-            let _ = self.frame(cam, tod, true, true, mode, ms, 1.0);
+            let _ = self.frame(cam, tod, true, true, mode, ms, 1.0, 0.0);
             std::thread::sleep(std::time::Duration::from_millis(8));
             i += 1;
         }

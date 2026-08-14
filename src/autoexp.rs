@@ -440,6 +440,381 @@ pub fn trace_on() -> bool {
     *ON.get_or_init(|| std::env::var("FR_AEXP_TRACE").is_ok_and(|v| v != "0"))
 }
 
+// ---------------------------------------------------------------------------
+// THE LINEARITY PROBE — `FR_AEXP_PROBE=1`
+// ---------------------------------------------------------------------------
+//
+// WHAT IT MEASURES, and why the existing trace cannot. `degain` above is exact
+// only if the metered image scales EXACTLY with the light gain. Write the
+// meter's reading as
+//
+//     measured = log2(L) + alpha * g_ev + D
+//
+// where `alpha` is the share of the frame that actually moves with the gain and
+// `D` is any gain-invariant depression (noise pushing a mean-of-log down, the
+// LUMA_EPS floor, a stale temporal history). The controller's `desired` is
+// `TARGET - (measured - g_ev)`, so its fixed point is
+//
+//     ev* = (TARGET - log2 L - D) / alpha
+//
+// The design is alpha = 1, D = 0, which makes that `TARGET - log2 L` and the
+// controller open-loop. Any alpha < 1 AMPLIFIES the aperture by 1/alpha and any
+// D > 0 adds D/alpha on top — and since the meter reads the tonemap SOURCE
+// (`gpu::Gpu::fullscreen_to_backbuffer`), i.e. the image AFTER the denoiser and
+// the upscaler, neither term is structurally guaranteed. `FR_AEXP_TRACE` prints
+// `measured` and `ev`, which confounds all three; this probe separates them.
+//
+// HOW. It freezes the controller and DRIVES the gain around a fixed ladder,
+// then reads the slope back out: `alpha` is `d(measured)/d(g_ev)`, fitted over
+// the rungs. Nothing about the estimate is model-based — the ladder is spent
+// through the same `apply_light_gain` -> render -> denoise -> upscale -> meter
+// path the session uses, so whatever breaks linearity is inside the number.
+//
+// THE MEASUREMENT DISCIPLINE THIS OWES (CLAUDE.md), each rule earned:
+//
+//   * INTERLEAVED, not a monotone sweep. The ladder returns to 0 between every
+//     departure, so a drifting scene (TOD, foliage sway, a temporal history
+//     still settling from the last rung) cannot be read as slope.
+//   * EVERY RUNG MEASURED AT THE SAME AGE. A rung held longer than its
+//     neighbour is measured at a different sample count and therefore at a
+//     different D — which would land in the slope and be reported as alpha.
+//     Hence one fixed timeline per rung, in METERED FRAMES rather than
+//     iterations, so the arm's frame rate cannot change what is compared.
+//   * TWO WINDOWS PER RUNG. `early` opens right after the readback latency
+//     clears, `late` after the histories have had `PROBE_SETTLE` frames. A
+//     temporal lag and a genuine clamp both depress alpha, and only the
+//     early/late split tells them apart: lag relaxes (alpha_late ~ 1,
+//     alpha_early < 1), a clamp does not (both < 1).
+//   * MEDIANS, never single samples.
+//
+// ANTI-VACUITY — the two controls that must be run BEFORE any number off the
+// real arm is believed (the `FR_ABL` probe-reach trap, four times over):
+//
+//   * `--autoexp-mode tonemap`: the ladder still commands rungs but
+//     `light_gain_ev` is pinned at 0, so the renderer never sees them and the
+//     meter — which reads the PRE-exposure source — must come back FLAT.
+//     alpha ~ 0 is the pass. Anything else means the probe is measuring its own
+//     tail, or the meter is not where it claims to be.
+//   * A bare arm with nothing nonlinear downstream (`--cpu --no-upscale`, no
+//     denoiser): alpha ~ 1 is the pass. A probe that cannot rank a known-good
+//     control correctly cannot rank anything.
+//
+// The slope is fitted against the COMMANDED rung, not the stamp the frame came
+// back with, which is what lets control 1 read 0 rather than dividing by a
+// zero-variance x. The stamps are still checked, per row: under `Mode::Lights`
+// a commanded rung that does not appear in the stamp means the ladder never
+// reached the scene, and the probe says so instead of reporting a slope.
+
+/// `FR_AEXP_PROBE=1` — the linearity probe (read once). Default-off, loud when
+/// armed, and structurally inert otherwise: `Probe::new` is the only
+/// constructor and main.rs only builds one when this returns true.
+pub fn probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FR_AEXP_PROBE").is_ok_and(|v| v != "0"))
+}
+
+/// The ladder, in stops, INTERLEAVED around 0 (see the section note). The
+/// departures bracket the controller's own clamp band (`EV_MIN`..`EV_MAX`) so
+/// the fit spans the range a real session can actually reach.
+pub const PROBE_LADDER: [f32; 6] = [0.0, 1.0, 0.0, 2.0, 0.0, -1.0];
+/// Ladder repetitions. Three gives every rung three independent medians, which
+/// is what makes the residual below a statement about repeatability rather
+/// than about one unlucky frame.
+pub const PROBE_REPS: u32 = 3;
+/// Metered frames discarded at the head of every rung: the GPU readback lands
+/// `FRAMES_IN_FLIGHT` frames after the record, so the first few measurements
+/// after a rung change describe the PREVIOUS rung.
+pub const PROBE_LATENCY: u32 = 4;
+/// Metered frames per window (`early` and `late` alike).
+pub const PROBE_WINDOW: u32 = 16;
+/// Metered frames from the rung change to the opening of the `late` window —
+/// comfortably past `TAU_S`, a temporal upscaler's history and NRD's
+/// accumulation, so `late` is a SETTLED reading and `late - early` is what
+/// those histories were still holding back.
+pub const PROBE_SETTLE: u32 = 90;
+
+/// One finished rung.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeRow {
+    /// The rung the probe COMMANDED, in stops.
+    pub commanded: f32,
+    /// The gain the metered frames actually came back stamped with. Under
+    /// `Mode::Lights` this must track `commanded`; under `Mode::Tonemap` it is
+    /// pinned at 0 by `light_gain_ev` and that is the control.
+    pub stamp: f32,
+    /// Median raw (NOT de-gained) mean-log2-luminance over the early window.
+    pub early: f32,
+    /// The same over the settled window.
+    pub late: f32,
+    /// Median accumulated sample count of the metered frames — 1 on every
+    /// upscaler/denoiser arm (they present `inv_samples = 1.0` and carry their
+    /// own history), > 1 only on plain accumulation. Reported because it is
+    /// what says whether the `D` column below is about accumulation noise or
+    /// about a temporal history.
+    pub samples: u32,
+}
+
+/// The linearity probe's state machine. PURE in the `step` sense — main.rs owns
+/// it, feeds it one metered frame at a time and applies the EV it returns, so
+/// the ladder is spent through the session's real gain path.
+pub struct Probe {
+    /// Flattened rung index into `PROBE_LADDER` x `PROBE_REPS`.
+    rung: u32,
+    /// Metered frames seen on the current rung.
+    held: u32,
+    early: Vec<f32>,
+    late: Vec<f32>,
+    stamps: Vec<f32>,
+    samples: Vec<u32>,
+    rows: Vec<ProbeRow>,
+    done: bool,
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Probe {
+    pub fn new() -> Probe {
+        Probe {
+            rung: 0,
+            held: 0,
+            early: Vec::new(),
+            late: Vec::new(),
+            stamps: Vec::new(),
+            samples: Vec::new(),
+            rows: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Total rungs in the run.
+    pub fn total_rungs() -> u32 {
+        PROBE_LADDER.len() as u32 * PROBE_REPS
+    }
+
+    /// The stops this rung asks the SCENE to carry.
+    fn commanded(&self) -> f32 {
+        PROBE_LADDER[(self.rung as usize) % PROBE_LADDER.len()]
+    }
+
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    /// The session EV that makes the scene carry `commanded`. `light_gain_ev`
+    /// spends `ev_total` — the eased EV PLUS the manual bias — so the bias has
+    /// to be backed out here or a `--exposure-bias` session would silently
+    /// measure a shifted ladder.
+    pub fn drive_ev(&self) -> f32 {
+        self.commanded() - bias()
+    }
+
+    /// Feed one metered frame. `measured_log2` is the RAW meter reading (never
+    /// de-gained — the de-gain is the very assumption under test), `stamp` the
+    /// gain in stops that frame was rendered with, `samples` its accumulated
+    /// sample count. Returns the EV the session should drive next.
+    pub fn tick(&mut self, measured_log2: f32, stamp: f32, samples: u32) -> f32 {
+        if self.done {
+            return self.drive_ev();
+        }
+        if measured_log2.is_finite() {
+            let h = self.held;
+            if h >= PROBE_LATENCY && h < PROBE_LATENCY + PROBE_WINDOW {
+                self.early.push(measured_log2);
+                self.stamps.push(stamp);
+                self.samples.push(samples);
+            } else if h >= PROBE_SETTLE && h < PROBE_SETTLE + PROBE_WINDOW {
+                self.late.push(measured_log2);
+                self.stamps.push(stamp);
+                self.samples.push(samples);
+            }
+        }
+        self.held += 1;
+        if self.held >= PROBE_SETTLE + PROBE_WINDOW {
+            self.close_rung();
+        }
+        self.drive_ev()
+    }
+
+    fn close_rung(&mut self) {
+        let row = ProbeRow {
+            commanded: self.commanded(),
+            stamp: median(&mut self.stamps).unwrap_or(f32::NAN),
+            early: median(&mut self.early).unwrap_or(f32::NAN),
+            late: median(&mut self.late).unwrap_or(f32::NAN),
+            samples: {
+                let mut s: Vec<f32> = self.samples.iter().map(|&v| v as f32).collect();
+                median(&mut s).unwrap_or(0.0) as u32
+            },
+        };
+        // Only the ARMED lever narrates. `self_test` drives this same state
+        // machine against a synthetic meter and would otherwise dump 36 rows
+        // into every `--check`.
+        if probe_on() {
+            eprintln!(
+                "aexp-probe: rung {:>2}/{} g_ev {:+.3} (stamp {:+.3}) early {:+.4} late {:+.4} \
+                 spp {}",
+                self.rung + 1,
+                Probe::total_rungs(),
+                row.commanded,
+                row.stamp,
+                row.early,
+                row.late,
+                row.samples
+            );
+        }
+        self.rows.push(row);
+        self.early.clear();
+        self.late.clear();
+        self.stamps.clear();
+        self.samples.clear();
+        self.held = 0;
+        self.rung += 1;
+        if self.rung >= Probe::total_rungs() {
+            self.done = true;
+        }
+    }
+
+    pub fn rows(&self) -> &[ProbeRow] {
+        &self.rows
+    }
+
+    /// The finding. `arm` is the caller's description of the present path being
+    /// measured — printed because a slope with no arm attached is exactly the
+    /// silent-probe failure this whole block exists to avoid.
+    pub fn report(&self, arm: &str) {
+        let m = mode();
+        eprintln!("aexp-probe: ---- FR_AEXP_PROBE result ----");
+        eprintln!("aexp-probe: arm: {arm}");
+        eprintln!(
+            "aexp-probe: mode {} | auto-exposure {} | bias {:+.2} EV | {} rungs, ladder {:?} x{}",
+            m.as_str(),
+            if enabled() { "on" } else { "OFF" },
+            bias(),
+            self.rows.len(),
+            PROBE_LADDER,
+            PROBE_REPS
+        );
+        if self.rows.len() < 2 {
+            eprintln!("aexp-probe: too few rungs to fit — nothing is claimed");
+            return;
+        }
+        // PROBE REACH, before any slope. Under the lights arm the stamp must
+        // follow the command; if it does not, the ladder never reached the
+        // scene and every number below would be a comparison of identical
+        // frames (the FR_ABL trap, stated in this module's own words).
+        let reach: f32 = self
+            .rows
+            .iter()
+            .map(|r| (r.stamp - r.commanded).abs())
+            .fold(0.0, f32::max);
+        match m {
+            Mode::Lights if reach > 1e-3 => {
+                eprintln!(
+                    "aexp-probe: DID NOT REACH — commanded and stamped gains differ by up to \
+                     {reach:.3} stops under --autoexp-mode lights. The ladder is not driving \
+                     `apply_light_gain`; no slope is reported."
+                );
+                return;
+            }
+            Mode::Lights => eprintln!("aexp-probe: reach OK — every stamp matched its command"),
+            Mode::Tonemap => eprintln!(
+                "aexp-probe: CONTROL 1 (--autoexp-mode tonemap) — the gain is pinned at 0 by \
+                 construction, so the meter must read FLAT and alpha must come back ~0"
+            ),
+        }
+        let (a_late, r_late) = fit(self.rows.iter().map(|r| (r.commanded, r.late)));
+        let (a_early, r_early) = fit(self.rows.iter().map(|r| (r.commanded, r.early)));
+        eprintln!(
+            "aexp-probe: ALPHA settled {a_late:.3} (max resid {r_late:.3}) | early {a_early:.3} \
+             (max resid {r_early:.3})"
+        );
+        // D — what a settled frame recovers over a fresh one, read at the
+        // rungs where the gain is not moving at all, so it is a statement
+        // about convergence and not about the ladder.
+        let mut d: Vec<f32> = self
+            .rows
+            .iter()
+            .filter(|r| r.commanded == 0.0)
+            .map(|r| r.late - r.early)
+            .collect();
+        if let Some(dm) = median(&mut d) {
+            eprintln!(
+                "aexp-probe: D (settled - fresh at g_ev 0) {dm:+.3} stops — the aperture pays \
+                 D/alpha of this as a permanent over-brightening while it is not converged"
+            );
+        }
+        // The fixed point the measured alpha predicts, against the design's.
+        // NOT in the tonemap control, where alpha ~ 0 is the PASS and 1/alpha
+        // is a division by the thing being confirmed absent — it printed
+        // "amplification 220x" on a arm that has no gain path at all, which is
+        // exactly the self-lying readout this module keeps warning about.
+        if m == Mode::Lights && a_late.abs() > 1e-3 {
+            eprintln!(
+                "aexp-probe: amplification 1/alpha = {:.2}x (design 1.00x) — an aperture the \
+                 controller means to open by 1 stop opens by {:.2}",
+                1.0 / a_late,
+                1.0 / a_late
+            );
+        }
+        let verdict = if m == Mode::Tonemap {
+            if a_late.abs() <= 0.05 {
+                "CONTROL 1 PASSED (flat, as it must be) — the probe has teeth"
+            } else {
+                "CONTROL 1 FAILED — the gain cannot reach the renderer here, so a non-zero \
+                 slope means the meter is NOT reading the pre-exposure source"
+            }
+        } else if (a_late - 1.0).abs() <= 0.05 {
+            "LINEAR — the de-gain is exact on this arm and the controller is genuinely open-loop"
+        } else if a_late < 1.0 && (a_early - a_late).abs() > 0.05 {
+            "SUB-LINEAR, and it RELAXES — a temporal lag (history still catching up), not a clamp"
+        } else if a_late < 1.0 {
+            "SUB-LINEAR and it does NOT relax — a real clamp/floor sits between the renderer \
+             and the meter"
+        } else {
+            "SUPER-LINEAR — the gain is reaching the frame more than once"
+        };
+        eprintln!("aexp-probe: {verdict}");
+    }
+}
+
+/// Least-squares slope of y over x, with the largest absolute residual. f64
+/// because the ladder's x values are small integers and the y values are logs
+/// a few stops apart — the normal equations lose more than they need to in f32.
+fn fit(pts: impl Iterator<Item = (f32, f32)> + Clone) -> (f32, f32) {
+    let v: Vec<(f64, f64)> = pts
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (x as f64, y as f64))
+        .collect();
+    let n = v.len() as f64;
+    if n < 2.0 {
+        return (f32::NAN, f32::NAN);
+    }
+    let (sx, sy) = v.iter().fold((0.0, 0.0), |(ax, ay), (x, y)| (ax + x, ay + y));
+    let (mx, my) = (sx / n, sy / n);
+    let sxx: f64 = v.iter().map(|(x, _)| (x - mx) * (x - mx)).sum();
+    if sxx <= 0.0 {
+        return (f32::NAN, f32::NAN);
+    }
+    let sxy: f64 = v.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    let a = sxy / sxx;
+    let b = my - a * mx;
+    let resid = v.iter().map(|(x, y)| (y - (a * x + b)).abs()).fold(0.0, f64::max);
+    (a as f32, resid as f32)
+}
+
+/// Median of a scratch slice (sorts in place). `None` on empty.
+fn median(v: &mut [f32]) -> Option<f32> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
 /// One controller tick: ease the session's EV toward what the measurement asks
 /// for. Pure — the caller owns the state (one f32, persisted across resize in
 /// `Persist::autoexp_ev`), which is what makes it trivially deterministic and
@@ -1157,6 +1532,96 @@ pub fn self_test() -> Result<(), String> {
     let correct = step(0.3, scene_log2, 1.0 / 60.0);
     if (naive - correct).abs() < 1e-3 {
         return Err("degain teeth: a NON-de-gained measurement must move the controller".into());
+    }
+
+    // ---- (17) THE LINEARITY PROBE, and what it is FOR --------------------
+    //
+    // Two claims, in the order they matter.
+    //
+    // FIRST, the probe recovers a KNOWN slope. `Probe` is a pure state machine
+    // over `(measured, stamp, samples)`, so a synthetic meter obeying
+    // `measured = log2 L + alpha * g_ev` can be fed to it and the reported
+    // alpha checked against the alpha that was planted. A probe that cannot
+    // rank a synthetic control correctly cannot rank a GPU (the `FR_ABL`
+    // probe-reach rule, applied to the probe itself and CHEAPLY — this arm is
+    // DLL-free and runs in the plain `--check`).
+    //
+    // SECOND, and this is the invariant nothing else in the tree states: at
+    // alpha < 1 the CONTROLLER AMPLIFIES. `step`'s fixed point is
+    // `(TARGET - log2 L) / alpha`, so a frame whose metered luminance only
+    // half-follows the gain drives twice the aperture the scene asks for. That
+    // is the shape of the "a bright emitter in frame makes everything
+    // BRIGHTER" report, and it is scored here as arithmetic rather than as a
+    // feel-test.
+    set_mode(Mode::Lights);
+    set_enabled(true);
+    set_bias(0.0);
+    let scene_l = -4.0f32;
+    for (alpha, want_linear) in [(1.0f32, true), (0.6f32, false)] {
+        let mut pb = Probe::new();
+        // Drive the ladder to completion against the synthetic meter. The
+        // stamp is what the ladder COMMANDED — i.e. this models a session
+        // where the gain provably reaches the scene, so a non-unit alpha here
+        // can only be the meter's own non-linearity, never a reach failure.
+        let mut guard = 0u32;
+        while !pb.done() {
+            let g = light_gain_ev(pb.drive_ev());
+            pb.tick(scene_l + alpha * g, g, 1);
+            guard += 1;
+            if guard > Probe::total_rungs() * (PROBE_SETTLE + PROBE_WINDOW) + 16 {
+                return Err("probe: the ladder did not terminate".into());
+            }
+        }
+        let rows = pb.rows();
+        if rows.len() != Probe::total_rungs() as usize {
+            return Err(format!("probe: {} rows, want {}", rows.len(), Probe::total_rungs()));
+        }
+        // Recovering the planted slope from the rows is the probe's whole
+        // product; recompute it here the way `report` does.
+        let (got, resid) = fit(rows.iter().map(|r| (r.commanded, r.late)));
+        if (got - alpha).abs() > 1e-3 {
+            return Err(format!("probe: planted alpha {alpha}, recovered {got}"));
+        }
+        if resid > 1e-3 {
+            return Err(format!("probe: a noiseless ladder must fit exactly (resid {resid})"));
+        }
+        // The reach check must PASS here (stamp == command) so that a failure
+        // of it elsewhere means what it says.
+        if rows.iter().any(|r| (r.stamp - r.commanded).abs() > 1e-6) {
+            return Err("probe: the synthetic stamps must match their commands".into());
+        }
+        // THE AMPLIFICATION, scored against the controller itself rather than
+        // asserted: run `step` to convergence against the same synthetic meter
+        // and check where it parks.
+        let mut ev = 0.0f32;
+        for _ in 0..4000 {
+            let g = light_gain_ev(ev);
+            ev = step(ev, degain(scene_l + alpha * g, g), 1.0 / 60.0);
+        }
+        let ideal = (TARGET_LOG2 - scene_l).clamp(EV_MIN, EV_MAX);
+        let parked = ((TARGET_LOG2 - scene_l) / alpha).clamp(EV_MIN, EV_MAX);
+        if (ev - parked).abs() > DEADBAND_EV {
+            return Err(format!(
+                "probe: at alpha {alpha} the controller parked at {ev}, the fixed point is {parked}"
+            ));
+        }
+        // TEETH, both ways: the linear arm must land on the honest aperture,
+        // and the sub-linear one must provably MISS it. Without this second
+        // half the arm would pass on a controller that ignored alpha entirely.
+        let linear = (ev - ideal).abs() <= DEADBAND_EV;
+        if linear != want_linear {
+            return Err(format!(
+                "probe: alpha {alpha} parked at {ev} (honest aperture {ideal}) — expected \
+                 {}, got {}",
+                if want_linear { "agreement" } else { "amplification" },
+                if linear { "agreement" } else { "amplification" }
+            ));
+        }
+        if !want_linear && ev <= ideal {
+            return Err(format!(
+                "probe: alpha {alpha} must amplify the aperture, not reduce it ({ev} <= {ideal})"
+            ));
+        }
     }
 
     eprintln!("autoexp self-test: OK");

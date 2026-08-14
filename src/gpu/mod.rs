@@ -1018,6 +1018,30 @@ pub struct GpuContext {
 /// options per frame); jitter polarity and mv_scale come lever-resolved off
 /// the session (`ngxrr::NgxRr` — the ONE place those conventions live);
 /// `{fc.rw, fc.rh}` is the DRS subrect (the sl::Extent replacement).
+/// FLAG_EMIS_DEMOD's re-add, dispatched on whichever tracer owns the wired
+/// feed (gfx::frame carries the rationale and the measurements).
+///
+/// A NO-OP when the `RrEmis` descriptor set is absent, which is every arm that
+/// did not demodulate — `TraceGpu::emis_demod` requires that same set before
+/// it arms, so "nothing was subtracted" and "nothing is added back" are the
+/// same condition and cannot drift apart.
+fn rr_emis_readd(
+    trace: Option<&trace::TraceGpu>,
+    dxr: Option<&dxr::DxrGpu>,
+    list: &ID3D12GraphicsCommandList,
+    slot: usize,
+    ow: u32,
+    oh: u32,
+) -> Result<()> {
+    if let Some(d) = dxr {
+        d.record_rr_emis(list, slot, ow, oh)
+    } else if let Some(t) = trace {
+        t.record_rr_emis(list, slot, ow, oh)
+    } else {
+        Ok(())
+    }
+}
+
 fn rr_ngx_sequence(
     nx: &ngxrr::NgxRr,
     feat: &ngxrr::RrFeature,
@@ -2653,6 +2677,22 @@ impl GpuContext {
                 // the FSR-RR kernel that owns it. Not an RR input.
                 (trace::FEED_FSR_AO, pl[7].0, pl[7].1),
             ],
+        )?;
+        // FLAG_EMIS_DEMOD's re-add set (gfx::frame): slot 0 (FEED_COLOR, u16)
+        // holds RR's OUTPUT as a UAV so `record_rr_emis` can add the emission
+        // back in place. Wired HERE, immediately beside the feed it pairs
+        // with, because `TraceGpu::emis_demod` requires BOTH sets before it
+        // arms — the subtraction alone would delete every emitter.
+        //
+        // Not a feed input: `record_feed` skips this kind rather than
+        // transitioning a resource whose state rr_ngx_sequence owns.
+        wire(
+            trace::FeedKind::RrEmis,
+            &[(
+                trace::FEED_COLOR,
+                &rr.output,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            )],
         )
     }
 
@@ -3742,6 +3782,13 @@ impl GpuContext {
                 d3d.abort_frame();
                 return Err(e);
             }
+            // FLAG_EMIS_DEMOD (gfx::frame): add back the primary emission
+            // cs_feed_rr demodulated out of RR's colour input. HERE, while
+            // the output is still a UAV and BEFORE the tonemap — the bloom
+            // pyramid reads that source, so a later re-add would stop
+            // emitters blooming. A no-op on every arm that did not
+            // demodulate (the set is simply not wired there).
+            rr_emis_readd(self.trace.as_ref(), self.dxr.as_ref(), &d3d.list, slot, rr.ow, rr.oh)?;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
                     &rr.output,
@@ -4451,6 +4498,7 @@ impl GpuContext {
     #[allow(clippy::too_many_arguments)]
     fn record_quin_engines(
         &mut self,
+        slot: usize,
         rw: u32,
         rh: u32,
         jitter: (f32, f32),
@@ -4474,6 +4522,13 @@ impl GpuContext {
                 )]);
             }
             rr_ngx_sequence(nx, feat, rr, &d3d.list, fc)?;
+            // FLAG_EMIS_DEMOD (gfx::frame): add back the primary emission
+            // cs_feed_rr demodulated out of RR's colour input. HERE, while
+            // the output is still a UAV and BEFORE the tonemap — the bloom
+            // pyramid reads that source, so a later re-add would stop
+            // emitters blooming. A no-op on every arm that did not
+            // demodulate (the set is simply not wired there).
+            rr_emis_readd(self.trace.as_ref(), self.dxr.as_ref(), &d3d.list, slot, rr.ow, rr.oh)?;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
                     &rr.output,
@@ -4616,7 +4671,7 @@ impl GpuContext {
             (tg.rw, tg.rh)
         };
         if let Err(e) =
-            self.record_quin_engines(rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+            self.record_quin_engines(slot, rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms, sky_sh)
         {
             self.d3d.abort_frame();
             return Err(e);
@@ -4661,7 +4716,7 @@ impl GpuContext {
             (d.rw, d.rh)
         };
         if let Err(e) =
-            self.record_quin_engines(rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+            self.record_quin_engines(slot, rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms, sky_sh)
         {
             self.d3d.abort_frame();
             return Err(e);
@@ -5912,6 +5967,13 @@ impl GpuContext {
             return Err(e);
         }
 
+        // FLAG_EMIS_DEMOD (gfx::frame): add back the primary emission
+        // cs_feed_rr demodulated out of RR's colour input. HERE, while
+        // the output is still a UAV and BEFORE the tonemap — the bloom
+        // pyramid reads that source, so a later re-add would stop
+        // emitters blooming. A no-op on every arm that did not
+        // demodulate (the set is simply not wired there).
+        rr_emis_readd(self.trace.as_ref(), self.dxr.as_ref(), &self.d3d.list, slot, rr.ow, rr.oh)?;
         unsafe {
             self.d3d.list.ResourceBarrier(&[transition(
                 &rr.output,
@@ -5993,6 +6055,13 @@ impl GpuContext {
                 d3d.abort_frame();
                 return Err(e);
             }
+            // FLAG_EMIS_DEMOD (gfx::frame): add back the primary emission
+            // cs_feed_rr demodulated out of RR's colour input. HERE, while
+            // the output is still a UAV and BEFORE the tonemap — the bloom
+            // pyramid reads that source, so a later re-add would stop
+            // emitters blooming. A no-op on every arm that did not
+            // demodulate (the set is simply not wired there).
+            rr_emis_readd(self.trace.as_ref(), self.dxr.as_ref(), &d3d.list, slot, rr.ow, rr.oh)?;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
                     &rr.output,

@@ -1682,7 +1682,7 @@ impl VkTracer {
         let g = self.gbuf_full;
         let sig = g && self.nrd_sig.get();
         let mut cb =
-            self.cb_base.with_frame(p, g, sig, g, sig, false, false, sig, (false, false));
+            self.cb_base.with_frame(p, g, sig, g, sig, false, false, sig, (false, false), false);
         cb.cloud_grid = if self.cloud_shadow_n == 0 || !p.clouds.enabled {
             [0.0; 4]
         } else {

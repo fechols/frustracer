@@ -96,6 +96,9 @@
                                // waveviz — the sibling branched before the
                                // detail flags landed); detail keeps it,
                                // waveviz takes the next free bit.
+#define FLAG_EMIS_DEMOD 268435456u // primary emissive rides sig.w, subtracted
+                                   // from the DLSS-RR feed and re-added after
+                                   // (gfx::frame::FLAG_EMIS_DEMOD)
 #define FLAG_RTGI_CORR 134217728u // the GI ladder's rouletted correction is
                                   // live this frame (gfx/frame.rs's twin) --
                                   // the runtime half of RTGI_CORR, so a gate
@@ -1467,6 +1470,11 @@ struct PrimSurf {
     float3 direct_d; // albedo-free direct diffuse (kd multiplies later)
     float3 direct_s; // direct specular incl. per-sample Fresnel
     float ao;        // AO open fraction, the `ambient = AMBIENT * ao` factor
+    float3 emis;     // PRIMARY-hit emissive radiance, already gained by
+                     // scene_light_gain — captured for FLAG_EMIS_DEMOD so the
+                     // DLSS-RR feed can subtract it and the re-add pass can
+                     // put it back. Zero on every non-emissive surface and on
+                     // every unarmed frame (shade.hlsli writes it once).
     float3 ind_s;    // the reflection bounce's whole contribution to color
     float ao_t;      // AO sample 0's occluder t (miss = AO_RADIUS, no ray = 0)
     float shadow_t;  // sun shadow sample 0's occluder t (miss = INF -> CAM_FAR
@@ -1597,6 +1605,33 @@ uint f16bits_rtne(float v) {
     return s | h;
 }
 
+// R11G11B10_FLOAT pack/unpack for the emissive demodulation lane
+// (FLAG_EMIS_DEMOD). 32 bits for an HDR RGB triple, which is what lets the
+// capture ride `sig.w` without moving GBufExt's stride.
+//
+// The quantization error CANCELS by construction: cs_feed_rr subtracts
+// exactly `emis_unpack(sig.w)` and the re-add pass adds exactly the same
+// decode of the same lane, so the composite is the pre-fix image up to the
+// error RR itself introduces on a signal it no longer sees. Only the value
+// handed to RR is approximate, and only by ~1.5%.
+//
+// No sign bit and no NaN/Inf handling: emissive radiance is non-negative and
+// finite by the time it reaches here (shade clamps its own inputs), and the
+// pack saturates rather than wrapping.
+uint emis_pack(float3 c) {
+    c = clamp(c, 0.0, 65024.0);
+    uint r = (f16bits_rtne(c.r) >> 4) & 0x7ffu;   // 5-bit exp + 6-bit mantissa
+    uint g = (f16bits_rtne(c.g) >> 4) & 0x7ffu;
+    uint b = (f16bits_rtne(c.b) >> 5) & 0x3ffu;   // 5-bit exp + 5-bit mantissa
+    return r | (g << 11) | (b << 22);
+}
+
+float3 emis_unpack(uint p) {
+    return float3(f16tof32(((p       ) & 0x7ffu) << 4),
+                  f16tof32(((p >> 11u) & 0x7ffu) << 4),
+                  f16tof32(((p >> 22u) & 0x3ffu) << 5));
+}
+
 // fsr::f16_sat's twin: saturate into the finite f16 range (an inf on a signal
 // plane turns the residual remainder into inf*0 = NaN downstream).
 uint f16bits_sat(float v) { return f16bits_rtne(clamp(v, -65504.0, 65504.0)); }
@@ -1715,6 +1750,13 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     g.spec = float4(spec_alb, isinf(ps.spec_t) ? CAM_FAR : ps.spec_t);
     g.sig = uint4(0u, 0u, 0u, 0u);
     g.sig2 = uint2(0u, 0u);
+    // EMISSIVE DEMODULATION (FLAG_EMIS_DEMOD, gfx::frame's rationale): the
+    // primary hit's emission rides sig.w, which is `shadow_t`'s lane under
+    // FLAG_FSR_SIG — the two bits are mutually exclusive where the flag is
+    // BUILT, so this can never overwrite a live hit distance.
+    if (flags & FLAG_EMIS_DEMOD) {
+        g.sig.w = emis_pack(ps.emis);
+    }
     if (flags & FLAG_FSR_SIG) {
         // The demodulation divides direct_s / ind_s by the un-floored WIRE F0
         // — fsr::split_signals with sqrt_wire in place of albedo_wire (the

@@ -3420,6 +3420,14 @@ pub enum FeedKind {
     Rr,
     Fsr3,
     FsrRr,
+    /// NOT a feed: a descriptor set whose slot-0 (FEED_COLOR / u16) holds
+    /// DLSS-RR's OUTPUT as a UAV, so `record_rr_emis` can re-add the emission
+    /// `cs_feed_rr` demodulated out (gfx::frame::FLAG_EMIS_DEMOD). It rides
+    /// the feed heap because the spare sets are already there and the register
+    /// type matches — the FEED_FSR_AO/ripple precedent. `record_feed` SKIPS
+    /// it: its plane is not a feed input and must not be transitioned with
+    /// them (RR owns that resource's state).
+    RrEmis,
 }
 
 /// The kernel a feed kind runs. Shared by TraceGpu and DxrGpu, which hold the
@@ -3441,6 +3449,8 @@ pub(crate) fn feed_pso<'a>(
         FeedKind::Fsr3 => xess,
         FeedKind::Rr => rr,
         FeedKind::FsrRr => fsr_rr,
+        // record_feed skips this kind before it ever asks for a PSO.
+        FeedKind::RrEmis => None,
     }
 }
 
@@ -3588,6 +3598,8 @@ pub struct TraceGpu {
     pso_feed_xess: Option<ID3D12PipelineState>,
     pso_feed_rr: Option<ID3D12PipelineState>,
     pso_feed_fsr_rr: Option<ID3D12PipelineState>,
+    /// FLAG_EMIS_DEMOD's re-add kernel (gfx::frame).
+    pso_rr_emis: Option<ID3D12PipelineState>,
     /// The wired upscaler feed targets (wire_feed): plane resources cloned for
     /// record_feed's barriers, plus which feed kernel consumes them. ONE entry
     /// per wired engine — normally exactly one, several under `--quinlight`.
@@ -3860,6 +3872,10 @@ impl TraceGpu {
         } else {
             (None, None, None)
         };
+        // FLAG_EMIS_DEMOD's re-add (gfx::frame). Same compile unit as the
+        // feeds, same root signature — only the dispatch differs.
+        let pso_rr_emis =
+            if gbuf_full { Some(pso(&srcs.feed, "cs_rr_emis_readd", "rr_emis_readd")?) } else { None };
         // NRD bridge kernels: --nrd sessions + the check-gpu bridge gates.
         // abl_defs FIRST (the probe-reach lesson — an ablation define that
         // cannot reach its unit answers confidently).
@@ -4172,6 +4188,7 @@ impl TraceGpu {
             pso_feed_xess,
             pso_feed_rr,
             pso_feed_fsr_rr,
+            pso_rr_emis,
             feed: Vec::new(),
             device: device.clone(),
             nppd: nppd_res,
@@ -4247,6 +4264,7 @@ impl TraceGpu {
             self.nrd_rejitter(),
             self.remod_exact(),
             self.nrd_rclamp(),
+            self.emis_demod(),
         );
         cb.cloud_grid = self.cloud_grid_row(p);
         cb.set_split(self.split.get());
@@ -4321,6 +4339,22 @@ impl TraceGpu {
             || self.nppd.is_some()
             || !self.nrd_wired.is_empty()
             || self.feed.iter().any(|(k, _)| matches!(k, FeedKind::Rr | FeedKind::FsrRr))
+    }
+
+    /// EMISSIVE DEMODULATION (`FLAG_EMIS_DEMOD`, gfx::frame's rationale): armed
+    /// only for a wired DLSS-RR feed. FSR-RR is deliberately EXCLUDED — its
+    /// `feed_color` is already a residual and its sig lanes are live, so the
+    /// `sig.w` this packs into is `shadow_t` there. The `--no-rr-emis-demod`
+    /// kill lever clears it session-wide.
+    pub fn emis_demod(&self) -> bool {
+        // BOTH halves or NEITHER. The subtraction is only safe when the
+        // re-add's descriptor set is actually wired — armed alone it would
+        // delete every emitter's emission from the frame. Requiring the set
+        // here makes that a structural impossibility rather than a wiring
+        // convention someone has to remember.
+        crate::gfx::frame::rr_emis_demod()
+            && self.feed.iter().any(|(k, _)| matches!(k, FeedKind::Rr))
+            && self.feed.iter().any(|(k, _)| matches!(k, FeedKind::RrEmis))
     }
 
     /// Force the guide/signal half to be stored even with no guide-consuming
@@ -5380,6 +5414,12 @@ impl TraceGpu {
         };
         let mut feeds: Vec<(&ID3D12PipelineState, u32, &[ID3D12Resource])> = Vec::new();
         for (set, (kind, planes)) in self.feed.iter().enumerate() {
+            // The emissive re-add set is not an upscaler input: its plane is
+            // RR's own output, whose state RR owns. Transitioning it here
+            // would fight rr_ngx_sequence's own barriers.
+            if matches!(kind, FeedKind::RrEmis) {
+                continue;
+            }
             let pso = feed_pso(
                 *kind,
                 nppd.map(|n| &n.pso_feed_dm),
@@ -5400,6 +5440,52 @@ impl TraceGpu {
             self.rh,
             &|| unsafe { self.bind_common(list, slot) },
         );
+        Ok(())
+    }
+
+    /// FLAG_EMIS_DEMOD's second half: add the primary emission back onto RR's
+    /// output, in place, after `rr_ngx_sequence` and BEFORE the tonemap (the
+    /// bloom pyramid reads that source, so a later re-add would stop emitters
+    /// blooming). Records NO transitions — the caller has `rr.output` in
+    /// UNORDERED_ACCESS already, which is exactly the state this needs.
+    ///
+    /// `(ow, oh)` is RR's output extent; the kernel re-derives it from the UAV
+    /// itself, so the two cannot disagree about the grid.
+    ///
+    /// Recording this is NOT the arming decision. The dispatch is gated only on
+    /// the set being wired, which is coarser than the CB bit `cs_feed_rr`
+    /// subtracted under, so the kernel re-reads `FLAG_EMIS_DEMOD` itself and
+    /// returns immediately when it is clear. That is what keeps the two halves
+    /// the same condition on every arm — including one that wired the set and
+    /// then cleared the bit for `FLAG_FSR_SIG`, where `sig.w` is a pair of hit
+    /// distances and decoding it as emissive would flood the frame.
+    pub fn record_rr_emis(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        ow: u32,
+        oh: u32,
+    ) -> Result<()> {
+        let Some(pso) = self.pso_rr_emis.as_ref() else {
+            return Err("rr-emis PSO missing (TraceGpu built without gbuf)".into());
+        };
+        // Absent set = this arm never demodulated; adding nothing back is
+        // the correct and only safe answer, not an error.
+        let Some(set) = self.feed.iter().position(|(k, _)| matches!(k, FeedKind::RrEmis)) else {
+            return Ok(());
+        };
+        let set = set as u32;
+        let _ev = super::pix::scope(list, c"rr-emis-readd");
+        unsafe {
+            self.bind_common(list, slot);
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(
+                RP_TEX,
+                feed_set_handle(&self.device, &self.uav_heap, set),
+            );
+            list.SetPipelineState(pso);
+            list.Dispatch(ow.div_ceil(8), oh.div_ceil(8), 1);
+        }
         Ok(())
     }
 
