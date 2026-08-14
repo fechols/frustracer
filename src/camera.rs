@@ -57,15 +57,20 @@ impl Camera {
 // ---------------------------------------------------------------------------
 // Keyboard flight ease (the flycam integrator's inertia)
 //
-// Lives here rather than in flycam.rs for two reasons. `mod flycam` is
-// `#[cfg(windows)]`, so a gate hosted there would not run off Windows (the
-// audio.rs/qa.rs precedent: pure halves live somewhere unconditional so
-// `--check` covers them everywhere). And the contract these functions exist to
-// satisfy is documented at the top of THIS file — `Camera: PartialEq` is the
-// "the integrator thread wrote something" signal, and an ease that never
-// reaches exact rest would keep writing `cam.pos` forever after key release,
-// silently defeating plain accumulation, structure replay, and every upscaler
-// history on an idle session.
+// Lives here rather than in flycam.rs because the contract these functions
+// exist to satisfy is documented at the top of THIS file: `Camera: PartialEq`
+// is the "the integrator thread wrote something" signal, and an ease that
+// never reaches exact rest would keep writing `cam.pos` forever after key
+// release, silently defeating plain accumulation, structure replay, and every
+// upscaler history on an idle session.
+//
+// It USED to be here for a second reason as well — `mod flycam` was
+// `#[cfg(windows)]`, so a gate hosted there would not have run off Windows.
+// B6b rung 2 retired that: the integrator is platform-free now and only its
+// two sources are cfg'd, so `flycam::self_test` runs everywhere `--check`
+// does. The reason above still stands on its own; the cfg one no longer
+// exists, and leaving it written down would send the next reader to look for
+// a constraint that is not there.
 //
 // The analog stick path does NOT go through here: deflection is already the
 // throttle there, and `stick()`'s magnitude^2 shaping is its response curve.
@@ -225,8 +230,9 @@ impl CamBasis {
 }
 
 /// Pure gate for the keyboard flight ease (`--check`). Pure math, no window,
-/// no Win32 — which is the whole reason it lives here and not in the
-/// `#[cfg(windows)]` flycam module.
+/// no Win32 — which is why it lives beside the `Camera: PartialEq` contract it
+/// defends rather than in `flycam`, whose own `self_test` gates the integrator
+/// that calls these.
 ///
 /// The arm that matters most is (1): the flycam integrator's idle early-out,
 /// and therefore accumulation / structure replay / every upscaler history on a
