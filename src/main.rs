@@ -14235,6 +14235,11 @@ fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, St
     push!("fsr-composite", sh::fsr_composite_src(), Shape::Compute("cs_6_5"));
     push!("smoke", sh::SMOKE_HLSL.to_string(), Shape::Compute("cs_6_5"));
     push!("waveprobe", sh::WAVEPROBE_HLSL.to_string(), Shape::Compute("cs_6_5"));
+    // C3's argument-buffer probe. cs_6_5 for no reason beyond matching its
+    // neighbours — it uses nothing above SM 6.0 — and it is here, in the
+    // corpus BOTH gates read, so `--check-spirv` and Linux CI's spirv-val
+    // cover it on boxes that have no Metal at all.
+    push!("mtlbind", sh::MTLBIND_HLSL.to_string(), Shape::Compute("cs_6_5"));
     push!("bc7read", sh::BC7_READ_HLSL.to_string(), Shape::Compute("cs_6_0"));
     push!("quin", sh::QUIN_HLSL.to_string(), Shape::Compute("cs_6_5"));
     // DELIBERATELY ABSENT: nppd.hlsl. Its staging kernels are ordinary

@@ -69,11 +69,27 @@
 //!
 //! # What compiles, measured
 //!
-//! **75 of 80 modules reach AIR under one uniform recipe**, no per-unit
+//! **78 of 83 modules reach AIR under one uniform recipe**, no per-unit
 //! conditionals. The 5 that do not are one class — `dxr-lib`, `Expect::
 //! NoAnalogue` — and `Expect`'s doc says why a gate that merely skipped them
-//! would be worse than useless. 80 − 75 = 5 is the whole remaining gap, so the
+//! would be worse than useless. 83 − 78 = 5 is the whole remaining gap, so the
 //! count is self-checking against that class's size.
+//!
+//! The denominators below are pre-C3 and stay as written: `mtlbind.hlsl`'s
+//! three entry points took every arm up by 3 (80 → 83, 68 → 71) without
+//! touching the gap, which is itself the check that the probe added coverage
+//! and not exceptions.
+//!
+//! AND "REACHES AIR" IS NOT "IS CORRECT", which C3 had to learn the hard way.
+//! `leaf` and `reference` are two of the 78, and both are MISCOMPILED:
+//! spirv-cross cannot lay out a descriptor set holding an unsized array
+//! beside anything else, so it drops `samp_lin` behind an `// Overlapping
+//! binding:` comment and reinterpret_casts the texture array's storage in its
+//! place. This gate cannot see that — nothing here executes a kernel — and
+//! saying so is the point: `--check-msl` is a COMPILE gate, `--check-mtl` is
+//! where a map is proven, and the distance between them is exactly the
+//! failure class C3's probe exists to occupy. See `docs/history/
+//! metal-backend.md`'s C3 record.
 //!
 //! # The spirv-cross scoping defect, and how it was retired (C3)
 //!

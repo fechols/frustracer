@@ -783,6 +783,12 @@ pub fn nrd_bridge_tail() -> String {
 }
 pub const WAVEPROBE_HLSL: &str = include_str!("../shaders/waveprobe.hlsl");
 pub const WORKGRAPH_HLSL: &str = include_str!("../shaders/workgraph.hlsl");
+// The Metal backend's C3 probe — textures, samplers, a second descriptor set
+// and an unbounded array, in the smallest subject that holds all four. It is
+// in the SHARED corpus rather than in `src/mtl/` on `waveprobe`'s precedent,
+// and the shader's own header says why. `mtlbind_space1_matches_trace_common`
+// below pins its space1 block against `trace_common.hlsli`'s.
+pub const MTLBIND_HLSL: &str = include_str!("../shaders/mtlbind.hlsl");
 
 // The DXR pipeline's own three units. They live here with the rest of the
 // corpus because the shader-source gates below pin rt.hlsli and rt_dxr.hlsli
@@ -3440,5 +3446,185 @@ void check_empty_cell(float3 o, float3 a, float3 b, float3 c, float t_lim) {
             "code_only over-stripped hemi_wave: the live check_empty_cell body no \
              longer carries the ray call and the counter it bumps"
         );
+    }
+}
+
+/// `mtlbind.hlsl` — the C3 argument-buffer probe — is only worth compiling if
+/// it still has the two properties it was written for. Both are the kind a
+/// tidy-up destroys silently: one is a copied declaration that could drift
+/// from its original, the other is a deliberately ugly ordering that reads
+/// like an oversight.
+///
+/// CPU-ONLY AND CROSS-PLATFORM ON PURPOSE. The gate that consumes this probe
+/// is `--check-mtl`, which needs macOS and a Metal device and is not in CI. A
+/// Windows or Linux author editing `trace_common.hlsli`'s `texs[]` table, or
+/// sorting this probe's declarations into the order they obviously "should"
+/// be in, cannot run that gate — so the pin lives where `cargo test` reaches
+/// them. Same argument as `hemi_verify_shader_source_tests` above.
+#[cfg(test)]
+mod mtlbind_probe_shader_source_tests {
+    use crate::spirv::{SHIFT_B, SHIFT_S, SHIFT_T, SHIFT_U};
+
+    /// The three `space1` declarations `mtlbind.hlsl` copies verbatim from
+    /// `trace_common.hlsli`'s RP_SCENE_TEX table. Byte-identical is the claim,
+    /// so they are written here as bytes rather than as a pattern.
+    const SPACE1_DECLS: [&str; 3] = [
+        "Texture2D<float4>        texs[]     : register(t10, space1);",
+        "SamplerState             samp_lin   : register(s0, space1);",
+        "SamplerState             samp_aniso : register(s1, space1);",
+    ];
+
+    /// PROPERTY 3. The probe stands in for the real scene-texture table, and a
+    /// stand-in that has drifted from its subject is worse than no stand-in:
+    /// `--check-mtl` would keep passing while proving something about a
+    /// declaration the tracer no longer makes. Pinning against BOTH files —
+    /// rather than just asserting the probe contains some `texs[]` — is what
+    /// makes a change to either one a failure.
+    ///
+    /// The unbounded `texs[]` is the whole subject of C3's set-1 half: it is
+    /// the tier-2 argument-buffer feature, the thing `count == 0` means in
+    /// `vk::reflect`, and the one member whose host-side layout spirv-cross
+    /// does not fully describe. Losing its exact spelling loses the milestone.
+    #[test]
+    fn mtlbind_space1_matches_trace_common() {
+        for decl in SPACE1_DECLS {
+            assert!(
+                super::TRACE_COMMON_HLSLI.contains(decl),
+                "trace_common.hlsli no longer declares `{decl}` — if the scene-texture \
+                 table changed on purpose, copy the new line into mtlbind.hlsl's space1 \
+                 block and update SPACE1_DECLS. Do NOT relax this to a pattern: the \
+                 probe's job is to be byte-identical to what the tracer declares."
+            );
+            assert!(
+                super::MTLBIND_HLSL.contains(decl),
+                "mtlbind.hlsl's space1 block drifted from trace_common.hlsli: `{decl}` \
+                 is missing. The C3 probe stands in for the real RP_SCENE_TEX table and \
+                 stops standing for anything the moment it declares something else."
+            );
+        }
+    }
+
+    /// PROPERTY 1, and it is the anti-vacuity half of C3's corrected id pin.
+    ///
+    /// spirv-cross assigns argument-buffer `[[id(n)]]` in DECLARATION order,
+    /// not binding order (`mtl::bind::cross_check` carries the measured
+    /// table). C2 pinned binding order and passed anyway, because `smoke.hlsl`
+    /// declares b1,u0,u1,u2 — where the two orders coincide. This probe exists
+    /// to be a case where they CANNOT coincide, so if a future edit sorts
+    /// these four declarations the corrected pin quietly goes back to proving
+    /// nothing. That is the failure this test exists to make loud.
+    ///
+    /// Derived from `spirv::SHIFT_*` rather than from literal 1000/2000/3000,
+    /// so a shift that moved would be a compile-time-visible change here
+    /// instead of a stale comment.
+    /// Every `: register(...)` DECLARATION in `src`, in file order, as
+    /// `(name, binding)` — the binding computed from the register class with
+    /// `spirv::SHIFT_*`, exactly as DXC's `-fvk-*-shift` flags do it.
+    ///
+    /// It parses declarations rather than searching for names, and that is the
+    /// load-bearing part: the first draft of this module walked the file for
+    /// bare identifiers, and `outbuf` appears in `cs_tex`'s BODY as well as in
+    /// its declaration. A planted reorder passed — the walk found the body
+    /// reference further down and read the order as unchanged. A pin that
+    /// cannot see the edit it exists to catch is the vacuity class this
+    /// codebase keeps re-learning; anchoring on `: register(` is what fixes it.
+    fn declarations<'a>(src: &'a str, space: Option<&str>) -> Vec<(&'a str, u32)> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let line = line.split_once("//").map_or(line, |(code, _)| code);
+            let Some((lhs, reg)) = line.split_once(": register(") else { continue };
+            let Some((reg, _)) = reg.split_once(')') else { continue };
+            // `t10, space1` vs `t0` — the space suffix selects the set.
+            let (reg, sp) = match reg.split_once(", ") {
+                Some((r, s)) => (r, Some(s)),
+                None => (reg, None),
+            };
+            if sp != space {
+                continue;
+            }
+            let name = lhs.split_whitespace().last().expect("declaration has no name");
+            let (class, num) = reg.split_at(1);
+            let num: u32 = num.parse().expect("register number");
+            let shift = match class {
+                "b" => SHIFT_B,
+                "t" => SHIFT_T,
+                "u" => SHIFT_U,
+                "s" => SHIFT_S,
+                other => panic!("unknown register class `{other}` in `{line}`"),
+            };
+            out.push((name, shift + num));
+        }
+        out
+    }
+
+    #[test]
+    fn mtlbind_declaration_order_disagrees_with_binding_order() {
+        let declared = declarations(super::MTLBIND_HLSL, None);
+        // Anti-vacuity for the parser itself: it must have FOUND the block.
+        // An empty or one-element list agrees with its own sort for free.
+        assert_eq!(
+            declared.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            vec!["src", "samp_clamp", "samp_repeat", "outbuf"],
+            "mtlbind.hlsl's set-0 block is not the four declarations this pin was \
+             written against (or the parser stopped seeing them). If a resource was \
+             added on purpose, keep the two orders disagreeing and update this list."
+        );
+        let mut by_binding = declared.clone();
+        by_binding.sort_by_key(|&(_, b)| b);
+        assert_ne!(
+            declared.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            by_binding.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            "mtlbind.hlsl's set-0 declarations are now in binding order, so the probe \
+             can no longer tell declaration order from binding order — which is the \
+             ONE thing it was added to prove. It looks like a tidy-up and it silently \
+             re-creates the accident that let C2's false id pin ship. Put the \
+             declarations back as t, s, s, u."
+        );
+    }
+
+    /// TEETH for the test above, both ways.
+    ///
+    /// The discriminator has to be capable of answering "they agree", or its
+    /// `assert_ne!` is decoration. `smoke.hlsl`'s three UAVs are that layout —
+    /// and they are not a synthetic example, they are the historical one: the
+    /// reason C2's binding-order pin measured "true" is that `u0,u1,u2` are
+    /// declared in the order they are numbered.
+    #[test]
+    fn declaration_order_check_can_say_agree() {
+        let smoke = declarations(super::SMOKE_HLSL, None);
+        assert_eq!(
+            smoke.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            vec!["Push", "counters", "args", "outbuf"],
+            "smoke.hlsl's registers changed — this test reads it as the historical \
+             coincidence C2's pin passed on, so a change here needs the note in \
+             `mtl::bind::cross_check` re-read, not just this list updated"
+        );
+        let mut sorted = smoke.clone();
+        sorted.sort_by_key(|&(_, b)| b);
+        assert_eq!(
+            smoke.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            sorted.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            "the comparison used by the pin above cannot report agreement, so its \
+             assert_ne! proves nothing"
+        );
+    }
+
+    /// The parser must also see the SECOND set, and see it separately — the
+    /// set-1 block is where C3's real work is, and a `declarations` that
+    /// silently dropped `space1` would make the pin above look complete while
+    /// covering half the probe.
+    #[test]
+    fn mtlbind_space1_block_is_reachable_and_unbounded() {
+        let set1 = declarations(super::MTLBIND_HLSL, Some("space1"));
+        assert_eq!(
+            set1.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            vec!["texs[]", "samp_lin", "samp_aniso", "set1_out"],
+            "mtlbind.hlsl's space1 block changed shape"
+        );
+        // `texs[]` keeps its brackets through the parse, which is the only
+        // textual trace of the unbounded array — `vk::reflect` reports it as
+        // `count == 0` and K7 asserts that, but this is the cheap half and it
+        // runs on boxes with no Metal.
+        assert_eq!(set1[0], ("texs[]", SHIFT_T + 10));
     }
 }

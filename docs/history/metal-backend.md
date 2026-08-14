@@ -800,8 +800,96 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # second set are C3's; so is the [loop]-for-[unroll] hemi_wave
                                       # workaround, which needs --check-gpu (unreachable from CI at
                                       # all) and --check-vk re-run.
+                                      # C3, FIRST MEASUREMENT (2026-08-14, Apple M1, spirv-cross
+                                      # 2026-07-06). Before any host code: src/shaders/mtlbind.hlsl, an
+                                      # argument-buffer probe in the SHARED corpus (waveprobe's
+                                      # precedent) with three entry points -- cs_tex (set 0 only),
+                                      # cs_arr (both), cs_set1 (set 1 only). --check-spirv 80 -> 83
+                                      # modules, S3 all validated. It was added to settle one unknown
+                                      # and it found a second, larger one.
+                                      # THE ID RULE IS DECLARATION ORDER, CONFIRMED ON A SUBJECT THAT
+                                      # DISAGREES. The paragraph above -- "assigned in ascending
+                                      # binding order" -- is FALSE, and passed only because smoke.hlsl
+                                      # declares b1,u0,u1,u2 where the two orders coincide. bind.rs's
+                                      # pin was corrected in e1b0abf off FFX SPIR-V; the probe is the
+                                      # independent second subject, declared t,s,s,u on purpose:
+                                      #   cs_tex   id0 src (t0->1000)    id1 samp_clamp  (s0->3000)
+                                      #            id2 samp_repeat       id3 outbuf      (u0->2000)
+                                      # Binding order would have been 0,3,1,2. The governing ordinal is
+                                      # the SPIR-V OpVariable stream (vk::reflect::Desc::decl), which
+                                      # DXC picks and which need not equal HLSL source order -- it does
+                                      # here, and one experiment below shows it need not in general.
+                                      # STEP 0's THREE-WAY QUESTION ANSWERS "SHAPE A": the unsized
+                                      # array stays a MEMBER of the set struct, so MTLArgumentEncoder
+                                      # writes everything and bind.rs:55-67's "the encoder writes the
+                                      # layout" survives C3 intact. Verbatim:
+                                      #     struct spvDescriptorSetBuffer1 {
+                                      #         spvDescriptor<texture2d<float>> texs [[id(0)]][1] /* unsized array hack */;
+                                      #         sampler samp_aniso [[id(1)]];
+                                      #     };
+                                      #     kernel void cs_set1(device spvDescriptorSetBuffer1& spvDescriptorSet1 [[buffer(1)]])
+                                      # encodedLength therefore budgets exactly ONE element: the host
+                                      # over-allocates and writes elements >= 1 raw at offset +
+                                      # i*stride, stride from MTLArrayType, never a literal 8.
+                                      # cs_set1's signature is also the C2 refutation the probe was
+                                      # built for -- one argument buffer, at [[buffer(1)]]. C2's
+                                      # `const BUFFER_INDEX: usize = 0` fails here and nowhere else in
+                                      # the corpus, and so does a scan written as a dense 0..n loop.
+                                      # THE DEFECT, AND IT IS A SILENT MISCOMPILE. spirv-cross cannot
+                                      # lay out a descriptor set holding an unsized array ALONGSIDE
+                                      # anything else. It assigns two members the same [[id]], drops
+                                      # one behind an "// Overlapping binding:" comment, and rewrites
+                                      # that member's uses as a reinterpret_cast of the survivor's
+                                      # storage. It COMPILES. It reaches AIR. It reads texture
+                                      # descriptor bytes as a sampler. On leaf and reference -- the
+                                      # shipping tracer kernels, both already counted among --check-msl
+                                      # 75/80 PASSES -- the casualty is samp_lin, the trilinear sampler
+                                      # every colour / normal / rough-metal read goes through:
+                                      #     spvDescriptor<texture2d<float>> texs [[id(4)]][1] /* unsized array hack */;
+                                      #     // Overlapping binding: sampler samp_lin [[id(4)]];
+                                      #     sampler samp_aniso [[id(5)]];
+                                      #     const device auto &samp_lin = reinterpret_cast<const device sampler &>(spvDescriptorSet1.texs);
+                                      # NO ORDERING INSIDE ONE SET AVOIDS IT, measured by moving the
+                                      # array through the block: array FIRST drops the member after it;
+                                      # array in the MIDDLE or LAST drops the array itself; the array
+                                      # ALONE in a set is clean. (The middle case is also where DXC's
+                                      # OpVariable stream visibly reordered against source order.) THE
+                                      # ARRANGEMENT THAT WORKS is the array alone in its OWN set, both
+                                      # sets marked device -- samplers survive, both sample sites bind
+                                      # correctly, no overlap anywhere:
+                                      #     struct spvDescriptorSetBuffer1 { sampler samp_lin [[id(0)]]; sampler samp_aniso [[id(1)]]; ... };
+                                      #     struct spvDescriptorSetBuffer2 { spvDescriptor<texture2d<float>> texs [[id(0)]][1]; };
+                                      # That is a change to trace_common.hlsli's RP_SCENE_TEX table --
+                                      # shared corpus, D3D12 root signature and the Vulkan layout, not
+                                      # a Metal-local fix -- so it is recorded here and NOT taken.
+                                      # THE PROBE-REACH TRAP FIRED ON THE VERY MEASUREMENT THAT FOUND
+                                      # THE FIX, exactly as FR_ABL's does. The first run of the
+                                      # own-set experiment grepped 0 "Overlapping binding" lines and
+                                      # read as CLEAN; spirv-cross had in fact thrown "Runtime sized
+                                      # variables must be in device storage argument buffers", because
+                                      # --msl-device-argument-buffer names ONE set and space2 was not
+                                      # named. A count of zero over an error message is not a null
+                                      # result. Re-run with the flag passed for both sets.
+                                      # THE TIER LITERAL IS NOT OUT OF RANGE, correcting the reading
+                                      # that --help-msl's "0 = Tier1, 1 = Tier2" invites: tier 0 THROWS
+                                      # "Unsized array of descriptors requires argument buffer tier 2",
+                                      # and 1 and 2 are byte-identical -- the check is >= Tier2, so
+                                      # CROSS_ARGS's literal 2 is undocumented spelling and not a bug.
+                                      # It is the only value that was ever exercised by texs[]-carrying
+                                      # modules, which is why they reached AIR at all.
+                                      # CPU-ONLY TEETH, since --check-mtl needs a Metal device and is
+                                      # not in CI: gfx/shaders.rs pins the probe's space1 block
+                                      # BYTE-IDENTICAL to trace_common.hlsli's and pins its set-0
+                                      # declaration order as DISAGREEING with binding order -- the one
+                                      # property that keeps the corrected id pin non-vacuous. Both
+                                      # proven to fail on a planted edit. The first draft of the second
+                                      # pin searched for bare identifiers and PASSED on a planted
+                                      # reorder, because `outbuf` also occurs in cs_tex's body; it
+                                      # anchors on ": register(" now.
                                       # Touch src/mtl/bind.rs / src/mtl/smoke.rs / device.rs's buffer
-                                      # + compute half / msl.rs's compile_lib / spirv::local_size ->
+                                      # + compute half / msl.rs's compile_lib / spirv::local_size /
+                                      # src/shaders/mtlbind.hlsl / trace_common.hlsli's space1
+                                      # block ->
                                       # run --check-mtl clean AND each of the five levers (four must
                                       # exit 1; the residency one is reported), --check-msl on the
                                       # procedural scene AND san-miguel-low-poly AND --sw-rays,
