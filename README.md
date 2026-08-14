@@ -760,7 +760,7 @@ Real flags, all of them measured rather than guessed.
 | `--spin-hybrid`, `--spin-plain` | Select the quadtree or root-traversal arm for CPU/`--gpu` benchmarks (`--dxr` has only its DXR arm) |
 | `--spin-warmup N` | Exclude leading frames; defaults to 1600 on Intel and 20 elsewhere. A *defaulted* `--spin-frames` is extended so the timed span still covers a whole 600-frame lap |
 | `--cam ex,ey,ez,tx,ty,tz` | Start camera — reproducible viewpoints for benchmarks and screenshots |
-| `--lock-res native\|quality\|0.75\|dynamic` | Render-resolution lock (default `native` — the wired upscaler runs DLAA-shaped) or step-wise dynamic resolution |
+| `--lock-res ultra-quality\|quality\|native\|0.75\|dynamic` | Render-resolution lock (default `ultra-quality` = 0.75, so the wired upscaler reconstructs the window from 0.5625× the pixels; `native` is the DLAA-shaped arm) or step-wise dynamic resolution |
 | `--no-vsync` | Uncapped presentation, so interactive frame times measure the renderer instead of the monitor |
 | `--dual-gpu [N]` \| `--dual-gpu-auto` | Split the frame across two adapters — the secondary renders N of 8 tile rows, either pipeline on either device. Measured honestly: it **loses** interactively on this box (the second slot is electrically x4, and the band transfer costs more than the tracing it offloads), and wins 4–8% on `--cinematic` GI captures, where the band crosses once per *output* frame. The auto balancer converges its share and prints the verdict |
 | `--hdr10` \| `--no-hdr10` \| `--no-hdr` | The display three-way: force PQ / force 10-bit gamma (deep-colour SDR) / legacy 8-bit. `--hdr-paper-white <nits>` sets where linear 1.0 lands; `--hdr-peak <nits>` overrides the probed display peak |

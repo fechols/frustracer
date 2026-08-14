@@ -214,29 +214,49 @@ pub fn quantize_res(
     (width_for_height(rh, out, min.0, max.0), rh)
 }
 
-/// The render scale every mode locks at by default — native 100%, the
-/// DLAA-shaped arm (the wired upscaler runs as a pure antialiaser/denoiser at
-/// window res). ONE value for the CPU tracer, `--gpu` and `--dxr` alike:
-/// the upscalers are the reconstruction stage in all three, so the arm that
-/// happens to be live is not a reason to change how many pixels get traced
-/// (F/SPACE cycling between arms therefore no longer moves the render res).
-/// HISTORY, fourth move: quality 2/3 from 2026-07-26, native 100% from
+/// The render scale every mode locks at by default — 0.75 (`--lock-res
+/// ultra-quality`), i.e. the wired upscaler reconstructs the window from
+/// 0.5625x-pixels rather than running DLAA-shaped at window res. It coincides
+/// with a preset name, as the 2/3 eras did with "quality"; that is a
+/// convenience for the menu row, NOT a coupling — see `lock_scale`. ONE value
+/// for the CPU tracer, `--gpu` and `--dxr` alike: the upscalers are the
+/// reconstruction stage in all three, so the arm that happens to be live is
+/// not a reason to change how many pixels get traced (F/SPACE cycling between
+/// arms therefore no longer moves the render res).
+///
+/// HISTORY, fifth move: quality 2/3 from 2026-07-26, native 100% from
 /// 2026-07-31, quality 2/3 again briefly on 2026-08-08, native again the same
-/// day (the user's call) — so perf numbers recorded at "the flagless default"
-/// carry their era's scale: 0.444x-pixels in the two quality windows,
-/// full-res in the native ones. `--lock-res quality` spells the 2/3 arm.
-/// NOTE this re-closes the vendor_defaults res-basis caveat the quality
-/// window had re-opened (see main::vendor_defaults).
-pub const DEFAULT_LOCK_SCALE: f32 = 1.0;
+/// day, 0.75 from 2026-08-13 (each the user's call) — so perf numbers
+/// recorded at "the flagless default" carry their era's scale: 0.444x-pixels
+/// in the two quality windows, full-res in the native ones, 0.5625x now.
+/// `--lock-res quality` spells the 2/3 arm and `--lock-res native` the
+/// full-res one, so every era stays measurable.
+///
+/// The 0.75 rung is named `ultra-quality` in `lock_scale`'s preset table, so
+/// this const and that entry are two literals of the same number by design —
+/// `cli::self_test` pins the menu row's default through `lock_scale`, which
+/// fails if they part.
+///
+/// NOTE this RE-OPENS the vendor_defaults res-basis caveat that the native
+/// window had closed — the Intel flagless-arm decomposition was measured at
+/// native and the arms do not scale together (see main::vendor_defaults).
+pub const DEFAULT_LOCK_SCALE: f32 = 0.75;
 
 /// --lock-res argument -> fixed render scale (both upscaler paths consume it
 /// through `quantize_res`, which range-clamps). Named presets are the
-/// standard DLSS ratios — "quality" is deliberately the literal 2/3, NOT
-/// `DEFAULT_LOCK_SCALE` (they coincide today, but the default has moved three
-/// times; the preset vocabulary must not move with it); a bare number is
-/// accepted as a ratio in (0, 1] — the filter also rejects NaN.
+/// standard DLSS ratios plus "ultra-quality" (0.75) above them. Each is a
+/// LITERAL, deliberately not `DEFAULT_LOCK_SCALE`: the default has sat on
+/// "quality" and on "native" before landing on "ultra-quality", and the
+/// vocabulary must not move with it — a session that spells a preset asks for
+/// that ratio, not for whatever ships today. A bare number is also accepted
+/// as a ratio in (0, 1] — the filter rejects NaN.
 pub fn lock_scale(arg: &str) -> Option<f32> {
     match arg {
+        // 0.75 — the rung ABOVE "quality", added 2026-08-13 with the default
+        // that sits on it. The name mirrors "ultra-performance" at the other
+        // end of the ladder rather than following any vendor, none of whom
+        // publish a 3/4 tier under a single name.
+        "ultra-quality" => Some(0.75),
         "quality" => Some(2.0 / 3.0),
         "balanced" => Some(0.58),
         "performance" => Some(0.5),
