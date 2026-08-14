@@ -81,7 +81,7 @@ void cs_prep(uint3 id : SV_DispatchThreadID) {
     uint groups = (n + push2 - 1) / push2;
     uint gx = min(groups, 32768u);
     uint gy = (groups + 32767u) / 32768u;
-    args[push3] = uint3(gx, groups > 0 ? gy : 0, 1);
+    args_write(push3, uint3(gx, groups > 0 ? gy : 0, 1));
     if (push1 != 0xffffffffu) counters[push1] = 0;
 }
 
@@ -93,7 +93,7 @@ void cs_prep(uint3 id : SV_DispatchThreadID) {
 [numthreads(1, 1, 1)]
 void cs_prep_mul(uint3 id : SV_DispatchThreadID) {
     uint groups = counters[push0] * push2;
-    args[push3] = uint3(min(groups, 32768u), groups > 0 ? (groups + 32767u) / 32768u : 0u, 1);
+    args_write(push3, uint3(min(groups, 32768u), groups > 0 ? (groups + 32767u) / 32768u : 0u, 1));
 }
 
 // --- check builds: flood info with the exactly-once coverage sentinel ---
@@ -121,7 +121,7 @@ void cs_prep_batch(uint3 id : SV_DispatchThreadID) {
     uint total = counters[push0];
     uint n = total > push1 ? min(total - push1, hemi_batch) : 0u;
     uint groups = (n + push2 - 1) / push2;
-    args[push3] = uint3(min(groups, 32768u), groups > 0 ? (groups + 32767u) / 32768u : 0u, 1);
+    args_write(push3, uint3(min(groups, 32768u), groups > 0 ? (groups + 32767u) / 32768u : 0u, 1));
     counters[CTR_HEMI_A] = 0;
     counters[CTR_HEMI_B] = 0;
     counters[CTR_HEMI_LEAF] = 0;
