@@ -2,9 +2,11 @@
 //! named for its API exactly as those are.
 //!
 //! **Scope today: FOUR consumers of one G-buffer — two upscalers, a denoiser
-//! and a frame interpolator — plus the cinematic capture stage they feed.
-//! There is no Metal tracer.** The G-buffer comes from the CPU renderer
-//! (`src/dlss.rs`), which runs on every platform.
+//! and a frame interpolator — plus the cinematic capture stage they feed, and
+//! since C2 a fifth thing that is not a consumer at all: the corpus's own
+//! kernels, compiled, bound and DISPATCHED.** The G-buffer comes from the CPU
+//! renderer (`src/dlss.rs`), which runs on every platform; there is still no
+//! Metal TRACER, but the machinery one needs now runs.
 //!
 //! * `fsr3` — FidelityFX 1.1.4, through a hand-written `FfxInterface`
 //!   (`shim/ffx_fsr3_metal.mm`) over shaders transpiled to `.metallib` at build
@@ -64,13 +66,24 @@
 //! rather than five `Option`s on `Trio` precisely because of that un-share
 //! condition — its own doc gives the argument.
 //!
-//! `msl` is the ONE module here that is not a G-buffer consumer, and it is the
-//! first rung of a tracer rather than another arm beside them: the corpus's
-//! third code generator, HLSL -> SPIR-V -> MSL -> `.metallib`, gated by
-//! `--check-msl`. It renders nothing and binds nothing by design. Read its
-//! header before touching the arg set — every flag in it is a measurement,
-//! including one that `build.rs` passes for FidelityFX and this route must
-//! not.
+//! `msl`, `bind` and `smoke` are the modules here that are not G-buffer
+//! consumers. They are the tracer's first two rungs rather than more arms
+//! beside the others:
+//!
+//! * `msl` (C1) — the corpus's third code generator, HLSL -> SPIR-V -> MSL ->
+//!   `.metallib`, gated by `--check-msl`. It renders nothing and binds nothing
+//!   by design. Read its header before touching the arg set: every flag in it
+//!   is a measurement, including one that `build.rs` passes for FidelityFX and
+//!   this route must not.
+//! * `bind` (C2) — how one of those `.metallib`s is BOUND. The argument-buffer
+//!   map is derived off the compiled function and cross-checked against an
+//!   independent read of the module's own SPIR-V, because it cannot be written
+//!   down: spirv-cross assigns `[[id(n)]]` densely and PER ENTRY POINT, so the
+//!   three kernels of one file disagree about where the same buffer lives.
+//! * `smoke` (C2) — the chain that proves it: seed -> prep -> **indirect**
+//!   fill, the same `smoke.hlsl` D3D12 and Vulkan each run as their own first
+//!   dispatch. Gated by `--check-mtl`, which is to `--check-msl` what
+//!   `--check-vk` is to `--check-spirv`.
 //!
 //! It also retired the premise the tracer plan was written on: **spirv-cross
 //! lowers `RayQuery` to Metal**, so `leaf`/`reference`/`leaf_fb`/`hemi_leaf`
@@ -78,11 +91,13 @@
 //! `--sw-rays`.
 //!
 //! Nothing here is reachable from `src/gfx/`. The entry points are
-//! `--check-fsr3`, `--check-metalfx`, `--check-msl`, and — since B4 —
-//! `--cinematic`, whose CPU arm reconstructs through `mfxdn` (or `mfx`) when
-//! one is available. That last one is the first thing on this platform that
-//! produces a PICTURE rather than a number.
+//! `--check-fsr3`, `--check-metalfx`, `--check-msl`, `--check-mtl`, and — since
+//! B4 — `--cinematic`, whose CPU arm reconstructs through `mfxdn` (or `mfx`)
+//! when one is available. That last one is the first thing on this platform
+//! that produces a PICTURE rather than a number; `--check-mtl` is the first
+//! that runs one of OUR OWN shaders on the GPU.
 
+pub mod bind;
 pub mod device;
 pub mod fsr3;
 pub mod mfx;
@@ -90,3 +105,4 @@ pub mod mfxdn;
 pub mod mfxfi;
 pub mod msl;
 pub mod planes;
+pub mod smoke;
