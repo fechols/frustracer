@@ -8,15 +8,50 @@
 
 // Verify: an empty-cell claim re-validated with the CPU check's 6-direction
 // grid — a hit inside the claim is exactly the false-sky bug shape.
+// The six grid weights, as a SWITCH rather than a `const float3 W[6]` indexed
+// by the loop counter. Under `[unroll]` the two are identical — the index is a
+// literal in every body, so the array folds away. Under `[loop]` they are not:
+// a dynamically indexed local array becomes an `internal constant [18 x float]`
+// global plus a load per component in DXIL, while the switch folds to `phi`s and
+// touches no memory at all (measured on SDKs/dxc-macos, `-T cs_6_5 -HV 2021
+// -O3 -Fc`). `cs_hemi_cell` is measured at 240 VGPR / 6-of-16 waves
+// (docs/history/profiling.md) — the regime where `leaf-fb`'s +24 VGPRs cost a
+// whole wave slot — so the free form is the one to spell.
+float3 check_dir_w(uint i) {
+    switch (i) {
+        case 0:  return float3(1, 1, 1);
+        case 1:  return float3(6, 1, 1);
+        case 2:  return float3(1, 6, 1);
+        case 3:  return float3(1, 1, 6);
+        case 4:  return float3(3, 3, 1);
+        default: return float3(1, 3, 3);
+    }
+}
+
 void check_empty_cell(float3 o, float3 a, float3 b, float3 c, float t_lim) {
     float tmax = t_lim < FLT_MAX ? t_lim * (1.0 - 1e-3) : FLT_MAX;
-    const float3 W[6] = {
-        float3(1, 1, 1), float3(6, 1, 1), float3(1, 6, 1),
-        float3(1, 1, 6), float3(3, 3, 1), float3(1, 3, 3),
-    };
     uint dummy;
-    [unroll] for (uint i = 0; i < 6; ++i) {
-        float3 d = normalize(a * W[i].x + b * W[i].y + c * W[i].z);
+    // [loop], NOT [unroll], and it is LOAD-BEARING rather than a style choice.
+    // Each `occluded_q` declares its own `RayQuery`; SPIR-V requires every
+    // `OpVariable` in a function's FIRST block, so six unrolled bodies share one
+    // function-scope variable — and spirv-cross then declares it inside a
+    // `do{}while(false)` and references it after that block closes, emitting
+    // `use of undeclared identifier`. Six bodies reproduce it; one does not.
+    // MEASURED identical on spirv-cross 1.4.350.1 and 1.4.357.0, so it is not a
+    // stale-tool artifact.
+    //
+    // The symptom is Metal-only (`--check-msl`) but the fix is in the SHARED
+    // corpus deliberately: `gfx/shaders.rs` states that the assembled string IS
+    // the contract, and a per-backend arm would mean the gate stops covering the
+    // program D3D12 and Vulkan actually ship. `cargo test`'s hemi-wave source pin
+    // is what keeps a well-meaning revert to `[unroll]` from landing.
+    //
+    // It also costs the two backends that were already fine strictly less work:
+    // `cs_hemi_root` drops from ~24 inlined `RayQuery` bodies to 4 (this loop
+    // sits inside a 4-octant `for`), `cs_hemi_cell` from 6 to 1.
+    [loop] for (uint i = 0; i < 6; ++i) {
+        float3 W = check_dir_w(i);
+        float3 d = normalize(a * W.x + b * W.y + c * W.z);
         if (occluded_q(o, d, 0.0, tmax)) {
             InterlockedAdd(counters[CTR_V_FALSE_EMPTY], 1, dummy);
         }
