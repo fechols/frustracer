@@ -94,6 +94,7 @@ of NVIDIA's NRD entry names.
 | `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V19 |
 | `--check-spirv` | unix + DXC/spirv-val | the whole shader corpus → SPIR-V |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
+| `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
 | `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |
 | `--check-fsr3` | macOS | FSR3 over the hand-written Metal backend |
 | `--check-dlss` `--check-xess` `--check-fsr` `--check-nrd` | nothing | DLL-free contract self-tests |
@@ -104,7 +105,7 @@ Each takes an optional scene and composes with `--stress N`. Exit **2** = enviro
 
 **CI** (`.github/workflows/ci.yml`, 5 jobs, all `--profile quick`): Windows/Linux/macOS run
 `--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-nrd`; a Vulkan job runs
-`--check-spirv` + `--check-vk` with anti-vacuity greps; a Metal job runs the three Metal
+`--check-spirv` + `--check-vk` with anti-vacuity greps; a Metal job runs the four Metal
 gates. No clippy or fmt job.
 
 **The "touch X → run Y" convention.** ~35 such run-lists live in module headers and the

@@ -663,6 +663,20 @@ jobs:
       # re-enable these without the answer; the first step toward it is arming
       # the two layers SEPARATELY, since only one of them is implicated.
       #
+      # ONE NARROWING, from C2 (2026-08-12), and it is a narrowing rather than
+      # an answer: --check-mtl — our OWN pipelines, our own dispatch, the same
+      # smoke.hlsl chain — PASSES on an Apple M1 with MTL_DEBUG_LAYER=1 alone,
+      # with MTL_SHADER_VALIDATION=1 alone, and with neither. So "GPU validation
+      # makes a Metal compute dispatch write nothing" is NOT a general property
+      # of this class of work. The two variables are still confounded, which is
+      # why this is not the answer: that failure was on the PARAVIRTUAL runner
+      # and this measurement is on real silicon, so it remains open whether the
+      # implicated half is the layer, the device, or FFX's own resource setup
+      # (the four GOTCHAs in shim/ffx_fsr3_metal.mm are all texture-shaped, and
+      # C2 has no textures). Running --check-mtl under both layers ON THIS
+      # RUNNER is the cheap next step — it is a 40-line chain with exact-integer
+      # observables, where FSR3 is eleven pipelines and an image.
+      #
       # THE GUARDS ARE ASYMMETRIC, deliberately. Unlike --check-vk, whose
       # summary is unreachable after a SKIP, these gates skip a stage and still
       # print PASSED — so PASSED alone would go green on an image that lost the
@@ -708,6 +722,30 @@ jobs:
       # break the one-release-tag invariant that keeps the DXIL and SPIR-V front
       # ends identical), so it is cached on DXC_TAG like the Vulkan job's.
       #
+      # --check-mtl IS THE FIRST REAL GPU TEETH THIS JOB HAS, and it is here
+      # because the runner can actually run it: --check-fsr3's U3/U4 already
+      # build 11 pipelines and dispatch a scored upscale on this same
+      # paravirtual device, so a compute pipeline + dispatch + readback is
+      # PROVEN to work — the thing --check-metalfx cannot say. It binds and
+      # dispatches smoke.hlsl, the same kernel --check-vk's V3 runs on Linux and
+      # --check-gpu's smoke test runs on Windows: three backends, one kernel.
+      #
+      # TWO THINGS IT NEEDS THAT THE JOB ALREADY INSTALLS: spirv-cross and the
+      # Metal cryptex (for --check-msl) and SDKs/dxc-macos (likewise). It adds
+      # no new prerequisite; what it adds is a DEVICE requirement, which is why
+      # it is a separate flag from --check-msl rather than more M-stages — that
+      # gate's whole value here is that it needs no GPU at all.
+      #
+      # GUARDED ON K4, not just on PASSED, for the reason the two above already
+      # carry: K1/K2 SKIP (exit 0) when the device or the toolchain is absent,
+      # so PASSED alone would go green on a runner that lost either. K4 is the
+      # line only a real dispatch prints. WHAT IS UNMEASURED ON THIS RUNNER is
+      # argument-buffer tier 2 — K1 SKIPs on tier 1, which is an environment
+      # fact rather than a failure, and the K4 guard is what turns that skip
+      # into a red job instead of a quiet pass. If the first run reports tier 1,
+      # relax the guard and say so here; do not tighten it to a line that has
+      # not been proven to run (the --check-metalfx lesson below).
+      #
       # ALL THREE GATES RUN BEFORE ANY GUARD IS EVALUATED. The first draft
       # asserted after each, so the fsr3 failure above exited the step and
       # --check-metalfx never ran at all — one gate's failure hid the other's
@@ -721,6 +759,7 @@ jobs:
           cargo run --profile quick -- --check-fsr3    2>&1 | tee fsr3.log    || rc=1
           cargo run --profile quick -- --check-metalfx 2>&1 | tee metalfx.log || rc=1
           cargo run --profile quick -- --check-msl     2>&1 | tee msl.log     || rc=1
+          cargo run --profile quick -- --check-mtl     2>&1 | tee mtl.log     || rc=1
           grep -q "check-fsr3: PASSED" fsr3.log \
             || { echo "::error::--check-fsr3 did not pass"; rc=1; }
           grep -q "check-fsr3: U4 upscale" fsr3.log \
@@ -731,6 +770,10 @@ jobs:
             || { echo "::error::--check-msl did not pass"; rc=1; }
           grep -q "check-msl: M3/M4" msl.log \
             || { echo "::error::--check-msl compiled nothing — the toolchain skipped:"; grep -E "SKIP M[0-9]" msl.log || true; rc=1; }
+          grep -q "CHECK-MTL PASSED" mtl.log \
+            || { echo "::error::--check-mtl did not pass"; rc=1; }
+          grep -q "check-mtl: K4" mtl.log \
+            || { echo "::error::--check-mtl dispatched nothing — a stage skipped:"; grep -E "SKIP K[0-9]" mtl.log || true; rc=1; }
           exit $rc
 
       - uses: actions/upload-artifact@v4
@@ -741,4 +784,5 @@ jobs:
             fsr3.log
             metalfx.log
             msl.log
+            mtl.log
           if-no-files-found: warn

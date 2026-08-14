@@ -572,6 +572,91 @@ pub fn to_words(bytes: &[u8]) -> std::result::Result<Vec<u32>, String> {
     Ok(words)
 }
 
+/// A compute kernel's workgroup size, recovered from `OpExecutionMode <entry>
+/// LocalSize x y z`.
+///
+/// # Why a HOST-side parse exists at all
+///
+/// D3D12 and Vulkan both take the group size from the bytecode: `[numthreads]`
+/// rides the DXIL, and `vkCmdDispatch` counts GROUPS whose shape the module
+/// already declared. **Metal does not.** `dispatchThreadgroups:
+/// threadsPerThreadgroup:` — and the indirect form with it — take that shape as
+/// a CPU argument, because MSL has no `[numthreads]` to carry it. So a Metal
+/// dispatch of a corpus kernel has to be told, and this is where it is told
+/// from.
+///
+/// # `Err` on a miss, never a `[1, 1, 1]` fallback
+///
+/// That value is indistinguishable from a real 1x1x1 kernel — nonzero, product
+/// well under Metal's 1024 ceiling, so every downstream sanity check accepts it
+/// — and dispatching with it runs one thread per threadgroup: correct-looking
+/// output at 1/64 the rate for `cs_fill`, with no error anywhere. A miss is
+/// always a defect, and the realistic trigger has a name, so the message says
+/// it: `OpExecutionModeId` + `LocalSizeId` (a specialization-constant group
+/// size), which this deliberately does not decode because nothing in this
+/// corpus emits one.
+///
+/// # Disagreement is a finding, not a first match
+///
+/// Every compute unit here is compiled one entry point at a time
+/// (`main.rs::corpus_jobs` yields one job per entry), so a well-formed module
+/// declares exactly one `LocalSize`. Returning the first and walking on would
+/// silently pick an arbitrary kernel's shape out of a module that somehow
+/// carried two; requiring them to AGREE costs one comparison and turns that
+/// into a diagnosis.
+///
+/// # The twin
+///
+/// `build.rs::spirv_local_size` is a byte-for-byte equivalent of this walk, and
+/// is deliberately NOT a call to it: a build script is its own compilation unit
+/// and cannot `use crate::spirv`. The tree already accepts documented twins
+/// where the language forbids sharing — `build.rs::fnv1a64` names its own in
+/// `shim/ffx_fsr3_metal.mm` — so both sides carry a comment naming the other.
+/// Change one, change both.
+pub fn local_size(words: &[u32]) -> std::result::Result<[u32; 3], String> {
+    /// `OpExecutionMode`. `OpExecutionModeId` (331) is deliberately not read;
+    /// see the module doc.
+    const OP_EXECUTION_MODE: u16 = 16;
+    const EXEC_MODE_LOCAL_SIZE: u32 = 17;
+
+    if words.len() < 5 || words[0] != SPIRV_MAGIC {
+        return Err("local_size: not a SPIR-V module (call to_words first)".into());
+    }
+    let mut found: Option<[u32; 3]> = None;
+    // Past the 5-word header, stepping every instruction by its own declared
+    // word count — which is what keeps this total over SPIR-V versions and
+    // opcodes it has never seen (`vk::reflect`'s discipline).
+    let mut i = 5;
+    while i < words.len() {
+        let count = (words[i] >> 16) as usize;
+        // A zero count cannot advance, so it is a malformed stream rather than
+        // an unknown opcode: stop instead of looping forever.
+        if count == 0 || i + count > words.len() {
+            break;
+        }
+        if (words[i] & 0xffff) as u16 == OP_EXECUTION_MODE
+            && count >= 6
+            && words[i + 2] == EXEC_MODE_LOCAL_SIZE
+        {
+            let ls = [words[i + 3], words[i + 4], words[i + 5]];
+            match found {
+                Some(prev) if prev != ls => {
+                    return Err(format!(
+                        "local_size: module declares two different LocalSize modes, \
+                         {prev:?} and {ls:?} — it carries more than one entry point"
+                    ));
+                }
+                _ => found = Some(ls),
+            }
+        }
+        i += count;
+    }
+    found.ok_or_else(|| {
+        "local_size: no OpExecutionMode LocalSize (a LocalSizeId group size is not decoded)"
+            .to_string()
+    })
+}
+
 /// Pure gate: the binding scheme, with the property that actually matters.
 ///
 /// `spirv-val` validates a MODULE and knows nothing about pipeline layouts, so
@@ -675,6 +760,60 @@ pub fn self_test() -> std::result::Result<(), String> {
             return Err(format!("to_words did not diagnose the byte swap: {e}"))
         }
         Err(_) => {}
+    }
+
+    // local_size, on synthetic modules. The REAL corpus is parsed by
+    // `--check-mtl`'s K-stages, which have a compiler; what belongs here is the
+    // walk's own behaviour, including the two ways it must refuse.
+    let hdr = |body: &[u32]| -> Vec<u32> {
+        let mut w = vec![SPIRV_MAGIC, 0x0001_0600, 0, 1, 0];
+        w.extend_from_slice(body);
+        w
+    };
+    // OpExecutionMode <entry> LocalSize x y z — 6 words including the opcode.
+    let exec_mode = |x: u32, y: u32, z: u32| -> [u32; 6] { [(6 << 16) | 16, 1, 17, x, y, z] };
+
+    match local_size(&hdr(&exec_mode(64, 1, 1))) {
+        Ok([64, 1, 1]) => {}
+        other => return Err(format!("local_size on a plain module = {other:?}")),
+    }
+    // An unknown opcode must be stepped over by its OWN word count, not by a
+    // guess — the property that keeps this total over instructions it has never
+    // seen. A 4-word filler whose payload deliberately contains the LocalSize
+    // pattern would be misread by a scan that walked word by word.
+    let mut hidden = vec![(4u32 << 16) | 999, 1, 17, 8];
+    hidden.extend_from_slice(&exec_mode(64, 1, 1));
+    match local_size(&hdr(&hidden)) {
+        Ok([64, 1, 1]) => {}
+        other => return Err(format!("local_size did not step over an unknown opcode: {other:?}")),
+    }
+    // A miss must NAME the realistic cause rather than reporting a bare absence.
+    match local_size(&hdr(&[])) {
+        Err(e) if e.contains("LocalSizeId") => {}
+        other => return Err(format!("local_size on a module with no LocalSize = {other:?}")),
+    }
+    // Two entry points that disagree is a diagnosis, not a first match.
+    let mut two = exec_mode(64, 1, 1).to_vec();
+    two.extend_from_slice(&exec_mode(8, 8, 1));
+    match local_size(&hdr(&two)) {
+        Err(e) if e.contains("two different LocalSize") => {}
+        other => return Err(format!("local_size accepted disagreeing LocalSize modes: {other:?}")),
+    }
+    // Two that AGREE are not an error — the refusal is about ambiguity, not
+    // about the count.
+    let mut same = exec_mode(64, 1, 1).to_vec();
+    same.extend_from_slice(&exec_mode(64, 1, 1));
+    if local_size(&hdr(&same)) != Ok([64, 1, 1]) {
+        return Err("local_size refused two agreeing LocalSize modes".into());
+    }
+    // A zero word count cannot advance the cursor. This must TERMINATE — a
+    // walk that trusted the count would hang here, and a hung gate reads
+    // exactly like a slow one.
+    if local_size(&hdr(&[0, 0, 0])).is_ok() {
+        return Err("local_size read a size out of a malformed instruction stream".into());
+    }
+    if local_size(&[SPIRV_MAGIC]).is_ok() {
+        return Err("local_size accepted a blob with no header".into());
     }
     Ok(())
 }

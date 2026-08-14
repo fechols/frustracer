@@ -19,9 +19,10 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize,
-    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLArgumentBuffersTier, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin,
+    MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureUsage,
 };
 use std::ffi::c_void;
 
@@ -83,10 +84,15 @@ impl Mtl {
     /// a gate log that omits it cannot explain a failure that involves it.
     pub fn line(&self) -> String {
         format!(
-            "{} | unified {} | linear-tex-align {} B",
+            "{} | unified {} | linear-tex-align {} B | arg-buffers tier {}",
             self.device.name(),
             self.device.hasUnifiedMemory(),
             self.linear_tex_align(),
+            match self.arg_buffers_tier() {
+                MTLArgumentBuffersTier::Tier1 => "1",
+                MTLArgumentBuffersTier::Tier2 => "2",
+                _ => "?",
+            },
         )
     }
 
@@ -119,6 +125,146 @@ impl Mtl {
     /// wants the real thing.
     pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    /// Which argument-buffer tier the device supports.
+    ///
+    /// `--msl-argument-buffer-tier 2` (`mtl::msl::CROSS_ARGS`) is a spirv-cross
+    /// CODEGEN promise; this is the device's side of it, and the two are
+    /// unrelated until something checks. Every Apple silicon GPU is Tier 2, but
+    /// nothing in this tree had ever read the property, so a Tier-1 device would
+    /// have surfaced as a pipeline that builds and then reads the wrong
+    /// resource. `line()` prints it for the reason `linear-tex-align` is there:
+    /// a gate log that omits it cannot explain a failure that involves it.
+    pub fn arg_buffers_tier(&self) -> MTLArgumentBuffersTier {
+        self.device.argumentBuffersSupport()
+    }
+
+    /// Does the device honour what `msl::CROSS_ARGS` asks spirv-cross for?
+    ///
+    /// A predicate rather than a raw tier at the call site, so `main.rs` does
+    /// not have to name an `objc2_metal` type to ask — the same reason
+    /// `PresentSpace::format` lives in `gpu/d3d12.rs`.
+    pub fn is_tier2(&self) -> bool {
+        self.arg_buffers_tier() == MTLArgumentBuffersTier::Tier2
+    }
+
+    /// A `Shared`-storage buffer, host-writable and host-readable with no
+    /// staging.
+    ///
+    /// Deliberately NOT parameterised by storage mode, unlike `texture` — that
+    /// one takes the mode because MetalFX's output surface is REQUIRED to be
+    /// `Private`, and no such consumer exists for buffers. `Shared` here is the
+    /// unified-memory precondition `Mtl::new` already enforces as ABSENT, so
+    /// `contents()` is a plain host pointer on every device this harness will
+    /// ever see, and the whole `vk/stage.rs` upload-ring apparatus has nothing
+    /// to do.
+    pub fn buffer(&self, len: usize) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
+        // A zero-length buffer is nil rather than an empty allocation, which
+        // would surface later as an unrelated nil-deref inside an encoder.
+        if len == 0 {
+            return Err("buffer(0) — Metal has no zero-length allocation".into());
+        }
+        self.device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| format!("newBufferWithLength({len}) returned nil"))
+    }
+
+    /// Fill a buffer with one repeated `u32`, host-side.
+    ///
+    /// The poison. `vk/headless.rs` does this with `vkCmdFillBuffer` because a
+    /// device-local Vulkan buffer has no host pointer; `Shared` storage has one,
+    /// so this is a plain write and needs no blit encoder, no barrier, and no
+    /// command buffer at all. A `Private` buffer could not be filled this way —
+    /// which is the other half of why `buffer` does not take a mode.
+    ///
+    /// WORDS RATHER THAN BYTES, and that is a safety property, not a
+    /// convenience. A byte fill can only produce byte-uniform patterns, so
+    /// every buffer would have to share one sentinel — and `smoke.hlsl`'s
+    /// `cs_prep` turns whatever it reads from `counters` into a THREADGROUP
+    /// COUNT (`(n + 63) / 64`). Poisoning `counters` with the natural
+    /// `0xEEEE_EEEE` means a mis-bound run asks for ~62 million threadgroups,
+    /// which on a dev Mac can take the WindowServer down with it and on CI is a
+    /// 45-minute timeout. So the caller picks a per-buffer poison, and the ones
+    /// a dispatch count is derived from get a small distinctive value.
+    pub fn fill_words(&self, buf: &ProtocolObject<dyn MTLBuffer>, word: u32) {
+        let n = buf.length() / 4;
+        // SAFETY: `Shared` storage on a unified-memory device (the `Mtl::new`
+        // precondition), `length()` is the allocation's own size, and the count
+        // is derived from it. Nothing is in flight: every submit here blocks in
+        // `run`.
+        unsafe {
+            std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u32, n).fill(word)
+        };
+    }
+
+    /// Write `u32` words at the start of a buffer.
+    ///
+    /// Here rather than at the call site so every raw host-pointer access in
+    /// this backend lives in the module that owns the precondition making one
+    /// legal (`Shared` storage on unified memory, enforced as ABSENT in
+    /// `Mtl::new`). A caller doing its own `from_raw_parts_mut` would be
+    /// relying on that precondition without being able to see it.
+    ///
+    /// Silently writes nothing past the allocation rather than trusting the
+    /// caller's length.
+    pub fn write_words(&self, buf: &ProtocolObject<dyn MTLBuffer>, words: &[u32]) {
+        let n = words.len().min(buf.length() / 4);
+        // SAFETY: as `fill_words` — Shared storage, host pointer, GPU idle,
+        // count clamped to the allocation.
+        unsafe {
+            std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u32, n)
+                .copy_from_slice(&words[..n]);
+        }
+    }
+
+    /// Read a buffer back as `u32` words.
+    ///
+    /// MUST be called after the submit that wrote it has completed — `run`
+    /// blocks, so "outside the closure" is the whole rule. Reading inside would
+    /// race the GPU with no diagnostic: unified memory means the stale value is
+    /// a perfectly valid read of the wrong moment.
+    pub fn read_words(&self, buf: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec<u32> {
+        let want = n * 4;
+        let have = buf.length();
+        let n = if want <= have { n } else { have / 4 };
+        // SAFETY: as `fill` — Shared storage, host pointer, GPU idle. The count
+        // is clamped to the allocation above rather than trusted.
+        unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u32, n).to_vec() }
+    }
+
+    /// Record one COMPUTE pass and block until it completes.
+    ///
+    /// `run`'s sibling, and it exists to carry two disciplines rather than to
+    /// save typing. First, `blit`'s nil-encoder rule: a nil
+    /// `computeCommandEncoder()` must be an ERROR, not an empty command buffer
+    /// that commits cleanly and reads exactly like a pass that ran and wrote
+    /// nothing. Second, ONE encoder for the whole chain — Metal's default
+    /// dispatch type is `MTLDispatchTypeSerial`, so consecutive dispatches in
+    /// one encoder are ordered and hazard-tracked by the driver. That is why
+    /// this has no barrier apparatus at all where `vk/headless.rs` needs
+    /// `compute_barrier` between every pass; if that ordering ever proves not
+    /// to hold for an indirect ARGUMENT read, the fallback is one encoder per
+    /// dispatch (Metal orders those absolutely), not scattered barriers.
+    pub fn compute<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> Result<(), String>,
+    {
+        let mut inner: Result<(), String> = Ok(());
+        let outer = self.run(|cb| {
+            let enc = match cb.computeCommandEncoder() {
+                Some(e) => e,
+                None => {
+                    inner = Err("computeCommandEncoder() returned nil".into());
+                    return;
+                }
+            };
+            inner = f(&enc);
+            enc.endEncoding();
+        });
+        // The inner error first: a bad bind is the interesting failure, and the
+        // command buffer's own error is often its downstream consequence.
+        inner.and(outer)
     }
 
     /// A texture, in the storage mode the CALLER names.

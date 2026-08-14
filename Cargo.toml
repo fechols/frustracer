@@ -210,11 +210,22 @@ sdl3 = { version = "0.18", features = ["build-from-source-static", "ash"] }
 #
 # `default-features = false` + a named feature per Metal header, because
 # objc2-metal gates each header behind a same-named feature and the default set
-# is the whole framework. The list is deliberately SHORT: the Rust side only
-# creates a device, textures and a command buffer and reads bytes back — it
-# never records a compute pass or builds a pipeline, because shim/ffx_metal.mm
-# does all of that on the FFX side. No MTLLibrary, no MTLComputePipeline, no
-# MTLSampler here.
+# is the whole framework.
+#
+# THE LIST WAS "DELIBERATELY SHORT" AND IS NOW MERELY EXPLICIT, and that is a
+# scope change rather than a slip. Until C2 the Rust side only created a device,
+# textures and a command buffer and read bytes back, because shim/ffx_metal.mm
+# built every pipeline on the FFX side; C2 (src/mtl/bind.rs) binds and
+# dispatches OUR OWN corpus kernels, so it records a compute pass and builds
+# pipelines from Rust. The claim that replaced this one is per-entry below.
+#
+# The old wording also said "no MTLLibrary", which was never true: objc2-metal's
+# own `MTLDevice` feature pulls `MTLLibrary`, `MTLResource` and `MTLGPUAddress`,
+# so it has been in the build from the first commit. Naming it is the same
+# invisible-widening complaint the MetalFX block below already makes about
+# itself. `MTLSampler`, `MTLHeap`, `MTLIndirectCommandBuffer` (which is
+# GPU-encoded command LISTS, a different thing from indirect dispatch — do not
+# add it on the name) and every MTL4* stay out.
 #
 # NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
 # are pulled in and compile there); this is additive and touches neither.
@@ -239,6 +250,41 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLResource",
     "MTLPixelFormat",
     "MTLTypes",
+    # C2 — binding and dispatching the corpus's own kernels (src/mtl/bind.rs).
+    # MTLAllocation above is load-bearing TWICE more, and both are silent: it
+    # also gates `MTLComputeCommandEncoder::useResource:usage:` (residency,
+    # `all(MTLAllocation, MTLResource)`) and `newBufferWithLength:options:`.
+    # Drop it and the one call that argument buffers make MANDATORY simply
+    # ceases to exist as a method.
+    "MTLBuffer",
+    "MTLLibrary",
+    "MTLComputePipeline",
+    "MTLComputeCommandEncoder",
+    # The DERIVED argument-buffer map. `MTLArgumentEncoder` writes each member
+    # at the offset the COMPILED FUNCTION declares, so nothing here assumes a
+    # struct layout; `MTLArgument` is the concrete reflection class that names
+    # the members. The non-deprecated route (`MTLComputePipelineReflection::
+    # bindings()` -> `MTLBufferBinding::bufferStructType()`) is unreachable in
+    # objc2 0.6: `MTLBufferBinding` is an `extern_protocol!`, and there is no
+    # `DowncastTarget` for `ProtocolObject`, so a `dyn MTLBinding` cannot be
+    # narrowed to it without hand-rolled `msg_send!`.
+    "MTLArgumentEncoder",
+    "MTLArgument",
+    "MTLDataType",
+    "MTLFunctionConstantValues",
+] }
+# Named directly as of C2, which overturns the note this replaces ("deliberately
+# NOT a direct dependency: nothing under src/ names it"). Rust-side pipeline
+# creation cannot avoid it: `newFunctionWithName:` takes `&NSString`,
+# `functionNames()`/`members()` return `NSArray`, and `newLibraryWithURL:` takes
+# `&NSURL`. No new download and no new compile — objc2-foundation is already in
+# Cargo.lock and already builds as objc2-metal's own dependency; this only makes
+# it nameable.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSArray",
+    "NSURL",
 ] }
 # MetalFX (src/mtl/mfx.rs) — Apple's temporal upscaler, a second consumer of the
 # same G-buffer `mtl::fsr3` feeds FidelityFX. No shim, no shader transpile, no

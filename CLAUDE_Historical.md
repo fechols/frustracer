@@ -262,6 +262,10 @@ cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (un
                                       # -> docs/history/shader-toolchains.md
 cargo run --release -- --check-msl    # THE METAL SHADER TOOLCHAIN, gated (macOS; src/mtl/msl.rs +
                                       # -> docs/history/shader-toolchains.md
+cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMETHING (macOS;
+                                      # src/mtl/bind.rs + src/mtl/smoke.rs -- binds and
+                                      # DISPATCHES one of those metallibs; the map is DERIVED
+                                      # -> docs/history/metal-backend.md
 cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOMETHING (unix; src/vk/device.rs
                                       # -> docs/history/vulkan-backend.md
 cargo run --release -- --check-fsr3   # FSR3 UPSCALING ON METAL, gated (macOS; src/mtl/ +

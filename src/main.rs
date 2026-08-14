@@ -367,6 +367,7 @@ fn main() {
         check_metalfx,
         check_spirv,
         check_msl,
+        check_mtl,
         check_vk,
         check_gpu,
         check_dxr,
@@ -1041,8 +1042,10 @@ fn main() {
         // Scene-keyed for the line above's reason, and it is the SAME corpus:
         // both gates enumerate it through `corpus_units`.
         || check_msl
-        // NOT scene-keyed: the smoke kernel is one file with no scene-derived
-        // defines, so this gate is a pure function of the device.
+        // NOT scene-keyed, either of them: the smoke kernel is one file with no
+        // scene-derived defines, so both gates are a pure function of the
+        // device.
+        || check_mtl
         || check_vk
         || check_gpu
         || check_dxr;
@@ -1383,6 +1386,25 @@ fn main() {
                  macOS-only: `xcrun metal` has no counterpart elsewhere. The SPIR-V half \
                  it builds on runs on every unix in --check-spirv, and the corpus both \
                  gates enumerate is the same one (main.rs::corpus_units)."
+            );
+            std::process::exit(2);
+        }
+    }
+    if check_mtl {
+        #[cfg(target_os = "macos")]
+        {
+            let code = run_check_mtl(&scene);
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Exit 2 on the wrong OS — the --check-fsr3 convention, for the
+            // reason its sibling above states.
+            eprintln!(
+                "--check-mtl binds and dispatches one of the `.metallib`s --check-msl \
+                 compiles, so it is macOS-only. Its Vulkan peer is --check-vk (whose V3 \
+                 runs the same smoke.hlsl chain), and its D3D12 peer is the smoke test \
+                 --check-gpu runs before its own M-stages."
             );
             std::process::exit(2);
         }
@@ -14680,6 +14702,320 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
     }
     println!("CHECK-MSL {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// `--check-mtl`: the Metal backend actually running something.
+///
+/// `--check-msl` proves the corpus COMPILES to `.metallib`; this proves a
+/// DEVICE consumes one — and those are different claims, the same pair
+/// `--check-spirv` and `--check-vk` already make. A metallib can be perfectly
+/// well-formed and still read the wrong resource, because nothing in the
+/// compile step knows what it will be bound against.
+///
+/// **They are separate flags rather than more `M` stages, and the reason is
+/// CI.** `ci.yml:689-694` records that `--check-msl` is the coverage
+/// `--check-metalfx` cannot give precisely because it needs the shader
+/// toolchain *and no GPU at all* — so the paravirtual runner that makes MetalFX
+/// skip is irrelevant to it. Folding a dispatch in would either make it need a
+/// device or give it two independent SKIP axes, and its `M3/M4` guard line
+/// could no longer say which half ran.
+///
+/// The stages, and what each is the only one able to fail on:
+///
+/// * **K0** the pure half — the cross-check logic and the group-size parser.
+///   No device, no toolchain, so it runs on a box with neither.
+/// * **K1** a real `MTLDevice`, and the argument-buffer TIER. Tier 1 is an
+///   environment fact and SKIPs: `msl::CROSS_ARGS` asks spirv-cross for tier 2,
+///   and a device that cannot honour it has not failed a gate.
+/// * **K2** the toolchain — spirv-cross, `xcrun metal`, and DXC.
+/// * **K3** the DERIVED map: three entry points compiled, loaded and reflected,
+///   each cross-checked against an independent read of its own SPIR-V.
+/// * **K4** the chain: seed -> prep -> indirect fill, at 555 and at 0.
+///
+/// K3 is the milestone's product and K4 is its proof. Neither alone is enough:
+/// K3 can only compare two derivations of a map, and K4 can only observe what a
+/// dispatch wrote — a map that is self-consistently wrong passes K3, and a
+/// binding that happens to land right passes K4.
+#[cfg(target_os = "macos")]
+fn run_check_mtl(scene: &scene::Scene) -> i32 {
+    let _ = scene; // Not scene-keyed: `smoke.hlsl` has no scene-derived defines.
+    let mut ok = true;
+
+    // ---- K0: pure. No tools, no device. ----
+    match mtl::bind::self_test() {
+        Ok(()) => println!("check-mtl: K0 argument-buffer cross-check OK"),
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K0 {e}");
+            ok = false;
+        }
+    }
+    match crate::spirv::self_test() {
+        Ok(()) => println!("check-mtl: K0 binding scheme + group-size parse OK"),
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K0 spirv: {e}");
+            ok = false;
+        }
+    }
+
+    let plant = mtl::smoke::Plant::from_env();
+    if plant.any() {
+        // Loud on departure, and it says what it expects: a plant that ran and
+        // PASSED is the finding, not a quiet success.
+        println!(
+            "check-mtl: PLANT {} armed — this run MUST fail; a pass is the finding",
+            plant.line()
+        );
+    }
+
+    // ---- K1: the device. Absence is an environment fact, so it SKIPs. ----
+    let m = match mtl::device::Mtl::new() {
+        Ok(m) => m,
+        Err(e) if e.absent => {
+            println!("check-mtl: SKIP K1 ({})", e.msg);
+            return i32::from(!ok);
+        }
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K1 {}", e.msg);
+            println!("CHECK-MTL FAILED");
+            return 1;
+        }
+    };
+    println!("check-mtl: K1 {}", m.line());
+    // The device's half of `--msl-argument-buffer-tier 2`. Nothing in this tree
+    // had ever read this property, so a tier-1 device would have surfaced as a
+    // pipeline that builds and then reads the wrong resource.
+    if !m.is_tier2() {
+        println!(
+            "check-mtl: SKIP K1 — the device reports argument-buffer tier 1, and \
+             mtl::msl::CROSS_ARGS asks spirv-cross for tier 2"
+        );
+        return i32::from(!ok);
+    }
+
+    // ---- K2: the toolchain. ----
+    let scratch = std::env::temp_dir().join(format!("frustracer-mtl-{}", std::process::id()));
+    let msl = match mtl::msl::Msl::find(scratch.clone()) {
+        Ok(m) => m,
+        Err(e) if e.absent => {
+            println!("check-mtl: SKIP K2 ({})", e.msg);
+            return i32::from(!ok);
+        }
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K2 {}", e.msg);
+            println!("CHECK-MTL FAILED");
+            return 1;
+        }
+    };
+    let dir = crate::spirv::default_dir();
+    let sp = match crate::spirv::Spirv::load(&dir) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("check-mtl: SKIP K2 ({e})");
+            let _ = std::fs::remove_dir_all(&scratch);
+            return i32::from(!ok);
+        }
+    };
+    println!("check-mtl: K2 {} | {}", msl.line(), crate::spirv::LIB_NAME);
+
+    let code = (|| -> i32 {
+        // ---- K3: the derived map. ----
+        let pipes = match mtl::smoke::build(&m, &msl, &sp) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("check-mtl: FAIL K3 {e}");
+                println!("CHECK-MTL FAILED");
+                return 1;
+            }
+        };
+
+        let show = std::env::var_os("FR_MTL_MAP").is_some();
+        let mut slots_total = 0usize;
+        for (name, k) in pipes.all() {
+            slots_total += k.map.slots.len();
+            for bad in mtl::bind::cross_check(&k.map, &k.descs) {
+                eprintln!("check-mtl: FAIL K3 {name}: {bad}");
+                ok = false;
+            }
+            // The group size is asserted DIRECTLY, and that is not redundant
+            // with K4: `cs_fill`'s own `id.x < counters[1]` guard rejects the
+            // surplus, so an OVER-large threadgroup produces a byte-identical
+            // readback and is invisible to every assertion K4 has. A gate that
+            // scored only the picture would gate nothing here.
+            let ls = k.local_size;
+            let want: [u32; 3] = match name {
+                "cs_fill" => [64, 1, 1],
+                _ => [1, 1, 1],
+            };
+            if ls != want {
+                eprintln!(
+                    "check-mtl: FAIL K3 {name}: group size {ls:?}, smoke.hlsl declares {want:?}"
+                );
+                ok = false;
+            }
+            let n = (ls[0] * ls[1] * ls[2]) as usize;
+            if n > k.max_threads() {
+                eprintln!(
+                    "check-mtl: FAIL K3 {name}: group of {n} exceeds the pipeline's own \
+                     maxTotalThreadsPerThreadgroup {}",
+                    k.max_threads()
+                );
+                ok = false;
+            }
+            if show {
+                println!("check-mtl:   {name} ({}) local_size {ls:?}", k.name);
+                for l in k.map.lines() {
+                    println!("check-mtl:   {name}   {l}");
+                }
+            }
+        }
+        // Anti-vacuity: a reflection that came back empty would build an empty
+        // argument buffer, dispatch nothing, and report clean. The three
+        // kernels declare 2 members each.
+        if slots_total != 6 {
+            eprintln!(
+                "check-mtl: FAIL K3 the three kernels reflected {slots_total} member(s) \
+                 in total, expected 6 (2 each) — the derivation is not reading the map"
+            );
+            ok = false;
+        }
+        // The measured disagreement IS the milestone's argument, so assert it:
+        // if all three maps agreed, a hand-written table would have worked and
+        // the per-kernel argument buffers below would be unmotivated.
+        if pipes.seed.map.slot("counters").map(|s| s.id)
+            == pipes.prep.map.slot("counters").map(|s| s.id)
+        {
+            eprintln!(
+                "check-mtl: FAIL K3 `counters` has the same [[id]] in cs_seed and cs_prep — \
+                 spirv-cross's per-entry-point id assignment changed, and the reason this \
+                 milestone derives the map rather than tabulating it no longer holds as \
+                 measured. Re-measure before simplifying anything."
+            );
+            ok = false;
+        }
+        // Two `ArgBuf`s from ONE kernel must encode into their OWN buffers.
+        // They share an `MTLArgumentEncoder` — `Retained::clone` is a retain,
+        // not a copy — so this holds only because `ArgBuf::set_buffer`
+        // re-points it per write, and nothing a caller can see reports it.
+        //
+        // THE ORDER IS THE TEST: creating `b` is what would steal the encoder,
+        // so `a`'s write has to come AFTER, and the observable is on `b` rather
+        // than on `a` — if `a`'s write lands in the wrong buffer, `b`'s
+        // contents CHANGE. Scored that way on purpose: a before/after compare
+        // of one buffer needs no assumption about what a fresh allocation
+        // contains, where "is `a` still empty" would rest on Metal
+        // zero-initialising it, which is true in practice and promised
+        // nowhere.
+        let mut isolated = true;
+        match (|| -> Result<(), String> {
+            let (r0, r1) = (m.buffer(16)?, m.buffer(16)?);
+            let mut a = pipes.seed.arg_buf(&m)?;
+            let mut b = pipes.seed.arg_buf(&m)?;
+            b.set_buffer("Push", &r1)?;
+            let before = b.encoded_words(&m);
+            // Anti-vacuity: if `b`'s own write never landed, the compare below
+            // is between two empty reads and passes having proven nothing.
+            if before.iter().all(|&w| w == 0) {
+                return Err("the second ArgBuf encoded nothing, so the compare is vacuous".into());
+            }
+            a.set_buffer("Push", &r0)?;
+            let after = b.encoded_words(&m);
+            if after != before {
+                return Err(format!(
+                    "writing to one ArgBuf changed another's bytes ({before:?} -> {after:?}) — \
+                     the shared argument encoder was not re-pointed, so correctness is a \
+                     property of statement ORDER"
+                ));
+            }
+            Ok(())
+        })() {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("check-mtl: FAIL K3 argument-buffer isolation: {e}");
+                isolated = false;
+                ok = false;
+            }
+        }
+        // The summary reports what HELD, not what was attempted. The first
+        // draft ended this line with a flat "per-ArgBuf isolation OK" and
+        // printed it unconditionally, so a run whose isolation check had just
+        // failed still claimed it passed two lines later — the summary line
+        // agreeing with the FAIL above it is the whole point of having one.
+        println!(
+            "check-mtl: K3 3 pipelines | {slots_total} argument-buffer members | maps derived \
+             and cross-checked against the SPIR-V | per-ArgBuf isolation {}",
+            if isolated { "OK" } else { "FAILED" }
+        );
+
+        // ---- K4: the chain. ----
+        match mtl::smoke::run(&m, &pipes, plant) {
+            Ok((r_n, r_0)) => {
+                // A residency list that silently came back empty would make the
+                // structural `set_buffer` guarantee decorative.
+                if r_n != 6 || r_0 != 6 {
+                    eprintln!(
+                        "check-mtl: FAIL K4 residency declared {r_n}/{r_0} resources, expected 6"
+                    );
+                    ok = false;
+                }
+                println!(
+                    "check-mtl: K4 seed -> prep -> indirect fill OK at {} and at 0 | \
+                     {r_n} resources resident",
+                    mtl::smoke::FILL_N
+                );
+            }
+            Err(e) => {
+                eprintln!("check-mtl: FAIL K4 smoke: {e}");
+                ok = false;
+            }
+        }
+
+        // ---- K5: the verdict. ----
+        // A TOOTH that did not bite is a defect in the gate, so it fails here.
+        if plant.must_fail() && ok {
+            eprintln!(
+                "check-mtl: FAIL K5 the plant {} did not make the gate fail — \
+                 that is the finding, not a pass",
+                plant.line()
+            );
+            ok = false;
+        }
+        // The residency lever is a MEASUREMENT, not a tooth, and is reported
+        // either way — see `mtl::smoke::Plant`. Measured on an M1: the omission
+        // is invisible, plain and under both validation layers, because on
+        // unified memory a non-heap buffer is already page-backed. That is
+        // exactly why `ArgBuf::set_buffer` makes the declaration structural
+        // instead of checked: no instrument this gate has could enforce it, and
+        // the day these buffers move into an `MTLHeap` the omission turns fatal.
+        if plant.no_residency {
+            println!(
+                "check-mtl: K5 NOTE FR_MTL_NO_RESIDENCY {} — a `useResource:` omission \
+                 is {} on this device",
+                if ok { "changed nothing" } else { "changed the result" },
+                if ok { "UNOBSERVABLE" } else { "observable" }
+            );
+        }
+        // The sibling Metal gates print this and so does this one, for the same
+        // reason — except that here it is a NARROWING rather than a warning:
+        // --check-mtl PASSES on an M1 under either layer armed alone, which is
+        // the first evidence that --check-fsr3's recorded "uniformly zero under
+        // validation" is not a general property of Metal compute. Still worth
+        // re-running, because this run saw none of it.
+        if std::env::var_os("MTL_DEBUG_LAYER").is_none()
+            && std::env::var_os("MTL_SHADER_VALIDATION").is_none()
+        {
+            println!(
+                "check-mtl: NOTE MTL_DEBUG_LAYER / MTL_SHADER_VALIDATION unset — a \
+                 `useResource:` omission is reported by API validation and by nothing \
+                 else, so this run cannot see it. Re-run with each =1 SEPARATELY: only \
+                 one layer is implicated in the --check-fsr3 finding."
+            );
+        }
+        println!("CHECK-MTL {}", if ok { "PASSED" } else { "FAILED" });
+        i32::from(!ok)
+    })();
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    code
 }
 
 /// `--check-vk`: the Vulkan backend actually running something.

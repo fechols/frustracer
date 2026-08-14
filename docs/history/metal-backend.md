@@ -1,6 +1,6 @@
 # The Metal backend
 
-`--check-fsr3` (FidelityFX FSR3 over a hand-written Metal `FfxInterface`) and `--check-metalfx` (MetalFX temporal upscaling, denoising, and frame interpolation).
+`--check-fsr3` (FidelityFX FSR3 over a hand-written Metal `FfxInterface`) and `--check-metalfx` (MetalFX temporal upscaling, denoising, and frame interpolation), plus `--check-mtl` (the backend binding and dispatching the corpus's own kernels -- C2).
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 
@@ -632,4 +632,180 @@ cargo run --release -- --check-metalfx# MetalFX TEMPORAL UPSCALING, gated (macOS
                                       # `--cinematic hero --no-world --cinematic-res 640x360` with
                                       # and without --no-upscale. Restore check.png/check_gi.png:
                                       # they are tracked WINDOWS goldens.
+cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMETHING (macOS;
+                                      # src/mtl/bind.rs + src/mtl/smoke.rs, 2026-08-12 — the Metal
+                                      # port's C2, "how do we bind it", which msl.rs:7-8 names).
+                                      # --check-msl proves the corpus COMPILES to .metallib; this
+                                      # proves a DEVICE consumes one — the same pair --check-spirv
+                                      # and --check-vk already make, and a metallib can be perfectly
+                                      # well-formed and still read the wrong resource. THE SUBJECT IS
+                                      # smoke.hlsl, already in the shared corpus (main.rs's
+                                      # corpus_units), and already what D3D12 (gpu::trace::smoke_test)
+                                      # and Vulkan (vk::headless::smoke_test, V3) each run as their
+                                      # first dispatch: three backends, one kernel, comparable line
+                                      # for line. It proves the wavefront tracer's own machinery in
+                                      # miniature — constants reaching a kernel, a storage buffer
+                                      # written, a GPU-WRITTEN COUNTER turned into dispatch arguments,
+                                      # and a third kernel launched INDIRECTLY from them with the CPU
+                                      # never seeing the count.
+                                      # THE MAP IS DERIVED AND IT CANNOT BE A TABLE, which is the
+                                      # milestone's whole finding. Under the shipping msl::CROSS_ARGS
+                                      # (argument buffers on, --msl-decoration-binding deliberately
+                                      # off) spirv-cross moves each resource inside a per-set struct
+                                      # as [[id(n)]] — and those ids are NOT the SPIR-V bindings.
+                                      # They are dense, sequential, and assigned in ascending binding
+                                      # order over ONLY the resources that entry point references.
+                                      # MEASURED on smoke.hlsl, whose three kernels disagree:
+                                      #   cs_seed  id0 Push (b1->1)      id1 counters (u0->2000)
+                                      #   cs_prep  id0 counters          id1 args     (u1->2001)
+                                      #   cs_fill  id0 counters          id1 outbuf   (u2->2002)
+                                      # `counters` is id(1) in one kernel and id(0) in the other two,
+                                      # and `args` is absent from cs_fill entirely. So a hand-written
+                                      # table is not merely a liability the way create_root_signature
+                                      # is — it is UNREPRESENTABLE, and one argument buffer shared
+                                      # across the three pipelines would bind the wrong pointers with
+                                      # no error anywhere. (This also corrects msl.rs:38-47's recorded
+                                      # [[id(0)]] [[id(1000)]] [[id(2000)]] [[id(3000)]] — that is the
+                                      # layout when --msl-decoration-binding IS passed.)
+                                      # TWO DERIVATIONS, CROSS-CHECKED, because one cannot check
+                                      # itself and Metal has no validation layer armed by default (CI
+                                      # runs the Metal job with them explicitly OFF): mtl::bind::derive
+                                      # reads the map off the COMPILED MTLFunction, vk::reflect reads
+                                      # the same module's SPIR-V independently (it already runs on
+                                      # macOS — --check-spirv's S0), and cross_check requires them to
+                                      # agree. The join key is the resource NAME and that it works is
+                                      # MEASURED: spirv-cross's MSL member names and the SPIR-V
+                                      # OpNames are byte-identical (Push/counters/args/outbuf), so no
+                                      # normalizer. cross_check also PINS the dense-ascending-binding
+                                      # rule — not by hardcoding an id, but so a change in
+                                      # spirv-cross's assignment is a loud finding instead of a
+                                      # silently different binding.
+                                      # THE DEPRECATED REFLECTION SPELLING IS DELIBERATE and the
+                                      # reason is objc2, not taste: the modern route is
+                                      # MTLComputePipelineReflection::bindings() ->
+                                      # MTLBufferBinding::bufferStructType(), but MTLBufferBinding is
+                                      # an extern_protocol! and objc2 0.6 implements DowncastTarget
+                                      # for classes only, so a ProtocolObject<dyn MTLBinding> cannot
+                                      # be narrowed to it without hand-rolled msg_send!.
+                                      # newArgumentEncoderWithBufferIndex:reflection: hands back the
+                                      # concrete MTLArgument class. The ENCODER also writes each
+                                      # member at the offset the compiled function declares, so
+                                      # nothing here computes id*8 or assumes tier-2 argument buffers
+                                      # are raw pointers.
+                                      # THE GROUP SIZE COMES FROM THE HOST, which is Metal-specific:
+                                      # MSL carries no [numthreads] and both dispatchThreadgroups: and
+                                      # the indirect form take it as an argument. crate::spirv::
+                                      # local_size recovers it from OpExecutionMode LocalSize and
+                                      # ERRS rather than defaulting to [1,1,1] — a value
+                                      # indistinguishable from a real 1x1x1 kernel that would run
+                                      # cs_fill at 1/64 rate with no error anywhere (build.rs's own
+                                      # argument, whose spirv_local_size is the documented TWIN; a
+                                      # build script is its own compilation unit and cannot `use
+                                      # crate::spirv`, the fnv1a64 situation).
+                                      # RESIDENCY IS STRUCTURAL, NOT CHECKED. A resource reached
+                                      # THROUGH an argument buffer is neither made resident nor
+                                      # hazard-tracked, so useResource: is mandatory and has no Vulkan
+                                      # or D3D12 analogue. It is also MEASURED UNOBSERVABLE here —
+                                      # FR_MTL_NO_RESIDENCY changes nothing, plain AND under
+                                      # MTL_DEBUG_LAYER=1 AND MTL_SHADER_VALIDATION=1, because on
+                                      # unified memory a non-heap MTLBuffer is already page-backed. So
+                                      # ArgBuf exposes ONE mutator, set_buffer, which records the
+                                      # resource as it binds it: "forgot useResource" is not
+                                      # EXPRESSIBLE rather than caught (planes.rs's move). It turns
+                                      # fatal the day these buffers move into an MTLHeap.
+                                      # THE ENCODER IS SHARED, AND THE RETARGET IS PER WRITE — the
+                                      # one invariant here that ordinary use would never exercise. An
+                                      # ArgBuf holds a `Retained::clone` of its Kernel's
+                                      # MTLArgumentEncoder, which is a RETAIN and not a copy, and
+                                      # setArgumentBuffer:offset: is what selects the destination. So
+                                      # pointing it once at construction makes a LATER arg_buf on the
+                                      # same kernel silently redirect the first one's remaining
+                                      # writes into the new buffer — while bind() keeps using the
+                                      # right buffer, so nothing looks wrong. It shipped that way for
+                                      # a review cycle, correct only because two statements happened
+                                      # to be in the right order (the seed-map plant is the sole path
+                                      # that creates two, and it fails structurally first).
+                                      # set_buffer re-points per write instead, which costs one
+                                      # message send and makes each ArgBuf self-contained. GATED, and
+                                      # the gate had to be built for it: K3's isolation arm creates
+                                      # two ArgBufs from ONE kernel, writes the SECOND, snapshots its
+                                      # bytes, then writes the FIRST and requires the second's bytes
+                                      # UNCHANGED. Scored as a before/after on one buffer because
+                                      # "is the first still empty" would rest on Metal
+                                      # zero-initialising a fresh allocation — true in practice,
+                                      # promised nowhere — and the order matters (creating the second
+                                      # is what steals the encoder, so the first's write must come
+                                      # after). Anti-vacuity: the second's own write must have landed
+                                      # first, else the compare is between two empty reads. TOOTH
+                                      # FIRED: the pre-fix code reads "writing to one ArgBuf changed
+                                      # another's bytes ([23040, 21, 0, 0] -> [22784, 21, 0, 0])" —
+                                      # the two probe buffers' addresses, one overwriting the other.
+                                      # THE POISON IS PER BUFFER, and that is a SAFETY property the
+                                      # plants make real: vk/headless.rs poisons outbuf alone (its
+                                      # validation layer catches the rest), but `args` is read by the
+                                      # HARDWARE as a threadgroup grid, so SENTINEL there is ~5e10
+                                      # threadgroups — a wedged WindowServer on a dev Mac; and
+                                      # counters[1] is cs_fill's bounds guard, so a poison past
+                                      # outbuf's length is an out-of-bounds WRITE. Hence GRID_POISON
+                                      # (cube = 27) and COUNT_POISON (const-asserted inside the
+                                      # allocation).
+                                      # THE SAME HAZARD BOUNDS AN ALLOCATION, not just a poison:
+                                      # `counters` is FOUR words though smoke.hlsl reads two, because
+                                      # spirv-cross emits `packed_uint3 _m0[1]` for
+                                      # RWStructuredBuffer<uint3> (measured), so cs_prep's
+                                      # `args[0] = uint3(...)` is a 12-byte store — and swap_members
+                                      # deliberately points the `args` MEMBER at that buffer. At two
+                                      # words the plant ran 4 bytes past the allocation: benign
+                                      # (Metal rounds up) and unreported by either validation layer,
+                                      # but a plant that corrupts memory instead of failing an
+                                      # assertion is not a tooth.
+                                      # Stages: K0 pure (no device, no toolchain) | K1 the device,
+                                      # SKIP on absent AND on argument-buffer tier 1 (an environment
+                                      # fact — CROSS_ARGS asks spirv-cross for tier 2) | K2 the
+                                      # toolchain | K3 the derived map + cross-check + the group-size
+                                      # assertion + the per-ArgBuf isolation arm above | K4 the
+                                      # chain at 555 and at 0. K3 and K4 are both
+                                      # needed: a map that is self-consistently wrong passes K3, a
+                                      # binding that happens to land right passes K4. K3 asserts
+                                      # local_size DIRECTLY because cs_fill's own id.x < counters[1]
+                                      # guard makes an OVER-large threadgroup produce a byte-identical
+                                      # readback — invisible to everything K4 has.
+                                      # TEETH, all five fired and their observables recorded (M1):
+                                      # FR_MTL_SEED_MAP (bind cs_prep through cs_seed's map — exactly
+                                      # what a hand-written table produces) reads "no argument-buffer
+                                      # member named `args`" and fails STRUCTURALLY before any
+                                      # dispatch; FR_MTL_ARGBUF_INDEX and FR_MTL_SWAP_MEMBERS both
+                                      # read "indirect args [3, 3, 3], expected [9, 1, 1]" (the grid
+                                      # poison — cs_prep never wrote it); FR_MTL_TG_ONE reads
+                                      # "outbuf[9] = 0xeeeeeeee ... (never written)" = 9 groups x 1
+                                      # thread. FR_MTL_NO_RESIDENCY is a MEASUREMENT rather than a
+                                      # tooth (the Expect::ToolDefect asymmetry): it is REPORTED, and
+                                      # demanding it fail would fail the gate on every Apple-silicon
+                                      # Mac. FR_MTL_MAP=1 prints the derived map (the FR_VK_MAP idiom).
+                                      # A VALIDATION-LAYER NARROWING, free: --check-mtl PASSES on an
+                                      # M1 under MTL_DEBUG_LAYER=1 alone, MTL_SHADER_VALIDATION=1
+                                      # alone, and neither — so the recorded --check-fsr3 U4
+                                      # "uniformly zero under validation" is NOT a general property of
+                                      # Metal compute under those layers. Still confounded (that was
+                                      # the PARAVIRTUAL runner, this is real silicon), so it is a
+                                      # narrowing and not the answer; running --check-mtl under both
+                                      # layers ON THAT RUNNER is the cheap next step, since this is a
+                                      # 40-line chain with exact-integer observables where FSR3 is
+                                      # eleven pipelines and an image.
+                                      # SCOPE, stated because a green run does not imply it:
+                                      # smoke.hlsl declares no t, no s and nothing in space1, so C2
+                                      # exercises the set-0 BUFFER half of CROSS_ARGS and NEITHER
+                                      # --msl-device-argument-buffer 1 NOR the tier-2 unbounded texs[]
+                                      # array those flags argue hardest for. Textures, samplers and a
+                                      # second set are C3's; so is the [loop]-for-[unroll] hemi_wave
+                                      # workaround, which needs --check-gpu (unreachable from CI at
+                                      # all) and --check-vk re-run.
+                                      # Touch src/mtl/bind.rs / src/mtl/smoke.rs / device.rs's buffer
+                                      # + compute half / msl.rs's compile_lib / spirv::local_size ->
+                                      # run --check-mtl clean AND each of the five levers (four must
+                                      # exit 1; the residency one is reported), --check-msl on the
+                                      # procedural scene AND san-miguel-low-poly AND --sw-rays,
+                                      # --check-spirv, --check-fsr3 and --check-metalfx (they share
+                                      # the objc2-metal graph and mtl::device), --check + cargo test,
+                                      # then restore the Windows goldens
 ```

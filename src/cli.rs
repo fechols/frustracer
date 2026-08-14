@@ -840,6 +840,14 @@ pub struct Cli {
     /// (`--check-spirv`) had for the Vulkan port, where it found the one
     /// blocker nobody predicted.
     pub check_msl: bool,
+    /// `--check-mtl`: bind and DISPATCH one of the `.metallib`s `--check-msl`
+    /// compiles — the Metal backend's `--check-vk`.
+    ///
+    /// A separate flag rather than more `--check-msl` stages, and the reason is
+    /// CI: that gate's value is that it needs the shader toolchain and NO GPU
+    /// at all, so the paravirtual runner which makes `--check-metalfx`
+    /// near-vacuous is irrelevant to it. This one needs a device.
+    pub check_mtl: bool,
     /// `--check-vk`: bring up a real Vulkan device, run the indirect-dispatch
     /// smoke chain on it, probe the compiled subgroup width at every group
     /// width the tracer dispatches, bind every tracer kernel against the
@@ -1145,6 +1153,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_metalfx = false;
     let mut check_spirv = false;
     let mut check_msl = false;
+    let mut check_mtl = false;
     let mut check_vk = false;
     let mut no_xess_explicit = false;
     let mut fsr_forced = false;
@@ -1208,6 +1217,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
             "--check-msl" => check_msl = true,
+            "--check-mtl" => check_mtl = true,
             "--check-vk" => check_vk = true,
             "--nrd" => {
                 opts.nrd = true;
@@ -2572,6 +2582,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_metalfx,
         check_spirv,
         check_msl,
+        check_mtl,
         check_vk,
         check_gpu,
         check_dxr,
@@ -2770,6 +2781,12 @@ pub fn usage() {
                 eprintln!("                MSL (spirv-cross) -> .metallib (xcrun metal). The first rung of a Metal");
                 eprintln!("                tracer: it compiles and nothing else, so what refuses IS the product.");
                 eprintln!("                Needs SDKs/dxc-macos + spirv-cross + the Metal toolchain; no GPU");
+                eprintln!("  --check-mtl   headless (macOS): BIND and DISPATCH one of those .metallib s — the");
+                eprintln!("                Metal peer of --check-vk, running the same smoke.hlsl chain (seed ->");
+                eprintln!("                prep -> indirect fill). The argument-buffer map is DERIVED off the");
+                eprintln!("                compiled function and cross-checked against the module's own SPIR-V;");
+                eprintln!("                it cannot be a table, because spirv-cross assigns [[id(n)]] densely");
+                eprintln!("                PER ENTRY POINT. Needs a Metal device as well as the toolchain");
                 eprintln!("  --check-vk    headless (unix): bring up a real Vulkan device and run the indirect-");
                 eprintln!("                dispatch smoke chain on it (constants, storage buffers, a GPU-written");
                 eprintln!("                counter turned into dispatch args, vkCmdDispatchIndirect consuming");

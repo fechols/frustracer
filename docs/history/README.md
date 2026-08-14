@@ -23,7 +23,7 @@ block still works as a complete flag index.
 | [gpu-and-dxr.md](gpu-and-dxr.md) | 30 KB | `--gpu`, `--check-gpu`, `--dxr`, `--dxr-inline`, `--dxr-sbt` |
 | [shader-toolchains.md](shader-toolchains.md) | 29 KB | `--check-spirv`, `--check-msl` — the corpus's second and third code generators |
 | [vulkan-backend.md](vulkan-backend.md) | 226 KB | `--check-vk`, stages V0–V19. The largest entry in the notebook |
-| [metal-backend.md](metal-backend.md) | 60 KB | `--check-fsr3`, `--check-metalfx` |
+| [metal-backend.md](metal-backend.md) | 60 KB | `--check-fsr3`, `--check-metalfx`, `--check-mtl` |
 | [tooling-and-capture.md](tooling-and-capture.md) | 30 KB | Tracy, `--quinlight`, `--spin`, `--cinematic`, settings, HDR, GPU timing |
 | [profiling.md](profiling.md) | 41 KB | the `## Profiling` section — Tracy, PIX, timestamp queries, the perf campaigns |
 | [intel-arc-xe2.md](intel-arc-xe2.md) | 38 KB | the `## Intel Arc / Xe2` section — what the hardware does and does not offer |
@@ -62,6 +62,7 @@ prefix to the suite that owns it and the file where its story lives:
 | `F0`–`F10` | FRD gates (`--check-gpu`) | denoisers.md |
 | `U0`–`U4` | `--check-fsr3` | metal-backend.md |
 | `X0`–`X6` | `--check-metalfx` | metal-backend.md |
+| `K0`–`K5` | `--check-mtl` | metal-backend.md |
 | `G1`–`G14` | `clouds::self_test` | sky-lighting-clouds.md |
 
 **Two hazards.** The `M` prefix is genuinely ambiguous — `--check-gpu` and `--check-msl` both

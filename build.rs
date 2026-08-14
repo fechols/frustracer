@@ -574,6 +574,16 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// 2x (64,1,1), and no [1,1,1] at all), so a miss is always a defect and is
 /// worth failing the permutation for. The realistic trigger is a blob using
 /// `OpExecutionModeId LocalSizeId`, which this does not decode.
+///
+/// TWIN: `src/spirv.rs::local_size` is the same walk for OUR corpus, which
+/// needs it for the same reason (Metal takes the group shape from the host).
+/// It is not shared because a build script is its own compilation unit and
+/// cannot `use crate::spirv` — the `fnv1a64` situation exactly, and handled the
+/// same way. Change one, change both. The differences are deliberate and local:
+/// this side takes BYTES and tolerates a big-endian module because it reads
+/// whatever `extract_spirv_from_header` produced, while that side takes WORDS
+/// from `to_words` (which has already rejected a byte-swapped blob) and refuses
+/// disagreeing entry points, which cannot arise in FFX's one-entry permutations.
 #[cfg(not(windows))]
 fn spirv_local_size(spv: &[u8]) -> Option<[u32; 3]> {
     const MAGIC: u32 = 0x0723_0203;

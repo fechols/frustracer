@@ -319,11 +319,29 @@ impl Msl {
 
     /// MSL -> AIR -> `.metallib`, returning the library bytes.
     ///
-    /// NO 12-BYTE THREADGROUP HEADER, unlike `build.rs`'s FFX path. That
-    /// header exists because the FFX shim must dispatch without reflecting,
-    /// and this gate dispatches nothing; adding it here would be inventing a
-    /// wire format for a consumer that does not exist yet.
+    /// NO 12-BYTE THREADGROUP HEADER, unlike `build.rs`'s FFX path. That header
+    /// exists because the FFX shim must dispatch without reflecting; C2's
+    /// dispatcher holds the SPIR-V words and reads the group size out of them
+    /// (`crate::spirv::local_size`), so adding one here would still be inventing
+    /// a wire format for a consumer that does not exist.
     pub fn compile(&self, msl: &str, stem: &str) -> Result<Vec<u8>, String> {
+        let lib = self.compile_lib(msl, stem)?;
+        let bytes = std::fs::read(&lib).map_err(|e| format!("read {}: {e}", lib.display()));
+        let _ = std::fs::remove_file(&lib);
+        bytes
+    }
+
+    /// The same recipe, leaving the `.metallib` ON DISK and returning its path.
+    ///
+    /// `compile` is this plus a read and an unlink — ONE recipe, two consumers,
+    /// the `corpus_units` rule. `--check-msl` wants the bytes and nothing else;
+    /// `mtl::bind` wants a file, because `newLibraryWithURL:` is the route that
+    /// costs no dependency (`newLibraryWithData:` is gated behind objc2-metal's
+    /// `dispatch2` feature and would pull `block2` in with it).
+    ///
+    /// The caller owns the file. Every caller here writes into `Msl::scratch`,
+    /// which the gate removes wholesale when it finishes.
+    pub fn compile_lib(&self, msl: &str, stem: &str) -> Result<PathBuf, String> {
         let m = self.scratch.join(format!("{stem}.metal"));
         let air = self.scratch.join(format!("{stem}.air"));
         let lib = self.scratch.join(format!("{stem}.metallib"));
@@ -351,17 +369,18 @@ impl Msl {
                 break;
             }
         }
-        let bytes = if err.is_none() {
-            std::fs::read(&lib).map_err(|e| format!("read {}: {e}", lib.display()))
-        } else {
-            Err(String::new())
-        };
-        for p in [&m, &air, &lib] {
+        // The intermediates go either way; the library survives only on
+        // success, so a stale one from a previous stem can never be mistaken
+        // for this compile's output.
+        for p in [&m, &air] {
             let _ = std::fs::remove_file(p);
         }
         match err {
-            Some(e) => Err(e),
-            None => bytes,
+            Some(e) => {
+                let _ = std::fs::remove_file(&lib);
+                Err(e)
+            }
+            None => Ok(lib),
         }
     }
 }
