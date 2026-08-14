@@ -23,6 +23,12 @@ pub mod fsr3;
 pub mod headless;
 pub mod layout;
 pub mod nrd;
+// The window (B6b rung 1). NOT `cfg(unix)` like its siblings: it is the one
+// module here that depends on `sdl3`, which is scoped to non-macOS unix in
+// Cargo.toml so a macOS build does not compile SDL3 from source for a presenter
+// that platform has no tracer to feed.
+#[cfg(not(target_os = "macos"))]
+pub mod present;
 pub mod reflect;
 pub mod scene;
 // `spirv` MOVED OUT of this backend (it is `crate::spirv` now) and is

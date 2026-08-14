@@ -456,7 +456,7 @@ fn main() {
     }
     if opts.nppd && !no_xess_explicit && !no_upscale && (opts.chain.dlss || opts.chain.fsr4) {
         // The default NPPD experience is the XeSS composition: trace at the
-        // --lock-res scale (default native 100%), NPPD denoises at that
+        // --lock-res scale (default 0.75), NPPD denoises at that
         // render res, XeSS upscales to the window. Standalone window-res
         // NPPD remains the automatic fallback when the XeSS DLL is missing,
         // or explicitly via --nppd --no-xess.
@@ -1426,10 +1426,30 @@ fn main() {
     // world layout the load produces) are derived there, post-join.
     #[cfg(windows)]
     run_window(req, &opts, file_settings, cli_over);
-    #[cfg(not(windows))]
+    // THE LINUX WINDOW (B6b rung 1). No settings file and no CLI-override
+    // replay: both feed the pause menu's restart tier, and there is no menu
+    // here — `settings` stays Windows-side until rung 2 gives it a session to
+    // belong to.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = (file_settings, cli_over);
+        match run_window_vk(req, &opts) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("window: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    // macOS has a Metal arm for FSR3 and MetalFX but no tracer and no
+    // presentation stage, so there is nothing here to put in a window yet.
+    #[cfg(any(target_os = "macos", not(any(windows, unix))))]
     {
         let _ = (req, &opts, file_settings, cli_over);
-        eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
+        eprintln!(
+            "the interactive window is Windows (D3D12) and Linux (Vulkan) today; \
+             use --check / --check-fsr3 / --check-metalfx"
+        );
         std::process::exit(2);
     }
 }
@@ -4824,7 +4844,7 @@ fn locked_render_res(
 fn lock_dynamic_note(arm: &str, res: (usize, usize)) {
     eprintln!(
         "{arm}: dynamic render res is unsupported on this path (no DRS); locking at {}x{} (the \
-         native default scale)",
+         default scale)",
         res.0, res.1
     );
 }
@@ -24217,6 +24237,7 @@ fn run_check_xess(
     {
         let mut pass = true;
         for (a, want) in [
+            ("ultra-quality", Some(0.75f32)),
             ("quality", Some(2.0f32 / 3.0)),
             ("balanced", Some(0.58)),
             ("performance", Some(0.5)),
@@ -26616,6 +26637,238 @@ fn run_cinematic_cpu(
 /// THE TRACER IS CACHED BY RESOLUTION and not rebuilt per shot: constructing
 /// one compiles the whole kernel corpus through DXC, which is ~20 s, and the
 /// `islands` preset is seven shots at one resolution.
+/// THE WINDOW — B6b rung 1, and the one thing a Linux user could not do.
+///
+/// Everything headless works here: twenty `--check-vk` stages, the media mode,
+/// six suites. `main` used to end this path with *"the interactive window
+/// requires Windows"* and exit 2. This opens one.
+///
+/// WHAT IT IS AND IS NOT. A window opens, the Vulkan tracer's output reaches a
+/// real compositor through the same `tonemap.hlsl` D3D12 presents through, and
+/// the present cadence is reported. The camera flies `cinematic::pose_at`;
+/// there is NO input, no resize, no HUD, no audio, no `--qa` — those are rung 2,
+/// and the split is what keeps the surface work from landing underneath an
+/// untested threading inversion (SDL's event entry points are main-thread-only
+/// and Wayland has no off-thread keyboard state, so rung 2 has a three-thread
+/// shape this rung deliberately does not need).
+///
+/// IT REUSES THE CAPTURE ARM RATHER THAN PARALLELING IT. `CineVk` already is
+/// the frame driver — tracer, upscaler, denoiser, the free-running Halton
+/// `seq`, and `cinematic::Temporal`, which is the hard-won prev-camera / reset /
+/// jitter / replay contract B5c extracted precisely so two loops could share it.
+/// The only thing it lacked was a way to stop before the CPU readback, which is
+/// what `render_frame` is. So the interactive loop inherits, for free, the
+/// property that a PARKED camera replays its terminal quadtree (`Temporal`
+/// derives `replay` from basis bit-equality) — the same win D3D12 measures at
+/// −43% of frame span.
+///
+/// THE SCENE IS THE WORLD, because `req` already says so: a bare invocation
+/// sets `world_wanted`, and nothing about this path changes it. So the first
+/// look at this backend is the seven-island ring on its day-sweep, which is
+/// also the first time the world reaches an interactive Vulkan path at all.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
+    // THE WINDOW OPENS BEFORE THE SCENE LOADS, and that ordering is a
+    // usability decision rather than a technical one: a cold world boot is
+    // ~13 s, and a terminal that prints nothing for that long looks hung. It
+    // also fails fast — if there is no display server, that is knowable in
+    // milliseconds instead of after the load.
+    let (ww, wh) = (1280u32, 720u32);
+    let mut win = vk::present::Win::open(ww, wh, "frustracer")?;
+    let exts = win.instance_extensions()?;
+
+    // Default OFF, unlike the gate's default ON. The layer costs real
+    // per-dispatch time and this is the one Vulkan path here that runs a
+    // continuous loop rather than a bounded gate — but it stays reachable,
+    // because it is the ONLY instrument for a whole class of defects on this
+    // backend (a pipeline whose format disagrees with the swapchain's makes
+    // RADV segfault rather than error).
+    let validate = std::env::var("FR_VK_VALIDATION").is_ok_and(|v| v != "0");
+    let hg = vk::headless::VkHeadless::new_with_exts(validate, &exts)
+        .map_err(|e| e.to_string())?;
+    eprintln!("vk: window on {}{}", hg.vk.info.name, if validate { " (validated)" } else { "" });
+
+    let surface = win.surface(&hg.vk)?;
+    let sp = vk::spirv::Spirv::load(&vk::spirv::default_dir())?;
+
+    // FSR3 IS REQUIRED HERE, and refusing is better than the alternative: the
+    // accumulation arm produces a CPU image, so presenting it would mean a
+    // full readback and re-upload every frame — a per-frame cost paid to avoid
+    // printing one line. `--cinematic` keeps that arm, where the frame was
+    // going to the CPU anyway.
+    if !vk::fsr3::built() {
+        return Err(
+            "the window needs FidelityFX, which is not compiled in — run \
+             ./install-prerequisites.sh fsr3src and rebuild"
+                .into(),
+        );
+    }
+
+    // THE SWAPCHAIN BEFORE THE SCENE, and the ordering is the point: every way
+    // presenting can be refused — no `VK_KHR_swapchain`, no graphics bit on the
+    // picked family, a surface this queue cannot present to, a format nothing
+    // here can decode, a software device — is knowable in milliseconds, and a
+    // world boot is ~13 s. Building it after the load would make the answer to
+    // "can this box show a window" arrive a quarter of a minute late, which for
+    // a refusal is the same wart as printing nothing while loading.
+    //
+    // The window's PIXEL size, not the size asked for: a HiDPI compositor may
+    // hand back something else, and the swapchain, the tracer and the display
+    // pipelines all have to agree on ONE number.
+    let (ww, wh) = win.size();
+    let mut pres = vk::present::Presenter::new(&hg, &sp, surface, ww, wh)?;
+    let (rw, rh) = (pres.sc.w as usize, pres.sc.h as usize);
+
+    let LoadedScene { mut scene, bvh, cam0, world_info } = load_scene(&req);
+    let attractors: Vec<world::TodAttractor> = match (world_info.as_ref(), opts.tod) {
+        (Some(w), None) => world::attractors(w),
+        _ => Vec::new(),
+    };
+
+    let vs = vk::scene::VkScene::new(&hg, &scene, &bvh)?;
+    let vt = vk::textures::VkTextures::new(&hg, &sp, &scene, opts.bc7)?;
+    let want_dn = opts.nrd;
+    let mut cv =
+        CineVk::build(&hg, &sp, &scene, &vs, &vt, &bvh, rw, rh, true, want_dn, opts)?;
+    // THE SIZES MUST AGREE, and the failure mode is why this is checked rather
+    // than assumed: `tonemap.hlsl` samples its source by UV, so an FFX output
+    // of a different extent than the swapchain would STRETCH — a wrong image
+    // that still looks like a picture, which is the shape this backend refuses
+    // formats over. They agree by construction here (the tracer and the
+    // upscaler are built at the swapchain's own negotiated extent), so this
+    // costs one comparison and catches a future edit that separates them.
+    // A REFUSAL, NOT AN `expect`. `fsr3::built()` above is a COMPILE-time fact;
+    // `CineVk::build` can still fail to create the context at RUN time and
+    // degrades loudly to `None` — which the capture arm answers by
+    // accumulating and the window cannot. Reachable, and not exotically:
+    // `FR_VK_PRESENT_SOFTWARE=1` gets a software device past the swapchain
+    // stand-down and lands exactly here (lavapipe fails
+    // `ffxFsr3UpscalerContextCreate` outright), as can a driver fault or an OOM
+    // on a real GPU. It panicked with an internal-invariant string and exit
+    // 101 until this; the doctrine everywhere else in this tree is a named
+    // refusal at exit 2.
+    let up = cv.up.as_ref().ok_or_else(|| {
+        format!(
+            "FidelityFX is compiled in but {} could not create an FSR3 context — see the \
+             [fsr3-vk] line above for FFX's own diagnosis. The window needs it: the accumulation \
+             arm produces a CPU image, so presenting it would mean a full readback and re-upload \
+             every frame. Pick another device with FR_VK_DEVICE=<name>",
+            hg.vk.info.name
+        )
+    })?;
+    if up.upscale_size() != (pres.sc.w, pres.sc.h) {
+        let (uw, uh) = up.upscale_size();
+        return Err(format!(
+            "FSR3 upscales to {uw}x{uh} but the swapchain is {}x{} — the tonemap samples by UV, \
+             so this would stretch silently rather than fail",
+            pres.sc.w, pres.sc.h
+        ));
+    }
+    pres.bind_source(&hg.vk, up.output_view());
+
+    // ONE SHOT, flown on a loop, resolved through `resolve_shots` rather than
+    // authored here — so the window inherits the preset's own island picking
+    // and its degradation for a non-world scene, and there is one definition of
+    // what "orbit" means. `orbit` is the right choice twice over: it is CLOSED,
+    // so the flight repeats with no seam, and it is continuously MOVING, which
+    // is what makes an interval statistic mean anything (a parked camera
+    // replays its quadtree every frame and would measure the present path
+    // alone).
+    //
+    // `samples: 1` is the interactive contract and the one real difference from
+    // a capture: the temporal model integrates across PRESENTED frames rather
+    // than across sub-frames of one. A LONG lap (60 s at 60 fps) because the
+    // clock wraps with the pose — see the loop below.
+    let center = (scene.content_min + scene.content_max) * 0.5;
+    let radius = ((scene.content_max - scene.content_min).length() * 0.5).max(1e-3) * 2.2;
+    let cine = cinematic::CineOpts {
+        res: Some((rw, rh)),
+        samples: Some(1),
+        frames: Some(3600),
+        fps: 60,
+        ..Default::default()
+    };
+    let shot = cinematic::resolve_shots("orbit", &cine, world_info.as_ref(), cam0, center, radius)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the orbit preset produced no shot".to_string())?;
+    let frames = shot.kind.frames().max(1);
+    let q = cine_quality(&shot);
+    let mut prev_hour: Option<f32> = None;
+
+    eprintln!(
+        "vk: rung 1 — the camera flies a canned path and there is NO input yet; \
+         close the window or press ESC to quit"
+    );
+
+    let mut f: u32 = 0;
+    while win.pump() {
+        // TWO INDICES, and they are different questions. `cine_frame_state`
+        // derives the pose as `u = f / frames` and `segment_at` CLAMPS `u` to
+        // [0, 1] rather than wrapping, so a monotonic index would park the
+        // camera at the end of the lap forever — the pose index has to wrap.
+        // `render_frame` uses its `f` for one thing only, the frame-0 warm-up
+        // (`JITTER_PHASE - samples` extra passes, so frame 0 is not
+        // reconstructed from half a jitter phase), and that must fire ONCE:
+        // handing it the wrapped index would re-run 71 extra passes every lap,
+        // a periodic hitch once a minute.
+        //
+        // KNOWN ACCEPT: the cloud and firefly clocks ride the wrapped index too
+        // (`cine_frame_state` couples them to the pose, which is right for a
+        // capture, where they are the same question), so the sky snaps back at
+        // the lap seam. A 60 s lap is what makes that rare rather than
+        // rhythmic; decoupling them is a change to a capture helper and belongs
+        // with rung 2's real camera, which has no lap at all.
+        let lap = f % frames;
+        let fs = cine_frame_state(&mut scene, &shot, &attractors, &cine, lap, &mut prev_hour);
+        cv.tg.refresh_sky(&scene);
+        cv.render_frame(&hg, &scene, &shot, &fs, f, rw, rh, q, opts)?;
+        // `inv_samples` is 1.0: the reconstruction arm's output is one finished
+        // image, not a sum to be averaged (that divisor belongs to the
+        // accumulation arm). `ToneParams::SDR` matches the UNORM swapchain
+        // `pick_format` negotiates — an HDR wire is its own slice — and bloom
+        // is (0,0,0) because this backend has no bloom pyramid, which
+        // `Params`' own doc records as the structurally dead glare tap.
+        let params = vk::display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
+        // STALE IS A CLEAN QUIT, not an error. The surface going out of date
+        // means the swapchain has to be rebuilt, and rung 1 builds it once —
+        // the tracer, the upscaler and the display pipelines are all sized
+        // against that one extent. So this stops and SAYS SO at exit 0, rather
+        // than propagating `vkQueuePresentKHR: ERROR_OUT_OF_DATE_KHR` out of
+        // `main` as if the renderer had failed.
+        if let vk::present::Frame::Stale = pres.present(&hg, params)? {
+            eprintln!(
+                "vk: the window's surface no longer matches the swapchain (a resize?) — rung 1 \
+                 builds it once and has no rebuild path, so this stops here rather than \
+                 presenting a stretched image. Rebuilding on resize is rung 2"
+            );
+            break;
+        }
+        f = f.wrapping_add(1);
+    }
+
+    // WAIT BEFORE TEARING DOWN. `wait_submit` waited the SUBMIT fence, but
+    // `vkQueuePresentKHR` is asynchronous, so the presentation engine can still
+    // be reading the image a `Swapchain::destroy` is about to free. This
+    // happens to hold today via the `device_wait_idle` inside `Fsr3::destroy`,
+    // which `cv.destroy` reaches first — but that is an unrelated object's
+    // internal detail, and the ordering comment below says "reverse
+    // construction order", not "wait first". Saying it here is one call and
+    // removes the coupling.
+    unsafe {
+        let _ = hg.vk.device.device_wait_idle();
+    }
+
+    // Reverse construction order, the `CineVk::destroy` rule: these types have
+    // `destroy(&hg)` and no `Drop`, so a forgotten teardown is a leak the
+    // validation layer reports at instance destruction.
+    cv.destroy(&hg);
+    pres.destroy(&hg.vk);
+    vt.destroy(&hg);
+    vs.destroy(&hg);
+    Ok(0)
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 fn run_cinematic_vk(
     scene: &mut scene::Scene,
@@ -26819,7 +27072,17 @@ impl CineVk {
             ) {
                 Ok(f) => Some(f),
                 Err(e) => {
-                    eprintln!("cinematic: FSR3 unavailable ({e}) — accumulation fallback");
+                    // NO CONSEQUENCE CLAUSE, deliberately: `CineVk` has two
+                    // callers since B6b rung 1 and they do OPPOSITE things
+                    // about this. The capture falls back to accumulation
+                    // (`output_frame` picks that arm); the WINDOW refuses,
+                    // because presenting an accumulated frame means a full
+                    // readback and re-upload every frame. Naming either one
+                    // here made the line a lie in the other — the same
+                    // staleness the two `nrd:` lines below were fixed for, and
+                    // this one printed "accumulation fallback" one line before
+                    // the window panicked.
+                    eprintln!("fsr3: unavailable ({e}) — no reconstruction arm");
                     None
                 }
             }
@@ -26831,14 +27094,20 @@ impl CineVk {
                 Some(planes) => {
                     match vk::nrd::VkNrd::new(hg, &opts.nrd_path, rw as u32, rh as u32, &planes) {
                         Ok(e) => {
+                            // NO MODE WORD, deliberately: `CineVk` has two
+                            // callers since B6b rung 1 — the capture and the
+                            // window — so "cinematic" would be a lie in a
+                            // session and the D3D12 twin's identical line
+                            // (gpu/mod.rs) is right to keep it, because there
+                            // it really is only the capture.
                             eprintln!(
-                                "nrd: armed — cinematic pre-upscale denoising at {rw}x{rh} ({})",
+                                "nrd: armed — pre-upscale denoising at {rw}x{rh} ({})",
                                 opts.nrd_path
                             );
                             Some(e)
                         }
                         Err(e) => {
-                            eprintln!("nrd: unavailable ({e}) — the capture upscales undenoised");
+                            eprintln!("nrd: unavailable ({e}) — upscaling undenoised");
                             None
                         }
                     }
@@ -26875,6 +27144,15 @@ impl CineVk {
     }
 
     /// Render ONE output frame and return it as a linear f32 RGB image.
+    ///
+    /// `render_frame` + one readback. The split exists because the readback is
+    /// exactly what a PRESENTER must not do: this arm writes a PNG, so pulling
+    /// the frame to the CPU is the point, while `src/vk/present.rs` draws the
+    /// same image straight into a swapchain and a per-frame
+    /// `vkCmdCopyImageToBuffer` of the whole output would be a hard cost for
+    /// nothing. Splitting rather than duplicating is what keeps the capture arm
+    /// and the presenter on ONE sub-frame loop — one `cinematic::Temporal`
+    /// contract, one warm-up rule, one replay predicate — so they cannot drift.
     #[allow(clippy::too_many_arguments)]
     fn output_frame(
         &mut self,
@@ -26888,12 +27166,49 @@ impl CineVk {
         q: Quality,
         opts: &Opts,
     ) -> Result<Vec<f32>, String> {
+        // The accumulation fallback is chosen HERE rather than inside
+        // `render_frame`, because it is a property of what the caller wants
+        // back: it produces a CPU image directly and has no GPU-side result to
+        // hand a presenter. `render_frame` therefore requires the upscaler and
+        // says so, which is also what lets the presenter refuse at startup
+        // instead of discovering it mid-frame.
+        if self.up.is_none() {
+            let basis = fs.cam.basis(rw, rh);
+            return self.accumulate(hg, scene, fs, &basis, shot.samples.max(1), q, opts);
+        }
+        self.render_frame(hg, scene, shot, fs, f, rw, rh, q, opts)?;
+        let up = self.up.as_ref().expect("checked Some immediately above");
+        up.read_output(hg)
+    }
+
+    /// The GPU half: run every sub-frame of ONE output frame, leaving the
+    /// reconstructed result in the FSR3 output IMAGE.
+    ///
+    /// Ends where `output_frame` used to read back. Requires the upscaler —
+    /// the accumulation arm is `output_frame`'s to choose (see there).
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame(
+        &mut self,
+        hg: &vk::headless::VkHeadless,
+        scene: &scene::Scene,
+        shot: &cinematic::Shot,
+        fs: &CineFrame,
+        f: u32,
+        rw: usize,
+        rh: usize,
+        q: Quality,
+        opts: &Opts,
+    ) -> Result<(), String> {
         let basis = fs.cam.basis(rw, rh);
         let (near, far) = dlss::near_far(scene.diag);
         let samples = shot.samples.max(1);
 
         let Some(up) = self.up.as_ref() else {
-            return self.accumulate(hg, scene, fs, &basis, samples, q, opts);
+            return Err(
+                "render_frame needs the FSR3 upscaler — the accumulation arm produces a CPU \
+                 image and has no GPU result to leave behind"
+                    .into(),
+            );
         };
 
         // OUTPUT FRAME 0 GETS A WARM-UP, and it is not optional: `seq`
@@ -26905,9 +27220,7 @@ impl CineVk {
         // arm, whose frame 0 is statistically identical to any other.
         let warm = if f == 0 { dlss::JITTER_PHASE.saturating_sub(samples) } else { 0 };
 
-        let mut out = Vec::new();
-        for k in 0..warm + samples {
-            let emit = k >= warm;
+        for _ in 0..warm + samples {
             let jit = dlss::jitter_for(self.seq);
             // What the PREVIOUS sub-frame was, which is a different question
             // from what this one is — and the question this arm used to answer
@@ -27021,11 +27334,12 @@ impl CineVk {
             // `Temporal` splits `step` from `advance`.
             self.seq += 1;
             self.temporal.advance(basis, fs.cam, jit);
-            if emit && k + 1 == warm + samples {
-                out = up.read_output(hg)?;
-            }
         }
-        Ok(out)
+        // No `emit` and no last-iteration special case: that flag only ever
+        // decided which sub-frame got COPIED OUT, and the copy is the caller's
+        // now. The warm-up passes still run and still produce nothing visible,
+        // which is what they were always for.
+        Ok(())
     }
 
     /// The accumulation arm: N sub-frames at ONE pose into `accum`, averaged.
@@ -29694,8 +30008,8 @@ fn run_spin_gpu(
     // 400 frames — two thirds of a lap, starting mid-path.
     let frames = spin_lap_frames(frames, frames_explicit, warmup, moving, arm);
     // Trace res = an EXPLICIT `--lock-res`, else NATIVE — deliberately NOT
-    // tied to the interactive default (which happens to be native again since
-    // 2026-08-08, but was quality 2/3 for two windows): this is a benchmark and
+    // tied to the interactive default (0.75 since 2026-08-13; native before
+    // that, and quality 2/3 for two windows earlier): this is a benchmark and
     // every GPU `--spin` number on record was taken at native 1080p; a
     // default that moved under it would make those non-reproducible and
     // ~2.25x flattering at 2/3 (a LINEAR scale). Same rule the vendor mode
@@ -31158,6 +31472,27 @@ fn run_check(
             false
         }
     };
+
+    // The Vulkan backend's PURE device logic — the adapter pick (including the
+    // iGPU-beside-llvmpipe hazard this box actually has), memory-type
+    // selection, and B6b's instance-extension union. It needs no loader and no
+    // device, which is what lets it run here.
+    //
+    // ALSO gated as `--check-vk`'s V0, and the duplication is deliberate: CI's
+    // `check-linux` job runs `--check` and NOT `--check-vk` (that lives in
+    // `check-vulkan`, which adds apt, a network fetch and a device gate), so
+    // without this the extension union — the one part of the window a headless
+    // gate can assert at all — would be covered by exactly one job.
+    #[cfg(unix)]
+    let vk_device_ok = match vk::device::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("vk device self-test: FAIL — {e}");
+            false
+        }
+    };
+    #[cfg(not(unix))]
+    let vk_device_ok = true;
 
     // Presentation-curve self-test — the SDR degeneracy (bit-for-bit against
     // the pre-HDR curve: the guard that --hdr did not move the default), the
@@ -33836,6 +34171,7 @@ fn run_check(
         ("cli", cli_ok),
         ("camera", camera_ok),
         ("qa", qa_ok),
+        ("vk-device", vk_device_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
@@ -34171,19 +34507,20 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // change if that trade ever reads the other way; make it on these
     // numbers, not the table above.
     //
-    // RES-BASIS DEBT, RE-CLOSED (2026-07-26 quality -> 2026-07-31 native ->
-    // 2026-08-08 quality -> native again the same day, the user's call —
-    // fourth move): the flagless default is `--lock-res native` (100%,
-    // xess::DEFAULT_LOCK_SCALE), which IS the resolution the numbers above
-    // were taken at, so the caveat this paragraph used to carry is resolved
-    // again. It re-opens if the default ever moves sub-native once more: the
-    // arms don't scale together (`trace::depth_full` is 6 at 1920 AND 1280,
-    // so the wavefront's ladder is res-independent while leaf/sky and all of
+    // RES-BASIS DEBT, RE-OPENED 2026-08-13 (2026-07-26 quality -> 2026-07-31
+    // native -> 2026-08-08 quality -> native again the same day -> 0.75 now,
+    // the user's call — fifth move): every number above was taken at NATIVE
+    // 1080p, and the flagless default is no longer native
+    // (xess::DEFAULT_LOCK_SCALE = 0.75, i.e. 0.5625x-pixels), so this table
+    // no longer describes the resolution a flagless session runs at. The arms
+    // don't scale together (`trace::depth_full` is 6 at 1920 AND 1280, so the
+    // wavefront's ladder is res-independent while leaf/sky and all of
     // `dxr-rays` are per-pixel), and hand-scaling the decomposition suggested
     // the moving margin would invert (~2.75 vs ~1.90) — arithmetic that was
-    // never measured; re-measure at the new scale before revisiting the
-    // Intel entry if that happens. The feature grounds (H/R/C/O, >=spp-3,
-    // the replay win at rest) are untouched by resolution either way.
+    // never measured. RE-MEASURE at 0.75 before revisiting the Intel entry;
+    // `--lock-res native` still spells the arm these numbers describe, so the
+    // comparison is reproducible. The feature grounds (H/R/C/O, >=spp-3, the
+    // replay win at rest) are untouched by resolution either way.
     //
     // 2026-08-01 RE-MEASURE — the 0.92x producing-frame parity above is
     // RETIRED. It predates the (32,256) leaf frontier, the G-buffer pack
@@ -34369,6 +34706,77 @@ fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>, dn_fold: 
     }
 }
 
+/// ~30 Hz repaint of the loading page. THE one implementation: the scene-load
+/// loop, the GPU upload's `PumpSubmit`, and the eager-init boundaries in
+/// `session()` all come through here, so the page cannot drift between the
+/// phases of one boot.
+///
+/// Safe to call thousands of times — the throttle is what makes it so. Input
+/// is polled EVERY call (it is cheap, and it is what keeps the window from
+/// being ghosted by Windows); the raster + present are the expensive half and
+/// run at most every `LOAD_TICK_MS`.
+#[cfg(windows)]
+const LOAD_TICK_MS: u128 = 33;
+
+#[cfg(windows)]
+fn load_tick(
+    hud: &mut Option<hud::Hud>,
+    inp: &mut input::Input,
+    gpu: &mut gpu::GpuContext,
+    bg: &CpuPresent,
+    start: Instant,
+    last: &mut Instant,
+    // Repaint even if the throttle has not expired. The eager init's coarse
+    // boundaries are seconds apart and there are only a handful of them —
+    // each is worth a frame.
+    force: bool,
+) {
+    // A long BLAS build / sidecar store can't be interrupted cleanly; the OS
+    // reclaims the device on exit, and a truncated world.fcache is a silent
+    // cache miss by construction.
+    if inp.poll(None).quit {
+        eprintln!("frustracer: quit during load");
+        std::process::exit(0);
+    }
+    if !force && last.elapsed().as_millis() < LOAD_TICK_MS {
+        return;
+    }
+    *last = Instant::now();
+    if let Some(hd) = hud.as_mut() {
+        let snap = progress::snapshot().unwrap_or_default();
+        // A ~1.6 s marquee sweep for the indeterminate phases (world BVH
+        // build) — its whole job is to show liveness there.
+        let marquee = (start.elapsed().as_secs_f32() / 1.6).fract();
+        if let Some(hf) = hd.loading_frame(&snap, marquee) {
+            gpu.hud_stage(hf);
+        }
+    }
+    gpu.set_hud_visible(true);
+    let _ = bg.blit(gpu);
+}
+
+/// `load_tick`'s borrows, bundled so the GPU upload and the tracer
+/// constructors can drive it through `gpu::LoadUi` (which hands the context
+/// back per call — see `PumpSubmit`). Everything is BORROWED, including the
+/// throttle clock: a caller builds one of these for the length of one init
+/// call and gets its `hud`/`inp` back afterwards, with the repaint cadence
+/// carried across.
+#[cfg(windows)]
+struct LoadScreen<'a> {
+    hud: &'a mut Option<hud::Hud>,
+    inp: &'a mut input::Input,
+    bg: &'a CpuPresent,
+    start: Instant,
+    last: &'a mut Instant,
+}
+
+#[cfg(windows)]
+impl gpu::LoadUi for LoadScreen<'_> {
+    fn tick(&mut self, gpu: &mut gpu::GpuContext) {
+        load_tick(self.hud, self.inp, gpu, self.bg, self.start, self.last, false);
+    }
+}
+
 #[cfg(windows)]
 fn run_window(
     req: SceneRequest,
@@ -34546,30 +34954,12 @@ fn run_window(
         // near-opaque scrim covers it. `.blit` composites the staged HUD.
         let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
         let load_start = Instant::now();
-        loop {
-            let edges = inp.poll(None);
-            if edges.quit {
-                // A long BLAS build / sidecar store can't be interrupted
-                // cleanly; the OS reclaims the device on exit, and a truncated
-                // world.fcache is a silent cache miss by construction.
-                eprintln!("frustracer: quit during load");
-                std::process::exit(0);
-            }
-            if worker.is_finished() {
-                break;
-            }
-            if let Some(hd) = hud.as_mut() {
-                let snap = progress::snapshot().unwrap_or_default();
-                // A ~1.6 s marquee sweep for the indeterminate phases (world
-                // BVH build) — its whole job is to show liveness there.
-                let marquee = (load_start.elapsed().as_secs_f32() / 1.6).fract();
-                if let Some(hf) = hd.loading_frame(&snap, marquee) {
-                    gpu.hud_stage(hf);
-                }
-            }
-            gpu.set_hud_visible(true);
-            let _ = load_bg.blit(&mut gpu);
-            std::thread::sleep(Duration::from_millis(33));
+        // `load_tick` already throttles, so the sleep is only here to keep an
+        // idle spin off a core while the worker owns the wall clock.
+        let mut last = Instant::now() - Duration::from_millis(LOAD_TICK_MS as u64);
+        while !worker.is_finished() {
+            load_tick(&mut hud, &mut inp, &mut gpu, &load_bg, load_start, &mut last, false);
+            std::thread::sleep(Duration::from_millis(8));
         }
     }
     let loaded = match worker.join() {
@@ -34600,21 +34990,48 @@ fn run_window(
             }
         }
     }
-    // One more loading frame for the GPU-upload phase: the eager --dxr init
-    // (BC7 encode + BLAS/TLAS build) runs synchronously inside the first
-    // session and blocks ~1 s with no event pump, so freeze this label on
-    // screen across it. The page clears on the session's first HUD frame.
-    progress::phase(progress::Phase::GpuUpload, "", 0);
-    {
-        let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
-        if let Some(hd) = hud.as_mut() {
-            let snap = progress::snapshot().unwrap_or_default();
-            if let Some(hf) = hd.loading_frame(&snap, 0.0) {
-                gpu.hud_stage(hf);
-            }
+    // The GPU upload, with the page LIVE across it. It used to draw one frozen
+    // frame here and let the eager tracer init run inside `session()` with no
+    // event pump at all — thousands of blocking submits behind a marquee
+    // stopped mid-sweep, and a window Windows ghosted as "not responding".
+    //
+    // Hoisting the shared scene core out of the session is what makes it
+    // pumpable: `upload_scene_core` has `&mut GpuContext` free, so it can hand
+    // the whole context to a repaint between submits (`gpu::PumpSubmit`).
+    // `ensure_scene_gpu` then serves the cached Rc and the session's
+    // `init_trace`/`init_dxr` upload nothing.
+    //
+    // Gated on a GPU tracer being ATTEMPTED: under `--cpu` the core would be
+    // gigabytes serving nobody. If the tracer then fails to build,
+    // `evict_unused_scene_gpu` drops it on the same reasoning.
+    if opts.gpu || opts.dxr {
+        progress::stage(0, 0, ""); // the world loader's "7 / 7" row is stale here
+        progress::phase(
+            progress::Phase::GpuUpload,
+            "geometry",
+            gpu::trace::upload_units(&scene, opts.bc7),
+        );
+        let bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
+        let mut last = Instant::now() - Duration::from_millis(LOAD_TICK_MS as u64);
+        let mut ls = LoadScreen {
+            hud: &mut hud,
+            inp: &mut inp,
+            bg: &bg,
+            start: Instant::now(),
+            last: &mut last,
+        };
+        if let Err(e) = gpu.upload_scene_core(&scene, &bvh, opts.bc7, &mut ls) {
+            // Not fatal here: the session's own init will retry through
+            // `ensure_scene_gpu` and own the failure arm (tracer latch + the
+            // CPU-renderer fallback line).
+            eprintln!("gpu scene: eager upload failed ({e}); the session will retry");
         }
-        gpu.set_hud_visible(true);
-        let _ = load_bg.blit(&mut gpu);
+        // The staged work is done, so land the bar on 100% rather than on
+        // whatever `upload_units` guessed — see `progress::finish_phase`. What
+        // follows (shader compile, and on the wavefront arm the tracer's own
+        // tree upload) is unmetered by construction, and the DETAIL row names
+        // it instead.
+        progress::finish_phase();
     }
     // World auto-TOD attractors + audio cues — both need the world layout the
     // load produced, so they move here (from main()) after the join.
@@ -34639,12 +35056,10 @@ fn run_window(
         },
         _ => audio::Cues::None,
     };
-    // Clear the loading page; the session's first hud.frame uploads its removal
-    // as a dirty rect (set_loading forces a full-window repaint of the reveal).
-    if let Some(hd) = hud.as_mut() {
-        hd.set_loading(false);
-    }
-    progress::phase(progress::Phase::Idle, "", 0);
+    // The loading page deliberately STAYS UP into the session: its eager
+    // tracer init (shader compile, denoiser, upscaler wiring) is the rest of
+    // the boot's blocking work, and `session()` keeps the page live across it
+    // and clears it once frames are about to start.
 
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
     // (spawned here, not per session, so the pose survives resize rebuilds —
@@ -34870,6 +35285,28 @@ fn session(
     h: usize,
 ) -> SessionEnd {
     let p0: Option<Persist> = *persist;
+    // FIRST ENTRY: the loading page is still up (run_window leaves it live on
+    // purpose), and everything between here and the frame loop — shader
+    // compile, the tracer's own tree upload, denoiser and upscaler wiring —
+    // is seconds of blocking work on this thread. `load_step!` repaints the
+    // page at each coarse boundary and, just as importantly, drains the
+    // window's message queue so Windows never ghosts it. A resize re-entry
+    // has no page and every expansion is inert.
+    let loading = hud.as_ref().is_some_and(|hd| hd.is_loading());
+    let load_bg = loading.then(|| CpuPresent::new(w, h, gpu.encoding(), gpu.tone()));
+    let load_t0 = Instant::now();
+    let mut load_last = Instant::now();
+    // A macro, not a closure: this needs `hud`/`inp`/`gpu` mutably at each
+    // site, and a closure holding all three would conflict with every other
+    // use of them in the init below.
+    macro_rules! load_step {
+        ($detail:expr) => {
+            if let Some(bg) = &load_bg {
+                progress::detail($detail);
+                load_tick(hud, inp, gpu, bg, load_t0, &mut load_last, true);
+            }
+        };
+    }
     // Denoiser/pipeline intents: first entry from the CLI flags, re-entries
     // from the persisted runtime state (the CLI branches below double as the
     // restore path — they rebuild the contexts at the new size).
@@ -34964,7 +35401,7 @@ fn session(
     // change, not a scene change: the res-step block below does NOT reset
     // (no dlss_reset, no prev drop; history survives via the extent tags).
     // A degenerate reported range (min == max) means the driver offers no
-    // DRS — fixed res, no controller. --lock-res (default native = 100%)
+    // DRS — fixed res, no controller. --lock-res (default 0.75)
     // pins a fixed res inside the range instead; `--lock-res dynamic` opts
     // back into the controller.
     let dlss_range = gpu.rr_res_range();
@@ -35032,7 +35469,7 @@ fn session(
                 "ON (step-wise; history survives steps)".to_string()
             } else if opts.gpu {
                 // The CPU renderer never runs under --gpu, so its lock (the
-                // native default) is not this session's render res — the
+                // 0.75 default) is not this session's render res — the
                 // gpu: line below states the tracer's own locked one.
                 "LOCKED under --gpu, see the gpu: line".to_string()
             } else if opts.lock_scale.is_some() {
@@ -35068,7 +35505,7 @@ fn session(
     // grid no longer matches.
     let mut xess_on = p0.map_or(gpu.xess_ready(), |p| p.xess_on && gpu.xess_ready());
     let xess_range = gpu.xess_res_range(); // (optimal, min, max)
-    // --lock-res (default native): one fixed render res for the whole
+    // --lock-res (default 0.75): one fixed render res for the whole
     // session — the ScaleCtl/StepLimiter pair is never built/consulted.
     // quantize_res clamps the requested scale into the SDK range.
     let xess_lock = opts.lock_scale.and_then(|r| {
@@ -35082,7 +35519,7 @@ fn session(
         })
     });
     let mut xess_ctl = xess_range.filter(|_| xess_lock.is_none()).map(|(_, min, max)| {
-        // Start where the default lock would sit (native, clamped into the
+        // Start where the default lock would sit (0.75, clamped into the
         // range), not the SDK's "optimal" — with the ULTRA_PERFORMANCE init
         // that widens the range, optimal is the 1/3-scale floor and would
         // open blurry. The controller corrects from here either way
@@ -35188,7 +35625,7 @@ fn session(
     // BLAS/TLAS, and — in upscaler sessions — the feed wiring). The session
     // sub-mode mirrors the CPU defaults: DLSS-RR when supported, XeSS with
     // --xess, plain with --no-dlss. The render resolution is LOCKED for the
-    // session (from --lock-res, default native = 100%, quantized into the
+    // session (from --lock-res, default 0.75, quantized into the
     // upscaler's range) — the tracer's buffers are sized to it once; there
     // is no DRS on the GPU path. Any init failure falls back to the CPU
     // renderer with the reason on stderr.
@@ -35244,7 +35681,17 @@ fn session(
                 if opts.frd_explicit { "frd" } else { "nrd" }
             );
         }
+        load_step!("loading shader compiler");
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+            // Reborrowed, not moved: the page must survive this call for the
+            // rest of the session to keep using `hud`/`inp`.
+            let mut ls = load_bg.as_ref().map(|bg| LoadScreen {
+                hud: &mut *hud,
+                inp: &mut *inp,
+                bg,
+                start: load_t0,
+                last: &mut load_last,
+            });
             gpu.init_trace(
                 &dxc,
                 scene,
@@ -35259,6 +35706,7 @@ fn session(
                     .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
+                ls.as_mut().map(|l| l as &mut dyn gpu::LoadUi),
             )
         }) {
             Ok(()) => {
@@ -35581,7 +36029,7 @@ fn session(
     // contract — DxrGpu's buffers are sized once, no DRS), window-res when
     // plain. Computed once so the eager --dxr init and the lazy F init
     // build the pipeline at the same res. The scale is the GPU-mode one
-    // (native by default); `--lock-res dynamic` can't be honored here, so it
+    // (0.75 by default); `--lock-res dynamic` can't be honored here, so it
     // falls back to that same default.
     let dxr_quin_avail = gpu.quin_planned();
     let dxr_lock = opts.lock_scale.unwrap_or(xess::DEFAULT_LOCK_SCALE);
@@ -35612,7 +36060,16 @@ fn session(
         if compose && opts.lock_scale.is_none() {
             lock_dynamic_note("dxr", (dxw, dxh));
         }
+        load_step!("loading shader compiler");
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+            // Reborrowed, not moved — see the init_trace site.
+            let mut ls = load_bg.as_ref().map(|bg| LoadScreen {
+                hud: &mut *hud,
+                inp: &mut *inp,
+                bg,
+                start: load_t0,
+                last: &mut load_last,
+            });
             gpu.init_dxr(
                 &dxc,
                 scene,
@@ -35627,6 +36084,7 @@ fn session(
                     .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
+                ls.as_mut().map(|l| l as &mut dyn gpu::LoadUi),
             )
         }) {
             Ok(()) => {
@@ -35747,6 +36205,18 @@ fn session(
     // broken. A minimized window reports a 0 dimension and never commits.
     const RESIZE_SETTLE_MS: u128 = 250;
     let mut pending_resize: Option<Instant> = None;
+
+    // Init is done, so the loading page comes down here rather than in
+    // run_window: everything above this line is the rest of the boot's
+    // blocking work, and the page stayed live across it (`load_step!`). The
+    // session's first hud.frame uploads the removal as a dirty rect
+    // (set_loading forces a full-window repaint of the reveal).
+    if loading {
+        if let Some(hd) = hud.as_mut() {
+            hd.set_loading(false);
+        }
+        progress::phase(progress::Phase::Idle, "", 0);
+    }
 
     // Init is done and frames start now, so the integrator may fly again (it
     // spawned paused, and a resize re-entry paused it). Everything above this
@@ -36725,6 +37195,8 @@ fn session(
                                         .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
+                                    // Mid-session: no loading page to keep live.
+                                    None,
                                 )
                             });
                             if let Err(e) = built {
@@ -36811,6 +37283,8 @@ fn session(
                                         .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
+                                    // Mid-session: no loading page to keep live.
+                                    None,
                                 )
                             });
                             if let Err(e) = built {

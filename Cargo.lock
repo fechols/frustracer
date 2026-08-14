@@ -4074,6 +4074,7 @@ version = "0.6.7+SDL-3.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e89cde1ff23eb110e348da9b5be904381235163272a424938a2c99c86ea33041"
 dependencies = [
+ "ash",
  "cc",
  "cmake",
  "pkg-config",

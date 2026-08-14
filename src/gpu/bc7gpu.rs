@@ -121,13 +121,20 @@ impl Bc7Enc {
 
     /// Record the encode of one band: `staged_rows` RGBA8 texel rows of an
     /// `mw`-wide mip, resident in `src` (an upload-heap buffer — GENERIC_READ
-    /// covers the SRV read, no transition) at `src_pitch` bytes/row, into
-    /// `band_rows` block rows of `block_buf` (which must be resting in
-    /// UNORDERED_ACCESS — `record_copy_out` returns it there).
+    /// covers the SRV read, no transition) at byte offset `src_off` and
+    /// `src_pitch` bytes/row, into `band_rows` block rows of `block_buf`
+    /// (which must be resting in UNORDERED_ACCESS — `record_copy_out` returns
+    /// it there).
+    ///
+    /// `src_off` names the band's slice of a BATCHED staging ring, whose
+    /// cursor hands out increasing offsets so many bands can ride one submit.
+    /// It must be 16-aligned (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`); the ring's
+    /// own 512-byte reservation granularity covers that with room to spare.
     pub fn record_encode(
         &self,
         l: &ID3D12GraphicsCommandList,
         src: &ID3D12Resource,
+        src_off: u64,
         mw: u32,
         staged_rows: u32,
         src_pitch: u32,
@@ -142,16 +149,20 @@ impl Bc7Enc {
         );
         // The two trailing zeros are the kernel's `src_off`/`dst_off` window,
         // which this backend expresses as the root SRV/UAV virtual addresses
-        // instead (they name a band's ring slice and the whole block buffer);
-        // the Vulkan host binds one descriptor per buffer for a whole batch
-        // and moves the window in the constants. Zero byte offsets are exact
-        // integer identities, so both hosts encode the same blocks.
+        // instead (they name a band's ring slice and the whole block buffer):
+        // the SRV is slid by `src_off` above — non-zero since the staging ring
+        // gained a cursor, so several bands ride one submit — and the block
+        // buffer is always the whole allocation. The Vulkan host binds one
+        // descriptor per buffer for a whole batch and moves the window in
+        // these constants instead. A byte offset applied to the base address
+        // and one applied inside the kernel are exact integer identities, so
+        // both hosts encode the same blocks.
         let consts: [u32; 9] =
             [mw, staged_rows, src_pitch, bw, band_rows, row_blocks, effort, 0, 0];
         unsafe {
             l.SetComputeRootSignature(&self.root_sig);
             l.SetPipelineState(&self.pso);
-            l.SetComputeRootShaderResourceView(0, src.GetGPUVirtualAddress());
+            l.SetComputeRootShaderResourceView(0, src.GetGPUVirtualAddress() + src_off);
             l.SetComputeRootUnorderedAccessView(1, self.block_buf.GetGPUVirtualAddress());
             l.SetComputeRoot32BitConstants(2, 9, consts.as_ptr() as *const _, 0);
             l.Dispatch(bw.div_ceil(8), band_rows.div_ceil(8), 1);

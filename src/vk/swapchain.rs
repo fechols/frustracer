@@ -64,8 +64,90 @@ const NEED_USAGE: vk::ImageUsageFlags =
         vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
     );
 
-/// A headless surface, its swapchain, and the synchronisation one present
-/// cycle needs.
+/// Why a swapchain could not be built — split by what the CALLER should do
+/// about it, which is the same distinction `device::VkError`'s `absent` draws
+/// one level up.
+///
+/// IT EXISTS BECAUSE ONE BODY NOW SERVES TWO CALLERS WITH OPPOSITE DUTIES.
+/// `new` is a gate's constructor: a box whose surface cannot present, or whose
+/// format nothing here can decode, is an environment fact and V19 must SKIP.
+/// `from_surface` is a window's constructor: the user asked for a window, so
+/// the identical fact is a REFUSAL that has to name itself and exit, the
+/// `--fsr4` being-told doctrine. Returning a bare `Option` from `build` could
+/// express the first and not the second — the caller got "no" with no way to
+/// say why, so a window would have had to print "no swapchain" and leave the
+/// reason on the floor.
+///
+/// `From<String>` is what keeps the ~10 existing `.map_err(|e| format!(..))?`
+/// sites in `build` textually unchanged: they still produce a `String` and `?`
+/// lifts it into `Err`.
+enum Refusal {
+    /// A fact about this box. A gate skips; a window refuses and says this.
+    Env(String),
+    /// An API call failed. Both callers propagate it.
+    Err(String),
+}
+
+impl From<String> for Refusal {
+    fn from(s: String) -> Refusal {
+        Refusal::Err(s)
+    }
+}
+
+impl Refusal {
+    /// The message either way — a window has no use for the distinction, only
+    /// for the sentence.
+    fn text(self) -> String {
+        match self {
+            Refusal::Env(s) | Refusal::Err(s) => s,
+        }
+    }
+}
+
+/// Why an acquire or a present did not go through.
+///
+/// `Stale` IS NOT A FAILURE, and separating it is the whole reason this type
+/// exists. `VK_ERROR_OUT_OF_DATE_KHR` says the surface no longer matches the
+/// swapchain — a resize, a mode change, a monitor move — and the spec's answer
+/// is to rebuild, not to give up. Folded into a string it reads as a crash, and
+/// that is exactly what a window did with it before B6b rung 1: a compositor
+/// resizing the window ended the session with a raw
+/// `vkQueuePresentKHR: ERROR_OUT_OF_DATE_KHR` and exit 2.
+///
+/// IT IS SEPARATE FROM `SUBOPTIMAL_KHR`, which stays ignored below. Suboptimal
+/// means the swapchain still works and the presentation engine would rather it
+/// were built differently; out-of-date means it does not work at all. MEASURED
+/// on RADV under XWayland: a resize from 1280x720 to 320x240 reports SUBOPTIMAL
+/// and keeps presenting (the compositor scales), so the two really are
+/// different answers on real hardware and a driver that reports the other one
+/// is equally conformant.
+///
+/// `Display`, so the ~4 existing `{e}` call sites in `--check-vk`'s V19 are
+/// textually unchanged by the type moving under them.
+pub enum Lost {
+    /// The surface and the swapchain disagree. Rebuild, or quit cleanly.
+    Stale,
+    /// Anything else — a real failure.
+    Fatal(String),
+}
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Named as the CAUSE rather than as the error code, since every
+            // consumer that prints this has no rebuild path and is about to
+            // stop.
+            Lost::Stale => write!(f, "the surface no longer matches the swapchain (resized?)"),
+            Lost::Fatal(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// A surface, its swapchain, and the synchronisation one present cycle needs.
+///
+/// The surface is a HEADLESS one under `new` and a window's under
+/// `from_surface`; nothing below that line can tell the difference, which is
+/// what rung 2 built and what rung 1 of B6b consumes.
 pub struct Swapchain {
     surface_fn: ash::khr::surface::Instance,
     swapchain_fn: ash::khr::swapchain::Device,
@@ -181,19 +263,94 @@ impl Swapchain {
         // unrelated later stage.
         let built = Self::build(hg, &surface_fn, surface, w, h);
         match built {
-            Ok(Some(mut sc)) => {
+            Ok(mut sc) => {
                 sc.surface_fn = surface_fn;
                 sc.surface = surface;
                 Ok(Some(sc))
             }
-            Ok(None) => {
+            // A gate SKIPS on an environment fact and FAILS on a broken call —
+            // the split `Refusal` exists to preserve now that `from_surface`
+            // reads the same body the other way.
+            Err(Refusal::Env(_)) => {
                 unsafe { surface_fn.destroy_surface(surface, None) };
                 Ok(None)
             }
-            Err(e) => {
+            Err(Refusal::Err(e)) => {
                 unsafe { surface_fn.destroy_surface(surface, None) };
                 Err(e)
             }
+        }
+    }
+
+    /// Build a swapchain over a surface SOMEBODY ELSE created — the window's
+    /// constructor, and the one thing B6b rung 1 adds to this module.
+    ///
+    /// EVERY REFUSAL IS AN ERROR HERE, and that is the whole difference from
+    /// `new`. A gate that finds a box which cannot present has learned an
+    /// environment fact and should skip; a caller that was TOLD to open a
+    /// window and cannot has to say which fact stopped it and exit non-zero
+    /// (`--fsr4`'s doctrine — being told IS the feature). Silently presenting
+    /// nothing, or falling back to something that is not a window, would be the
+    /// worst of the three.
+    ///
+    /// THE SOFTWARE-DEVICE STAND-DOWN IS KEPT, and it is not inherited
+    /// laziness: lavapipe advertises `VK_KHR_swapchain`, answers every
+    /// capability query, and then jumps to address zero inside
+    /// `vkCreateSwapchainKHR`. A window on a software device would take the
+    /// process down rather than report, so this refuses BEFORE the call for the
+    /// same reason `new` does, and names the device so the message is
+    /// actionable.
+    ///
+    /// OWNERSHIP: the surface passes to us. SDL creates it and does NOT destroy
+    /// it when the window drops — `vkDestroySurfaceKHR` is the application's
+    /// job — and `destroy` already frees a non-null surface, so handing it over
+    /// here is what makes the lifetimes come out even.
+    pub fn from_surface(
+        hg: &VkHeadless,
+        surface: vk::SurfaceKHR,
+        w: u32,
+        h: u32,
+    ) -> Result<Swapchain, String> {
+        let vkd = &hg.vk;
+
+        // Two of `new`'s three environment checks apply; `headless_surface`
+        // deliberately does not, because the surface arrived from SDL and
+        // `VK_EXT_headless_surface` has nothing to do with it. The instance
+        // extension that DID matter (`VK_KHR_surface`, plus SDL's platform
+        // one) was unioned in at `Vk::new` before the instance existed.
+        if !vkd.info.swapchain {
+            return Err(format!(
+                "{} does not support VK_KHR_swapchain — this device cannot present",
+                vkd.info.name
+            ));
+        }
+        if !vkd.info.graphics_queue {
+            return Err(format!(
+                "the queue family picked on {} has no GRAPHICS bit — it can trace but not draw",
+                vkd.info.name
+            ));
+        }
+        let force = std::env::var("FR_VK_PRESENT_SOFTWARE").is_ok_and(|v| v != "0");
+        if vkd.info.kind == vk::PhysicalDeviceType::CPU && !force {
+            return Err(format!(
+                "{} is a software device — lavapipe segfaults inside vkCreateSwapchainKHR, so \
+                 this refuses the call rather than taking the process down. Pick a real GPU with \
+                 FR_VK_DEVICE=<name>, or FR_VK_PRESENT_SOFTWARE=1 to try anyway",
+                vkd.info.name
+            ));
+        }
+
+        let surface_fn = ash::khr::surface::Instance::new(&vkd.entry, &vkd.instance);
+        match Self::build(hg, &surface_fn, surface, w, h) {
+            Ok(mut sc) => {
+                sc.surface_fn = surface_fn;
+                sc.surface = surface;
+                Ok(sc)
+            }
+            // The surface is NOT destroyed here: it came from the caller, who
+            // still holds the window it belongs to and is about to exit. `new`
+            // frees it on this path because `new` is also the one that made it.
+            Err(r) => Err(r.text()),
         }
     }
 
@@ -203,7 +360,7 @@ impl Swapchain {
         surface: vk::SurfaceKHR,
         w: u32,
         h: u32,
-    ) -> Result<Option<Swapchain>, String> {
+    ) -> Result<Swapchain, Refusal> {
         let vkd = &hg.vk;
 
         // PRESENT SUPPORT IS PER (device, queue family, surface) and is its own
@@ -214,7 +371,10 @@ impl Swapchain {
         }
         .map_err(|e| format!("vkGetPhysicalDeviceSurfaceSupportKHR: {e}"))?;
         if !supported {
-            return Ok(None);
+            return Err(Refusal::Env(format!(
+                "queue family {} on {} cannot present to this surface",
+                vkd.qfam, vkd.info.name
+            )));
         }
 
         let caps = unsafe {
@@ -232,13 +392,22 @@ impl Swapchain {
             // read differently so nobody mistakes it for tier 1's claim.
             // Neither is written because both ICDs here report 0x8009F, so
             // shipping them would mean shipping code no gate can reach.
-            return Ok(None);
+            return Err(Refusal::Env(format!(
+                "this surface supports image usage {:?}, which is missing part of the required \
+                 {:?} (COLOR_ATTACHMENT to draw into it, TRANSFER_SRC to copy it out)",
+                caps.supported_usage_flags, NEED_USAGE
+            )));
         }
 
         let formats = unsafe { surface_fn.get_physical_device_surface_formats(vkd.phys, surface) }
             .map_err(|e| format!("vkGetPhysicalDeviceSurfaceFormatsKHR: {e}"))?;
         let Some(sf) = pick_format(&formats) else {
-            return Ok(None);
+            return Err(Refusal::Env(format!(
+                "none of this surface's {} format(s) is usable — see `pick_format` for the two \
+                 refusals (_SRGB would double-encode the shader's own transfer function; an \
+                 unknown byte order cannot be decoded)",
+                formats.len()
+            )));
         };
 
         // FIFO is the one present mode the spec guarantees, and with no
@@ -249,7 +418,13 @@ impl Swapchain {
         }
         .map_err(|e| format!("vkGetPhysicalDeviceSurfacePresentModesKHR: {e}"))?;
         if !modes.contains(&vk::PresentModeKHR::FIFO) {
-            return Ok(None);
+            // FIFO is the one mode the spec GUARANTEES, so this cannot fire on
+            // a conformant driver — which is exactly why it stays a check
+            // rather than an assumption.
+            return Err(Refusal::Env(
+                "this surface does not offer FIFO, the one present mode the spec guarantees"
+                    .into(),
+            ));
         }
 
         // `currentExtent` of 0xFFFFFFFF means the swapchain chooses — measured
@@ -325,9 +500,10 @@ impl Swapchain {
             render_done.push(sem().map_err(|e| format!("vkCreateSemaphore(render): {e}"))?);
         }
 
-        Ok(Some(Swapchain {
-            // Filled by `new` — `build` does not own the surface, so that it
-            // can be freed on every early return above.
+        Ok(Swapchain {
+            // Filled by the CALLER — `build` does not own the surface, so that
+            // `new` can free it on every early return above and `from_surface`
+            // can leave it with the window it belongs to.
             surface_fn: ash::khr::surface::Instance::new(&vkd.entry, &vkd.instance),
             swapchain_fn,
             surface: vk::SurfaceKHR::null(),
@@ -339,7 +515,7 @@ impl Swapchain {
             views,
             acquire,
             render_done,
-        }))
+        })
     }
 
     /// The image count, which is what the exhaustion proof counts cycles
@@ -353,7 +529,7 @@ impl Swapchain {
     /// The timeout is FINITE by design (see `ACQUIRE_TIMEOUT_NS`): a present
     /// that returned success and did nothing shows up here as a timeout on the
     /// cycle after the pool is exhausted, which is the whole exhaustion proof.
-    pub fn acquire(&self) -> Result<usize, String> {
+    pub fn acquire(&self) -> Result<usize, Lost> {
         let (idx, suboptimal) = unsafe {
             self.swapchain_fn.acquire_next_image(
                 self.swapchain,
@@ -363,14 +539,15 @@ impl Swapchain {
             )
         }
         .map_err(|e| match e {
-            vk::Result::TIMEOUT | vk::Result::NOT_READY => format!(
+            vk::Result::ERROR_OUT_OF_DATE_KHR => Lost::Stale,
+            vk::Result::TIMEOUT | vk::Result::NOT_READY => Lost::Fatal(format!(
                 "vkAcquireNextImageKHR timed out after {} s with {} image(s) in the pool — the \
                  presentation engine released none, i.e. a present that reported success did \
                  nothing",
                 ACQUIRE_TIMEOUT_NS / 1_000_000_000,
                 self.images.len()
-            ),
-            other => format!("vkAcquireNextImageKHR: {other}"),
+            )),
+            other => Lost::Fatal(format!("vkAcquireNextImageKHR: {other}")),
         })?;
         // Reported, never failed on: a headless surface has no scanout to be
         // suboptimal FOR, and treating it as an error would be inventing a
@@ -407,7 +584,7 @@ impl Swapchain {
     ///
     /// Waits on the render-finished semaphore, so it must follow a
     /// `run_present` that signalled it.
-    pub fn present(&self, vkd: &Vk, idx: usize) -> Result<(), String> {
+    pub fn present(&self, vkd: &Vk, idx: usize) -> Result<(), Lost> {
         let sems = [self.render_done[idx]];
         let chains = [self.swapchain];
         let indices = [idx as u32];
@@ -416,8 +593,12 @@ impl Swapchain {
             .swapchains(&chains)
             .image_indices(&indices);
         unsafe { self.swapchain_fn.queue_present(vkd.queue, &pi) }
+            // Suboptimal is a SUCCESS code and stays ignored — see `Lost`.
             .map(|_suboptimal| ())
-            .map_err(|e| format!("vkQueuePresentKHR: {e}"))
+            .map_err(|e| match e {
+                vk::Result::ERROR_OUT_OF_DATE_KHR => Lost::Stale,
+                other => Lost::Fatal(format!("vkQueuePresentKHR: {other}")),
+            })
     }
 
     /// Record the barrier a presented image needs after the readback copy.

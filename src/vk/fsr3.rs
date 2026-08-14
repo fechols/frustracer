@@ -837,6 +837,33 @@ impl Fsr3 {
         r
     }
 
+    /// The upscaled frame's view, for a consumer that draws it instead of
+    /// reading it back — the presenter (B6b rung 1).
+    ///
+    /// IT RESTS IN `GENERAL`, which is the whole reason this is an accessor and
+    /// not a transition helper: `read_output` below copies from `GENERAL`, and
+    /// `display::Passes::bind_source` declares `GENERAL` on the descriptor it
+    /// writes, so the two already agree and there is no layout work to do at
+    /// the seam. The image also carries `SAMPLED` usage (see `Img::new`'s
+    /// uniform usage set), so a `SAMPLED_IMAGE` descriptor over this view is
+    /// legal rather than incidentally working.
+    ///
+    /// Its LIFETIME is the `Fsr3`'s, so a caller must not outlive it — which
+    /// the presenter satisfies by holding both for the whole session and
+    /// re-binding nothing per frame: the view is stable across frames because
+    /// FFX writes the same image every time.
+    pub fn output_view(&self) -> vk::ImageView {
+        self.output.view
+    }
+
+    /// The output resolution — what the swapchain and the display `Passes` are
+    /// sized against. `render` is the traced res; at rung 1's DLAA-shaped 1:1
+    /// they are equal, and reading this rather than assuming that is what keeps
+    /// a future non-1:1 presenter honest.
+    pub fn upscale_size(&self) -> (u32, u32) {
+        self.upscale
+    }
+
     /// The upscaled frame as linear f32 RGB at output res.
     pub fn read_output(&self, hg: &VkHeadless) -> Result<Vec<f32>, String> {
         let (ow, oh) = self.upscale;
