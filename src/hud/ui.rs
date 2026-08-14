@@ -152,6 +152,15 @@ slint::slint! {
         // While `loading`, the compass/graph/keymap are gated off below so the
         // screen owns the frame; a `set_loading(false)` clears it in one dirty
         // rect. `load-frac < 0` => indeterminate (the marquee sweeps instead).
+        // --cam-readout: the pose plate (bottom-left). Four independent
+        // strings rather than one newline-joined blob — each is guarded by
+        // value on the Rust side, and a parked camera then dirties NOTHING
+        // while the aperture line keeps ticking.
+        in property <bool> cam-on: false;
+        in property <string> cam-pos: "";
+        in property <string> cam-quat: "";
+        in property <string> cam-flag: "";
+        in property <string> cam-exp: "";
         in property <bool> loading: false;
         in property <string> load-stage: "";   // "island 5 / 7  san-miguel"
         in property <string> load-phase: "";    // "decoding textures"
@@ -395,6 +404,49 @@ slint::slint! {
         // Keymap / controller layout: fades IN while the camera is moving
         // (that is when the pilot wants it), lingers briefly, fades OUT at
         // rest. One animated opacity — settled states dirty nothing.
+        // --cam-readout: everything a bug report needs about WHERE the camera
+        // is, sized and placed so a plain screenshot is a complete answer.
+        // Bottom-LEFT, one row clear of the keymap panel below it (which is
+        // bottom-centre and 720px wide) so the two never overlap at any
+        // window width this renders at.
+        camplate := Rectangle {
+            visible: root.cam-on && !root.loading;
+            x: 16px;
+            y: parent.height - 206px;
+            width: 396px;
+            height: 100px;
+            border-radius: 8px;
+            background: #10141cC8;
+            border-width: 1px;
+            border-color: #58f0ff50;
+            VerticalLayout {
+                padding: 9px;
+                spacing: 3px;
+                Text {
+                    text: root.cam-pos;
+                    color: #7df3ff;
+                    font-size: 13px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.cam-quat;
+                    color: #7df3ff;
+                    font-size: 13px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.cam-exp;
+                    color: #ffd24d;
+                    font-size: 12px;
+                }
+                Text {
+                    text: root.cam-flag;
+                    color: #b8c0cc;
+                    font-size: 11px;
+                }
+            }
+        }
+
         help := Rectangle {
             x: (parent.width - self.width) / 2;
             y: parent.height - 96px;

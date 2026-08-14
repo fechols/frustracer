@@ -436,6 +436,24 @@ pub struct Opts {
     /// the per-pass AMD-vs-NVIDIA diff it makes possible is what found the
     /// leaf kernel's wave64 bug.
     pub gpu_timing: bool,
+    /// `--cam-readout` — draw the live camera pose into the HUD's bottom-left
+    /// corner, so a SCREENSHOT carries everything needed to reproduce the
+    /// exact pose and lighting regime: position, orientation quaternion, a
+    /// paste-ready `--cam` argument, and the TOD + live aperture.
+    ///
+    /// It exists because "where were you standing?" is otherwise unanswerable
+    /// across a bug report — a pose described in prose cannot be re-flown, and
+    /// the aperture's behaviour is a function of the whole frame's content.
+    /// Purely display-stage (a HUD string), so no gate, golden or benchmark
+    /// can move; the pose it prints is the same `Camera` the tracer used.
+    pub cam_readout: bool,
+    /// `--no-rr-emis-demod` clears (`gfx::frame::set_rr_emis_demod`); the
+    /// default is ON. Kills the DLSS-RR emissive demodulation and restores the
+    /// pre-fix feed, which is the A/B arm the artifact was measured with — see
+    /// `gfx::frame::FLAG_EMIS_DEMOD`. Bit-identical when off (the CB bit
+    /// clears and both shader halves branch around themselves), and inert on
+    /// every arm that is not DLSS-RR.
+    pub rr_emis_demod: bool,
     /// V-sync'd presentation (default on). `--no-vsync` presents at sync
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
@@ -1016,6 +1034,8 @@ pub fn defaults() -> Opts {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
         gpu_timing: false,
+        cam_readout: false,
+        rr_emis_demod: true,
         vsync: true,
         // The 10-bit swapchain is the default: see Opts::hdr (the probe picks
         // PQ vs gamma). The 8-bit path survives as --no-hdr and as the FG
@@ -2297,6 +2317,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--pix-markers" => opts.pix_markers = true,
             "--gpu-timing" => opts.gpu_timing = true,
+            "--cam-readout" => opts.cam_readout = true,
+            "--no-rr-emis-demod" => opts.rr_emis_demod = false,
+            "--rr-emis-demod" => opts.rr_emis_demod = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
                     eprintln!("--pix-path needs a directory argument");
@@ -3048,6 +3071,12 @@ pub fn usage() {
                 eprintln!("                      wasn't already; an adapter without RT tier 1.0 still degrades to");
                 eprintln!("                      the wavefront, loudly)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + GPU-based validation");
+                eprintln!("  --no-rr-emis-demod  stop demodulating emissive out of the DLSS-RR");
+                eprintln!("                colour input (the pre-fix feed: an on-screen emitter then");
+                eprintln!("                lifts the WHOLE frame ~0.5 stops). The A/B arm, not a tuning knob");
+                eprintln!("  --cam-readout  draw the live camera pose (position, quaternion, a paste-ready");
+                eprintln!("                --cam argument, TOD and aperture) into the HUD's bottom-left —");
+                eprintln!("                a screenshot then carries everything needed to reproduce the pose");
                 eprintln!("  --gpu-timing  D3D12 timestamp queries: a per-region GPU-ms table every 120 frames");
                 eprintln!("                and at exit — vendor-neutral, and the only per-pass GPU profiler");
                 eprintln!("                that works on Intel Arc");

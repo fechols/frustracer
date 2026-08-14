@@ -75,7 +75,20 @@ void cs_feed_rr(uint3 id : SV_DispatchThreadID) {
     uint i3 = pi * 3u;
     GBufCore c = gbuf[pi];
     GBufExt g = gbuf_ext[pi]; // FLAG_GBUF_EXT is set whenever this kernel runs
-    feed_color[id.xy] = float4(accum[i3], accum[i3 + 1u], accum[i3 + 2u], 1.0);
+    // EMISSIVE DEMODULATION (FLAG_EMIS_DEMOD): hand RR the radiance WITHOUT
+    // the primary hit's emission. The guides beside this plane describe
+    // REFLECTANCE, which explains none of an emitter's emission, so an
+    // undemodulated ~1e3-radiance texel gets redistributed across RR's
+    // receptive field — measured at +0.488 stops of whole-frame lift on an
+    // emitter-free region (gfx::frame::FLAG_EMIS_DEMOD carries the numbers).
+    // `cs_rr_emis_readd` puts it back after RR resolves, decoding the SAME
+    // lane, so the round trip cancels exactly and only what RR SAW changed.
+    // Structurally off: a BRANCH, never a `- 0.0`.
+    float3 lit = float3(accum[i3], accum[i3 + 1u], accum[i3 + 2u]);
+    if (flags & FLAG_EMIS_DEMOD) {
+        lit = max(lit - emis_unpack(g.sig.w), 0.0);
+    }
+    feed_color[id.xy] = float4(lit, 1.0);
     feed_nr[id.xy] = g.nr;
     feed_depth[id.xy] = c.core.z; // linear view-Z, RR's LINEAR_DEPTH contract
     feed_mvec[id.xy] = c.core.xy;
@@ -161,4 +174,53 @@ void cs_feed_fsr_rr(uint3 id : SV_DispatchThreadID) {
     // view-Z for the denoiser.
     feed_depth[id.xy] = view_z_to_clip_depth(c.core.z, CAM_NEAR, CAM_FAR);
     feed_spechit[id.xy] = FSR_DEPTH_SIGN * c.core.z;
+}
+
+// --- FLAG_EMIS_DEMOD's other half: put the emission back after RR ----------
+//
+// Runs between `rr_ngx_sequence` and the tonemap, while `rr.output` is still
+// a UAV. Reads the SAME `sig.w` lane cs_feed_rr subtracted, so the pair
+// cancels to the pre-fix radiance up to the R11G11B10F quantum — the only
+// approximation is in what RR SAW, never in what is presented.
+//
+// It re-adds BEFORE the tonemap source is finalized rather than inside the
+// tonemap draw, because the bloom pyramid reads that source: folding it into
+// the tonemap would have silently stopped emitters blooming.
+//
+// Dispatched over the OUTPUT grid, whose extent comes from the UAV itself
+// (no new root constants); the emissive is point-sampled from the render
+// grid, which is an exact 1:1 map at DLAA. Emission is a sharp, noise-free
+// feature, so nearest is the honest reconstruction — there is nothing to
+// interpolate between.
+//
+// It writes through `feed_color` (u16) rather than a register of its own: the
+// re-add rides a spare FEED SET whose slot 0 holds RR's OUTPUT as a UAV
+// (GpuContext::wire_rr_feed), so the register is already in the root
+// signature and its TYPE matches. A private register would need a root-layout
+// change in BOTH pipelines — and the DXR root signature rejected exactly that
+// (`CreateComputePipelineState: The parameter is incorrect`). This is the
+// FEED_FSR_AO/ripple precedent: the register's VALUE may differ per kernel,
+// its type may not.
+
+[numthreads(8, 8, 1)]
+void cs_rr_emis_readd(uint3 id : SV_DispatchThreadID) {
+    // THE SAME PREDICATE cs_feed_rr subtracted under, and not a weaker one.
+    // The dispatch is gated on the RrEmis descriptor SET being wired, which is
+    // a strictly coarser condition than the CB bit: `with_frame` also requires
+    // the ext pack and, decisively, `!FLAG_FSR_SIG` — because `sig.w` carries
+    // `pack_h2(ao_t, shadow_t)` there. A frame that wired the set but cleared
+    // the bit would decode two f16 DISTANCES as an emissive triple and add
+    // hundreds of nits to every pixel. Reading the bit here makes subtract and
+    // re-add the same condition by construction, which is also what makes
+    // `--no-rr-emis-demod` a BRANCH rather than a `+ 0.0` (`x + 0.0 != x` for
+    // -0.0, and the off arm must be bit-identical to the pre-fix renderer).
+    if ((flags & FLAG_EMIS_DEMOD) == 0u) return;
+    uint ow, oh;
+    feed_color.GetDimensions(ow, oh);
+    if (id.x >= ow || id.y >= oh) return;
+    uint sx = min((id.x * rw) / ow, rw - 1u);
+    uint sy = min((id.y * rh) / oh, rh - 1u);
+    float3 e = emis_unpack(gbuf_ext[sy * rw + sx].sig.w);
+    float4 c = feed_color[id.xy];
+    feed_color[id.xy] = float4(c.rgb + e, c.a);
 }

@@ -536,6 +536,8 @@ pub struct DxrGpu {
     /// wired planes record_feed barriers over.
     pso_feed_xess: Option<ID3D12PipelineState>,
     pso_feed_rr: Option<ID3D12PipelineState>,
+    /// FLAG_EMIS_DEMOD's re-add kernel (gfx::frame).
+    pso_rr_emis: Option<ID3D12PipelineState>,
     pso_feed_fsr_rr: Option<ID3D12PipelineState>,
     /// One entry per wired engine; the index IS its descriptor set (see
     /// trace::FEED_SETS). Normally one — several under --quinlight.
@@ -872,7 +874,7 @@ impl DxrGpu {
         };
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
-        let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = match &srcs.feed {
+        let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr, pso_rr_emis) = match &srcs.feed {
             Some(feed_src) => {
                 let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                     trace::compute_pso(
@@ -886,9 +888,10 @@ impl DxrGpu {
                     Some(pso("cs_feed_xess", "dxr feed_xess")?),
                     Some(pso("cs_feed_rr", "dxr feed_rr")?),
                     Some(pso("cs_feed_fsr_rr", "dxr feed_fsr_rr")?),
+                    Some(pso("cs_rr_emis_readd", "dxr rr_emis_readd")?),
                 )
             }
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         // --nrd bridge kernels: the same nrd_bridge.hlsl unit at this
         // pipeline's cs_6_3 floor.
@@ -1528,6 +1531,7 @@ impl DxrGpu {
             tex_table,
             pso_feed_xess,
             pso_feed_rr,
+            pso_rr_emis,
             pso_feed_fsr_rr,
             feed: Vec::new(),
             device: device.clone(),
@@ -1773,6 +1777,10 @@ impl DxrGpu {
             self.nrd_rejitter(),
             self.remod_exact(),
             self.nrd_rclamp(),
+            // Both halves or neither — see TraceGpu::emis_demod.
+            crate::gfx::frame::rr_emis_demod()
+                && self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::Rr))
+                && self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::RrEmis)),
         );
         // Sway MVs: arm the flag + the ring-slot base, and stash the clock
         // pair for record_frame's dmv fill — one predicate (sway_mv_pair +
@@ -1933,6 +1941,10 @@ impl DxrGpu {
         }
         let mut feeds: Vec<(&ID3D12PipelineState, u32, &[ID3D12Resource])> = Vec::new();
         for (set, (kind, planes)) in self.feed.iter().enumerate() {
+            // Not a feed input — RR owns that resource's state (TraceGpu's twin).
+            if matches!(kind, trace::FeedKind::RrEmis) {
+                continue;
+            }
             let pso = trace::feed_pso(
                 *kind,
                 None,
@@ -1953,6 +1965,39 @@ impl DxrGpu {
             self.rh,
             &|| unsafe { self.bind_common(list, slot) },
         );
+        Ok(())
+    }
+
+    /// `TraceGpu::record_rr_emis`'s twin — FLAG_EMIS_DEMOD's re-add, recorded
+    /// after `rr_ngx_sequence` while RR's output is still a UAV. No
+    /// transitions: the caller already holds it in the state this needs.
+    pub fn record_rr_emis(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        ow: u32,
+        oh: u32,
+    ) -> Result<()> {
+        let Some(pso) = self.pso_rr_emis.as_ref() else {
+            return Err("rr-emis PSO missing (DxrGpu built without gbuf)".into());
+        };
+        // Absent set = this arm never demodulated; adding nothing back is
+        // the correct and only safe answer, not an error.
+        let Some(set) = self.feed.iter().position(|(k, _)| matches!(k, trace::FeedKind::RrEmis)) else {
+            return Ok(());
+        };
+        let set = set as u32;
+        let _ev = super::pix::scope(list, c"rr-emis-readd");
+        unsafe {
+            self.bind_common(list, slot);
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(
+                trace::RP_TEX,
+                trace::feed_set_handle(&self.device, &self.uav_heap, set),
+            );
+            list.SetPipelineState(pso);
+            list.Dispatch(ow.div_ceil(8), oh.div_ceil(8), 1);
+        }
         Ok(())
     }
 

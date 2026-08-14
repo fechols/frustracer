@@ -261,7 +261,8 @@ spells the opposite; A/B levers are generally bit-identical when off.
 `--no-adaptive`
 
 **Denoisers** (one slot) — `--nrd` (default) + the `--nrd-*` tuning family + `--nrd-perf` ·
-`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*`
+`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*` · `--no-rr-emis-demod`
+(the DLSS-RR emissive-demodulation A/B arm)
 
 **Lighting & sky** — `--rtgi-bounces 0..2` / `--rtgi` / `--no-rtgi` · `--emissive-lights [N]`
 `--el-cluster grid|som` · `--fireflies N` · `--no-clouds` `--cloud-shadow N` `--sky-lod K` ·
@@ -291,8 +292,9 @@ island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `
 `--bloom-lab [wobble]` (glare shift-variance probe; scene-free, GPU-free) · `--qa [port]`
 
 **Diagnostics** — `--gpu-debug` (debug layer + GBV) · `--gpu-timing` · `--pix-markers` ·
-`--waveviz [chs]` · `--no-crash-handler` · `--dlss-dump` `--xess-dump` `--oidn-dump`
-`--nppd-dump`
+`--waveviz [chs]` · `--cam-readout` (HUD pose plate: position, quaternion, a paste-ready
+`--cam`, TOD + live aperture — so a screenshot reproduces a pose) · `--no-crash-handler` ·
+`--dlss-dump` `--xess-dump` `--oidn-dump` `--nppd-dump`
 
 **SDK paths** — `--dxc-path` `--ffx-path` `--fg-path` `--nrd-path` `--oidn-path`
 `--xess-path` `--nppd-path` `--pix-path`, each with a `FRUSTRACER_*_PATH` env twin.

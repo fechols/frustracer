@@ -308,6 +308,50 @@ pub const FLAG_NRD_RCLAMP_HARD: u32 = 67108864;
 /// (rung 1). Lockstep with trace_common.hlsli's FLAG_RTGI_CORR.
 pub const FLAG_RTGI_CORR: u32 = 134217728;
 
+/// EMISSIVE DEMODULATION for the DLSS-RR feed: the primary hit's emissive
+/// radiance is captured into `GBufExt::sig.w` (R11G11B10F), SUBTRACTED from
+/// the colour handed to Ray Reconstruction, and added back after RR resolves.
+///
+/// WHY, measured rather than assumed. `cs_feed_rr` used to hand RR the full
+/// accumulated radiance with emissive folded in, while the `alb`/`spec` guides
+/// beside it describe the surface's REFLECTANCE — which explains none of an
+/// emitter's emission. RR is a neural reconstructor: given a ~1e3-radiance
+/// texel its guides cannot account for, it redistributes that energy across
+/// its receptive field. Parked in THE WORLD's bistro interior at tod 18.46,
+/// moving a lamp bulb 1.9 cm into frame lifted the EMITTER-FREE half of the
+/// image by **+0.488 stops** — a whole-frame brightening keyed on nothing but
+/// the bulb being on screen. The same pose measured +0.079 under
+/// `--no-upscale` and **+0.016 under XeSS+NRD**, whose bridge demodulates
+/// properly: the artifact is this feed, not denoising.
+///
+/// It presents as an EMISSIVE-only, ON-SCREEN-only effect because the sun and
+/// sky arrive as ray MISSES and never travel this path, and because RR is
+/// screen-space. And it is invisible to auto-exposure, which meters the
+/// tonemap source DOWNSTREAM of RR — so the aperture holds still while the
+/// image brightens, which is exactly how it was originally misreported as an
+/// exposure bug.
+///
+/// The lane is `sig.w`, which carries `shadow_t` under FLAG_FSR_SIG — so this
+/// bit is armed ONLY when an RR feed is wired and FLAG_FSR_SIG is clear, and
+/// the two are mutually exclusive by construction rather than by convention.
+/// Off is structural: the bit clears, `gbuf_write_hit` skips the pack, and
+/// `cs_feed_rr` subtracts nothing (a BRANCH, never a `- 0.0`).
+pub const FLAG_EMIS_DEMOD: u32 = 268435456;
+
+/// `--no-rr-emis-demod` clears; the default is ON. The kill lever for the
+/// demodulation above, kept because it is the A/B arm that MEASURED the
+/// artifact and is what any re-measurement has to toggle. Off restores the
+/// pre-fix feed exactly (the bit clears and every consumer branches around
+/// its own half), so the two arms differ by a branch and not by arithmetic.
+static RR_EMIS_DEMOD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_rr_emis_demod(on: bool) {
+    RR_EMIS_DEMOD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn rr_emis_demod() -> bool {
+    RR_EMIS_DEMOD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The GI ladder's correction probability for a bounce budget, as the GPU sees
 /// it — the ONE derivation `rtgi_defs` (the compile constant) and `with_frame`
 /// (the runtime bit) both read, so the two can never disagree about whether a
@@ -1233,6 +1277,7 @@ impl FrameCb {
         nrd_rejitter: bool,
         remod_exact: bool,
         rclamp: (bool, bool),
+        emis_demod: bool,
     ) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
@@ -1253,6 +1298,11 @@ impl FrameCb {
             // FSR-RR reads the sig lanes, which live in ext — so the sig flag
             // implies the ext flag by construction, not by convention.
             | ((gbuf_full && (gbuf_ext || fsr_sig)) as u32 * FLAG_GBUF_EXT)
+            // The sig.w lane it packs into carries `shadow_t` under
+            // FLAG_FSR_SIG, so the two are mutually exclusive HERE rather than
+            // by any downstream convention — a session that somehow wired both
+            // simply does not demodulate, and keeps today's behaviour.
+            | ((gbuf_full && gbuf_ext && !fsr_sig && emis_demod) as u32 * FLAG_EMIS_DEMOD)
             // The NRD RTGI fold rides the sig capture (it edits the lanes the
             // sig store writes), so it requires the sig flag by construction.
             | ((gbuf_full && fsr_sig && nrd_sig) as u32 * FLAG_NRD_GI)

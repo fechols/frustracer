@@ -782,6 +782,16 @@ fn main() {
     if opts.exposure_bias != 0.0 {
         eprintln!("exposure-bias: {:+} EV", opts.exposure_bias);
     }
+    // DLSS-RR emissive demodulation (gfx::frame::FLAG_EMIS_DEMOD). Default ON;
+    // only a DEPARTURE prints, and it earns a line because the off arm
+    // reinstates a measured whole-frame artifact that no gate can see.
+    crate::gfx::frame::set_rr_emis_demod(opts.rr_emis_demod);
+    if !opts.rr_emis_demod {
+        eprintln!(
+            "rr-emis-demod: OFF — emissive goes into DLSS-RR's colour input undemodulated \
+             (the pre-fix feed; an on-screen emitter lifts the whole frame)"
+        );
+    }
     autoexp::set_mode(opts.autoexp_mode);
     // DEFAULT Lights — only a DEPARTURE prints, so the loud line moved to the
     // other arm with the default. It still earns one: the two arms differ in
@@ -1162,6 +1172,15 @@ fn main() {
     }
 
     if let Some(sel) = &cinematic {
+        // FLAG_EMIS_DEMOD is INTERACTIVE-ONLY. The re-add dispatch lives on the
+        // present arms that own a tracer handle; `CineUp::record_eval` has RR
+        // but no tracer, so this path could subtract the emission and never put
+        // it back — emitters would silently vanish from published stills. Off
+        // here is the structural guarantee that "demodulated" and "re-added"
+        // stay the same set of frames, and it costs nothing a capture wants:
+        // cinematic keeps today's exact output, which its own inertness
+        // contract asks for anyway.
+        crate::gfx::frame::set_rr_emis_demod(false);
         let code = run_cinematic(
             &mut scene,
             &bvh,
@@ -28595,6 +28614,9 @@ fn cine_composite_hud(
                 // not a benchmark, and feeding the real seconds-per-frame would
                 // render an FPS graph reading 0.3 in a showcase image.
                 1.0,
+                // No aperture: this is the cinematic/media path, where the
+                // controller never ticks (autoexp is session-loop-only).
+                0.0,
             );
             h.composite_sdr(present, rw, rh);
         }
@@ -34519,7 +34541,19 @@ fn run_window(
         H as u32,
         file_settings.display.hud.unwrap_or(true),
     ) {
-        Ok(h) => Some(h),
+        Ok(mut h) => {
+            // --cam-readout: arm the pose plate and say so, because a HUD
+            // element that only appears under a flag is otherwise indistinct
+            // from a bug when it does not show up.
+            h.set_cam_readout(opts.cam_readout);
+            if opts.cam_readout {
+                eprintln!(
+                    "cam-readout: ON — the HUD's bottom-left plate carries the pose, the \
+                     aperture and a paste-ready --cam (F1 hides the HUD, and hides this too)"
+                );
+            }
+            Some(h)
+        }
         Err(e) => {
             eprintln!("hud: disabled — {e}");
             None
@@ -35852,6 +35886,24 @@ fn session(
     let mut aexp_gain_ev: f32 = autoexp::light_gain_ev(aexp_ev);
     let mut aexp_t = Instant::now();
     let mut aexp_trace_t = Instant::now();
+    // `FR_AEXP_PROBE=1` — the linearity probe (src/autoexp.rs's own section).
+    // `None` unless the lever is armed, which is what keeps it structurally
+    // absent from every default and headless session: the controller branch
+    // below is reached through this Option and nothing else.
+    let mut aexp_probe = autoexp::probe_on().then(autoexp::Probe::new);
+    let mut aexp_probe_reported = false;
+    if aexp_probe.is_some() {
+        eprintln!(
+            "FR_AEXP_PROBE: ARMED — the auto-exposure controller is FROZEN and the aperture \
+             walks {} rungs ({} metered frames each, ~{:.0} s at 60 fps). Park the camera and \
+             do not touch it.",
+            autoexp::Probe::total_rungs(),
+            autoexp::PROBE_SETTLE + autoexp::PROBE_WINDOW,
+            (autoexp::Probe::total_rungs() * (autoexp::PROBE_SETTLE + autoexp::PROBE_WINDOW))
+                as f32
+                / 60.0
+        );
+    }
     // The cloud clock. Advanced by the last frame's measured render time at
     // each arm's fresh-frame predicate (upscaler/denoiser frames always;
     // plain accumulation only at frame 0, so a converging still frame keeps
@@ -35999,19 +36051,64 @@ fn session(
             // CPU meter is the PREVIOUS iteration's resolve, and the gain has
             // not moved since — this block is the only writer, and it applies
             // below.
+            // The RAW pair — value and the stops that frame was rendered with.
+            // The de-gain happens below rather than here because
+            // `FR_AEXP_PROBE` is measuring exactly the assumption the de-gain
+            // makes, and so has to see the measurement before it is corrected.
             let m = match gpu.take_meter() {
-                Some((v, gev)) => Some(autoexp::degain(v, gev)),
-                None => present.take_meter().map(|v| autoexp::degain(v, aexp_gain_ev)),
+                Some((v, gev)) => Some((v, gev)),
+                None => present.take_meter().map(|v| (v, aexp_gain_ev)),
             };
-            if let Some(m) = m {
-                aexp_ev = autoexp::step(aexp_ev, m, dt);
-                if autoexp::trace_on() && aexp_trace_t.elapsed().as_secs_f64() >= 1.0 {
-                    aexp_trace_t = now;
-                    eprintln!(
-                        "autoexp: measured {m:+.3} ev {aexp_ev:+.3} scale {:.3} ({})",
-                        autoexp::exposure(aexp_ev),
-                        autoexp::mode().as_str()
-                    );
+            if let Some((v, gev)) = m {
+                match aexp_probe.as_mut() {
+                    // FR_AEXP_PROBE: the ladder DRIVES the aperture and the
+                    // controller is frozen out — `step` never runs, so nothing
+                    // eases underneath the measurement. The scene half below
+                    // spends the returned EV through the ordinary
+                    // `apply_light_gain` path, which is what makes the slope a
+                    // statement about the shipping pipeline.
+                    Some(pb) => {
+                        aexp_ev = pb.tick(v, gev, frame);
+                        if pb.done() && !aexp_probe_reported {
+                            aexp_probe_reported = true;
+                            let up = if opts.chain == upchain::UpChain::NONE {
+                                "no-upscale".to_string()
+                            } else {
+                                format!("{:?}", opts.chain)
+                            };
+                            let den = if opts.nrd {
+                                "nrd"
+                            } else if opts.frd {
+                                "frd"
+                            } else if opts.oidn {
+                                "oidn"
+                            } else if opts.nppd {
+                                "nppd"
+                            } else {
+                                "none"
+                            };
+                            let renderer =
+                                if dxr_on { "dxr" } else if gpu_trace { "gpu-wavefront" } else { "cpu" };
+                            pb.report(&format!(
+                                "{renderer} | upscale {up} | denoiser {den} | rtgi-bounces {} | \
+                                 emissive-lights {}",
+                                opts.rtgi_bounces,
+                                opts.emissive_lights
+                            ));
+                        }
+                    }
+                    None => {
+                        let m = autoexp::degain(v, gev);
+                        aexp_ev = autoexp::step(aexp_ev, m, dt);
+                        if autoexp::trace_on() && aexp_trace_t.elapsed().as_secs_f64() >= 1.0 {
+                            aexp_trace_t = now;
+                            eprintln!(
+                                "autoexp: measured {m:+.3} ev {aexp_ev:+.3} scale {:.3} ({})",
+                                autoexp::exposure(aexp_ev),
+                                autoexp::mode().as_str()
+                            );
+                        }
+                    }
                 }
             }
             // Exactly one destination is armed (autoexp::Mode): the tonemap
@@ -36660,6 +36757,7 @@ fn session(
                 mode_label,
                 last_ms as f32,
                 fg_mult,
+                aexp_ev,
             ) {
                 gpu.hud_stage(hf);
             }
