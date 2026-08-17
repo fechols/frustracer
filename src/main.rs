@@ -25975,8 +25975,10 @@ fn run_cinematic(
     let center = (scene.content_min + scene.content_max) * 0.5;
     let radius = ((scene.content_max - scene.content_min).length() * 0.5).max(1e-3) * 2.2;
 
-    let shots = if cinematic::is_preset(sel) {
-        match cinematic::resolve_shots(sel, cine, world, cam0, center, radius) {
+    // canonical_preset folds case (`--cinematic Hero` → "hero") — the else
+    // branch keeps `sel` verbatim, because a non-preset value is a PATH.
+    let shots = if let Some(preset) = cinematic::canonical_preset(sel) {
+        match cinematic::resolve_shots(preset, cine, world, cam0, center, radius) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("cinematic: {e}");
@@ -30263,7 +30265,9 @@ fn run_spin(
     warmup_override: Option<u32>,
     opts: &Opts,
 ) -> i32 {
-    let moving = match mode {
+    // ASCII-case-insensitive; the --spin vocabulary folds HERE (cli.rs stores
+    // the value verbatim).
+    let moving = match mode.to_ascii_lowercase().as_str() {
         "still" => false,
         "path" => true,
         _ => {

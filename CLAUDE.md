@@ -246,7 +246,8 @@ without a human feel-test.
 ## Flag index
 
 An **index, not documentation** — one line per family, pointing into the archive. 220 flags;
-`--help` and `src/cli.rs` are authoritative. Most `--x` features have a `--no-x` twin that
+`--help` and `src/cli.rs` are authoritative. Flag names and keyword values are ASCII-case-
+insensitive; paths, scene files and `settings:<Group>` names are taken verbatim. Most `--x` features have a `--no-x` twin that
 spells the opposite; A/B levers are generally bit-identical when off.
 
 **Scene & camera** — `<path>.obj|.gltf|.glb` (positional) · `--world` / `--no-world` ·

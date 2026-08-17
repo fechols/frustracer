@@ -303,8 +303,9 @@ pub enum Builder {
 
 static BUILDER: AtomicUsize = AtomicUsize::new(0);
 
+/// ASCII-case-insensitive; the CLI vocabulary folds HERE, nowhere else.
 pub fn set_builder(name: &str) -> Option<Builder> {
-    let b = match name {
+    let b = match name.to_ascii_lowercase().as_str() {
         "sah" => Builder::Sah,
         "lbvh" => Builder::Lbvh,
         "ploc" => Builder::Ploc,
@@ -2042,6 +2043,19 @@ fn height_march(
 /// descend through the sentinel root, and every query must return its clear
 /// identity without touching either that root or a supplied cut.
 pub fn empty_self_test() -> Result<(), String> {
+    // The --bvh-builder vocabulary folds in set_builder (cli.rs stores the
+    // value verbatim). set_builder writes the BUILDER atomic, so save and
+    // restore it — a gate must leave the process as it found it.
+    {
+        let prev = builder();
+        let folded = matches!(set_builder("PLOC"), Some(Builder::Ploc));
+        let rejected = set_builder("nope").is_none();
+        BUILDER.store(prev as usize, Ordering::Relaxed);
+        if !folded || !rejected {
+            return Err("set_builder must fold case and still reject unknown names".into());
+        }
+    }
+
     let mut scene = crate::scene::SceneBuilder::new().finish(crate::scene::default_sun());
     // Exercise the dedicated transmissive arms too. An empty scene has no
     // material to derive this bit naturally, but clear space remains ONE

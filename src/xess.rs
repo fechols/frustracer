@@ -251,7 +251,10 @@ pub const DEFAULT_LOCK_SCALE: f32 = 0.75;
 /// that ratio, not for whatever ships today. A bare number is also accepted
 /// as a ratio in (0, 1] — the filter rejects NaN.
 pub fn lock_scale(arg: &str) -> Option<f32> {
-    match arg {
+    // ASCII-case-insensitive; the vocabulary folds HERE, nowhere else. The
+    // bare-number fallback parses the folded copy — harmless for numerals
+    // ("INF" folds to "inf", which the (0, 1] filter rejects as before).
+    match arg.to_ascii_lowercase().as_str() {
         // 0.75 — the rung ABOVE "quality", added 2026-08-13 with the default
         // that sits on it. The name mirrors "ultra-performance" at the other
         // end of the ladder rather than following any vendor, none of whom
