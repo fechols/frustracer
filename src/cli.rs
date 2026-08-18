@@ -462,9 +462,11 @@ pub struct Opts {
     /// Purely display-stage (a HUD string), so no gate, golden or benchmark
     /// can move; the pose it prints is the same `Camera` the tracer used.
     pub cam_readout: bool,
-    /// `--no-rr-emis-demod` clears (`gfx::frame::set_rr_emis_demod`); the
-    /// default is ON. Kills the DLSS-RR emissive demodulation and restores the
-    /// pre-fix feed, which is the A/B arm the artifact was measured with — see
+    /// `--rr-emis-demod` arms (`gfx::frame::set_rr_emis_demod`); the default
+    /// is OFF (2026-08-18: emission rides DLSS-RR's temporal integration like
+    /// every other term — a post-RR re-add shimmers structurally, and the
+    /// near-emitter whole-frame lift is the default's known-accept). The
+    /// armed arm is the A/B lever that MEASURED that lift — see
     /// `gfx::frame::FLAG_EMIS_DEMOD`. Bit-identical when off (the CB bit
     /// clears and both shader halves branch around themselves), and inert on
     /// every arm that is not DLSS-RR.
@@ -1059,7 +1061,7 @@ pub fn defaults() -> Opts {
         }),
         gpu_timing: false,
         cam_readout: false,
-        rr_emis_demod: true,
+        rr_emis_demod: false,
         vsync: true,
         // The 10-bit swapchain is the default: see Opts::hdr (the probe picks
         // PQ vs gamma). The 8-bit path survives as --no-hdr and as the FG
@@ -3123,9 +3125,11 @@ pub fn usage() {
                 eprintln!("                      wasn't already; an adapter without RT tier 1.0 still degrades to");
                 eprintln!("                      the wavefront, loudly)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + GPU-based validation");
-                eprintln!("  --no-rr-emis-demod  stop demodulating emissive out of the DLSS-RR");
-                eprintln!("                colour input (the pre-fix feed: an on-screen emitter then");
-                eprintln!("                lifts the WHOLE frame ~0.5 stops). The A/B arm, not a tuning knob");
+                eprintln!("  --rr-emis-demod  demodulate emissive out of the DLSS-RR colour input and");
+                eprintln!("                re-add it post-RR (default OFF: emission rides RR's temporal");
+                eprintln!("                integration; armed, emitters bypass it and shimmer, but an");
+                eprintln!("                on-screen emitter no longer lifts the WHOLE frame ~0.5 stops).");
+                eprintln!("                The A/B arm that measured that lift, not a tuning knob");
                 eprintln!("  --cam-readout  draw the live camera pose (position, quaternion, a paste-ready");
                 eprintln!("                --cam argument, TOD and aperture) into the HUD's bottom-left —");
                 eprintln!("                a screenshot then carries everything needed to reproduce the pose");

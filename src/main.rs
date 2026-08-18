@@ -800,14 +800,18 @@ fn main() {
     if opts.exposure_bias != 0.0 {
         eprintln!("exposure-bias: {:+} EV", opts.exposure_bias);
     }
-    // DLSS-RR emissive demodulation (gfx::frame::FLAG_EMIS_DEMOD). Default ON;
-    // only a DEPARTURE prints, and it earns a line because the off arm
-    // reinstates a measured whole-frame artifact that no gate can see.
+    // DLSS-RR emissive demodulation (gfx::frame::FLAG_EMIS_DEMOD). Default OFF
+    // since 2026-08-18 (emission rides RR's temporal integration; the
+    // near-emitter whole-frame lift is the default's known-accept). Only a
+    // DEPARTURE prints — the loud line moved to the other arm with the
+    // default — and it earns one because the armed arm routes emitters
+    // AROUND temporal integration, which no gate can see.
     crate::gfx::frame::set_rr_emis_demod(opts.rr_emis_demod);
-    if !opts.rr_emis_demod {
+    if opts.rr_emis_demod {
         eprintln!(
-            "rr-emis-demod: OFF — emissive goes into DLSS-RR's colour input undemodulated \
-             (the pre-fix feed; an on-screen emitter lifts the whole frame)"
+            "rr-emis-demod: ON — primary emission is demodulated out of DLSS-RR's colour \
+             input and re-added post-RR (emitters bypass temporal integration; kills the \
+             on-screen-emitter frame lift)"
         );
     }
     autoexp::set_mode(opts.autoexp_mode);

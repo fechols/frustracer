@@ -263,8 +263,9 @@ spells the opposite; A/B levers are generally bit-identical when off.
 `--no-adaptive`
 
 **Denoisers** (one slot) — `--nrd` (default) + the `--nrd-*` tuning family + `--nrd-perf` ·
-`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*` · `--no-rr-emis-demod`
-(the DLSS-RR emissive-demodulation A/B arm)
+`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*` · `--rr-emis-demod`
+(the DLSS-RR emissive-demodulation A/B arm, default OFF — emission rides RR's temporal
+integration; armed, an on-screen emitter no longer lifts the frame but emitters shimmer)
 
 **Lighting & sky** — `--rtgi-bounces 0..2` / `--rtgi` / `--no-rtgi` · `--emissive-lights [N]`
 `--el-cluster grid|som` · `--fireflies N` · `--no-clouds` `--cloud-shadow N` `--sky-lod K` ·

@@ -338,12 +338,17 @@ pub const FLAG_RTGI_CORR: u32 = 134217728;
 /// `cs_feed_rr` subtracts nothing (a BRANCH, never a `- 0.0`).
 pub const FLAG_EMIS_DEMOD: u32 = 268435456;
 
-/// `--no-rr-emis-demod` clears; the default is ON. The kill lever for the
-/// demodulation above, kept because it is the A/B arm that MEASURED the
-/// artifact and is what any re-measurement has to toggle. Off restores the
-/// pre-fix feed exactly (the bit clears and every consumer branches around
-/// its own half), so the two arms differ by a branch and not by arithmetic.
-static RR_EMIS_DEMOD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// `--rr-emis-demod` arms; the default is OFF (flipped 2026-08-18, the
+/// full-temporal-integration call). Even with a jitter-aware bilinear
+/// re-add, a post-RR composite of the jittered 1-spp emission layer
+/// shimmers structurally (measured 7.4 vs 0.40 /255 emitter-pixel temporal
+/// delta at quality ratio) — only the temporal engine itself can integrate
+/// it, so emission now rides RR's colour input like every other term, and
+/// the whole-frame lift the demodulation fixed is a KNOWN-ACCEPT of the
+/// default. The lever stays because it is the A/B arm that MEASURED that
+/// lift and is what any re-measurement has to toggle; the two arms differ
+/// by a branch and not by arithmetic.
+static RR_EMIS_DEMOD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_rr_emis_demod(on: bool) {
     RR_EMIS_DEMOD.store(on, std::sync::atomic::Ordering::Relaxed);

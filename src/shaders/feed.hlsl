@@ -188,10 +188,19 @@ void cs_feed_fsr_rr(uint3 id : SV_DispatchThreadID) {
 // the tonemap would have silently stopped emitters blooming.
 //
 // Dispatched over the OUTPUT grid, whose extent comes from the UAV itself
-// (no new root constants); the emissive is point-sampled from the render
-// grid, which is an exact 1:1 map at DLAA. Emission is a sharp, noise-free
-// feature, so nearest is the honest reconstruction — there is nothing to
-// interpolate between.
+// (no new root constants). The emissive is reconstructed JITTER-AWARE and
+// BILINEAR from the render grid: the G-buffer's emission was evaluated at
+// the jittered sample position (px + 0.5 + frame_jitter), and RR — the one
+// component that consumes the declared jitter to resolve it — never sees
+// this layer, so the re-add must resolve the jitter itself. The first
+// shipping version point-sampled an integer map that ignored the jitter
+// entirely; the emitter layer alone then carried unresolved jitter, and its
+// edges crawled with the Halton sequence, whole-texel-quantized (measured
+// on the helmet visor at quality ratio: emitter-pixel temporal delta
+// 10.3/255 vs 0.47 with the lever off — the regression this rewrite fixes).
+// Interior emitter texels still cancel exactly against cs_feed_rr's
+// subtract (a uniform field bilerps to itself); only edge texels differ,
+// which is the point.
 //
 // It writes through `feed_color` (u16) rather than a register of its own: the
 // re-add rides a spare FEED SET whose slot 0 holds RR's OUTPUT as a UAV
@@ -218,9 +227,32 @@ void cs_rr_emis_readd(uint3 id : SV_DispatchThreadID) {
     uint ow, oh;
     feed_color.GetDimensions(ow, oh);
     if (id.x >= ow || id.y >= oh) return;
-    uint sx = min((id.x * rw) / ow, rw - 1u);
-    uint sy = min((id.y * rh) / oh, rh - 1u);
-    float3 e = emis_unpack(gbuf_ext[sy * rw + sx].sig.w);
+    // Output pixel center -> render-grid continuous coordinate, minus the
+    // jitter the G-buffer sample was taken at (sample 0's FLAG_FRAME_JITTER
+    // offset — the only jitter an RR session declares; rng-jitter sessions
+    // have no declared offset to compensate and take 0).
+    float2 j = (flags & FLAG_FRAME_JITTER) ? frame_jitter : float2(0.0, 0.0);
+    float fx = (float(id.x) + 0.5) * (float(rw) / float(ow)) - 0.5 - j.x;
+    float fy = (float(id.y) + 0.5) * (float(rh) / float(oh)) - 0.5 - j.y;
+    int x0 = int(floor(fx));
+    int y0 = int(floor(fy));
+    float tx = fx - float(x0);
+    float ty = fy - float(y0);
+    // Bilinear, DELIBERATELY not Catmull-Rom: the sharper C1 kernel was
+    // built and measured worse here (7.2 vs 6.0 /255 emitter-pixel temporal
+    // delta, 28.1 vs 24.1 edge energy, helmet visor at quality ratio) —
+    // it preserves more edge contrast for the jitter phase to modulate,
+    // while bilinear's mild softening is itself the stabilizer. Do not
+    // "upgrade" it without re-running that A/B.
+    uint x0c = uint(clamp(x0, 0, int(rw) - 1));
+    uint x1c = uint(clamp(x0 + 1, 0, int(rw) - 1));
+    uint y0c = uint(clamp(y0, 0, int(rh) - 1));
+    uint y1c = uint(clamp(y0 + 1, 0, int(rh) - 1));
+    float3 e00 = emis_unpack(gbuf_ext[y0c * rw + x0c].sig.w);
+    float3 e10 = emis_unpack(gbuf_ext[y0c * rw + x1c].sig.w);
+    float3 e01 = emis_unpack(gbuf_ext[y1c * rw + x0c].sig.w);
+    float3 e11 = emis_unpack(gbuf_ext[y1c * rw + x1c].sig.w);
+    float3 e = lerp(lerp(e00, e10, tx), lerp(e01, e11, tx), ty);
     float4 c = feed_color[id.xy];
     feed_color[id.xy] = float4(c.rgb + e, c.a);
 }
