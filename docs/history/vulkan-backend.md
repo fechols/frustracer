@@ -1,6 +1,6 @@
 # The Vulkan backend
 
-The `--check-vk` gate suite, stages V0 through V19 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths. The single largest entry in the notebook.
+The `--check-vk` gate suite, stages V0 through V20 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths (V19), and the present path across a swapchain rebuild (V20). The single largest entry in the notebook.
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 
@@ -2426,6 +2426,401 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # SEPARATELY CONFIRMED, and not ours: `FR_VK_PRESENT_SOFTWARE=1` on lavapipe still
                                       # segfaults inside vkCreateSwapchainKHR, exactly as swapchain.rs's stand-down
                                       # records. Mesa has not fixed it; V19's escape stays recorded rather than applied.
+                                      # B6b RUNG 3 — THE RESIZE (2026-08-14; Swapchain::rebuild + Presenter::resize +
+                                      # WinSize + rebuild_at + V20). Rungs 1 and 2 built the swapchain, the tracer and the
+                                      # display pipelines once at one extent, so the window was NOT `.resizable()` and a
+                                      # compositor that resized it anyway ended the session on a clean `Frame::Stale` break.
+                                      # On a floating compositor that reads as a missing feature; on a TILING one, which
+                                      # resizes whatever it likes regardless of the hint, it is a session that dies on its
+                                      # first frame. This rung makes the window resize.
+                                      # THE FINDING THE WHOLE RUNG RESTS ON: D3D12 HAS NO INCREMENTAL RESIZE EITHER, so
+                                      # there was nothing to port and nothing clever to invent. `session()` debounces
+                                      # `SizeChanged` for 250 ms and then BREAKS with `SessionEnd::Resize`, re-entering at
+                                      # the new size; `GpuContext::resize_output` keeps the device, the queue and the
+                                      # display PSOs and TEARS THE TRACER DOWN for `init_trace` to rebuild — which prints
+                                      # "compiling shaders", because there is no DXIL cache. Windows already pays a full
+                                      # kernel recompile per commit. The rung-2 plan had deferred this as "a rebuild of the
+                                      # tracer, the display pipelines and the FSR3 context — a session re-entry", implying
+                                      # new machinery; reading `resize_output` retired the risk before the rung started. No
+                                      # `VkTracer::resize`, no split of that 2506-line file into sized and unsized halves.
+                                      # TWO SCOUTING RESULTS SHRANK IT FURTHER. `display::Passes` is already
+                                      # resolution-independent — `record_to` sets viewport and scissor as DYNAMIC state per
+                                      # frame and `Passes::new` is keyed on the FORMAT alone — so it survives a resize
+                                      # untouched and `Presenter::resize` rebuilds it only if the negotiated format moved (a
+                                      # monitor move can; a drag cannot). And `window_frames` holds nothing else sized by the
+                                      # extent: unlike the capture arm there are no host-side rw*rh vectors, so `rw`/`rh`
+                                      # reach only `render_frame`.
+                                      # `Swapchain::rebuild` IS THE ONE THING `destroy` COULD NOT EXPRESS: it frees the
+                                      # surface along with everything above it, which is right for a gate that made its own
+                                      # headless surface and for a window shutting down, and WRONG for a resize — SDL's
+                                      # surface belongs to the window, must outlive every swapchain built on it, and could
+                                      # not be recreated from the render thread anyway (`SDL_Vulkan_CreateSurface` belongs to
+                                      # the thread that owns the window). `rebuild` waits the device idle, builds the new
+                                      # chain naming the dying one as `old_swapchain` (the spec's own resize path), and only
+                                      # then frees the old views, semaphores and chain. BUILD BEFORE TEARDOWN, so a refusal
+                                      # leaves the object intact and still destroyable — the reverse order reads better and
+                                      # leaves a half-freed swapchain the caller's own cleanup then double-frees.
+                                      # `rebuild_at` INVERTS THAT ORDER ONE LEVEL UP, deliberately, and the trade is worth
+                                      # naming: the tracer IS torn down before the new one is built, because holding two at
+                                      # once means two copies of the software BVH and the wide tree — hundreds of MB on a
+                                      # world-scale scene. An OOM mid-resize is worse than a clean fatal error, and a failed
+                                      # rebuild IS fatal here: D3D12 falls back on a whole fresh device (`GpuContext::new`),
+                                      # which has no peer on this backend, so the honest answer is the refusal.
+                                      # TWO ROUTES IN, ONE IMPLEMENTATION. The debounce is one; `Frame::Stale` is the other,
+                                      # and neither is redundant. A mode change, a monitor move or a DPI change invalidates
+                                      # the surface with NO size event behind it — and on THIS ICD the converse holds too,
+                                      # since RADV answers a resize with SUBOPTIMAL and keeps presenting (measured in rung 1:
+                                      # 1280x720 stretched into a 320x240 window, ~105 fps), so a backend that waited for
+                                      # `Stale` alone would advertise resizing and then silently stretch. `Stale` commits
+                                      # IMMEDIATELY rather than debouncing, because there is no old-extent image left to keep
+                                      # showing while a size settles.
+                                      # AN EDGE ARMS THE TIMER, NOT A LEVEL, and getting that wrong is a debounce that never
+                                      # fires at all. The first version armed on "the cell differs from the extent we render
+                                      # at", which re-arms on EVERY frame until the rebuild happens — so the elapsed time is
+                                      # always one frame and the settle is never reached. MEASURED as exactly that:
+                                      # `resize_pending` stayed true for 180 s with the window still at its original size.
+                                      # `last_seen` restores the edge D3D12 gets for free from `Edges::size_changed`. The
+                                      # bug was found by DRIVING the window rather than by reading the diff, and it was
+                                      # diagnosable in one `pos` read rather than a bisect precisely because `pos` reports
+                                      # the flag — a level-armed timer and a compositor that refused the size look identical
+                                      # in the extent alone.
+                                      # `--qa resize W H` IS HOW THIS IS DRIVEN, and it asks the COMPOSITOR rather than
+                                      # calling `rebuild_at`. The render thread writes a requested size, the pump applies
+                                      # `SDL_SetWindowSize` (it owns the window; the render thread does not), and the real
+                                      # `PixelSizeChanged` comes back through the ordinary path. A verb that rebuilt directly
+                                      # would prove the rebuild works and NOTHING about the events, the debounce or SDL —
+                                      # the parts a human dragging a corner actually exercises. The size is LOGICAL and the
+                                      # swapchain is PHYSICAL, so the reply tells the caller to read `pos` rather than assume
+                                      # it got what it asked for. `pos` grows `rebuilds` and `resize_pending`.
+                                      # MEASURED (Radeon 8060S / RADV / Wayland, 1280x720 <-> 960x540, THE WORLD, NRD armed,
+                                      # release), 13 rebuilds across three sessions:
+                                      #   * REBUILD WALL CLOCK 7.48-8.60 s, median ~7.8 s, no direction effect (growing and
+                                      #     shrinking interleave). SPLIT: swapchain 2.0-2.9 ms | teardown 2.1-3.8 ms |
+                                      #     tracer+upscaler+denoiser 7.5-8.5 s. So 99.94% of a resize is the tracer, and
+                                      #     within it the DXC compile of the 24 kernel units is 7.3-7.8 s (~92%) against ~1
+                                      #     ms of reflection.
+                                      #   * THE PLAN PREDICTED ~20 s AND WAS WRONG — it read the figure from
+                                      #     `run_cine_vk`'s header, which records a differently-configured constructor. The
+                                      #     prediction is what justified skipping the `VkTracer` refactor, so it is worth
+                                      #     saying that it was wrong in MAGNITUDE and right in SHAPE: the tracer does
+                                      #     dominate, and the conclusion survives. The split now rides the resize line so
+                                      #     the code keeps answering rather than the plan.
+                                      #   * AND IT NAMES THE NEXT SLICE. `gs::TraceKeys` is (scene, vendor, sway_armed) —
+                                      #     NO RESOLUTION — so the SPIR-V compiled across a resize is byte-for-byte the same
+                                      #     words. A memo keyed on (source, entry) returns ~7.3 s of the ~7.8 s for a
+                                      #     one-file change to `crate::spirv`, which is strictly cheaper than splitting
+                                      #     `VkTracer` into sized and unsized halves. That is the recommendation.
+                                      #   * THE DEBOUNCE HOLDS, ASSERTED BY COUNTING rather than by watching: five size
+                                      #     changes with ~100 ms gaps produce exactly ONE rebuild, landing at the LAST size;
+                                      #     thirteen separated requests produce thirteen. With the settle removed the same
+                                      #     five-change burst produces FIVE rebuilds — ~40 s of freeze for one drag, which
+                                      #     is what the 250 ms buys.
+                                      #   * PACING IS UNMOVED ACROSS A RESIZE. Before: 99.4-101.3 fps, p50 9.83-10.01, p99
+                                      #     10.37-10.83 ms. After: 100.8-102.0 fps, p50 9.79-9.90, p99 10.29-10.67 ms. The
+                                      #     two rebuild windows show p99 ~7.6 s (the rebuild, one sample) while their p50
+                                      #     stays 8.25-10.09 ms — the cadence BETWEEN rebuilds never moved. A one-off, not a
+                                      #     regression.
+                                      #   * THE PUMP DOES NOT NOTICE, and this is rung 2's design tested rather than
+                                      #     trusted: pump gap p50 1.06 / p99 1.06-1.11 ms in EVERY report, including the two
+                                      #     whose p99 present interval is 7.6 s. A multi-second block on the render thread
+                                      #     is the strongest available test of the three-thread split, and it held exactly.
+                                      #     The window stays alive and responsive across a rebuild; it just shows the last
+                                      #     frame — there is no loading page behind it until the HUD rung.
+                                      # GATED: V20, beside V19 on the same headless surface, re-asserting V19's OWN claim at
+                                      # a different extent rather than inventing a second one — same `Passes` into a
+                                      # swapchain image must equal an offscreen image of the same format and size, byte for
+                                      # byte; the tone curve must still match `tone::map`; no texel may keep the 0xEE flood
+                                      # sentinel; and the last acquire of image_count+1 cycles must succeed. THREE passes,
+                                      # 64x32 -> 96x48 -> 64x32, because a rebuild that only ever grows (or that corrupts
+                                      # what it leaves behind) passes a two-pass version. The extent is compared against what
+                                      # a FRESH swapchain at the same request negotiates, never against the request itself,
+                                      # so a surface that pins `currentExtent` fails honestly instead of vacuously; the
+                                      # reference chain is built and destroyed before the rebuild so two never coexist.
+                                      # ONE `Passes` SERVES ALL THREE PASSES, which is itself the claim that
+                                      # `Presenter::resize` may skip rebuilding it.
+                                      # FOUR TEETH, ALL FIRED, each by perturbing the thing it protects:
+                                      #   * keep the old image views -> SEGFAULT (139) at the `grown` pass. Recorded as a
+                                      #     crash rather than a scored mismatch, because that is what it is: RADV
+                                      #     dereferences a view whose images were freed. Unambiguous as an anti-vacuity
+                                      #     proof, and worth naming honestly rather than claiming an assertion caught it.
+                                      #   * skip the `vkDeviceWaitIdle` -> 2 validation errors, exit 1, and the layer names
+                                      #     the exact hazard: `vkDestroySemaphore(): can't be called on VkSemaphore ... that
+                                      #     is currently in use by VkQueue`. EVERY PICTURE ASSERTION STAYED GREEN across all
+                                      #     three passes — this is only visible through the validation channel, which is why
+                                      #     the stage is worth little unarmed.
+                                      #   * ignore the requested extent -> both guards fire (the extent-did-not-move check
+                                      #     AND the fresh-build comparison).
+                                      #   * remove the settle -> 5 rebuilds where 1 is correct.
+                                      # AND V20 CAUGHT A REAL DEFECT ON ITS FIRST RUN, in itself: `Passes`'s params UBO is
+                                      # zero-initialised, so a `Passes` that never sees `set_params` tonemaps at exposure 0
+                                      # and renders BLACK — and the byte identity PASSED, because the offscreen reference
+                                      # was black too. Only the `tone::map` oracle and the all-clear-colour classifier
+                                      # separated them. That is the argument for keeping an oracle beside an identity.
+                                      # V20 DOES NOT RUN IN CI and must never be added to the forbidden-skip list at
+                                      # ci.yml's `SKIP (V6|V7|V8|V9|V18)`. CI's Vulkan job is llvmpipe, the present path
+                                      # stands down on a CPU device, and V19 is absent from that list for the same reason —
+                                      # CONFIRMED here: on llvmpipe both V19 and V20 SKIP with the lavapipe stand-down
+                                      # reason and `--check-vk` still exits 0. Its teeth are proven locally on RADV and this
+                                      # file is the only place that evidence lives.
+                                      # KNOWN-ACCEPTS: the trace extent follows the swapchain 1:1 (`--lock-res` has no
+                                      # Vulkan arm, where D3D12's re-entry re-derives a LOCKED render res — applying it here
+                                      # would move every number rungs 1-2 recorded at native 1280x720); frames stop for the
+                                      # rebuild's ~7.8 s; a 0 dimension never commits (minimize), matching D3D12; a failed
+                                      # rebuild is fatal; and there is no F11, because fullscreen is a toggle EDGE and those
+                                      # arrive with the HUD rung.
+                                      # TWO SIDE-ORDERS, both fixing something that was wrong rather than missing.
+                                      # (a) `--spin --gpu` ON LINUX SILENTLY DROVE THE CPU TRACER. `run_spin`'s whole GPU
+                                      # dispatch is `#[cfg(windows)]`, so off Windows the block vanished and an explicit
+                                      # `--gpu` fell through to the reference renderer, printed `spin still [hybrid]`, and
+                                      # produced a table nothing in it identified as the wrong arm — the publish-a-wrong-
+                                      # number class every rule under "Measurement discipline" was written for, and worse
+                                      # than a missing feature because the output looks like a result. A
+                                      # `#[cfg(not(windows))]` arm now refuses with exit 2 on the SAME condition, spelled
+                                      # once and read twice so a future `run_spin_vk` cannot drift from it. Verified both
+                                      # ways: `--gpu` and explicit `--dxr` exit 2, and a bare `--spin` still drives the CPU
+                                      # renderer at exit 0.
+                                      # (b) `run_window_vk`'s header still listed `--qa` under "WHAT IS STILL NOT HERE".
+                                      # It landed in rung 2.
+                                      # `RESIZE_SETTLE_MS` IS NOW MODULE-LEVEL, one constant read by both sessions rather
+                                      # than 250 spelled twice — the constants-in-lockstep rule, satisfied by removing the
+                                      # second copy rather than by pinning it.
+                                      # Touch Swapchain::rebuild / Presenter::resize / Win::open + pump's WinSize /
+                                      # window_frames' debounce + rebuild_at / the resize verb -> run --check-vk (V20 among
+                                      # them) on procedural + san-miguel-low-poly + --tile 2 + both FR_VK_RES parities +
+                                      # --sw-rays + llvmpipe (V19/V20 SKIP there, which is correct), cargo test,
+                                      # --check-spirv/-fsr/-nrd/-dlss/-xess, tools/win-cross-check.sh (the --spin arm touches
+                                      # shared code), --check LAST with BOTH goldens byte-compared, and the window itself
+                                      # driven over --qa in both directions
+                                      # Verified: all of the above green; cargo test 27; --check PASSED with both goldens
+                                      # byte-identical to the tracked Windows ones; --check-vk validation clean on RADV.
+                                      # THE REVIEW PASS, same day, five findings — none in the happy path, all in the arms
+                                      # that only fire when something goes wrong, which is where a rung this shape puts its
+                                      # defects. Recorded because four of the five are reasoning errors, not typos.
+                                      # (1) `Frame::Stale` COULD REBUILD FOREVER. The debounce gates its commit on
+                                      # `(nw,nh) != (cur_w,cur_h)`; the stale route has no such test, because a stale surface
+                                      # must be rebuilt at whatever size is available. So a rebuild that lands back where it
+                                      # started and is immediately stale again repeats at ~7.8 s a turn with no counter and
+                                      # no exit. REACHABLE, not theoretical: off the pump thread the extent comes from the
+                                      # CELL, which holds what the pump last DRAINED, so a surface going out of date before
+                                      # its size event is drained rebuilds at the old extent — still stale. The 1 kHz pump
+                                      # refills the cell long before a 7.8 s rebuild ends, so that case self-corrects after
+                                      # ONE turn. `STALE_REBUILD_LIMIT = 2` turns "self-corrects in practice" into a bound,
+                                      # counting only rebuilds where the extent did NOT move — a rebuild to a new extent is
+                                      # progress even if the next present is also stale (a drag continuing across a rebuild
+                                      # does exactly that), and any successful present resets the count.
+                                      # (2) `last_seen` WAS SEEDED FROM THE SWAPCHAIN, THE CELL FROM THE WINDOW. Those agree
+                                      # only when the negotiation is the identity — and V20 exists precisely because it need
+                                      # not be, since it scores a rebuild against a FRESH BUILD rather than against the
+                                      # request, for surfaces that clamp to min/max_image_extent or pin `currentExtent`. On
+                                      # such a surface frame 1 reads as an edge and buys a ~7.8 s rebuild that changes
+                                      # nothing (once — the next `last_seen` is the cell, so it settles). The comment
+                                      # justifying the seeding had the argument BACKWARDS: seeding from the cell is what
+                                      # guarantees no edge on frame 1, which is what the seeding was for. One line.
+                                      # (3) `rebuild_at(...)?` INSIDE THE LOOP SKIPPED THE TEARDOWN. This function's
+                                      # teardown — the idle wait, then cv/pres/vt/vs — sits after the loop, so an early
+                                      # return leaves `Vk::drop` to call `vkDestroyDevice` with a live swapchain, its
+                                      # pipelines and the scene's buffers: VUID-vkDestroyDevice-device-00378, not merely a
+                                      # leak, and exactly what the teardown block's own comment says the layer reports. The
+                                      # pattern is PRE-EXISTING — every `?` before the loop does the same — but these two
+                                      # were the first that could fire MID-SESSION rather than at bring-up. Now `break`.
+                                      # (4) `--spin --gpu` REFUSED ONLY AFTER THE SCENE WAS LOADED, since `run_spin` takes
+                                      # `scene`/`bvh` by reference. The condition reads the command line alone, so `main`
+                                      # now answers it before `load_scene`; `run_spin` keeps its refusal as the STRUCTURAL
+                                      # backstop, so the guarantee does not rest on there being one caller. Both read
+                                      # `spin_wants_gpu` and both print `refuse_spin_gpu`, so there is no condition and no
+                                      # message to drift — the constants-in-lockstep rule applied to a predicate.
+                                      # (5) V20's fresh-build comparison degraded SILENTLY on `Ok(None)`. Near-unreachable
+                                      # (the stand-down facts are the ones the chain at A already cleared), but a gate that
+                                      # drops an arm without saying so is the no-silent-caps rule broken. It now names what
+                                      # it fell back to.
+                                      # ALSO ADDED, second-order to (1): a minimized window (a 0 dimension behind a stale
+                                      # present) re-traced a full frame per pass forever, uncapped, because `Frame::Stale`
+                                      # returns immediately and there is no vsync under this loop to pace it. A `minimized`
+                                      # flag now skips the trace and sleeps 16 ms while the pump and the --qa socket keep
+                                      # running, so the session stays drivable. UNVERIFIED ON THIS COMPOSITOR — whether
+                                      # RADV/Wayland reaches it depends on SDL reporting a 0 dimension on minimize AND the
+                                      # present going out of date, neither of which reproduced here. It is a bound on an
+                                      # otherwise unbounded path, not a measured fix, and it is recorded as such.
+                                      # THE WINDOWS CROSS-CHECK CAUGHT THE ONE MISTAKE THE FIXES MADE: `STALE_REBUILD_LIMIT`
+                                      # is Vulkan-window-only and needed the cfg `RESIZE_SETTLE_MS` does not (the debounce is
+                                      # shared with `session()`; `Frame::Stale` is not). dead_code, on a const, on a target
+                                      # this box cannot run — which is the whole argument for the script.
+                                      # RE-VERIFIED AFTER THE FIXES: cargo test 27; win-cross-check exit 0 with no warnings;
+                                      # --check-vk green on procedural + san-miguel-low-poly + --tile 2 + both FR_VK_RES
+                                      # parities + --sw-rays, V20 passing all three passes each time, validation clean under
+                                      # FR_VK_VALIDATION=1; llvmpipe still SKIPs V19 AND V20 at exit 0;
+                                      # --check-spirv/-fsr/-nrd/-dlss/-xess exit 0; --check LAST, PASSED, both goldens
+                                      # byte-identical. --spin --gpu and explicit --spin --dxr exit 2 IMMEDIATELY now (no
+                                      # BVH line before the refusal) while bare --spin and --spin --cpu still time the CPU
+                                      # renderer at exit 0. DRIVEN LIVE over --qa: at rest rebuilds 0 / resize_pending
+                                      # false (the seeding change raises no spurious edge); one `resize 960 540` -> exactly
+                                      # 1 rebuild (7.86 s, swapchain 4.0 | teardown 2.5 | tracer 7854 ms); a five-change
+                                      # burst at ~100 ms -> exactly 1 MORE rebuild, landing at the LAST size (8.00 s);
+                                      # pump gap 1.059-1.060 ms throughout; no stale and no fruitless rebuild fired.
+                                      # THE SECOND REVIEW PASS (2026-08-17), a recall-mode read of the whole rung-3 diff — 15
+                                      # findings, all applied. Again none in the happy path: the debounce, the rebuild and V20
+                                      # all still do what the measurements above say. What moved is every arm that fires when
+                                      # the world is not the measured one — a resize during the load, a size event landing
+                                      # DURING a rebuild, a WSI that answers a drag with OUT_OF_DATE, a compositor that never
+                                      # reports a 0 dimension, a create that fails after retiring the old chain — plus the copy
+                                      # of V19 that V20 had become. Recorded finding by finding, because most are reasoning
+                                      # errors in the previous pass's own fixes.
+                                      # (1) `last_seen` WAS SEEDED FROM THE CELL AFTER THE LOAD. The previous pass moved the
+                                      # seed from the swapchain to the cell (right) but read the cell where the seed line sits —
+                                      # AFTER `load_scene`, `VkScene::new`, `VkTextures::new` and `CineVk::build`, ~13-30 s
+                                      # during which the pump has been writing it. A resize in that window (a tiling compositor
+                                      # placing the still-blank window; a drag) was absorbed into the seed, never became an
+                                      # edge, and with RADV answering the mismatch as SUBOPTIMAL rather than `Stale` the
+                                      # bring-up chain would be presented stretched, `pos` reporting rebuilds 0 / resize_pending
+                                      # false. The seed is now `win_size` — what the cell held before either thread existed,
+                                      # i.e. the size the presenter was built for — so anything the pump wrote since reads as
+                                      # the change it is on the first pass.
+                                      # (2) THE STALE ARM SWALLOWED A SIZE EVENT THAT LANDED DURING ITS REBUILD. After
+                                      # rebuilding at `(sw,sh)` it set `last_seen = winsz.get()` — the cell NOW, ~7.8 s later —
+                                      # so a drag during the rebuild left cur=S1, cell=S2, last_seen=S2: no edge, no debounce,
+                                      # and an S1 chain presented into an S2 window until an unrelated event. It is `last_seen =
+                                      # (sw, sh)`, the size the arm consumed, so a newer cell reads as the edge it is on the
+                                      # next pass.
+                                      # (3) THE STALE ARM NOW RESIZES THE SWAPCHAIN ALONE AND LEAVES THE TRACER TO THE DEBOUNCE.
+                                      # The previous pass wrote `Stale` as an IMMEDIATE full `rebuild_at` ("there is no
+                                      # old-extent image to keep showing"). True of the swapchain; false of the tracer. On a WSI
+                                      # that answers each configure of a drag with OUT_OF_DATE (the NVIDIA proprietary driver on
+                                      # X11 does; only RADV's SUBOPTIMAL was measured here) that is a ~7.8 s kernel recompile
+                                      # per configure, at intermediate sizes the window has already left, and
+                                      # `STALE_REBUILD_LIMIT` cannot bound it because every one of them MOVES the extent.
+                                      # `resize_swapchain` is the new presentation-only half (~3 ms): it rebuilds the chain, and
+                                      # if the negotiated extent is the tracer's it re-binds and returns; if not, it points the
+                                      # display at the old FFX image anyway (UV-resampled into the new chain — the same
+                                      # momentary softness the debounce route accepts in the other direction, where the
+                                      # compositor scales the old chain into the new window) and the arm ARMS THE DEBOUNCE. The
+                                      # debounce's commit gate grew a second reason — `tracer_lags`, the swapchain having moved
+                                      # away from the tracer — so a stale-driven resize whose cell then agrees with the chain
+                                      # still rebuilds the tracer once the size is quiet. `rebuild_at` remains the one place a
+                                      # tracer is rebuilt; `Stale` reaches it only through the timer.
+                                      # (4) `rebuild_at` RECOMPILED THE TRACER WHEN THE NEGOTIATED EXTENT HAD NOT MOVED. Its own
+                                      # documented stale-cell race (the cell holds the pre-resize size, so the arm rebuilds at
+                                      # the old extent) cost 2 x 7.8 s where 7.8 s + 3 ms suffices: `pres.resize` came back at
+                                      # the same extent and the tracer was destroyed and an identical one compiled anyway, with
+                                      # the fruitless-limit check running only AFTER the wasted rebuild. So did a monitor move
+                                      # at the same pixel size, and the terminal fruitless turn built a tracer that `break` then
+                                      # discarded. `rebuild_at` now compares the FFX output extent (`Fsr3::upscale_size`) with
+                                      # the negotiated one and keeps the tracer when they agree, printing `tracer kept` on the
+                                      # split line. Together with (3) a fruitless stale turn is milliseconds, and
+                                      # `STALE_REBUILD_LIMIT` moved from 2 to 8: two turns was justified by a 7.8 s turn
+                                      # comfortably outlasting the 1 kHz pump; a 3 ms turn does not, so the bound is several
+                                      # turns (tens of ms) rather than the two.
+                                      # (5) BRING-UP `?`s SKIPPED THE TEARDOWN — the same VUID-vkDestroyDevice-device-00378 the
+                                      # previous pass fixed INSIDE the loop by using `break`, still live at bring-up:
+                                      # `VkScene::new`, `VkTextures::new`, `CineVk::build`, `window_bind_upscaler` and
+                                      # `resolve_shots` all returned past the teardown block with the swapchain, the display
+                                      # pipelines and the scene buffers alive. `window_teardown` is now the ONE teardown (idle
+                                      # wait, then cv/pres/vt/vs, each an `Option` so any depth passes what exists), reached
+                                      # from the end of the loop and from every bring-up refusal. `Presenter::new` had the same
+                                      # shape one level down — a `Passes::new` refusal stranded the swapchain and the window's
+                                      # surface — and frees them now.
+                                      # (6) `Swapchain::rebuild`'s CONTRACT WAS FALSE. "A refusal leaves `self` completely
+                                      # intact and still destroyable" — but the spec retires `oldSwapchain` on the CALL, whether
+                                      # or not `vkCreateSwapchainKHR` succeeds, and a failure AFTER the create
+                                      # (`vkGetSwapchainImagesKHR`, a view, a semaphore) had no unwind at all: the new chain and
+                                      # its partial views/semaphores leaked while `self` held a retired one, every later acquire
+                                      # answered OUT_OF_DATE forever, a retry would have named a retired chain as `oldSwapchain`
+                                      # (VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933), and teardown destroyed the surface
+                                      # with the leaked chain still attached (VUID-vkDestroySurfaceKHR-surface-01266). `build`
+                                      # is now `negotiate` (queries only, no side effects) + `create` (the call, then
+                                      # images/views/semaphores, each level unwinding what it made and the whole freeing the
+                                      # chain on any failure). `rebuild` calls the halves separately: a refusal from `negotiate`
+                                      # changes nothing; a refusal from `create` sets a `retired` flag, so the chain stays
+                                      # destroyable, its next acquire is the `Stale` the window's arm already handles, and the
+                                      # next `rebuild` passes null in place of the retired handle. The doc now says
+                                      # "destroyable, and after the create call retired" instead of "intact".
+                                      # (7) THE FRAME-0 WARM-UP NEVER RE-FIRED AFTER A REBUILD. `render_frame` keyed
+                                      # `JITTER_PHASE - samples` extra sub-frames on the caller's `f`, which the window never
+                                      # resets — so a rebuilt `CineVk` (seq 0, `Temporal::default`'s reset, fresh FSR3/NRD
+                                      # history) reconstructed its first frame from ONE jittered sub-frame on a biased lattice:
+                                      # the soft, aliased pop the warm-up exists to prevent, once per resize instead of once per
+                                      # lap. It keys on `self.seq == 0` now — the two agree in the capture (`begin_shot` zeroes
+                                      # `seq` where the shot loop zeroes `f`) and `seq` is the state that actually says "this
+                                      # history is empty" — and `render_frame`/`output_frame` lost the frame index parameter,
+                                      # since nothing read it.
+                                      # (8) THE `minimized` STATE MACHINE WAS DEAD ON LINUX. It waited for a 0 dimension behind
+                                      # a stale present, D3D12's model — and Windows really does report 0x0 on minimize — but
+                                      # SDL3's Wayland backend substitutes the cached size for a 0x0 configure and
+                                      # `SDL_EVENT_WINDOW_MINIMIZED` never touches the window's w/h, so the flag could not be
+                                      # set and a real minimize kept tracing full frames at whatever rate the compositor's FIFO
+                                      # fallback released images. `WinSize` grew a `hidden` bit the pump sets off SDL3's
+                                      # Minimized/Occluded/Hidden and clears off Restored/Exposed/Shown (Wayland has no
+                                      # minimized state a client can see and maps xdg-toplevel's `suspended` to
+                                      # Occluded/Exposed); the renderer idles on it, still servicing the pump and the socket,
+                                      # printing one line per transition, and `pos` reports `hidden`. The 0-dimension route is
+                                      # kept as a belt for a platform that does report one. STILL UNVERIFIED that this
+                                      # compositor sends the events — a bound on an otherwise unbounded path, not a measured
+                                      # fix, and recorded as such again.
+                                      # (9) `--qa resize`'s `MAX_WIN = 16384` BOUNDED NOTHING. It equals RADV's
+                                      # `maxImageExtent`, so it refuses only what the swapchain would; nothing between the verb
+                                      # and `vkCreateSwapchainKHR` clamped further, a floating compositor honours a 16384x16384
+                                      # client size, and `rebuild_at` tears the old tracer down before building the new one — so
+                                      # `frqa resize 16384 16384` was a 1 GiB-per-image swapchain, a 268 Mpx tracer, and an OOM
+                                      # reached from a "bounded" verb; and `CineVk::build` created the FSR3 context AFTER the
+                                      # ~7.8 s compile, so an FFX refusal at the new extent was discovered eight seconds after
+                                      # the old tracer was gone. Two changes: the pump clamps the request to the display the
+                                      # window is on (a socket may not ask for what a user could not drag to; best-effort, if
+                                      # SDL cannot name the display the request goes through as asked), and `CineVk::build`
+                                      # creates the FSR3 context FIRST — milliseconds, needing only the device and the extents —
+                                      # destroying it if the tracer then refuses.
+                                      # (10) THE `set_size` "REFUSAL" BRANCH WAS DEAD, and its two comments contradicted each
+                                      # other. sdl3 0.18's `Window::set_size` validates the integers and discards
+                                      # `SDL_SetWindowSize`'s own result; SDL's Wayland and X11 backends silently no-op the call
+                                      # on a maximized or fullscreen window; a compositor that will not honour a client size
+                                      # sends no event. So a refused resize printed nothing, and the comment promising a loud
+                                      # one was a promise a driver might trust. The branch is `let _ =` with the honest comment
+                                      # (the only readout is `pos`), and the pass ordering is stated per platform (Wayland
+                                      # queues the event synchronously — same pass; X11 round-trips — a pass or two later).
+                                      # (11) V20 SCORED TWO EXTENTS AGAINST THE REQUEST, contrary to its own header. The
+                                      # "shrunk" pass asserted `(sc.w,sc.h) != A` — the literal request — and the "grown" pass
+                                      # failed on `== was` even when the fresh-build reference agreed. Hypothetical today (every
+                                      # measured ICD reports 0xFFFFFFFF `currentExtent`) but it is the rule the header states.
+                                      # The round trip is now scored against `want_a`, the extent the fixture itself negotiated
+                                      # at A; and "did it move" is asked only when a fresh build at B says it should have — when
+                                      # the surface pins, the gate says so and scores the rebuild at the one extent.
+                                      # (12) V20's `prove` WAS A ~170-LINE COPY OF V19. Same ramp, same source/offscreen/staging
+                                      # setup, same image_count+1 loop, same five scores and messages, same tolerance and
+                                      # sentinel constants — 400 lines apart, so a change to the shared scoring made in one and
+                                      # not the other left the suite green, and drift along this lineage already existed
+                                      # (M12/V18 assert `top >= 4.4e4` on the ramp; V19/V20 do not). `prove_vk_present(hg, sc,
+                                      # passes, stage)` is the one body, used by V19 once and V20 three times; it owns its
+                                      # source and params per call (the tonemap samples by UV, and the zero-initialised UBO
+                                      # renders black — the defect V20 caught on its first run). V20 still builds its own
+                                      # `Passes` (4 small DXC units) — the two stages stay independent functions so a box that
+                                      # cannot present takes neither claim down with the other.
+                                      # (13-15) SMALL: `RESIZE_SETTLE_MS` was hoisted to an unconditional module const whose
+                                      # only readers are `session()` (windows) and `window_frames` (unix-not-macOS), an orphan
+                                      # on macOS — gated `#[cfg(any(windows, all(unix, not(target_os = "macos"))))]`; `--help`'s
+                                      # `--qa` verb list gained `resize`, and the D3D12 dispatch answers `resize` with a NAMED
+                                      # refusal (the Vulkan window's rung 3) as `frqa`'s usage promises; and `CLAUDE.md`'s gate
+                                      # table, `docs/history/README.md`'s prefix map and this file's header all said V0-V19 with
+                                      # V20 already in the suite.
+                                      # WHAT THIS PASS DID NOT CHANGE: the debounce itself, its 250 ms, `rebuild_at`'s
+                                      # teardown-before-build (the OOM argument stands; (9) softens rather than reverses it),
+                                      # the fatal answer to a failed tracer rebuild, and every measurement above.
+                                      # Touch any of the above -> the rung-3 run-list, unchanged: --check-vk (V19 and V20) under
+                                      # FR_VK_VALIDATION=1, cargo test, --check LAST with both goldens byte-compared, and the
+                                      # window driven over --qa.
+                                      # VERIFIED AFTER THE FIXES (quick profile — gates and function only, no numbers below are
+                                      # benchmarks): cargo test 27; --check-vk under FR_VK_VALIDATION=1 green on RADV with V19
+                                      # and all three V20 passes byte-identical / oracle 2.4e-3 under a 3.9e-3 limit / sentinel
+                                      # survivors 0, `validation clean`; --check LAST, PASSED, both goldens byte-identical to
+                                      # the tracked ones; tools/win-cross-check.sh exit 0 with no warnings (the D3D12 verb
+                                      # table, cli.rs and the RESIZE_SETTLE_MS cfg are shared code). DRIVEN LIVE over --qa on
+                                      # THE WORLD, NRD armed: at rest rebuilds 0 / resize_pending false / hidden false (the
+                                      # `win_size` seed raises no spurious edge); `resize 960 540` -> exactly 1 rebuild (7.91 s,
+                                      # swapchain 1.9 | teardown 3.1 | tracer 7902 ms); a five-change burst at ~100 ms ->
+                                      # exactly 1 MORE rebuild, landing at the LAST size (7.95 s); `resize 16384 16384` ->
+                                      # `clamped to the display's 1440x900` printed by the pump, then exactly 1 rebuild at
+                                      # 1440x900 (8.36 s) rather than an OOM; pump gap p50 1.06 ms throughout; `quit` exits
+                                      # clean. NOT DRIVEN, because they need a stale surface or a minimize this rig cannot
+                                      # deliver synthetically: the swapchain-only stale turn, the `tracer kept` split line, and
+                                      # the hidden idle — all reachable only through `Frame::Stale` or the visibility events,
+                                      # and recorded as reasoned rather than measured.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

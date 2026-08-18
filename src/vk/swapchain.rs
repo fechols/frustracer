@@ -192,6 +192,26 @@ pub struct Swapchain {
     /// next acquire, and the submit it waits for is the one that waited on the
     /// acquire semaphore — so that wait is provably retired.
     render_done: Vec<vk::Semaphore>,
+
+    /// Set when a `rebuild` called `vkCreateSwapchainKHR` naming this chain as
+    /// `oldSwapchain` and the call did not go through. The spec retires the old
+    /// chain on the CALL, not on its success — so after such a failure this
+    /// handle still exists and is still ours to destroy, but every acquire and
+    /// present on it answers `OUT_OF_DATE`, and naming it as `oldSwapchain`
+    /// again is VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933. The next
+    /// `rebuild` reads this and passes null instead, which is what turns a
+    /// failed resize into a `Stale` the caller's own arm already handles rather
+    /// than into a chain that can never present again.
+    retired: bool,
+}
+
+/// What `Swapchain::negotiate` settled with the surface — the inputs to the one
+/// call with a side effect, kept apart from it so `rebuild` can tell a refusal
+/// before that call from one after it.
+struct Negotiated {
+    sf: vk::SurfaceFormatKHR,
+    extent: vk::Extent2D,
+    count: u32,
 }
 
 impl Swapchain {
@@ -261,7 +281,7 @@ impl Swapchain {
         // Leaking an instance-level handle would outlive the device teardown
         // below it and surface (pun intended) as a validation error in an
         // unrelated later stage.
-        let built = Self::build(hg, &surface_fn, surface, w, h);
+        let built = Self::build(hg, &surface_fn, surface, w, h, vk::SwapchainKHR::null());
         match built {
             Ok(mut sc) => {
                 sc.surface_fn = surface_fn;
@@ -341,7 +361,7 @@ impl Swapchain {
         }
 
         let surface_fn = ash::khr::surface::Instance::new(&vkd.entry, &vkd.instance);
-        match Self::build(hg, &surface_fn, surface, w, h) {
+        match Self::build(hg, &surface_fn, surface, w, h, vk::SwapchainKHR::null()) {
             Ok(mut sc) => {
                 sc.surface_fn = surface_fn;
                 sc.surface = surface;
@@ -354,13 +374,37 @@ impl Swapchain {
         }
     }
 
+    /// `old` is the swapchain being replaced, or `null` for a first build — see
+    /// `rebuild`, the one caller that passes a live handle.
+    ///
+    /// TWO HALVES, `negotiate` then `create`, and the seam is where the spec
+    /// puts a side effect: everything up to `vkCreateSwapchainKHR` is a QUERY
+    /// and leaves the world as it found it, while that call retires `old`
+    /// whether or not it succeeds. `rebuild` calls the halves separately so it
+    /// can tell which side of the seam a refusal came from.
     fn build(
         hg: &VkHeadless,
         surface_fn: &ash::khr::surface::Instance,
         surface: vk::SurfaceKHR,
         w: u32,
         h: u32,
+        old: vk::SwapchainKHR,
     ) -> Result<Swapchain, Refusal> {
+        let neg = Self::negotiate(hg, surface_fn, surface, w, h)?;
+        Self::create(hg, surface, &neg, old).map_err(Refusal::Err)
+    }
+
+    /// The query half of `build`: present support, usage, format, present
+    /// mode, extent and image count — every one of them a refusal BEFORE any
+    /// call with a side effect, so a `rebuild` that stops here still holds a
+    /// live, presentable chain.
+    fn negotiate(
+        hg: &VkHeadless,
+        surface_fn: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        w: u32,
+        h: u32,
+    ) -> Result<Negotiated, Refusal> {
         let vkd = &hg.vk;
 
         // PRESENT SUPPORT IS PER (device, queue family, surface) and is its own
@@ -450,6 +494,26 @@ impl Swapchain {
             count = count.min(caps.max_image_count);
         }
 
+        Ok(Negotiated { sf, extent, count })
+    }
+
+    /// The half of `build` with side effects: `vkCreateSwapchainKHR`, then the
+    /// images, their views and the semaphores one present cycle needs.
+    ///
+    /// UNWINDS ON EVERY ARM AFTER THE CREATE. A view or a semaphore that fails
+    /// mid-loop used to leave the new chain and everything made so far alive
+    /// with no handle to free them by — under a window's `rebuild` that is a
+    /// chain still attached to the surface at `vkDestroySurfaceKHR`
+    /// (VUID-vkDestroySurfaceKHR-surface-01266), and under `new` it is a leak
+    /// the layer reports at instance teardown against an unrelated stage.
+    fn create(
+        hg: &VkHeadless,
+        surface: vk::SurfaceKHR,
+        neg: &Negotiated,
+        old: vk::SwapchainKHR,
+    ) -> Result<Swapchain, String> {
+        let vkd = &hg.vk;
+        let (sf, extent, count) = (neg.sf, neg.extent, neg.count);
         let swapchain_fn = ash::khr::swapchain::Device::new(&vkd.instance, &vkd.device);
         let sci = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
@@ -463,42 +527,92 @@ impl Swapchain {
             .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(vk::PresentModeKHR::FIFO)
-            .clipped(true);
+            .clipped(true)
+            // THE SPEC'S OWN RESIZE PATH, and it is a hand-off rather than a
+            // hint: naming the dying chain lets the driver reuse its images
+            // and keeps the surface continuously owned, which is what stops a
+            // rebuild from flashing an unowned surface on compositors that
+            // notice. It does NOT free the old one — a retired swapchain is
+            // still the application's to destroy, which `rebuild` does after
+            // this call returns. And it retires `old` EVEN IF THIS CALL FAILS,
+            // which is why `rebuild` marks it so on that arm.
+            .old_swapchain(old);
         let swapchain = unsafe { swapchain_fn.create_swapchain(&sci, None) }
             .map_err(|e| format!("vkCreateSwapchainKHR: {e}"))?;
 
-        let images = unsafe { swapchain_fn.get_swapchain_images(swapchain) }
-            .map_err(|e| format!("vkGetSwapchainImagesKHR: {e}"))?;
+        // Everything after the create is fallible and owns handles, so it runs
+        // in a body whose failure frees what IT made, and then this frees the
+        // chain — one unwind per level, in reverse creation order.
+        let attach = || -> Result<(Vec<vk::Image>, Vec<vk::ImageView>, vk::Semaphore, Vec<vk::Semaphore>), String> {
+            let images = unsafe { swapchain_fn.get_swapchain_images(swapchain) }
+                .map_err(|e| format!("vkGetSwapchainImagesKHR: {e}"))?;
 
-        let mut views = Vec::with_capacity(images.len());
-        for &img in &images {
-            let view = unsafe {
-                vkd.device.create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(img)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(sf.format)
-                        .subresource_range(
-                            vk::ImageSubresourceRange::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .level_count(1)
-                                .layer_count(1),
-                        ),
-                    None,
-                )
+            let mut views: Vec<vk::ImageView> = Vec::with_capacity(images.len());
+            let unwind_views = |views: &[vk::ImageView]| unsafe {
+                for &v in views {
+                    vkd.device.destroy_image_view(v, None);
+                }
+            };
+            for &img in &images {
+                let view = unsafe {
+                    vkd.device.create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(img)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(sf.format)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .level_count(1)
+                                    .layer_count(1),
+                            ),
+                        None,
+                    )
+                };
+                match view {
+                    Ok(v) => views.push(v),
+                    Err(e) => {
+                        unwind_views(&views);
+                        return Err(format!("vkCreateImageView(swapchain): {e}"));
+                    }
+                }
             }
-            .map_err(|e| format!("vkCreateImageView(swapchain): {e}"))?;
-            views.push(view);
-        }
 
-        let sem = || unsafe {
-            vkd.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            let sem = || unsafe {
+                vkd.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            };
+            let acquire = match sem() {
+                Ok(s) => s,
+                Err(e) => {
+                    unwind_views(&views);
+                    return Err(format!("vkCreateSemaphore(acquire): {e}"));
+                }
+            };
+            let mut render_done: Vec<vk::Semaphore> = Vec::with_capacity(images.len());
+            for _ in 0..images.len() {
+                match sem() {
+                    Ok(s) => render_done.push(s),
+                    Err(e) => {
+                        unsafe {
+                            for &s in &render_done {
+                                vkd.device.destroy_semaphore(s, None);
+                            }
+                            vkd.device.destroy_semaphore(acquire, None);
+                        }
+                        unwind_views(&views);
+                        return Err(format!("vkCreateSemaphore(render): {e}"));
+                    }
+                }
+            }
+            Ok((images, views, acquire, render_done))
         };
-        let acquire = sem().map_err(|e| format!("vkCreateSemaphore(acquire): {e}"))?;
-        let mut render_done = Vec::with_capacity(images.len());
-        for _ in 0..images.len() {
-            render_done.push(sem().map_err(|e| format!("vkCreateSemaphore(render): {e}"))?);
-        }
+        let (images, views, acquire, render_done) = match attach() {
+            Ok(t) => t,
+            Err(e) => {
+                unsafe { swapchain_fn.destroy_swapchain(swapchain, None) };
+                return Err(e);
+            }
+        };
 
         Ok(Swapchain {
             // Filled by the CALLER — `build` does not own the surface, so that
@@ -515,7 +629,96 @@ impl Swapchain {
             views,
             acquire,
             render_done,
+            retired: false,
         })
+    }
+
+    /// Replace this swapchain with one at a new extent, KEEPING THE SURFACE —
+    /// B6b rung 3, and the one thing `destroy` cannot express.
+    ///
+    /// `destroy` frees the surface along with everything above it, which is
+    /// right for both of its callers (a gate that made its own headless
+    /// surface, and a window shutting down) and wrong for a resize: SDL's
+    /// surface belongs to the WINDOW and must outlive every swapchain built on
+    /// it. Destroying and re-creating it would also mean re-running
+    /// `SDL_Vulkan_CreateSurface` from a thread that does not own the window.
+    ///
+    /// `vkDeviceWaitIdle` FIRST, and it is load-bearing rather than defensive.
+    /// `Presenter::present` ends in `wait_submit`, so the SUBMIT is retired —
+    /// but `vkQueuePresentKHR`'s wait on `render_done[idx]` has no CPU-visible
+    /// completion at all. That is the very argument the `render_done` field's
+    /// own doc makes for why there is one semaphore per image; destroying that
+    /// array while a present may still be waiting inside it is a
+    /// use-after-free, and the only thing standing between here and it is this
+    /// wait. V20 perturbs it away to prove the layer notices.
+    ///
+    /// THE NEW CHAIN IS BUILT BEFORE THE OLD ONE IS TORN DOWN, so a refusal
+    /// leaves `self` intact and still destroyable — and, up to a point the
+    /// spec fixes, still PRESENTABLE. `negotiate` is queries only, so a
+    /// refusal from it changes nothing. `create` names `self.swapchain` as
+    /// `oldSwapchain`, and the spec retires it on the call whether or not the
+    /// call succeeds: after a refusal from that half the chain still exists and
+    /// `destroy` still frees it, but every acquire and present answers
+    /// `OUT_OF_DATE`, and naming it as `oldSwapchain` again would be
+    /// VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933. So that arm sets
+    /// `retired`, the next `rebuild` passes null in its place, and a caller
+    /// with a `Stale` arm (the window has one) recovers on its own rather than
+    /// holding a chain that can never present again. The reverse order — tear
+    /// down, then build — reads more naturally and would leave a half-freed
+    /// swapchain that the caller's own cleanup then double-frees on the way
+    /// out.
+    pub fn rebuild(&mut self, hg: &VkHeadless, w: u32, h: u32) -> Result<(), String> {
+        let vkd = &hg.vk;
+        unsafe { vkd.device.device_wait_idle() }
+            .map_err(|e| format!("vkDeviceWaitIdle before a swapchain rebuild: {e}"))?;
+
+        // The query half first: nothing here has happened yet if it refuses.
+        let neg = Self::negotiate(hg, &self.surface_fn, self.surface, w, h)
+            .map_err(|r| r.text())?;
+
+        // `old_swapchain` is the handle we are replacing: the driver may reuse
+        // its images, and it is RETIRED rather than freed by the call. A chain
+        // an earlier failed rebuild already retired may not be named again.
+        let old = if self.retired { vk::SwapchainKHR::null() } else { self.swapchain };
+        let new = match Self::create(hg, self.surface, &neg, old) {
+            Ok(n) => n,
+            Err(e) => {
+                // The call was made, so `old` is retired whatever it returned.
+                self.retired = true;
+                return Err(e);
+            }
+        };
+
+        unsafe {
+            for &v in &self.views {
+                vkd.device.destroy_image_view(v, None);
+            }
+            vkd.device.destroy_semaphore(self.acquire, None);
+            for &s in &self.render_done {
+                vkd.device.destroy_semaphore(s, None);
+            }
+            // The retired chain, freed through the OLD dispatch table — the new
+            // one below has not been installed yet, and they are equivalent
+            // anyway (both are loaded from the same instance + device).
+            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+        }
+
+        // The surface and its loader are DELIBERATELY not touched: `build`
+        // hands back a null surface and a fresh `surface_fn` of its own (see
+        // its tail), and taking those would drop the window's surface on the
+        // floor — the leak `from_surface`'s ownership comment exists to
+        // prevent, arriving from the other direction.
+        self.swapchain_fn = new.swapchain_fn;
+        self.swapchain = new.swapchain;
+        self.fmt = new.fmt;
+        self.w = new.w;
+        self.h = new.h;
+        self.images = new.images;
+        self.views = new.views;
+        self.acquire = new.acquire;
+        self.render_done = new.render_done;
+        self.retired = false;
+        Ok(())
     }
 
     /// The image count, which is what the exhaustion proof counts cycles

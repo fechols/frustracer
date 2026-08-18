@@ -1148,6 +1148,15 @@ fn main() {
         split_axes: opts.split_axes,
         max_leaf: opts.max_leaf,
     };
+    // REFUSE A GPU `--spin` BEFORE THE LOAD, not after it. `run_spin` keeps the
+    // same refusal as a structural backstop, but it only gets the chance once
+    // the scene and its BVH are already built — so a user who asks for an arm
+    // this platform does not have waits out a whole scene build to be told no.
+    // The condition reads only the command line, so it can be answered here.
+    #[cfg(not(windows))]
+    if spin.is_some() && spin_wants_gpu(&opts) {
+        std::process::exit(refuse_spin_gpu(&opts));
+    }
     // Headless suites/benchmarks (--check*, --spin) load synchronously here
     // and exit before any window, so the gates stay a pure function of the
     // command line (the progress sink is never activated). Interactive
@@ -15199,6 +15208,15 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V20: the same present path, ACROSS A REBUILD. ----
+    //
+    // Beside V19 rather than inside it for the reason V19 sits beside V18: it
+    // stands down on the same environment facts, and folding it in would let a
+    // box that cannot present take V19's claim down with it.
+    if !run_check_vk_rebuild(&hg, &sp) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
@@ -15569,6 +15587,304 @@ fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
     ok
 }
 
+/// V19's claim, as ONE call — shared by V19 (once, on a fresh chain) and V20
+/// (three times, across two rebuilds), so the two cannot drift.
+///
+/// WHAT IT PROVES, at whatever extent `sc` currently is: `passes` drawing into
+/// the swapchain's images presents byte-for-byte what it draws into an
+/// offscreen image of the same format and size; the presented bytes match
+/// `tone::map` at the negotiated wire's own tolerance; every texel's alpha is
+/// at maximum; no texel keeps the `0xEE` flood sentinel; and the last of
+/// `image_count + 1` cycles acquires, which is the exhaustion proof that the
+/// presentation engine RELEASED an image this call presented. See V19's header
+/// for why each arm exists and what the identity alone cannot see.
+///
+/// IT OWNS ITS SOURCE, and rebuilds it per call rather than taking one: the
+/// tonemap samples by UV, so a source of a different extent than the target
+/// would RESAMPLE and there would be no per-texel oracle left. Re-binding at
+/// every extent is also exactly what `window_bind_upscaler` does on the real
+/// path — FFX allocates a new output image at the new size — so V20 exercises
+/// the ordering the window depends on. The params are written per call too:
+/// the UBO is zero-initialised, so a `Passes` that never sees one tonemaps at
+/// exposure 0 and renders BLACK.
+///
+/// ONE BODY, and the reason it was factored: the first V20 was a ~170-line
+/// copy of V19's cycle loop, and a change to the shared scoring (the 10-bit
+/// tolerance derivation, the sentinel window, the f16 quantisation of the
+/// oracle) made in one and not the other left the suite green — the same
+/// drift that already sits between M12/V18 (which assert `top >= 4.4e4` on the
+/// ramp) and V19 (which does not).
+#[cfg(unix)]
+fn prove_vk_present(
+    hg: &vk::headless::VkHeadless,
+    sc: &vk::swapchain::Swapchain,
+    passes: &vk::display::Passes,
+    stage: &str,
+) -> bool {
+    use ash::vk as avk;
+    use vk::display;
+
+    let vkd = &hg.vk;
+    let (w, h) = (sc.w, sc.h);
+    let n = (w * h) as usize;
+    let mut ok = true;
+
+    // The tolerance is a property of the NEGOTIATED wire, so derive it rather
+    // than assuming V18's sdr one — the surface's own preference here is
+    // 8-bit, but a 10-bit surface must be scored at ten bits.
+    let tol = if sc.fmt == avk::Format::A2B10G10R10_UNORM_PACK32 {
+        1.0 / 1023.0 + 1e-4
+    } else {
+        1.0 / 255.0 + 1e-6
+    };
+
+    // V18's ramp, verbatim: the same geometric span with the same two pinned
+    // low entries, so the oracle arm below is that gate's comparison rather
+    // than a second one that could drift from it.
+    const RAMP_LO: f32 = 1e-3;
+    const RAMP_HI: f32 = 6e4;
+    let span = (n - 3) as f32;
+    let radiance = |i: usize| -> f32 {
+        match i {
+            0 => 0.0,
+            1 => 1.0,
+            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+        }
+    };
+    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
+
+    let src = match display::Image::new(
+        vkd,
+        w,
+        h,
+        avk::Format::R16G16B16A16_SFLOAT,
+        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL {stage} source image: {e}");
+            return false;
+        }
+    };
+    let fin = |ok: bool| -> bool {
+        src.destroy(vkd);
+        ok
+    };
+    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
+        eprintln!("check-vk: FAIL {stage} ramp upload: {e}");
+        return fin(false);
+    }
+    passes.bind_source(vkd, src.view);
+    let params = display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
+    if let Err(e) = passes.set_params(vkd, params) {
+        eprintln!("check-vk: FAIL {stage} params: {e}");
+        return fin(false);
+    }
+
+    // ---- The offscreen reference at THIS extent, rendered once. ----
+    let off = match display::Image::new(
+        vkd,
+        w,
+        h,
+        sc.fmt,
+        avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL {stage} offscreen image: {e}");
+            return fin(false);
+        }
+    };
+    let want = {
+        let r = hg
+            .run(|d, cmd| passes.record(d, cmd, &off, true))
+            .and_then(|_| display::read_target(hg, &off, 4));
+        off.destroy(vkd);
+        match r {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL {stage} offscreen render: {e}");
+                return fin(false);
+            }
+        }
+    };
+
+    // The sentinel, as a float clear and as the byte it must land on. 238/255
+    // round-trips EXACTLY through an 8-bit UNORM, so a surviving texel is
+    // unambiguous rather than approximately unambiguous.
+    const SENTINEL: f32 = 238.0 / 255.0;
+
+    // A staging buffer for the copy-before-present, reused across cycles.
+    let stage_buf = match vkd.buffer((n * 4) as u64, avk::BufferUsageFlags::TRANSFER_DST, true) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("check-vk: FAIL {stage} staging buffer: {e}");
+            return fin(false);
+        }
+    };
+
+    // ---- The cycles. ONE MORE THAN THERE ARE IMAGES. ----
+    let cycles = sc.image_count() + 1;
+    let mut order = Vec::with_capacity(cycles);
+    let mut identity_bad = 0usize;
+    let mut oracle_worst = 0.0f32;
+    let mut alpha_bad = 0usize;
+    let mut sentinel_alive = 0usize;
+    let mut clear_alive = 0usize;
+
+    for cycle in 0..cycles {
+        let idx = match sc.acquire() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("check-vk: FAIL {stage} cycle {cycle}: {e}");
+                ok = false;
+                break;
+            }
+        };
+        order.push(idx);
+
+        let (wait, stages) = sc.wait_pair();
+        let signal = sc.signal(idx);
+        let rec = hg.run_present(&wait, &stages, &signal, |d, cmd| {
+            // Flood, then draw. `record_to`'s opening barrier is FROM
+            // UNDEFINED, which discards — so on the correct path the sentinel
+            // is gone by construction and the readback shows the image. It
+            // survives only if the draw went somewhere else, which is exactly
+            // the outcome it is here to name.
+            sc.clear_to(d, cmd, idx, [SENTINEL, SENTINEL, SENTINEL, SENTINEL]);
+            passes.record_to(d, cmd, sc.images[idx], sc.view(idx), sc.w, sc.h, true);
+            // Copy BEFORE presenting: ownership returns to the presentation
+            // engine at present, so this is the last moment the bytes are
+            // readable at all.
+            unsafe {
+                let region = avk::BufferImageCopy::default()
+                    .image_subresource(
+                        avk::ImageSubresourceLayers::default()
+                            .aspect_mask(avk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(avk::Extent3D { width: sc.w, height: sc.h, depth: 1 });
+                d.cmd_copy_image_to_buffer(
+                    cmd,
+                    sc.images[idx],
+                    avk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    stage_buf.buf,
+                    &[region],
+                );
+            }
+            sc.to_present_layout(d, cmd, idx);
+        });
+        if let Err(e) = rec {
+            eprintln!("check-vk: FAIL {stage} cycle {cycle} submit: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = sc.present(vkd, idx) {
+            eprintln!("check-vk: FAIL {stage} cycle {cycle} present: {e}");
+            ok = false;
+            break;
+        }
+        if let Err(e) = hg.wait_submit() {
+            eprintln!("check-vk: FAIL {stage} cycle {cycle} wait: {e}");
+            ok = false;
+            break;
+        }
+
+        let got = match vkd.read(&stage_buf, n * 4) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check-vk: FAIL {stage} cycle {cycle} readback: {e}");
+                ok = false;
+                break;
+            }
+        };
+
+        for i in 0..n {
+            let px = &got[i * 4..i * 4 + 4];
+            if px != &want[i * 4..i * 4 + 4] {
+                identity_bad += 1;
+            }
+            let have = display::decode(px, sc.fmt);
+            let q = |v: f32| half::f16::from_f32(v).to_f32();
+            let c = glam::Vec3A::new(q(ramp[i * 3]), q(ramp[i * 3 + 1]), q(ramp[i * 3 + 2]));
+            let want_c = tone::map(c, tone::ToneParams::SDR);
+            for ch in 0..3 {
+                let d = (have[ch] - want_c[ch]).abs() / (1.0f32).max(want_c[ch].abs());
+                oracle_worst = oracle_worst.max(d);
+            }
+            if display::decode_alpha(px, sc.fmt) < 1.0 {
+                alpha_bad += 1;
+            }
+            // The three-way classification. Both comparisons are on DECODED
+            // values so a 10-bit surface reads the same way an 8-bit one does.
+            if have.iter().all(|v| (v - SENTINEL).abs() < 2.0 / 255.0) {
+                sentinel_alive += 1;
+            } else if have.iter().all(|v| *v < 1.0 / 255.0) {
+                clear_alive += 1;
+            }
+        }
+    }
+
+    vkd.free_buffer(&stage_buf);
+
+    if ok {
+        if identity_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL {stage} swapchain vs offscreen — {identity_bad} texel(s) of \
+                 {} differ. Same pipeline, same format, two targets: this is the present \
+                 path's own claim (after a rebuild, a stale view or a retired image lands \
+                 here).",
+                n * cycles
+            );
+            ok = false;
+        }
+        if sentinel_alive > 0 {
+            eprintln!(
+                "check-vk: FAIL {stage} {sentinel_alive} texel(s) still carry the 0xEE sentinel — \
+                 the draw went to a DIFFERENT image than the one flooded and copied (after a \
+                 rebuild, a view outliving its swapchain)"
+            );
+            ok = false;
+        } else if clear_alive == n * cycles {
+            eprintln!(
+                "check-vk: FAIL {stage} every texel is the clear colour — the render pass ran and \
+                 the DRAW did not"
+            );
+            ok = false;
+        }
+        if oracle_worst > tol {
+            eprintln!(
+                "check-vk: FAIL {stage} presented image vs tone::map — worst {oracle_worst:.2e} > \
+                 {tol:.2e}. The byte identity alone cannot see this: two targets that were \
+                 BOTH wrong agree."
+            );
+            ok = false;
+        }
+        if alpha_bad > 0 {
+            eprintln!(
+                "check-vk: FAIL {stage} {alpha_bad} texel(s) with alpha below maximum — the draw \
+                 did not cover them"
+            );
+            ok = false;
+        }
+        if ok {
+            println!(
+                "check-vk: {stage} present path {w}x{h}: {cycles} cycle(s) over {} image(s) — \
+                 swapchain vs offscreen byte-identical over {} texel(s) | oracle worst \
+                 {oracle_worst:.2e} (limit {tol:.2e}) | alpha full | sentinel survivors 0",
+                sc.image_count(),
+                n * cycles
+            );
+            println!(
+                "check-vk: {stage}   acquire order {order:?} — reported, never asserted (the spec \
+                 constrains none of it); the LAST acquire succeeding is the proof the engine \
+                 released an image this gate presented"
+            );
+        }
+    }
+    fin(ok)
+}
+
 /// V19 — the same pipeline, into a SWAPCHAIN image, and presented.
 ///
 /// V18 proves this backend can rasterise and that its tone curve matches
@@ -15623,7 +15939,6 @@ fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
 /// family the pick chose. `vk::swapchain::skip_reason` names which.
 #[cfg(unix)]
 fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
-    use ash::vk as avk;
     use vk::display;
     use vk::swapchain::Swapchain;
 
@@ -15635,7 +15950,6 @@ fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
     // ICDs here), i.e. the swapchain picks its own size.
     const TW: u32 = 64;
     const TH: u32 = 32;
-    let n = (TW * TH) as usize;
 
     let sc = match Swapchain::new(hg, TW, TH) {
         Ok(Some(s)) => s,
@@ -15649,7 +15963,6 @@ fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
         }
     };
 
-    let mut ok = true;
     println!(
         "check-vk: V19 headless surface: {:?} {}x{}, {} image(s), FIFO",
         sc.fmt,
@@ -15658,280 +15971,19 @@ fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
         sc.image_count()
     );
 
-    // The tolerance is a property of the NEGOTIATED wire, so derive it rather
-    // than assuming V18's sdr one — the surface's own preference here is
-    // 8-bit, but a 10-bit surface must be scored at ten bits.
-    let tol = if sc.fmt == avk::Format::A2B10G10R10_UNORM_PACK32 {
-        1.0 / 1023.0 + 1e-4
-    } else {
-        1.0 / 255.0 + 1e-6
-    };
-
-    // V18's ramp, verbatim: the same geometric span with the same two pinned
-    // low entries, so the oracle arm below is that gate's comparison rather
-    // than a second one that could drift from it.
-    const RAMP_LO: f32 = 1e-3;
-    const RAMP_HI: f32 = 6e4;
-    let span = (n - 3) as f32;
-    let radiance = |i: usize| -> f32 {
-        match i {
-            0 => 0.0,
-            1 => 1.0,
-            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
-        }
-    };
-    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
-
-    let cleanup = |sc: &Swapchain| sc.destroy(vkd);
-
-    let src = match display::Image::new(
-        vkd,
-        TW,
-        TH,
-        avk::Format::R16G16B16A16_SFLOAT,
-        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
-    ) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("check-vk: FAIL V19 source image: {e}");
-            cleanup(&sc);
-            return false;
-        }
-    };
-
     // ONE `Passes`, at the swapchain's own format, used for BOTH targets. That
     // is what makes the identity a statement about the TARGET rather than
     // about two pipelines that happen to agree.
     let passes = match display::Passes::new(hg, sp, sc.fmt) {
-        Ok(p) => {
-            p.bind_source(vkd, src.view);
-            p
-        }
+        Ok(p) => p,
         Err(e) => {
             eprintln!("check-vk: FAIL V19 display passes ({:?}): {e}", sc.fmt);
-            src.destroy(vkd);
-            cleanup(&sc);
+            sc.destroy(vkd);
             return false;
         }
     };
 
-    let params = display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
-
-    let fin = |ok: bool| -> bool {
-        passes.destroy(vkd);
-        src.destroy(vkd);
-        cleanup(&sc);
-        ok
-    };
-
-    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
-        eprintln!("check-vk: FAIL V19 ramp upload: {e}");
-        return fin(false);
-    }
-    if let Err(e) = passes.set_params(vkd, params) {
-        eprintln!("check-vk: FAIL V19 params: {e}");
-        return fin(false);
-    }
-
-    // ---- The offscreen reference, rendered once. ----
-    let off = match display::Image::new(
-        vkd,
-        TW,
-        TH,
-        sc.fmt,
-        avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
-    ) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("check-vk: FAIL V19 offscreen image: {e}");
-            return fin(false);
-        }
-    };
-    let want = {
-        let r = hg
-            .run(|d, cmd| passes.record(d, cmd, &off, true))
-            .and_then(|_| display::read_target(hg, &off, 4));
-        off.destroy(vkd);
-        match r {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("check-vk: FAIL V19 offscreen render: {e}");
-                return fin(false);
-            }
-        }
-    };
-
-    // The sentinel, as a float clear and as the byte it must land on. 238/255
-    // round-trips EXACTLY through an 8-bit UNORM, so a surviving texel is
-    // unambiguous rather than approximately unambiguous.
-    const SENTINEL: f32 = 238.0 / 255.0;
-
-    // A staging buffer for the copy-before-present, reused across cycles.
-    let stage = match vkd.buffer((n * 4) as u64, avk::BufferUsageFlags::TRANSFER_DST, true) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("check-vk: FAIL V19 staging buffer: {e}");
-            return fin(false);
-        }
-    };
-
-    // ---- The cycles. ONE MORE THAN THERE ARE IMAGES. ----
-    let cycles = sc.image_count() + 1;
-    let mut order = Vec::with_capacity(cycles);
-    let mut identity_bad = 0usize;
-    let mut oracle_worst = 0.0f32;
-    let mut alpha_bad = 0usize;
-    let mut sentinel_alive = 0usize;
-    let mut clear_alive = 0usize;
-
-    for cycle in 0..cycles {
-        let idx = match sc.acquire() {
-            Ok(i) => i,
-            Err(e) => {
-                eprintln!("check-vk: FAIL V19 cycle {cycle}: {e}");
-                ok = false;
-                break;
-            }
-        };
-        order.push(idx);
-
-        let (wait, stages) = sc.wait_pair();
-        let signal = sc.signal(idx);
-        let rec = hg.run_present(&wait, &stages, &signal, |d, cmd| {
-            // Flood, then draw. `record_to`'s opening barrier is FROM
-            // UNDEFINED, which discards — so on the correct path the sentinel
-            // is gone by construction and the readback shows the image. It
-            // survives only if the draw went somewhere else, which is exactly
-            // the outcome it is here to name.
-            sc.clear_to(d, cmd, idx, [SENTINEL, SENTINEL, SENTINEL, SENTINEL]);
-            passes.record_to(d, cmd, sc.images[idx], sc.view(idx), sc.w, sc.h, true);
-            // Copy BEFORE presenting: ownership returns to the presentation
-            // engine at present, so this is the last moment the bytes are
-            // readable at all.
-            unsafe {
-                let region = avk::BufferImageCopy::default()
-                    .image_subresource(
-                        avk::ImageSubresourceLayers::default()
-                            .aspect_mask(avk::ImageAspectFlags::COLOR)
-                            .layer_count(1),
-                    )
-                    .image_extent(avk::Extent3D { width: sc.w, height: sc.h, depth: 1 });
-                d.cmd_copy_image_to_buffer(
-                    cmd,
-                    sc.images[idx],
-                    avk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    stage.buf,
-                    &[region],
-                );
-            }
-            sc.to_present_layout(d, cmd, idx);
-        });
-        if let Err(e) = rec {
-            eprintln!("check-vk: FAIL V19 cycle {cycle} submit: {e}");
-            ok = false;
-            break;
-        }
-        if let Err(e) = sc.present(vkd, idx) {
-            eprintln!("check-vk: FAIL V19 cycle {cycle} present: {e}");
-            ok = false;
-            break;
-        }
-        if let Err(e) = hg.wait_submit() {
-            eprintln!("check-vk: FAIL V19 cycle {cycle} wait: {e}");
-            ok = false;
-            break;
-        }
-
-        let got = match vkd.read(&stage, n * 4) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("check-vk: FAIL V19 cycle {cycle} readback: {e}");
-                ok = false;
-                break;
-            }
-        };
-
-        for i in 0..n {
-            let px = &got[i * 4..i * 4 + 4];
-            if px != &want[i * 4..i * 4 + 4] {
-                identity_bad += 1;
-            }
-            let have = display::decode(px, sc.fmt);
-            let q = |v: f32| half::f16::from_f32(v).to_f32();
-            let c = glam::Vec3A::new(q(ramp[i * 3]), q(ramp[i * 3 + 1]), q(ramp[i * 3 + 2]));
-            let w = tone::map(c, tone::ToneParams::SDR);
-            for ch in 0..3 {
-                let d = (have[ch] - w[ch]).abs() / (1.0f32).max(w[ch].abs());
-                oracle_worst = oracle_worst.max(d);
-            }
-            if display::decode_alpha(px, sc.fmt) < 1.0 {
-                alpha_bad += 1;
-            }
-            // The three-way classification. Both comparisons are on DECODED
-            // values so a 10-bit surface reads the same way an 8-bit one does.
-            if have.iter().all(|v| (v - SENTINEL).abs() < 2.0 / 255.0) {
-                sentinel_alive += 1;
-            } else if have.iter().all(|v| *v < 1.0 / 255.0) {
-                clear_alive += 1;
-            }
-        }
-    }
-
-    vkd.free_buffer(&stage);
-
-    if ok {
-        if identity_bad > 0 {
-            eprintln!(
-                "check-vk: FAIL V19 swapchain vs offscreen — {identity_bad} texel(s) of \
-                 {} differ. Same pipeline, same format, two targets: this is the present \
-                 path's own claim.",
-                n * cycles
-            );
-            ok = false;
-        }
-        if sentinel_alive > 0 {
-            eprintln!(
-                "check-vk: FAIL V19 {sentinel_alive} texel(s) still carry the 0xEE sentinel — \
-                 the draw went to a DIFFERENT image than the one flooded and copied"
-            );
-            ok = false;
-        } else if clear_alive == n * cycles {
-            eprintln!(
-                "check-vk: FAIL V19 every texel is the clear colour — the render pass ran and \
-                 the DRAW did not"
-            );
-            ok = false;
-        }
-        if oracle_worst > tol {
-            eprintln!(
-                "check-vk: FAIL V19 presented image vs tone::map — worst {oracle_worst:.2e} > \
-                 {tol:.2e}. The byte identity alone cannot see this: two targets that were \
-                 BOTH wrong agree."
-            );
-            ok = false;
-        }
-        if alpha_bad > 0 {
-            eprintln!(
-                "check-vk: FAIL V19 {alpha_bad} texel(s) with alpha below maximum — the draw \
-                 did not cover them"
-            );
-            ok = false;
-        }
-        if ok {
-            println!(
-                "check-vk: V19 present path: {cycles} cycle(s) over {} image(s) — swapchain vs \
-                 offscreen byte-identical over {} texel(s) | oracle worst {oracle_worst:.2e} \
-                 (limit {tol:.2e}) | alpha full | sentinel survivors 0",
-                sc.image_count(),
-                n * cycles
-            );
-            println!(
-                "check-vk: V19   acquire order {order:?} — reported, never asserted (the spec \
-                 constrains none of it); the LAST acquire succeeding is the proof the engine \
-                 released an image this gate presented"
-            );
-        }
-    }
+    let mut ok = prove_vk_present(hg, &sc, &passes, "V19");
 
     // The device must be idle before the swapchain and its semaphores go: a
     // presented image is still referenced by the presentation engine, and the
@@ -15945,7 +15997,236 @@ fn run_check_vk_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
         eprintln!("check-vk: FAIL V19 {ve} validation error(s) in the present path");
         ok = false;
     }
-    fin(ok)
+    passes.destroy(vkd);
+    sc.destroy(vkd);
+    ok
+}
+
+/// V20 — the present path SURVIVING A SWAPCHAIN REBUILD (B6b rung 3).
+///
+/// V19 proves this backend can present into a swapchain image. What it cannot
+/// say is anything about the SECOND swapchain, and rung 3 makes there be one:
+/// the window is `.resizable()` now, and every resize destroys the views, the
+/// semaphores and the chain and builds them again over the SAME surface. That
+/// is a path a session takes on a window drag and a gate never took at all.
+///
+/// THE CLAIM IS V19'S, RE-ASSERTED AT A DIFFERENT EXTENT, and re-using it
+/// rather than inventing a second one is the point: the same `Passes` drawing
+/// into a swapchain image must produce the same bytes as into an offscreen
+/// image of the same format and size, the tone curve must still match
+/// `tone::map`, no texel may keep the flood sentinel, and the last acquire of
+/// `image_count + 1` cycles must succeed. If a rebuild leaves a stale view, a
+/// retired chain or a semaphore from the old pool, one of those four fails.
+///
+/// THREE PASSES, AND THE THIRD IS NOT REDUNDANT. 64x32 -> 96x48 -> 64x32: a
+/// rebuild that only ever grows, or that works once and corrupts the state it
+/// leaves behind, passes a two-pass version of this. The round trip is also
+/// what makes the extent assertion two-sided.
+///
+/// THE EXTENT IS COMPARED AGAINST A FRESH BUILD, never against what was asked
+/// for. `build` clamps to `min/max_image_extent` and obeys a pinned
+/// `currentExtent`, so on a surface that pins one the honest answer is "the
+/// rebuild negotiated what a fresh swapchain would" — asserting the REQUEST
+/// would fail there for a reason that is not a defect. The reference chain is
+/// built and destroyed BEFORE the rebuild so two never exist at once.
+///
+/// EACH PASS REBUILDS ITS SOURCE, and that is deliberate rather than tidy:
+/// `tonemap.hlsl` samples by UV, so a source of a different extent than the
+/// target would RESAMPLE and there would be no per-texel oracle left to score.
+/// Re-binding it at every extent is also exactly what `window_bind_upscaler`
+/// does on the real path, for the same reason — FFX allocates a new output
+/// image at the new size — so the gate exercises the ordering the window
+/// depends on.
+///
+/// SKIPs on the same three environment facts V19 does, via the same
+/// `skip_reason`. It therefore does NOT run in CI, whose Vulkan job is
+/// llvmpipe and whose present path stands down on a CPU device — which is why
+/// V19 is absent from the forbidden-skip list in `ci.yml` and why V20 must stay
+/// absent too. Its teeth are proven locally on RADV and recorded in
+/// `docs/history/vulkan-backend.md`.
+#[cfg(unix)]
+fn run_check_vk_rebuild(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use vk::display;
+    use vk::swapchain::Swapchain;
+
+    let ve0 = vk::device::validation_errors();
+    let vkd = &hg.vk;
+
+    // Two extents, both small: this gate scores a REBUILD, and every texel past
+    // the first few hundred is repetition. They differ in BOTH dimensions and
+    // in area, so a rebuild that carried one of them over is visible.
+    const A: (u32, u32) = (64, 32);
+    const B: (u32, u32) = (96, 48);
+
+    let mut sc = match Swapchain::new(hg, A.0, A.1) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("check-vk: SKIP V20 ({})", vk::swapchain::skip_reason(hg));
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V20 swapchain: {e}");
+            return false;
+        }
+    };
+    // What a FRESH chain at A negotiates — the reference the round trip's
+    // landing is scored against, captured off the fixture itself so no second
+    // chain has to exist for it.
+    let want_a = (sc.w, sc.h);
+
+    // `Passes` is built ONCE and outlives all three passes, which is itself a
+    // claim worth making: the display pipelines carry no extent (viewport and
+    // scissor are dynamic state in `record_to`), so a resize must not need
+    // them rebuilt. `Presenter::resize` rebuilds them only when the FORMAT
+    // moves, and a headless surface's format cannot move — so if this one
+    // `Passes` could not serve both extents, that shortcut would be wrong.
+    let passes = match display::Passes::new(hg, sp, sc.fmt) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V20 display passes ({:?}): {e}", sc.fmt);
+            sc.destroy(vkd);
+            return false;
+        }
+    };
+
+    println!(
+        "check-vk: V20 rebuild fixture: {:?} {}x{}, {} image(s)",
+        sc.fmt,
+        sc.w,
+        sc.h,
+        sc.image_count()
+    );
+
+    let mut ok = prove_vk_present(hg, &sc, &passes, "V20 [before]");
+
+    // What a FRESH chain at B negotiates — the reference the rebuilt extent is
+    // scored against. Built and destroyed here so two swapchains never exist at
+    // once, and so a box that can build one but not two is not this gate's
+    // problem to diagnose.
+    let want_b = if ok {
+        match Swapchain::new(hg, B.0, B.1) {
+            Ok(Some(r)) => {
+                let e = (r.w, r.h);
+                r.destroy(vkd);
+                Some(e)
+            }
+            // NEAR-UNREACHABLE — the stand-down facts are the same ones the
+            // chain at A already cleared — but SAID rather than skipped: the
+            // equivalence check below is the half of the extent assertion that
+            // catches a surface pinning `currentExtent`, and a gate that
+            // silently drops an arm is the no-silent-caps rule broken.
+            Ok(None) => {
+                println!(
+                    "check-vk: V20 note — no reference swapchain at {}x{} ({}), so the rebuild \
+                     is scored on the extent-CHANGED assertion alone",
+                    B.0,
+                    B.1,
+                    vk::swapchain::skip_reason(hg)
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V20 reference swapchain at {}x{}: {e}", B.0, B.1);
+                ok = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // EVERY EXTENT ASSERTION IS AGAINST A FRESH BUILD, NEVER THE REQUEST —
+    // the header's rule, and the two checks below both keep it. "Did it move"
+    // is asked only when a fresh build at B says it should have: a surface
+    // that pins `currentExtent` negotiates `was` for every request, and
+    // failing it for that would be failing a non-defect. When it pins, the
+    // gate says so and scores the rebuild at the extent it landed on.
+    if ok {
+        let was = (sc.w, sc.h);
+        if let Err(e) = sc.rebuild(hg, B.0, B.1) {
+            eprintln!("check-vk: FAIL V20 rebuild to {}x{}: {e}", B.0, B.1);
+            ok = false;
+        } else {
+            match want_b {
+                Some(want) if (sc.w, sc.h) != want => {
+                    eprintln!(
+                        "check-vk: FAIL V20 rebuild negotiated {}x{} but a FRESH swapchain at \
+                         the same request negotiates {}x{} — the rebuild is not equivalent to a \
+                         build",
+                        sc.w, sc.h, want.0, want.1
+                    );
+                    ok = false;
+                }
+                Some(want) if want == was => {
+                    println!(
+                        "check-vk: V20 note — this surface negotiates {}x{} for both requests \
+                         (a pinned currentExtent), so the round trip is scored at one extent \
+                         and the extent-CHANGED half of the assertion has nothing to say",
+                        was.0, was.1
+                    );
+                }
+                _ => {}
+            }
+            if want_b.is_none() && (sc.w, sc.h) == was {
+                eprintln!(
+                    "check-vk: FAIL V20 rebuild left the extent at {}x{} — it did not resize, so \
+                     every assertion below would score the OLD chain and pass vacuously",
+                    was.0, was.1
+                );
+                ok = false;
+            }
+            if ok {
+                ok = prove_vk_present(hg, &sc, &passes, "V20 [grown]");
+            }
+        }
+    }
+
+    // BACK DOWN. A rebuild that only ever grows, or that corrupts what it
+    // leaves behind, passes everything above. Scored against what the fixture
+    // itself negotiated at A, not against A.
+    if ok {
+        if let Err(e) = sc.rebuild(hg, A.0, A.1) {
+            eprintln!("check-vk: FAIL V20 rebuild back to {}x{}: {e}", A.0, A.1);
+            ok = false;
+        } else {
+            if (sc.w, sc.h) != want_a {
+                eprintln!(
+                    "check-vk: FAIL V20 rebuild back landed at {}x{}, not the {}x{} a fresh \
+                     swapchain at {}x{} negotiated",
+                    sc.w, sc.h, want_a.0, want_a.1, A.0, A.1
+                );
+                ok = false;
+            }
+            if ok {
+                ok = prove_vk_present(hg, &sc, &passes, "V20 [shrunk]");
+            }
+        }
+    }
+
+    unsafe {
+        let _ = vkd.device.device_wait_idle();
+    }
+    passes.destroy(vkd);
+    sc.destroy(vkd);
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        // THE LEAK AND USE-AFTER-FREE CHANNEL. A rebuild that forgets the old
+        // views or the old semaphores cannot be caught by any readback — the
+        // picture is right and the objects pile up. The layer is what sees it,
+        // which is why this stage is worth nothing unarmed and why the run-list
+        // says to run it under FR_VK_VALIDATION=1.
+        eprintln!("check-vk: FAIL V20 {ve} validation error(s) across the rebuilds");
+        ok = false;
+    }
+    if ok {
+        println!(
+            "check-vk: V20 rebuild survived {}x{} -> {}x{} -> {}x{} over ONE surface — views, \
+             semaphores and chain replaced, `Passes` and the surface kept",
+            A.0, A.1, B.0, B.1, A.0, A.1
+        );
+    }
+    ok
 }
 
 /// V10 — the BC7 encoder, scored through the hardware decoder.
@@ -25684,6 +25965,58 @@ pub(crate) fn catmull_rom(p0: Vec3A, p1: Vec3A, p2: Vec3A, p3: Vec3A, t: f32) ->
         * 0.5
 }
 
+/// How long a window's size must hold still before a resize commits, in ms.
+///
+/// ONE CONSTANT, TWO SESSIONS, and module-level since B6b rung 3 for exactly
+/// the reason `CLAUDE.md` gives about constants duplicated across sites: the
+/// D3D12 session (`session()`, which breaks with `SessionEnd::Resize`) and the
+/// Vulkan window (`window_frames`, which rebuilds in place) debounce the same
+/// event stream for the same reason, and two copies at 250 would have been two
+/// copies to retune. There is nothing to pin because there is nothing to drift.
+///
+/// WHY A DEBOUNCE AT ALL: a drag delivers a STREAM of size events, and a commit
+/// on either backend tears the tracer down and recompiles the whole kernel
+/// corpus. Per-event commits would start dozens of rebuilds across one drag and
+/// finish none of them. Until the size settles, both backends keep presenting
+/// into the old-extent swapchain and let the compositor scale — momentarily
+/// soft, never broken.
+///
+/// GATED TO THE TWO PLATFORMS THAT HAVE A WINDOW SESSION: on macOS neither
+/// reader exists (`session()` is Windows, `window_frames` is unix-not-macOS),
+/// and an unread constant there is a `dead_code` warning in the very CI job
+/// this file's per-site `allow` discipline exists to keep quiet.
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+const RESIZE_SETTLE_MS: u128 = 250;
+
+/// How many consecutive `Frame::Stale` swapchain rebuilds may land back at the
+/// extent they started from before the Vulkan window gives up — B6b rung 3.
+///
+/// THE BOUND ON THE ONE REBUILD ROUTE WITH NO EXTENT TEST. The debounce gates
+/// its commit on the size having actually changed; the stale route cannot,
+/// because a stale surface must be rebuilt whatever its size is said to be. So
+/// the loop is bounded here instead, and only on rebuilds that changed NOTHING
+/// — a rebuild to a new extent is progress and resets the count, as does any
+/// present that succeeds.
+///
+/// WHAT A FRUITLESS TURN COSTS decides the number. The stale arm rebuilds the
+/// SWAPCHAIN only (~2-3 ms) and leaves the tracer to the debounce, and
+/// `rebuild_at` keeps a tracer whose extent did not move — so a fruitless turn
+/// is milliseconds, not the ~7.8 s kernel recompile the first draft of this
+/// rung spent per turn. The one case known to produce one is a race: off the
+/// pump thread the extent comes from the cell, which can still hold the
+/// pre-resize size if the surface went out of date before the event was
+/// drained. The pump refills it at 1 kHz, and a 3 ms turn no longer
+/// guarantees a whole pump period has passed — so the bound is several turns
+/// (tens of ms, comfortably past the pump) rather than the two that a 7.8 s
+/// turn justified.
+///
+/// GATED WHERE `RESIZE_SETTLE_MS` ABOVE IS NOT ON WINDOWS, because the
+/// debounce is shared with the D3D12 session and this bound is not:
+/// `Frame::Stale` is a Vulkan present result, and D3D12 answers the same class
+/// of event by re-entering `session()` rather than by rebuilding in place.
+#[cfg(all(unix, not(target_os = "macos")))]
+const STALE_REBUILD_LIMIT: u32 = 8;
+
 /// Frames per full lap of the benchmark path.
 const SPIN_LAP: f32 = 600.0;
 /// Ordinary CPU/non-Intel frames excluded from `--spin` summaries.
@@ -26677,7 +27010,7 @@ fn run_cinematic_cpu(
 /// THE TRACER IS CACHED BY RESOLUTION and not rebuilt per shot: constructing
 /// one compiles the whole kernel corpus through DXC, which is ~20 s, and the
 /// `islands` preset is seven shots at one resolution.
-/// THE WINDOW — B6b rung 2, and the camera is yours.
+/// THE WINDOW — B6b rungs 2 (the camera is yours) and 3 (and it resizes).
 ///
 /// Rung 1 opened a window and flew `cinematic::pose_at` on a 60 s lap, with
 /// ESC as the only key that did anything. This adds INPUT: WASD/QE and the
@@ -26716,11 +27049,42 @@ fn run_cinematic_cpu(
 /// from basis bit-equality) — the same win D3D12 measures at −43% of frame
 /// span, and now reachable by holding still rather than by waiting for a lap.
 ///
+/// `--qa` REACHES THIS BACKEND, and it is why there is no bespoke pose readout
+/// here. The socket already IS this tree's answer to "drive it rather than ask
+/// a human to look", and the verbs it needs (`FlyCam::set` / `set_tod` /
+/// `drive`) are exactly what rung 2 added. `qa.rs` is transport-only and was
+/// already cross-platform; only the verb TABLE below is this backend's, and it
+/// is a deliberate subset that names the RUNG owning each missing verb.
+///
+/// RUNG 3 MAKES IT RESIZE, in D3D12's shape rather than a new one — see
+/// `rebuild_at`, which records the finding that shape rests on. `WinSize`
+/// carries the extent from the pump to the renderer, the renderer debounces it
+/// for `RESIZE_SETTLE_MS` (the same constant `session()` uses, now shared), and
+/// the commit rebuilds the swapchain and the tracer at the new extent while the
+/// scene, its uploads, the flycam and the socket all survive.
+///
+/// IT COSTS ~7.8 s PER COMMIT, and that number is the rung's own argument for
+/// what comes next: MEASURED as swapchain 2.0-2.9 ms, teardown 2.1-3.8 ms,
+/// tracer+upscaler+denoiser 7.5-8.5 s — of which the DXC compile of the 24
+/// kernel units is 7.3-7.8 s (~92%) and reflection is ~1 ms. The compiled
+/// SPIR-V does not depend on the resolution at all (`gs::TraceKeys` is scene,
+/// vendor and sway), so a memo keyed on (source, entry) would return nearly all
+/// of it — a cheaper slice than splitting `VkTracer` into sized and unsized
+/// halves, and the one this rung recommends.
+///
+/// THE PUMP DOES NOT NOTICE, which is rung 2's design being tested rather than
+/// trusted: through every one of those multi-second blocks the pump gap stayed
+/// p50 1.06 / p99 1.06-1.11 ms, in the same reports whose p99 PRESENT interval
+/// is 7.6 s. The window stays alive and responsive across a rebuild; it just
+/// shows the last frame.
+///
 /// WHAT IS STILL NOT HERE, each deferred for a reason rather than forgotten:
-/// resize (a rebuild of the tracer, the display pipelines and the FSR3 context
-/// at a new extent — its own rung), the HUD and pause menu (they need a
-/// `vk/hud.rs` peer of `gpu/hud.rs`), audio, `--qa`, and the toggle edges
-/// (`input.rs`'s `Edges`, which answer to a menu this backend has no peer of).
+/// the HUD and pause menu (they need a `vk/hud.rs` peer of `gpu/hud.rs`),
+/// audio, the toggle edges (`input.rs`'s `Edges`, which answer to a menu this
+/// backend has no peer of — F11 is one of them, which is why this window
+/// resizes but does not go fullscreen), a screenshot verb, and `--lock-res`:
+/// the trace extent follows the swapchain 1:1 here, where D3D12's re-entry
+/// re-derives a LOCKED render res.
 ///
 /// THE SCENE IS THE WORLD, because `req` already says so: a bare invocation
 /// sets `world_wanted`, and nothing about this path changes it.
@@ -26770,6 +27134,11 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
     // The pump's output and the integrator's input. Created HERE, before
     // either thread exists, because both of them borrow it.
     let mirror = std::sync::Arc::new(flycam::Mirror::new());
+    // The pump's OTHER output (rung 3), and deliberately not a mirror field —
+    // see `WinSize`. Seeded with the size read above so the debounce does not
+    // read the first frame as a resize away from 0x0.
+    let winsz = vk::present::WinSize::default();
+    winsz.set(ww, wh);
     let quit = std::sync::atomic::AtomicBool::new(false);
 
     // ARM B: one thread, pumping once per frame. Same mirror, same integrator,
@@ -26780,14 +27149,16 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
             "vk: FR_VK_PUMP_INLINE=1 — pumping on the render thread, so input is sampled once \
              per frame instead of every 2 ms"
         );
-        return window_frames(&hg, surface, (ww, wh), req, opts, &mirror, &quit, Some(&mut win));
+        return window_frames(
+            &hg, surface, (ww, wh), req, opts, &mirror, &winsz, &quit, Some(&mut win),
+        );
     }
 
     std::thread::scope(|s| {
-        let (hgr, mr, qr) = (&hg, &mirror, &quit);
+        let (hgr, mr, wr, qr) = (&hg, &mirror, &winsz, &quit);
         let render = s
             .spawn(move || {
-                let r = window_frames(hgr, surface, (ww, wh), req, opts, mr, qr, None);
+                let r = window_frames(hgr, surface, (ww, wh), req, opts, mr, wr, qr, None);
                 // However the frame loop ends — quit, error, or a stale
                 // surface — the pump has to stop waiting for it.
                 qr.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -26807,13 +27178,264 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
         // not set `panic = "abort"`), so the symptom was a full crash report
         // followed by a session that would not die.
         while !quit.load(std::sync::atomic::Ordering::Relaxed) && !render.is_finished() {
-            if !win.pump(&mirror) {
+            if !win.pump(&mirror, &winsz) {
                 quit.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         render.join().unwrap_or_else(|_| Err("the render thread panicked".into()))
     })
+}
+
+/// Check that the upscaler's output matches the swapchain, and point the
+/// display stage at it.
+///
+/// ONE IMPLEMENTATION FOR TWO CALLERS, which is the whole reason it is a
+/// function: it runs once at bring-up and again after every resize commit, and
+/// a resize is the rare path — the one that rots when it is a second copy of
+/// the checks the common path does. Since rung 3 there is no arrangement of
+/// extents that reaches the frame loop unchecked.
+///
+/// THE SIZES MUST AGREE, and the failure mode is why this is checked rather
+/// than assumed: `tonemap.hlsl` samples its source by UV, so an FFX output of a
+/// different extent than the swapchain would STRETCH — a wrong image that still
+/// looks like a picture, which is the shape this backend refuses formats over.
+///
+/// A REFUSAL, NOT AN `expect`. `fsr3::built()` at the call site is a
+/// COMPILE-time fact; `CineVk::build` can still fail to create the context at
+/// RUN time and degrades loudly to `None` — which the capture arm answers by
+/// accumulating and the window cannot.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn window_bind_upscaler(
+    hg: &vk::headless::VkHeadless,
+    pres: &vk::present::Presenter,
+    cv: &CineVk,
+) -> Result<(), String> {
+    let up = cv.up.as_ref().ok_or_else(|| {
+        format!(
+            "FidelityFX is compiled in but {} could not create an FSR3 context — see the \
+             [fsr3-vk] line above for FFX's own diagnosis. The window needs it: the accumulation \
+             arm produces a CPU image, so presenting it would mean a full readback and re-upload \
+             every frame. Pick another device with FR_VK_DEVICE=<name>",
+            hg.vk.info.name
+        )
+    })?;
+    if up.upscale_size() != (pres.sc.w, pres.sc.h) {
+        let (uw, uh) = up.upscale_size();
+        return Err(format!(
+            "FSR3 upscales to {uw}x{uh} but the swapchain is {}x{} — the tonemap samples by UV, \
+             so this would stretch silently rather than fail",
+            pres.sc.w, pres.sc.h
+        ));
+    }
+    // Re-bound rather than assumed stable across a resize: FFX allocates a NEW
+    // output image at the new extent, so the descriptor written at bring-up
+    // points at an image that no longer exists. `Presenter::resize` cannot do
+    // this itself — it does not know what it is presenting.
+    pres.bind_source(&hg.vk, up.output_view());
+    Ok(())
+}
+
+/// The presentation half of a resize alone: the swapchain moves to `(nw, nh)`
+/// NOW, and the answer says whether the tracer still agrees with it.
+///
+/// WHAT `Frame::Stale` NEEDS AND ALL IT NEEDS. A stale surface has nothing to
+/// present into, so the swapchain cannot wait — but the tracer can: it is a
+/// ~7.8 s kernel recompile that must not run once per configure event of a
+/// drag, and the debounce at the top of `window_frames` exists to run it once
+/// at the end instead. On RADV a drag never reaches this route at all (it
+/// answers a resize with SUBOPTIMAL and keeps presenting), but a WSI that
+/// answers `OUT_OF_DATE` per configure would otherwise pay a recompile per
+/// event and `STALE_REBUILD_LIMIT` could not bound it, since every one of them
+/// moves the extent.
+///
+/// `Ok(true)`: the negotiated extent is the one the tracer was built at, so the
+/// display is re-pointed at it and the frame loop carries on — this is the
+/// mode-change / monitor-move / stale-cell case, and it costs the swapchain
+/// alone. `Ok(false)`: the tracer is at the OLD extent; the display is pointed
+/// at it anyway so the frames until the debounce commits show the old image
+/// resampled by UV into the new chain (the same momentary softness the debounce
+/// route accepts in the other direction, where the compositor scales the old
+/// chain into the new window), and the caller arms the debounce to close the
+/// gap.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn resize_swapchain(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    pres: &mut vk::present::Presenter,
+    cv: &CineVk,
+    nw: u32,
+    nh: u32,
+) -> Result<bool, String> {
+    pres.resize(hg, sp, nw, nh)?;
+    let up = cv.up.as_ref().ok_or_else(|| {
+        "the window's tracer has no FSR3 context — window_bind_upscaler should have refused \
+         this at bring-up"
+            .to_string()
+    })?;
+    if up.upscale_size() == (pres.sc.w, pres.sc.h) {
+        window_bind_upscaler(hg, pres, cv)?;
+        Ok(true)
+    } else {
+        // Re-bound even though the FFX image did not move: `Presenter::resize`
+        // may have rebuilt `Passes` on a format change, and a fresh descriptor
+        // set points at nothing.
+        pres.bind_source(&hg.vk, up.output_view());
+        Ok(false)
+    }
+}
+
+/// Commit a resize: the swapchain and the tracer both come back at `(nw, nh)`.
+///
+/// THE ONE PLACE A TRACER REBUILD HAPPENS, reached from the debounce — and
+/// from `Frame::Stale` only through it, since that arm resizes the swapchain
+/// alone (`resize_swapchain`) and arms the debounce for the rest. It is
+/// D3D12's shape rather than a new one, and that is the finding this rung
+/// rests on: `session()` answers a resize by BREAKING with
+/// `SessionEnd::Resize` and re-entering, and `GpuContext::resize_output` keeps
+/// the device, the queue and the display PSOs while tearing the tracer down for
+/// `init_trace` to rebuild — which prints "compiling shaders", because there is
+/// no DXIL cache. So Windows already pays a full kernel recompile per commit,
+/// and there was no incremental resize to port. Nothing here is cleverer than
+/// that.
+///
+/// EXCEPT THAT AN UNCHANGED EXTENT KEEPS THE TRACER. The swapchain NEGOTIATES
+/// (`Swapchain::rebuild` obeys a pinned `currentExtent` and clamps to
+/// `min/max_image_extent`), so what comes back may be exactly where the tracer
+/// already is — a stale cell, a monitor move at the same pixel size, a surface
+/// that pins. Rebuilding then destroys a tracer and compiles an identical one
+/// for ~7.8 s to change nothing; the extent test here is what turns that into
+/// the swapchain's ~3 ms.
+///
+/// WHAT SURVIVES, and each for a reason rather than by omission: the device and
+/// the shader corpus (`hg`, `sp`), the scene, its BVH and their GPU uploads
+/// (`vs`, `vt` — extent-independent, and re-uploading a world-scale scene is
+/// ~13 s of work a resize does not need), `Passes` unless the format moved,
+/// `Pacing` (so the cadence can be compared ACROSS a resize), the flycam thread
+/// with the pose in it, and the `--qa` socket with its connections. That last
+/// pair is why this is a rebuild IN PLACE rather than a re-entry of
+/// `window_frames`: on Windows the FlyCam, the audio and the socket are
+/// constructed OUTSIDE `session()` precisely so they survive re-entry, and
+/// keeping the loop is the same continuity for free.
+///
+/// TEARDOWN BEFORE BUILD, deliberately, and the trade is worth naming. The
+/// reverse order would leave `cv` intact if the build refused — but it would
+/// also hold two tracers at once, and this one's buffers are the software BVH
+/// and the wide tree, hundreds of MB on a world-scale scene. An OOM mid-resize
+/// is a worse outcome than a clean fatal error, and a failed rebuild IS fatal
+/// here: D3D12 can fall back on a whole fresh device (`GpuContext::new`), which
+/// has no peer on this backend, so the honest answer is the refusal. What
+/// softens it: `CineVk::build` creates the FSR3 context BEFORE the ~7.8 s
+/// tracer compile, so an FFX refusal at the new extent is known in
+/// milliseconds rather than after the compile, and the `--qa resize` verb is
+/// clamped to the display so a socket cannot ask for an extent a user could
+/// not drag to.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn rebuild_at(
+    hg: &vk::headless::VkHeadless,
+    sp: &vk::spirv::Spirv,
+    pres: &mut vk::present::Presenter,
+    cv: &mut Option<CineVk>,
+    scene: &scene::Scene,
+    vs: &vk::scene::VkScene,
+    vt: &vk::textures::VkTextures,
+    bvh: &bvh::Bvh,
+    want_dn: bool,
+    opts: &Opts,
+    nw: u32,
+    nh: u32,
+) -> Result<(), String> {
+    // The presentation half first: `Swapchain::rebuild` NEGOTIATES the extent
+    // (a surface may pin `currentExtent`, and the clamp against
+    // min/max_image_extent is not a formality), so what the tracer is built
+    // against below has to be what came back rather than what was asked for.
+    // Building the tracer first and then discovering the swapchain landed
+    // elsewhere is the silent-stretch failure one function up.
+    // SPLIT THREE WAYS, and reported rather than inferred. The plan for this
+    // rung predicted the tracer would dominate at ~20 s (the figure
+    // `run_cine_vk`'s header records for the same constructor) and used that
+    // prediction to justify NOT splitting `VkTracer` into sized and unsized
+    // halves. A prediction load-bearing enough to skip a refactor is one the
+    // code should keep answering, so the three numbers ride the resize line.
+    let t_sc = std::time::Instant::now();
+    let agrees = {
+        let c = cv.as_ref().expect("rebuild_at is only reached with a tracer");
+        resize_swapchain(hg, sp, pres, c, nw, nh)?
+    };
+    let ms_sc = t_sc.elapsed().as_secs_f64() * 1000.0;
+    let (gw, gh) = (pres.sc.w as usize, pres.sc.h as usize);
+    if agrees {
+        eprintln!(
+            "vk: rebuild split — swapchain {ms_sc:.1} ms | tracer kept (the negotiated extent \
+             {gw}x{gh} is the one it was built at)"
+        );
+        return Ok(());
+    }
+
+    let t_down = std::time::Instant::now();
+    if let Some(old) = cv.take() {
+        old.destroy(hg);
+    }
+    let ms_down = t_down.elapsed().as_secs_f64() * 1000.0;
+
+    let t_up = std::time::Instant::now();
+    *cv = Some(CineVk::build(hg, sp, scene, vs, vt, bvh, gw, gh, true, want_dn, opts)?);
+    let ms_up = t_up.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!(
+        "vk: rebuild split — swapchain {ms_sc:.1} ms | teardown {ms_down:.1} ms | \
+         tracer+upscaler+denoiser {ms_up:.0} ms"
+    );
+    window_bind_upscaler(hg, pres, cv.as_ref().unwrap())
+}
+
+/// Free everything `window_frames` built, in reverse construction order — the
+/// ONE teardown, reached from the end of the loop and from every bring-up
+/// refusal alike.
+///
+/// WHY IT IS A FUNCTION: `window_frames`'s bring-up used to `?` its way past
+/// the teardown at the bottom, so a refusal from `VkScene::new`,
+/// `VkTextures::new`, `CineVk::build` or `window_bind_upscaler` returned with
+/// the swapchain, the display pipelines and the scene's buffers alive — and
+/// `Vk::drop` then destroyed the device out from under them, which is
+/// VUID-vkDestroyDevice-device-00378 (the layer names it under
+/// `FR_VK_VALIDATION=1`), on top of whatever the refusal was. The loop's own
+/// arms already `break` to reach the teardown for exactly that reason; the
+/// bring-up now reaches the same code by calling it.
+///
+/// `Option`s rather than a fixed arity, so a refusal at any depth passes what
+/// exists so far and nothing else. `vkDeviceWaitIdle` FIRST, always:
+/// `wait_submit` waited the SUBMIT fence, but `vkQueuePresentKHR` is
+/// asynchronous, so the presentation engine can still be reading the image a
+/// `Swapchain::destroy` is about to free. This happens to hold today via the
+/// `device_wait_idle` inside `Fsr3::destroy`, which `cv.destroy` reaches first
+/// — but that is an unrelated object's internal detail, and "reverse
+/// construction order" is not "wait first". Saying it here is one call and
+/// removes the coupling.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn window_teardown(
+    hg: &vk::headless::VkHeadless,
+    cv: Option<CineVk>,
+    pres: &vk::present::Presenter,
+    vt: Option<&vk::textures::VkTextures>,
+    vs: Option<&vk::scene::VkScene>,
+) {
+    unsafe {
+        let _ = hg.vk.device.device_wait_idle();
+    }
+    // These types have `destroy(&hg)` and no `Drop`, so a forgotten teardown is
+    // a leak the validation layer reports at instance destruction.
+    if let Some(c) = cv {
+        c.destroy(hg);
+    }
+    pres.destroy(&hg.vk);
+    if let Some(t) = vt {
+        t.destroy(hg);
+    }
+    if let Some(s) = vs {
+        s.destroy(hg);
+    }
 }
 
 /// The frame loop, and everything it owns. Runs on the render thread — or on
@@ -26827,6 +27449,7 @@ fn window_frames(
     req: SceneRequest,
     opts: &Opts,
     mirror: &std::sync::Arc<flycam::Mirror>,
+    winsz: &vk::present::WinSize,
     quit: &std::sync::atomic::AtomicBool,
     mut pump: Option<&mut vk::present::Win>,
 ) -> Result<i32, String> {
@@ -26851,45 +27474,51 @@ fn window_frames(
     let pres = &mut presenter;
     let sp = &sp;
 
-    let (rw, rh) = (pres.sc.w as usize, pres.sc.h as usize);
+    // `mut` since rung 3: the trace extent follows the swapchain 1:1 here (no
+    // `--lock-res` arm on this backend yet), so a resize moves both.
+    let (mut rw, mut rh) = (pres.sc.w as usize, pres.sc.h as usize);
     let LoadedScene { mut scene, bvh, cam0, world_info } = load_scene(&req);
     let attractors: Vec<world::TodAttractor> = match (world_info.as_ref(), opts.tod) {
         (Some(w), None) => world::attractors(w),
         _ => Vec::new(),
     };
 
-    let vs = vk::scene::VkScene::new(hg, &scene, &bvh)?;
-    let vt = vk::textures::VkTextures::new(hg, sp, &scene, opts.bc7)?;
+    // EVERY BRING-UP REFUSAL FROM HERE ON TEARS DOWN WHAT EXISTS, through the
+    // same `window_teardown` the end of the loop uses — never a bare `?`,
+    // which returns past it and leaves `Vk::drop` to destroy the device under
+    // a live swapchain (VUID-vkDestroyDevice-device-00378). See that
+    // function's header.
+    let vs = match vk::scene::VkScene::new(hg, &scene, &bvh) {
+        Ok(v) => v,
+        Err(e) => {
+            window_teardown(hg, None, pres, None, None);
+            return Err(e);
+        }
+    };
+    let vt = match vk::textures::VkTextures::new(hg, sp, &scene, opts.bc7) {
+        Ok(t) => t,
+        Err(e) => {
+            window_teardown(hg, None, pres, None, Some(&vs));
+            return Err(e);
+        }
+    };
     let want_dn = opts.nrd;
-    let mut cv =
-        CineVk::build(hg, sp, &scene, &vs, &vt, &bvh, rw, rh, true, want_dn, opts)?;
-    // THE SIZES MUST AGREE, and the failure mode is why this is checked rather
-    // than assumed: `tonemap.hlsl` samples its source by UV, so an FFX output
-    // of a different extent than the swapchain would STRETCH — a wrong image
-    // that still looks like a picture, which is the shape this backend refuses
-    // formats over.
-    // A REFUSAL, NOT AN `expect`. `fsr3::built()` at the call site is a
-    // COMPILE-time fact; `CineVk::build` can still fail to create the context
-    // at RUN time and degrades loudly to `None` — which the capture arm
-    // answers by accumulating and the window cannot.
-    let up = cv.up.as_ref().ok_or_else(|| {
-        format!(
-            "FidelityFX is compiled in but {} could not create an FSR3 context — see the \
-             [fsr3-vk] line above for FFX's own diagnosis. The window needs it: the accumulation \
-             arm produces a CPU image, so presenting it would mean a full readback and re-upload \
-             every frame. Pick another device with FR_VK_DEVICE=<name>",
-            hg.vk.info.name
-        )
-    })?;
-    if up.upscale_size() != (pres.sc.w, pres.sc.h) {
-        let (uw, uh) = up.upscale_size();
-        return Err(format!(
-            "FSR3 upscales to {uw}x{uh} but the swapchain is {}x{} — the tonemap samples by UV, \
-             so this would stretch silently rather than fail",
-            pres.sc.w, pres.sc.h
-        ));
+    // AN `Option` SINCE RUNG 3, and only because `CineVk::destroy` takes `self`
+    // by value: a rebuild has to move the old one out before the new one is
+    // built. `None` is reachable for the width of `rebuild_at`'s body and
+    // nowhere else — every path that leaves it empty returns immediately.
+    let mut cv = match CineVk::build(hg, sp, &scene, &vs, &vt, &bvh, rw, rh, true, want_dn, opts)
+    {
+        Ok(c) => Some(c),
+        Err(e) => {
+            window_teardown(hg, None, pres, Some(&vt), Some(&vs));
+            return Err(e);
+        }
+    };
+    if let Err(e) = window_bind_upscaler(hg, pres, cv.as_ref().unwrap()) {
+        window_teardown(hg, cv.take(), pres, Some(&vt), Some(&vs));
+        return Err(e);
     }
-    pres.bind_source(&hg.vk, up.output_view());
 
     // ONE SHOT, still resolved through `resolve_shots` — but rung 2 takes only
     // two things from it, and NEITHER is a pose: `samples` (the interactive
@@ -26906,10 +27535,16 @@ fn window_frames(
         fps: 60,
         ..Default::default()
     };
-    let shot = cinematic::resolve_shots("orbit", &cine, world_info.as_ref(), cam0, center, radius)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "the orbit preset produced no shot".to_string())?;
+    let shot = match cinematic::resolve_shots("orbit", &cine, world_info.as_ref(), cam0, center, radius)
+        .and_then(|shots| {
+            shots.into_iter().next().ok_or_else(|| "the orbit preset produced no shot".to_string())
+        }) {
+        Ok(sh) => sh,
+        Err(e) => {
+            window_teardown(hg, cv.take(), pres, Some(&vt), Some(&vs));
+            return Err(e);
+        }
+    };
     let q = cine_quality(&shot);
 
     // The integrator. It owns the pose and the hour from here on — the render
@@ -26940,9 +27575,10 @@ fn window_frames(
     let mut last_ms: f64 = 0.0;
     let mut prev_hour = tod0;
     scene::apply_tod(&mut scene, tod0);
-    // MONOTONIC, and it must be: `render_frame` uses it for one thing only,
-    // the frame-0 warm-up (`JITTER_PHASE - samples` extra passes), and that
-    // has to fire exactly once.
+    // MONOTONIC across the session; `render_frame` no longer reads it for the
+    // frame-0 warm-up (that keys on the tracer's own `seq`, so a REBUILT tracer
+    // warms up too — see there), so it is a frame count for `pos` and nothing
+    // else.
     let mut f: u32 = 0;
     let mut code = 0;
     // THE SOCKET, and it is the reason there is no bespoke pose readout here:
@@ -26960,8 +27596,8 @@ fn window_frames(
                 Ok(_h) => {
                     eprintln!(
                         "qa: control socket listening on 127.0.0.1:{port} — drive it with \
-                         `frqa` (pos | tp | look | tod | drive | drive stop | sync | quit; \
-                         key and screenshot are later rungs')"
+                         `frqa` (pos | tp | look | tod | drive | drive stop | resize | sync \
+                         | quit; key and screenshot are later rungs')"
                     );
                     Some((q, qflag))
                 }
@@ -26986,9 +27622,50 @@ fn window_frames(
     // stops guarding a minute into the session.
     let mut qa_pend: Vec<(u64, u64, std::time::Instant, std::sync::mpsc::SyncSender<String>)> =
         Vec::new();
+    // The resize debounce (rung 3). `pending` is armed by a size that differs
+    // from the one we are rendering at and RE-armed by every further change, so
+    // a drag commits once, at the end. `rebuilds` is the tally measurement 2
+    // reads — a debounce that is asserted by counting beats one that is
+    // asserted by watching.
+    let mut pending_resize: Option<std::time::Instant> = None;
+    let mut rebuilds: u32 = 0;
+    let (mut cur_w, mut cur_h) = (pres.sc.w, pres.sc.h);
+    // The size the cell held last iteration — what turns "the cell says X" into
+    // "the cell CHANGED to X".
+    //
+    // SEEDED FROM WHAT THE CELL HELD BEFORE THE PUMP EXISTED, NOT FROM THE
+    // SWAPCHAIN AND NOT FROM THE CELL NOW, and each half of that is a bug the
+    // other choice has. Not the swapchain: `pres.sc` holds what
+    // `vkCreateSwapchainKHR` NEGOTIATED while the cell holds `Win::size()`
+    // (what the window IS), and those agree only when the negotiation is the
+    // identity — V20 exists precisely because it need not be, for surfaces
+    // that clamp to `min/max_image_extent` or pin `currentExtent`, and seeding
+    // from the swapchain on one reads frame 1 as an edge and buys a ~7.8 s
+    // rebuild that changes nothing. Not the cell as it is HERE either: the
+    // ~13-30 s scene load sits between the presenter's construction and this
+    // line, and the pump has been writing the cell the whole time — so a
+    // resize that landed during the load (a tiling compositor placing the
+    // still-blank window, a user dragging it) would be absorbed into the seed
+    // and never become an edge, and with RADV answering the mismatch as
+    // SUBOPTIMAL rather than `Stale` the bring-up chain would be presented
+    // stretched until an unrelated size event. `win_size` is the value the
+    // cell was seeded with before either thread started, i.e. the size the
+    // presenter was actually built for; anything the pump wrote since is a
+    // change to it and reads as one on the first pass.
+    let mut last_seen = win_size;
+    // Consecutive `Frame::Stale` swapchain rebuilds that did NOT move the
+    // extent — see the stale arm at the bottom of this loop, which is the one
+    // route into a rebuild with no "did this change anything" guard of its own.
+    let mut fruitless: u32 = 0;
+    // The window has nothing to show into — the pump's visibility bit
+    // (`WinSize::hidden`), OR the stale arm saw a 0 dimension. The second is a
+    // belt for the first: no measured platform here reports 0x0, but a
+    // swapchain cannot be built at it if one does.
+    let mut zero_size = false;
+    let mut was_hidden = false;
     loop {
         if let Some(w) = pump.as_deref_mut() {
-            if !w.pump(mirror) {
+            if !w.pump(mirror, winsz) {
                 break;
             }
         }
@@ -26996,6 +27673,75 @@ fn window_frames(
             break;
         }
         let frame_start = std::time::Instant::now();
+
+        // --- THE RESIZE DEBOUNCE. One of the two routes into a rebuild; the
+        // other is `Frame::Stale` at the bottom of this loop, and both funnel
+        // into `rebuild_at`. Two ways in and one implementation, because a
+        // rarely-taken second copy is a rarely-taken second copy that rots.
+        //
+        // AN EDGE ARMS THE TIMER, NOT A LEVEL, and getting that wrong is a
+        // debounce that never fires: arming on "the cell differs from the
+        // extent we render at" re-arms on EVERY frame until the rebuild
+        // happens, so the elapsed time is always one frame and the settle can
+        // never be reached. MEASURED as exactly that — `resize_pending` stayed
+        // true for 180 s with the window at its original size — which is why
+        // `pos` reports the flag: a level-armed timer and a compositor that
+        // refused the size look identical in the extent alone. `last_seen` is
+        // what turns the level back into the edge D3D12 gets for free from
+        // `Edges::size_changed`.
+        //
+        // A ZERO DIMENSION NEVER COMMITS. A minimized window reports one, and a
+        // swapchain cannot be built at 0 — D3D12's session declines the same
+        // way, at `main.rs`'s `pending_resize` arm. It still ARMS, so the
+        // restore that follows is a fresh edge rather than a size the loop has
+        // stopped watching for.
+        {
+            let (nw, nh) = winsz.get();
+            if (nw, nh) != last_seen {
+                last_seen = (nw, nh);
+                pending_resize = Some(frame_start);
+            }
+            if let Some(t0) = pending_resize {
+                if (frame_start - t0).as_millis() >= RESIZE_SETTLE_MS {
+                    pending_resize = None;
+                    let (nw, nh) = winsz.get();
+                    // TWO REASONS TO COMMIT: the cell moved away from the
+                    // swapchain, or the swapchain moved away from the tracer
+                    // (the stale arm resizes the chain alone and leaves the
+                    // tracer to this timer — see `resize_swapchain`). Without
+                    // the second, a stale-driven resize whose cell then agrees
+                    // with the chain would never rebuild the tracer at all.
+                    let tracer_lags = (rw, rh) != (cur_w as usize, cur_h as usize);
+                    if nw > 0 && nh > 0 && ((nw, nh) != (cur_w, cur_h) || tracer_lags) {
+                        // `break` RATHER THAN `?`, and the difference is a
+                        // `vkDestroyDevice` with live children. This function's
+                        // teardown — the idle wait, then `cv`/`pres`/`vt`/`vs`
+                        // — sits AFTER this loop, so an early return skips it
+                        // and leaves `Vk::drop` to destroy the device out from
+                        // under a live swapchain, its pipelines and the scene's
+                        // buffers. That is VUID-vkDestroyDevice-device-00378,
+                        // not merely a leak, and it is exactly what the
+                        // teardown block's own comment says the layer reports.
+                        if let Err(e) = rebuild_at(
+                            hg, sp, pres, &mut cv, &scene, &vs, &vt, &bvh, want_dn, opts, nw, nh,
+                        ) {
+                            eprintln!("window: {e}");
+                            code = 1;
+                            break;
+                        }
+                        (cur_w, cur_h) = (pres.sc.w, pres.sc.h);
+                        (rw, rh) = (pres.sc.w as usize, pres.sc.h as usize);
+                        rebuilds += 1;
+                        eprintln!(
+                            "vk: resized to {}x{} (rebuild {rebuilds}, {:.2} s)",
+                            pres.sc.w,
+                            pres.sc.h,
+                            frame_start.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
 
         // ONE snapshot, used for everything in this iteration.
         let snap = fly.snapshot();
@@ -27059,6 +27805,19 @@ fn window_frames(
                             "upscaler": "FSR3",
                             "window": [pres.sc.w, pres.sc.h],
                             "render": [rw, rh],
+                            // Rung 3's readouts, and `rebuilds` is what makes
+                            // the debounce ASSERTABLE: a driver counts commits
+                            // rather than watching for one. `resize_pending`
+                            // separates "the settle has not elapsed" from "the
+                            // compositor refused the size", which look
+                            // identical in the extent alone.
+                            "rebuilds": rebuilds,
+                            "resize_pending": pending_resize.is_some(),
+                            // The compositor is not showing the window (or it
+                            // reported a 0 dimension), so frames are skipped —
+                            // a driver that sees `frame` stop advancing reads
+                            // why here.
+                            "hidden": winsz.hidden() || zero_size,
                             "last_ms": last_ms,
                             "frame": f,
                             "iter": qa_iter,
@@ -27195,6 +27954,56 @@ fn window_frames(
                         qa_pend.push((qa_iter + 1, 1, t0, req.reply));
                         continue;
                     }
+                    // IT ASKS THE COMPOSITOR RATHER THAN REBUILDING, and that
+                    // is the whole value of the verb. Calling `rebuild_at`
+                    // here would prove the rebuild works and nothing about the
+                    // events, the debounce or SDL — the parts a human dragging
+                    // a corner actually exercises. Instead the pump applies
+                    // `SDL_SetWindowSize` (it owns the window; this thread does
+                    // not), the compositor answers with a real
+                    // `PixelSizeChanged`, and the ordinary path runs.
+                    //
+                    // SO THE REPLY IS AN ACKNOWLEDGEMENT, NOT A RESULT: nothing
+                    // has resized yet when it is sent. The size is LOGICAL
+                    // (what `SDL_SetWindowSize` takes) and the swapchain is
+                    // built in PHYSICAL pixels, so on a fractional-scale output
+                    // the two differ — which is why the caller is told to read
+                    // `pos` rather than to assume it got what it asked for.
+                    ["resize", w, h] => {
+                        // Bounded twice. The window here is a parse bound (the
+                        // floor keeps a 1x1 window from producing a tracer
+                        // nothing can be measured on; the ceiling is RADV's
+                        // `maxImageExtent`, so it refuses what the swapchain
+                        // would); the bound that MATTERS is the pump's, which
+                        // clamps the request to the display the window is on
+                        // — a socket may not ask for an extent a user could not
+                        // drag to, because `rebuild_at` tears the old tracer
+                        // down before building the new one and an OOM at 268
+                        // Mpx would be a fatal session end reached from a
+                        // "bounded" verb.
+                        const MIN_WIN: u32 = 64;
+                        const MAX_WIN: u32 = 16384;
+                        match (w.parse::<u32>().ok(), h.parse::<u32>().ok()) {
+                            (Some(rw), Some(rh))
+                                if (MIN_WIN..=MAX_WIN).contains(&rw)
+                                    && (MIN_WIN..=MAX_WIN).contains(&rh) =>
+                            {
+                                winsz.request(rw, rh);
+                                qa::info_reply(&format!(
+                                    "resize {rw}x{rh} requested (clamped to the display) — it \
+                                     commits after the {RESIZE_SETTLE_MS} ms settle, so sync past \
+                                     that (~{} frames at 60 fps) and read `pos` for the extent \
+                                     negotiated",
+                                    RESIZE_SETTLE_MS * 60 / 1000 + 2
+                                ))
+                            }
+                            _ => qa::err_reply(&format!(
+                                "resize needs a width and height in {MIN_WIN}..={MAX_WIN} \
+                                 (logical pixels — `pos` reports the physical extent negotiated)"
+                            )),
+                        }
+                    }
+                    ["resize", ..] => qa::err_reply("resize needs W H"),
                     ["quit"] => {
                         quit.store(true, Relaxed);
                         qa::info_reply("quitting")
@@ -27213,13 +28022,50 @@ fn window_frames(
                     [] => qa::err_reply("empty request"),
                     _ => qa::err_reply(&format!(
                         "unknown verb {:?} — pos | tp x y z [yaw pitch] | look yaw pitch | \
-                         tod H | drive x y z ticks | drive stop | sync N | quit (key and \
-                         screenshot are later rungs')",
+                         tod H | drive x y z ticks | drive stop | resize W H | sync N | quit \
+                         (key and screenshot are later rungs')",
                         words[0]
                     )),
                 };
                 let _ = req.reply.send(json);
             }
+        }
+        // HIDDEN: NOTHING TO PRESENT INTO, SO NOTHING WORTH TRACING. The pump
+        // reports it (`WinSize::hidden`, off SDL3's Minimized/Occluded and
+        // Restored/Exposed events — the extent never says so on Linux, see that
+        // cell's doc), and the stale arm below adds a 0 dimension as a second
+        // route in case a platform does report one.
+        //
+        // Placed AFTER the pump and the `--qa` service above and before the
+        // trace, deliberately: a hidden session stays drivable (`sync` still
+        // advances, `pos` still answers and says `hidden`, `resize` still
+        // lands) while the frame itself is skipped, because a trace whose only
+        // consumer is a swapchain nobody is looking at is work with no reader.
+        // Without the skip the loop re-traces at whatever rate the
+        // compositor's FIFO fallback releases images, and without the sleep it
+        // does so uncapped — `Frame::Stale` returns immediately, so there is no
+        // vsync underneath this loop to pace it.
+        if zero_size {
+            let (mw, mh) = match pump.as_deref() {
+                Some(w) => w.size(),
+                None => winsz.get(),
+            };
+            if mw > 0 && mh > 0 {
+                zero_size = false;
+            }
+        }
+        let hidden = winsz.hidden() || zero_size;
+        if hidden != was_hidden {
+            eprintln!(
+                "vk: window {} — {}",
+                if hidden { "hidden" } else { "visible" },
+                if hidden { "pausing the trace" } else { "resuming" }
+            );
+            was_hidden = hidden;
+        }
+        if hidden {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
         }
         if snap.tod != prev_hour {
             scene::apply_tod(&mut scene, snap.tod);
@@ -27242,8 +28088,12 @@ fn window_frames(
             fireflies: fireflies::Fireflies::live(&scene, cloud_time as f32),
             sway_time,
         };
-        cv.tg.refresh_sky(&scene);
-        if let Err(e) = cv.render_frame(hg, &scene, &shot, &fs, f, rw, rh, q, opts) {
+        // `None` only exists inside `rebuild_at`, which returns on the way out
+        // of it — so by here it is always `Some`, and saying so beats threading
+        // an `Option` through the render call.
+        let c = cv.as_mut().expect("the tracer is Some outside a failed rebuild");
+        c.tg.refresh_sky(&scene);
+        if let Err(e) = c.render_frame(hg, &scene, &shot, &fs, rw, rh, q, opts) {
             eprintln!("window: {e}");
             code = 1;
             break;
@@ -27255,20 +28105,114 @@ fn window_frames(
         // is (0,0,0) because this backend has no bloom pyramid, which
         // `Params`' own doc records as the structurally dead glare tap.
         let params = vk::display::Params::new(tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
-        // STALE IS A CLEAN QUIT, not an error. The surface going out of date
-        // means the swapchain has to be rebuilt, and rung 2 still builds it
-        // once — the tracer, the upscaler and the display pipelines are all
-        // sized against that one extent.
+        // STALE IS A REBUILD SINCE RUNG 3, and the SECOND route into one — the
+        // debounce at the top of this loop is the first. It is not redundant
+        // with it: a mode change, a monitor move or a DPI change invalidates
+        // the surface with NO size event behind it, and on this ICD the
+        // opposite is true too (RADV answers a resize with SUBOPTIMAL and keeps
+        // presenting, so waiting for `Stale` alone would silently stretch).
+        // Each route catches what the other cannot.
+        //
+        // IMMEDIATE FOR THE SWAPCHAIN, DEBOUNCED FOR THE TRACER, and the split
+        // is the point: a stale surface has nothing to present into, so the
+        // chain cannot wait — but the ~7.8 s tracer recompile can, and must,
+        // or a WSI that answers every configure of a drag with `OUT_OF_DATE`
+        // pays a recompile per configure with nothing to bound it. So this arm
+        // calls `resize_swapchain` (milliseconds) and, if the tracer no longer
+        // agrees with the chain, arms the same debounce the size events do; the
+        // frames in between show the old image resampled into the new chain.
+        // Its extent comes from `Win::size()` rather than the cell for the same
+        // reason the arm exists — there may have been no event to fill the
+        // cell in.
         match pres.present(hg, params) {
             Ok(vk::present::Frame::Stale) => {
-                eprintln!(
-                    "vk: the window's surface no longer matches the swapchain (a resize?) — \
-                     rebuilding on resize is rung 3, so this stops here rather than presenting \
-                     a stretched image"
-                );
-                break;
+                let (sw, sh) = match pump.as_deref() {
+                    Some(w) => w.size(),
+                    // OFF THE PUMP THREAD, `Win` is unreachable — it is not
+                    // `Send` and stays on main. The cell is what the pump last
+                    // saw, which is the best available answer and the right one
+                    // whenever a size event did accompany the staleness.
+                    None => winsz.get(),
+                };
+                if sw == 0 || sh == 0 {
+                    // Nothing to build, and nothing to present into either —
+                    // wait for a size that exists rather than failing. The flag
+                    // is what stops the next pass from tracing a frame for the
+                    // same swapchain to refuse; see the hidden arm above.
+                    zero_size = true;
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                    continue;
+                }
+                eprintln!("vk: the surface went out of date — swapchain to {sw}x{sh}");
+                let before = (cur_w, cur_h);
+                let agrees = {
+                    let c = cv.as_ref().expect("the tracer is Some outside a failed rebuild");
+                    match resize_swapchain(hg, sp, pres, c, sw, sh) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            // `break`, not `?` — the teardown is after this
+                            // loop. Same argument as the debounce arm above.
+                            eprintln!("window: {e}");
+                            code = 1;
+                            break;
+                        }
+                    }
+                };
+                (cur_w, cur_h) = (pres.sc.w, pres.sc.h);
+                // THE GUARD THE DEBOUNCE HAS AND THIS ROUTE DID NOT. Up there a
+                // commit is gated on the size having changed, so a rebuild
+                // that would change nothing never runs. Here there is no such
+                // test — a stale surface is rebuilt at whatever size is
+                // available — and if the result is still stale the loop rebuilds
+                // again, forever.
+                //
+                // IT IS REACHABLE, NOT THEORETICAL: off the pump thread `sw/sh`
+                // come from the CELL, which holds what the pump last DRAINED, so
+                // a surface that goes out of date before its size event is
+                // drained rebuilds at the old extent — which is still stale. The
+                // 1 kHz pump makes the cell current within a few of these
+                // ~3 ms turns, so that case self-corrects; the count is what
+                // turns "self-corrects in practice" into a bound.
+                //
+                // FRUITLESS MEANS THE EXTENT DID NOT MOVE, which is the precise
+                // discriminator: a rebuild to a NEW extent is progress even if
+                // the next present is also stale (a drag continuing across the
+                // rebuild does exactly that), while a rebuild that lands where
+                // it started and is immediately stale again has achieved
+                // nothing and will keep achieving nothing.
+                if (cur_w, cur_h) == before {
+                    fruitless += 1;
+                } else {
+                    fruitless = 0;
+                }
+                if fruitless >= STALE_REBUILD_LIMIT {
+                    eprintln!(
+                        "vk: the surface is still out of date after {fruitless} swapchain \
+                         rebuild(s) that each landed back at {cur_w}x{cur_h} — rebuilding is \
+                         not fixing it, so stopping rather than spinning on a swapchain that \
+                         will not present"
+                    );
+                    code = 1;
+                    break;
+                }
+                // `last_seen` IS THE SIZE THIS ARM CONSUMED, not the cell as it
+                // is now: the two differ whenever a size event landed while the
+                // chain was being rebuilt, and taking the cell would swallow
+                // that event as if it had been adopted — no edge, no debounce,
+                // and a chain presented into a window of another size until an
+                // unrelated event. With `(sw, sh)` the newer size reads as the
+                // edge it is on the next pass. And if the tracer no longer
+                // agrees with the chain, the debounce is armed here so the
+                // commit runs once the size is quiet — the tracer's half of a
+                // resize this route deliberately did not do.
+                last_seen = (sw, sh);
+                if !agrees {
+                    pending_resize = Some(frame_start);
+                }
             }
-            Ok(vk::present::Frame::Presented) => {}
+            // A present that worked ends any stale streak: whatever the surface
+            // was objecting to, it no longer is.
+            Ok(vk::present::Frame::Presented) => fruitless = 0,
             Err(e) => {
                 eprintln!("window: {e}");
                 code = 1;
@@ -27294,25 +28238,9 @@ fn window_frames(
     // needless race for a reader to have to reason about.
     drop(fly);
 
-    // WAIT BEFORE TEARING DOWN. `wait_submit` waited the SUBMIT fence, but
-    // `vkQueuePresentKHR` is asynchronous, so the presentation engine can still
-    // be reading the image a `Swapchain::destroy` is about to free. This
-    // happens to hold today via the `device_wait_idle` inside `Fsr3::destroy`,
-    // which `cv.destroy` reaches first — but that is an unrelated object's
-    // internal detail, and the ordering comment below says "reverse
-    // construction order", not "wait first". Saying it here is one call and
-    // removes the coupling.
-    unsafe {
-        let _ = hg.vk.device.device_wait_idle();
-    }
-
-    // Reverse construction order, the `CineVk::destroy` rule: these types have
-    // `destroy(&hg)` and no `Drop`, so a forgotten teardown is a leak the
-    // validation layer reports at instance destruction.
-    cv.destroy(hg);
-    pres.destroy(&hg.vk);
-    vt.destroy(hg);
-    vs.destroy(hg);
+    // Wait, then reverse construction order — `window_teardown` is the one
+    // place that says so, shared with every bring-up refusal above.
+    window_teardown(hg, cv.take(), pres, Some(&vt), Some(&vs));
     Ok(code)
 }
 
@@ -27424,7 +28352,7 @@ fn run_cinematic_vk(
         for f in 0..frames {
             let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
             cv.tg.refresh_sky(scene);
-            let hdr = cv.output_frame(&hg, scene, shot, &fs, f, rw, rh, q, opts)?;
+            let hdr = cv.output_frame(&hg, scene, shot, &fs, rw, rh, q, opts)?;
 
             if shot.overlay {
                 let ib = hg.read_buffer(&cv.tg.info, rw * rh * 4)?;
@@ -27492,21 +28420,17 @@ impl CineVk {
         want_dn: bool,
         opts: &Opts,
     ) -> Result<CineVk, String> {
-        let tg = vk::tracer::VkTracer::new(
-            hg,
-            sp,
-            scene,
-            vs,
-            vt,
-            bvh,
-            rw as u32,
-            rh as u32,
-            vk::tracer::TracerOpts {
-                gbuf_full: recon,
-                feed: recon,
-                nrd: recon && want_dn,
-            },
-        )?;
+        // THE UPSCALER FIRST, THE TRACER SECOND, and the order is the cost of a
+        // refusal: `Fsr3::new` is milliseconds and needs only the device and
+        // the extents, `VkTracer::new` is the ~7.8 s kernel compile. A resize
+        // reaches this constructor AFTER `rebuild_at` has torn the old tracer
+        // down, so an FFX context that cannot be created at the new extent is
+        // better known before the compile than after it — the window is going
+        // to refuse either way (see `window_bind_upscaler`), and this is the
+        // difference between refusing at once and refusing eight seconds later.
+        // Nothing the tracer builds depends on the context; the feed is wired
+        // below, after both exist.
+        //
         // The upscaler runs at 1:1 — `--cinematic` is DLAA-shaped by design
         // (`run_cinematic_gpu` captures at 100% render scale), so the temporal
         // model is an antialiaser and integrator rather than a magnifier.
@@ -27535,6 +28459,30 @@ impl CineVk {
             }
         } else {
             None
+        };
+        let tg = match vk::tracer::VkTracer::new(
+            hg,
+            sp,
+            scene,
+            vs,
+            vt,
+            bvh,
+            rw as u32,
+            rh as u32,
+            vk::tracer::TracerOpts {
+                gbuf_full: recon,
+                feed: recon,
+                nrd: recon && want_dn,
+            },
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                // The context outlives nothing if the tracer refused.
+                if let Some(f) = up {
+                    f.destroy(hg);
+                }
+                return Err(e);
+            }
         };
         let dn = match (&up, want_dn) {
             (Some(_), true) => match tg.nrd_plane_handles() {
@@ -27607,7 +28555,6 @@ impl CineVk {
         scene: &scene::Scene,
         shot: &cinematic::Shot,
         fs: &CineFrame,
-        f: u32,
         rw: usize,
         rh: usize,
         q: Quality,
@@ -27623,7 +28570,7 @@ impl CineVk {
             let basis = fs.cam.basis(rw, rh);
             return self.accumulate(hg, scene, fs, &basis, shot.samples.max(1), q, opts);
         }
-        self.render_frame(hg, scene, shot, fs, f, rw, rh, q, opts)?;
+        self.render_frame(hg, scene, shot, fs, rw, rh, q, opts)?;
         let up = self.up.as_ref().expect("checked Some immediately above");
         up.read_output(hg)
     }
@@ -27640,7 +28587,6 @@ impl CineVk {
         scene: &scene::Scene,
         shot: &cinematic::Shot,
         fs: &CineFrame,
-        f: u32,
         rw: usize,
         rh: usize,
         q: Quality,
@@ -27665,7 +28611,17 @@ impl CineVk {
         // Self-limiting: a 256-sample still is already several phases, so the
         // extra count is 0 there. Deliberately NOT applied to the accumulation
         // arm, whose frame 0 is statistically identical to any other.
-        let warm = if f == 0 { dlss::JITTER_PHASE.saturating_sub(samples) } else { 0 };
+        //
+        // KEYED ON `seq`, NOT ON THE CALLER'S `f`: the two agree in the capture
+        // (`begin_shot` zeroes `seq` where the per-shot loop zeroes `f`), but
+        // the window's `f` is session-monotonic and a REBUILT tracer after a
+        // resize starts at `seq == 0` with `f` in the hundreds — fresh FSR3 and
+        // NRD history, `Temporal::default`'s `reset`, and no warm-up, which is
+        // exactly the soft, aliased first frame this exists to prevent, once
+        // per resize instead of once per lap. `seq` is the state that actually
+        // says "this history is empty", so it is what the warm-up reads —
+        // which is also why this method takes no frame index at all.
+        let warm = if self.seq == 0 { dlss::JITTER_PHASE.saturating_sub(samples) } else { 0 };
 
         for _ in 0..warm + samples {
             let jit = dlss::jitter_for(self.seq);
@@ -30187,6 +31143,39 @@ fn run_frd_lab(
     0
 }
 
+/// Does this `--spin` invocation ask for a GPU arm?
+///
+/// `--gpu` (the wavefront tracer) or an EXPLICIT `--dxr`. `opts.dxr` defaults
+/// ON, so its value alone cannot be read as a request — `mode_explicit` is what
+/// separates "the user asked for the DispatchRays pipeline" from "nobody said
+/// anything", and it is why a bare `--spin` drives the CPU renderer on every
+/// platform.
+///
+/// A FUNCTION RATHER THAN A CONDITION SPELLED THREE TIMES, which is the
+/// constants-in-lockstep rule applied to a predicate: the Windows dispatch in
+/// `run_spin`, its non-Windows refusal, and `main`'s pre-load guard must agree
+/// exactly or one of them times the wrong renderer. A future `run_spin_vk`
+/// replaces the arms and still cannot drift from them.
+fn spin_wants_gpu(opts: &Opts) -> bool {
+    opts.gpu || (opts.dxr && opts.mode_explicit)
+}
+
+/// Refuse a `--spin` GPU arm on a platform that has none, with the reason.
+///
+/// ONE MESSAGE, TWO CALL SITES — `main`'s guard (before the scene loads, which
+/// is the one a user notices) and `run_spin`'s backstop (which makes the
+/// refusal structural rather than dependent on there being a single caller).
+#[cfg(not(windows))]
+fn refuse_spin_gpu(opts: &Opts) -> i32 {
+    eprintln!(
+        "--spin has no GPU arm on this platform: `run_spin_gpu` is D3D12-only and the Vulkan \
+         peer is not written. Refusing rather than timing the CPU reference tracer and \
+         labelling it {}",
+        if opts.gpu { "--gpu" } else { "--dxr" }
+    );
+    2
+}
+
 /// Headless deterministic workload driver (--spin still|path): replicates
 /// the interactive frame contract — the replay/trace arm split, temporal
 /// ring rotation, cut-store pairing, recording gate — at the interactive
@@ -30215,13 +31204,8 @@ fn run_spin(
             return 2;
         }
     };
-    // GPU arms: `--gpu` (the wavefront tracer) or an EXPLICIT `--dxr`.
-    // `opts.dxr` defaults ON, so its value cannot be read as a request —
-    // `mode_explicit` is what separates "the user asked for the DispatchRays
-    // pipeline" from "nobody said anything", and that is why a bare `--spin`
-    // still drives the CPU renderer exactly as it always has.
     #[cfg(windows)]
-    if opts.gpu || (opts.dxr && opts.mode_explicit) {
+    if spin_wants_gpu(opts) {
         return run_spin_gpu(
             scene,
             bvh,
@@ -30234,6 +31218,19 @@ fn run_spin(
             warmup_override,
             opts,
         );
+    }
+    // THE STRUCTURAL BACKSTOP, and it should be unreachable: `main` refuses the
+    // same condition before the scene is loaded, which is where the refusal is
+    // USEFUL. This one is where it is SOUND — without it the `#[cfg]` above
+    // simply vanishes off Windows and an explicit `--spin --gpu` falls through
+    // to the CPU tracer, prints `spin still [hybrid]`, times the reference
+    // renderer, and hands back a table nothing in it identifies as the wrong
+    // arm. Keeping it here makes that impossible for any caller rather than for
+    // the one caller that exists today. Both read `spin_wants_gpu`, so there is
+    // no condition to drift.
+    #[cfg(not(windows))]
+    if spin_wants_gpu(opts) {
+        return refuse_spin_gpu(opts);
     }
     let warmup = warmup_override.unwrap_or(SPIN_WARMUP);
     if frames <= warmup {
@@ -36700,7 +37697,8 @@ fn session(
     // Until then frames keep presenting into the old-size swapchain and
     // DWM stretches them (DXGI_SCALING_STRETCH) — momentarily soft, never
     // broken. A minimized window reports a 0 dimension and never commits.
-    const RESIZE_SETTLE_MS: u128 = 250;
+    // The constant is module-level since B6b rung 3, because the Vulkan
+    // window debounces the same stream against the same number.
     let mut pending_resize: Option<Instant> = None;
 
     // Init is done, so the loading page comes down here rather than in
@@ -37129,10 +38127,20 @@ fn session(
                         edges.quit = true;
                         qa::info_reply("quitting")
                     }
+                    // A NAMED refusal, the Vulkan window's convention in the
+                    // other direction: `resize` exists there (B6b rung 3, where
+                    // the pump owns the window and applies `SDL_SetWindowSize`)
+                    // and not here, and `frqa`'s usage promises the session
+                    // says which rung owns a missing verb rather than "unknown".
+                    ["resize", ..] => qa::err_reply(
+                        "the D3D12 session has no resize verb — it is the Vulkan window's (B6b \
+                         rung 3); here a resize is the window manager's, and the session \
+                         re-enters at the new size",
+                    ),
                     _ => qa::err_reply(
                         "unknown verb — pos | tp x y z [yaw pitch] | look yaw pitch | tod H | \
                          drive x y z ticks | drive stop | key <name> | screenshot <path> | \
-                         sync N | quit",
+                         sync N | quit (resize is the Vulkan window's)",
                     ),
                 };
                 let _ = req.reply.send(json);

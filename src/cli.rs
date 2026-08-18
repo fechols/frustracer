@@ -2647,8 +2647,9 @@ pub fn usage() {
                 eprintln!("                against the closed form 2^(i+1)-1 px");
                 eprintln!("  --qa [port]   live AI QA control socket on 127.0.0.1 (default 4599):");
                 eprintln!("                line-in/JSON-line-out verbs driving the interactive session —");
-                eprintln!("                pos | tp | look | tod | drive | key | screenshot | sync | quit.");
-                eprintln!("                Drive it with the `frqa` client (or raw TCP)");
+                eprintln!("                pos | tp | look | tod | drive | key | screenshot | resize | sync | quit.");
+                eprintln!("                Drive it with the `frqa` client (or raw TCP); not every verb reaches");
+                eprintln!("                every backend, and a session names the rung that owns a missing one");
                 eprintln!("  --waveviz [chs]  wave-footprint overlay: every pixel wears its wave's hash");
                 eprintln!("                color (I toggles live in GPU arms, every upscaler included;");
                 eprintln!("                --spin runs dump waveviz-<arm>.png + compactness stats;");
