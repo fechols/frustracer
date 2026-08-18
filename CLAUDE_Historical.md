@@ -258,7 +258,8 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # -> docs/history/gpu-and-dxr.md
 cargo run --release -- --check-dxr    # DXR pipeline gate suite (needs a real RT GPU + the DXC DLLs;
                                       # -> docs/history/gpu-and-dxr.md
-cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (unix; src/spirv.rs
+cargo run --release -- --check-spirv  # THE CORPUS'S SHADER TOOLCHAIN, gated (any OS with a DXC drop
+                                      # -- unix-only until 2026-08-14; src/spirv.rs
                                       # -> docs/history/shader-toolchains.md
 cargo run --release -- --check-msl    # THE METAL SHADER TOOLCHAIN, gated (macOS; src/mtl/msl.rs +
                                       # -> docs/history/shader-toolchains.md

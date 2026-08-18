@@ -125,8 +125,9 @@ impl Bc7Mode {
 }
 
 impl Quality {
+    /// ASCII-case-insensitive; the CLI/settings vocabulary folds HERE.
     pub fn parse(s: &str) -> Option<Quality> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "ultrafast" => Some(Quality::UltraFast),
             "fast" => Some(Quality::Fast),
             "basic" => Some(Quality::Basic),

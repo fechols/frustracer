@@ -92,7 +92,7 @@ of NVIDIA's NRD entry names.
 | `--check-gpu` | real GPU + DXC | the wavefront tracer — **not in CI** |
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
 | `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V20 |
-| `--check-spirv` | unix + DXC/spirv-val | the whole shader corpus → SPIR-V |
+| `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
 | `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |
@@ -246,7 +246,8 @@ without a human feel-test.
 ## Flag index
 
 An **index, not documentation** — one line per family, pointing into the archive. 220 flags;
-`--help` and `src/cli.rs` are authoritative. Most `--x` features have a `--no-x` twin that
+`--help` and `src/cli.rs` are authoritative. Flag names and keyword values are ASCII-case-
+insensitive; paths, scene files and `settings:<Group>` names are taken verbatim. Most `--x` features have a `--no-x` twin that
 spells the opposite; A/B levers are generally bit-identical when off.
 
 **Scene & camera** — `<path>.obj|.gltf|.glb` (positional) · `--world` / `--no-world` ·
@@ -262,8 +263,9 @@ spells the opposite; A/B levers are generally bit-identical when off.
 `--no-adaptive`
 
 **Denoisers** (one slot) — `--nrd` (default) + the `--nrd-*` tuning family + `--nrd-perf` ·
-`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*` · `--no-rr-emis-demod`
-(the DLSS-RR emissive-demodulation A/B arm)
+`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*` · `--rr-emis-demod`
+(the DLSS-RR emissive-demodulation A/B arm, default OFF — emission rides RR's temporal
+integration; armed, an on-screen emitter no longer lifts the frame but emitters shimmer)
 
 **Lighting & sky** — `--rtgi-bounces 0..2` / `--rtgi` / `--no-rtgi` · `--emissive-lights [N]`
 `--el-cluster grid|som` · `--fireflies N` · `--no-clouds` `--cloud-shadow N` `--sky-lod K` ·

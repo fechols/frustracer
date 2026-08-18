@@ -11,17 +11,20 @@
 //! bit-rotted sidecar — is a silent miss, never a panic: every count is
 //! capped against the real file size before allocating, and the payload's
 //! cross-array links are validated before anything indexes them. Texels are
-//! deliberately NOT cached (decode is already rayon-parallel and takes
-//! seconds): the file stores each texture's resolved path + `alpha_masked`
-//! in id order and re-decodes on load, substituting a 1×1 white texture
-//! (with the cached flag) on failure — preserving ids, where a fresh load
-//! would shift them. Sidecars are per-machine derived artifacts: gitignored,
-//! never committed.
+//! deliberately NOT cached in THIS per-scene format (decode is already
+//! rayon-parallel and takes seconds): the file stores each texture's
+//! resolved path + `alpha_masked` in id order and re-decodes on load,
+//! substituting a 1×1 white texture (with the cached flag) on failure —
+//! preserving ids, where a fresh load would shift them. Sidecars are
+//! per-machine derived artifacts: gitignored, never committed.
 //!
 //! A second format shares the machinery: the WORLD sidecar
 //! (`scenes/world.fcache`, see the section at the bottom) caches the merged
-//! world Scene + BVH + layout under a multi-source key, with an INLINE
-//! texture flavor for glTF's path-less textures.
+//! world Scene + BVH + layout under a multi-source key. It is the exception
+//! to the texel rule (WORLD_VERSION 4): its warm boot was texture-bound
+//! (~4.2 s of ~4.8 s went to image re-decode + h2n/n2h re-derivation), so
+//! EVERY world texture inlines its post-conversion texels as a zstd frame.
+//! Mips are still never persisted in either format.
 //!
 //! Bump `CACHE_VERSION` on ANY change to: the Scene/Material/Texture layout,
 //! the Bvh build (node order is part of the contract), the OBJ loader, or
@@ -418,10 +421,10 @@ fn nodes_from_disk(disk: &[DiskNode]) -> Vec<BvhNode> {
 }
 
 /// One texture's on-disk record, load side. `Path` re-decodes from the file
-/// (the per-scene format's only flavor); `Inline` carries POST-conversion
-/// texels verbatim — the world format's flavor for sources with no decodable
-/// path (glTF's synthetic `"gltf:image:…"` ids, empty test sources) — and
-/// only rebuilds mips.
+/// — the PER-SCENE format's only flavor. `InlineZ` is the WORLD format's one
+/// flavor for every texture (v4): POST-conversion texels as a single zstd
+/// frame, so the warm load only decompresses and rebuilds mips — no image
+/// re-decode, no h2n/n2h re-derivation.
 enum TexRecord {
     Path {
         path: String,
@@ -430,7 +433,7 @@ enum TexRecord {
         h2n: bool,
         n2h: bool,
     },
-    Inline {
+    InlineZ {
         w: u32,
         h: u32,
         masked: bool,
@@ -438,23 +441,49 @@ enum TexRecord {
         h2n: bool,
         n2h: bool,
         source: String,
-        texels: Vec<[u8; 4]>,
+        comp: Vec<u8>,
     },
+}
+
+/// Decompress one `InlineZ` frame into exactly w×h texels. The frame carries
+/// a content checksum (store side pins it on), which libzstd verifies by
+/// default — so payload bit-rot surfaces HERE as an error, not as wrong
+/// texels downstream. Any zstd error or size mismatch is a `None` — the
+/// caller turns it into a WHOLE-cache miss,
+/// never a 1×1 fallback: the fallback exists for a vanished EXTERNAL file
+/// under a still-fresh sidecar, but inline data has no external file to
+/// blame, so a bad frame means the sidecar itself is bit-rotted and the
+/// module contract (silent miss, never degraded data) applies.
+fn decompress_texels(w: u32, h: u32, comp: &[u8]) -> Option<Vec<[u8; 4]>> {
+    let n = (w as usize).checked_mul(h as usize)?;
+    let mut v: Vec<[u8; 4]> = Vec::with_capacity(n);
+    let written = unsafe {
+        // The read_pod_vec idiom: u8 lanes, fully written before set_len.
+        let bytes = std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4);
+        zstd::bulk::Decompressor::new().ok()?.decompress_to_buffer(comp, bytes).ok()?
+    };
+    if written != n * 4 {
+        return None;
+    }
+    unsafe { v.set_len(n) };
+    Some(v)
 }
 
 /// Materialize the records IN ID ORDER; a `Path` failure keeps the slot with
 /// a 1×1 white texture carrying the cached flags so material tex ids never
 /// shift. Largest-first (LPT) scheduling via an index permutation, scattered
 /// back so ids never shift (see the scene.rs decode note — WebP's slower
-/// per-file decode makes the big-file tail dominate).
-fn decode_tex_records(recs: Vec<TexRecord>) -> Vec<Texture> {
+/// per-file decode makes the big-file tail dominate). Returns `None` — a
+/// whole-cache miss — on a corrupt `InlineZ` frame (see `decompress_texels`).
+fn decode_tex_records(recs: Vec<TexRecord>) -> Option<Vec<Texture>> {
     use rayon::prelude::*;
     let mut order: Vec<usize> = (0..recs.len()).collect();
     order.sort_by_key(|&i| {
         std::cmp::Reverse(match &recs[i] {
             TexRecord::Path { path, .. } => std::fs::metadata(path).map_or(0, |m| m.len()),
-            // An Inline "decode" is the mip rebuild — schedule by texel bytes.
-            TexRecord::Inline { texels, .. } => (texels.len() * 4) as u64,
+            // An InlineZ "decode" is the decompress + mip rebuild — both
+            // scale with the DECOMPRESSED size, not the frame's.
+            TexRecord::InlineZ { w, h, .. } => (*w as u64) * (*h as u64) * 4,
         })
     });
     // Per-slot cells so the parallel loop can MOVE each record out (inline
@@ -467,6 +496,10 @@ fn decode_tex_records(recs: Vec<TexRecord>) -> Vec<Texture> {
         .map(|&i| {
             let rec = cells[i].lock().unwrap().take().expect("each record taken once");
             let t = match rec {
+                TexRecord::InlineZ { w, h, masked, srgb, h2n, n2h, source, comp } => {
+                    let texels = decompress_texels(w, h, &comp)?;
+                    Texture::from_cached(w, h, texels, masked, srgb, source, h2n, n2h)
+                }
                 TexRecord::Path { path, masked, srgb, h2n, n2h } => {
                     let mut t = match image::open(&path) {
                         Ok(img) => Texture::from_image(img, srgb),
@@ -514,15 +547,12 @@ fn decode_tex_records(recs: Vec<TexRecord>) -> Vec<Texture> {
                     t.source = path;
                     t
                 }
-                TexRecord::Inline { w, h, masked, srgb, h2n, n2h, source, texels } => {
-                    Texture::from_cached(w, h, texels, masked, srgb, source, h2n, n2h)
-                }
             };
-            (i, t)
+            Some((i, t))
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     pairs.sort_unstable_by_key(|&(i, _)| i);
-    pairs.into_iter().map(|(_, t)| t).collect()
+    Some(pairs.into_iter().map(|(_, t)| t).collect())
 }
 
 /// Load the sidecar for an already-RESOLVED source path (see
@@ -625,7 +655,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
     }
 
     let materials: Vec<Material> = disk_mats.iter().map(mat_from_disk).collect();
-    let textures = decode_tex_records(tex_recs);
+    let textures = decode_tex_records(tex_recs)?;
     let nodes = nodes_from_disk(&disk_nodes);
 
     let mut sc = Scene {
@@ -749,12 +779,13 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
 // corruption discipline as the per-scene format; what differs is the KEY —
 // one world has many sources, so the key is a serialized blob covering every
 // curated entry's identity, PRESENCE (an island appearing on disk must miss),
-// and dependency file stats — and the TEXTURE payload, which grows an INLINE
-// flavor for sources with no decodable path (glTF's synthetic ids): their
-// post-conversion texels are stored verbatim, mips rebuilt on load. Keyed
-// additionally on `WORLD_VERSION` (world-format/layout changes — ring
-// constants ride the key blob), `CACHE_VERSION` (the shared payload repr),
-// `bvh::build_key()`, and `lever_word()`.
+// and dependency file stats — and the TEXTURE payload: every texture (v4)
+// stores its POST-conversion texels inline as one zstd frame
+// (`TEXEL_ZSTD_LEVEL`), mips rebuilt on load; path-sourced records keep a
+// per-record (size, mtime) stat gate, since the key's deps don't cover image
+// files. Keyed additionally on `WORLD_VERSION` (world-format/layout changes
+// — ring constants ride the key blob), `CACHE_VERSION` (the shared payload
+// repr), `bvh::build_key()`, and `lever_word()`.
 
 /// Bump on world-format layout changes (the key blob's shape included);
 /// `CACHE_VERSION` bumps invalidate the world sidecar too (shared repr).
@@ -765,8 +796,26 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
 //    layout meta; `foliage::attach` derives the partition from them, so a v2
 //    sidecar (empty regions ⇒ world-scale fused plants) is stale under the
 //    same key.
-pub const WORLD_VERSION: u32 = 3;
+// 4: warm-boot texel inlining — EVERY world texture (path-sourced included)
+//    stores its POST-conversion RGBA8 texels as one zstd frame
+//    (`TEXEL_ZSTD_LEVEL`, single-shot bulk = deterministic bytes), replacing
+//    the Path flavor's warm re-decode + h2n/n2h re-derivation (~4.2 s of a
+//    ~4.8 s warm world boot; the worst single texture's n2h re-solve alone
+//    was a 3.2 s single-threaded floor). The per-texture (size, mtime) stat
+//    stays for path-sourced records — still the ONLY staleness signal for a
+//    texture edit (the world key's deps don't cover image files). Mips are
+//    still never persisted. Frames carry the xxhash64 content checksum, so
+//    payload bit-rot is a DECODE error; any corrupt frame is a whole-cache
+//    miss, not a 1×1 fallback (inline data has no external file to blame).
+pub const WORLD_VERSION: u32 = 4;
 const WORLD_MAGIC: [u8; 8] = *b"FRWORLD\x01";
+
+/// The world sidecar's texel-frame compression level. Pinned, and only ever
+/// used through single-shot `zstd::bulk` (never the multithreaded stream
+/// writer): the regenerated-sidecar byte-identity property — gated by
+/// `world::self_test` — depends on the frame bytes being a pure function of
+/// (texels, level, linked libzstd).
+const TEXEL_ZSTD_LEVEL: i32 = 3;
 
 /// One curated entry's contribution to the world key. `deps` holds the
 /// RESOLVED paths of every file loading this island reads (source + mtl for
@@ -951,29 +1000,35 @@ pub fn try_load_world(
         r.read_exact(&mut flags).ok()?;
         let (masked, srgb, h2n, n2h) =
             (flags[0] != 0, flags[1] != 0, flags[2] != 0, flags[3] != 0);
+        // flags[4] = has_stat. Path-sourced textures keep the per-texture
+        // (size, mtime) gate — the world key's deps don't cover image files,
+        // so this stat is the ONLY staleness signal for a texture edit.
         match flags[4] {
-            0 => {
-                // Path flavor: the per-texture staleness stat, exactly the
-                // per-scene rule.
+            1 => {
                 let (t_size, t_mtime) = (read_u64(&mut r).ok()?, read_u64(&mut r).ok()?);
                 if stat_key(Path::new(&source)) != (t_size, t_mtime) {
                     return None;
                 }
-                tex_recs.push(TexRecord::Path { path: source, masked, srgb, h2n, n2h });
             }
-            1 => {
-                let w = read_u32(&mut r).ok()?;
-                let h = read_u32(&mut r).ok()?;
-                let n = (w as u64).checked_mul(h as u64)?;
-                if w == 0 || h == 0 {
-                    return None;
-                }
-                let texels: Vec<[u8; 4]> =
-                    read_pod_vec_checked(&mut r, n as usize, &mut remaining)?;
-                tex_recs.push(TexRecord::Inline { w, h, masked, srgb, h2n, n2h, source, texels });
-            }
+            0 => {}
             _ => return None,
         }
+        // Every v4 texture is inline-zstd: post-conversion texels, one frame.
+        // Dim caps bound a corrupt-field allocation (nothing here decodes
+        // past 4K; 16K² RGBA is 1 GiB, the read_pod_vec_checked order).
+        let w = read_u32(&mut r).ok()?;
+        let h = read_u32(&mut r).ok()?;
+        if w == 0 || h == 0 || w > 16384 || h > 16384 {
+            return None;
+        }
+        let comp_len = read_u32(&mut r).ok()? as usize;
+        if comp_len as u64 > remaining {
+            return None;
+        }
+        remaining -= comp_len as u64;
+        let mut comp = vec![0u8; comp_len];
+        r.read_exact(&mut comp).ok()?;
+        tex_recs.push(TexRecord::InlineZ { w, h, masked, srgb, h2n, n2h, source, comp });
     }
 
     let disk_nodes: Vec<DiskNode> = read_pod_vec_checked(&mut r, n_nodes, &mut remaining)?;
@@ -987,7 +1042,7 @@ pub fn try_load_world(
     }
 
     let materials: Vec<Material> = disk_mats.iter().map(mat_from_disk).collect();
-    let textures = decode_tex_records(tex_recs);
+    let textures = decode_tex_records(tex_recs)?;
     let nodes = nodes_from_disk(&disk_nodes);
 
     let mut sc = Scene {
@@ -1046,6 +1101,19 @@ pub fn store_world(
 ) {
     let tmp = path.with_extension(format!("fcache.{}.tmp", std::process::id()));
     let result = (|| -> std::io::Result<()> {
+        // The loader rejects texture dims > 16384 (its corrupt-field
+        // allocation cap), so a larger texture would yield a sidecar that
+        // misses EVERY boot — a silent full rebuild per run. Refuse to
+        // write instead: one loud line, and the run continues uncached.
+        if let Some(t) = scene.textures.iter().find(|t| t.w > 16384 || t.h > 16384) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "texture '{}' is {}x{} — over the loader's 16384 dim cap",
+                    t.source, t.w, t.h
+                ),
+            ));
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -1100,29 +1168,62 @@ pub fn store_world(
         write_pod(&mut w, &scene.tri_mat)?;
         let disk_mats: Vec<DiskMat> = scene.materials.iter().map(mat_to_disk).collect();
         write_pod(&mut w, &disk_mats)?;
-        for t in &scene.textures {
+        // v4: every texture's POST-conversion texels ride inline as ONE zstd
+        // frame — the warm load decompresses instead of re-decoding images
+        // and re-running h2n/n2h. Compressed in parallel BEFORE the
+        // sequential write pass; the indexed map+collect keeps id order and
+        // bulk::compress is single-shot, so the file bytes stay a pure
+        // function of (scene, TEXEL_ZSTD_LEVEL) — the regenerated-sidecar
+        // byte-identity gate in world::self_test.
+        let frames: Vec<Vec<u8>> = {
+            use rayon::prelude::*;
+            scene
+                .textures
+                .par_iter()
+                .map(|t| {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            t.texels.as_ptr() as *const u8,
+                            size_of_val(t.texels.as_slice()),
+                        )
+                    };
+                    // Content checksum ON (xxhash64, 4 bytes/frame): payload
+                    // bit-rot must be a decode ERROR → whole-cache miss.
+                    // Without it a flipped byte inside a RAW block (tiny or
+                    // incompressible texels) "decompresses" clean to wrong
+                    // data, and only the exact-size check would stand between
+                    // that and a served hit. Deterministic (a pure function
+                    // of content), so the byte-identity gate is unaffected.
+                    let mut c = zstd::bulk::Compressor::new(TEXEL_ZSTD_LEVEL)?;
+                    c.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+                    c.compress(bytes)
+                })
+                .collect::<std::io::Result<_>>()?
+        };
+        for (t, frame) in scene.textures.iter().zip(&frames) {
             write_u32(&mut w, t.source.len() as u32)?;
             w.write_all(t.source.as_bytes())?;
-            // A source with no decodable file path (glTF's synthetic ids,
-            // empty test sources) stores its POST-conversion texels inline —
-            // there is nothing on disk to re-decode them from.
-            let inline = t.source.starts_with("gltf:") || t.source.is_empty();
+            // has_stat: a texture with a real file path keeps the per-texture
+            // (size, mtime) staleness gate — the world key's deps don't cover
+            // image files, so this stat is the ONLY signal for a texture edit
+            // (glTF synthetic / empty test sources have no file to stat).
+            let has_stat = !(t.source.starts_with("gltf:") || t.source.is_empty());
             w.write_all(&[
                 t.alpha_masked as u8,
                 t.srgb as u8,
                 t.h2n as u8,
                 t.n2h as u8,
-                inline as u8,
+                has_stat as u8,
             ])?;
-            if inline {
-                write_u32(&mut w, t.w)?;
-                write_u32(&mut w, t.h)?;
-                write_pod(&mut w, &t.texels)?;
-            } else {
+            if has_stat {
                 let (t_size, t_mtime) = stat_key(Path::new(&t.source));
                 write_u64(&mut w, t_size)?;
                 write_u64(&mut w, t_mtime)?;
             }
+            write_u32(&mut w, t.w)?;
+            write_u32(&mut w, t.h)?;
+            write_u32(&mut w, frame.len() as u32)?;
+            w.write_all(frame)?;
         }
         write_pod(&mut w, &nodes_to_disk(bvh))?;
         write_pod(&mut w, &bvh.tri_idx)?;

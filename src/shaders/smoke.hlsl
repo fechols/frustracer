@@ -7,7 +7,12 @@
 cbuffer Push : register(b1) { uint fill_count; uint _p0; uint _p1; uint _p2; }
 
 RWStructuredBuffer<uint>  counters : register(u0); // [0]=produced, [1]=consumer bound
-RWStructuredBuffer<uint3> args     : register(u1); // DispatchIndirect (x,y,z)
+// FLAT, matching ctr.hlsli — see that file for why the corpus spells the
+// 12-byte DispatchIndirect record as three uints rather than one uint3. This
+// unit pastes nothing, so it carries its own declaration and its own writes;
+// if it kept the uint3 form it would be the one compile unit still asserting
+// the thing the port is removing.
+RWStructuredBuffer<uint>  args     : register(u1); // DispatchIndirect (x,y,z)
 RWStructuredBuffer<uint>  outbuf   : register(u2);
 
 // Stand-in for a producer pass: publish a work count via the counter.
@@ -24,7 +29,9 @@ void cs_seed(uint3 id : SV_DispatchThreadID)
 void cs_prep(uint3 id : SV_DispatchThreadID)
 {
     uint n = counters[0];
-    args[0] = uint3((n + 63) / 64, n > 0 ? 1 : 0, 1);
+    args[0] = (n + 63) / 64;
+    args[1] = n > 0 ? 1 : 0;
+    args[2] = 1;
     counters[1] = n;
 }
 

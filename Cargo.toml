@@ -69,6 +69,17 @@ intel_tex_2 = "0.5"
 # version pairs 1:1 with a Tracy server (GUI) protocol version — see the
 # Profiling section in CLAUDE.md before bumping either side.
 tracy-client = { version = "0.17.6", optional = true, default-features = false, features = ["enable", "broadcast"] }
+# The corpus's SPIR-V arm (src/spirv.rs). `libloading` is the cross-platform
+# spelling of the footprint policy every SDK in this tree already follows —
+# dlopen + dlsym at run time, nothing linked, nothing in the import table — and
+# it is the exact twin of gpu/dxc.rs's LoadLibraryExW + GetProcAddress.
+#
+# A BASE DEPENDENCY, NOT `cfg(unix)`, since --check-spirv runs on Windows: the
+# only thing that ever made src/spirv.rs unix-only was DXC's `wchar_t` width,
+# and both arms of that now exist. On Windows the crate resolves to
+# LoadLibraryExW itself, so the DLL-free bar for every OTHER --check* is
+# untouched — the library only loads when a gate asks this module to compile.
+libloading = "0.8"
 
 [features]
 tracy = ["dep:tracy-client"]
@@ -147,17 +158,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_XboxController",
 ] }
 
-# The Vulkan backend's shader toolchain (src/vk/spirv.rs). `libloading` is the
-# cross-platform spelling of the footprint policy every SDK in this tree
-# already follows — dlopen + dlsym at run time, nothing linked, nothing in the
-# import table — and it is the exact Linux twin of gpu/dxc.rs's
-# LoadLibraryExW + GetProcAddress. It costs no new download: it is already in
-# Cargo.lock via sdl3's Linux graph (dlib/glutin/clang-sys).
-#
-# unix-only because the module is, and the module is only because of ONE
-# platform fact: DXC's WinAdapter typedefs LPCWSTR as `const wchar_t*`, which
-# is 4 bytes here and 2 on Windows. Vulkan-on-Windows needs that cfg and the
-# library name flipped, nothing else — see the header in vk/spirv.rs.
+# `libloading` USED TO LIVE HERE and no longer does — it is a base dependency
+# now (see the [dependencies] block), because src/spirv.rs stopped being
+# unix-only. Nothing was added to the Windows build that it does not use: the
+# module it serves compiles there.
 #
 # `ash` is the raw Vulkan API — a generated binding, not a framework: no
 # allocator, no render graph, no policy of its own, which is what makes it the
@@ -165,11 +169,10 @@ windows = { version = "0.62", features = [
 # `loaded` feature is the same footprint policy again (it dlopens
 # libvulkan.so.1 through `libloading` and resolves every entry point by
 # symbol), so a box with no Vulkan loader gets a clean error instead of a
-# failed exec. unix-only for now for the same reason the module is: nothing
-# here forbids Vulkan on Windows, but the Windows build must not gain a
-# dependency it does not yet use.
+# failed exec. unix-only for now because `src/vk/` is: nothing here forbids
+# Vulkan on Windows — the shader half of that already moved — but the Windows
+# build must not gain a dependency it does not yet use.
 [target.'cfg(unix)'.dependencies]
-libloading = "0.8"
 ash = "0.38"
 
 # The Linux window (src/vk/present.rs, B6b rung 1). The SAME crate the Windows

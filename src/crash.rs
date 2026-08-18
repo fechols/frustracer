@@ -135,7 +135,8 @@ pub fn module_offset(module: &str, base: usize, addr: usize) -> String {
 /// pin it, and scanned from raw argv because the flag has to be readable
 /// BEFORE `cli::parse_from` runs — the `settings::headless_args` shape.
 pub fn disabled_by_args<I: IntoIterator<Item = S>, S: AsRef<str>>(args: I) -> bool {
-    args.into_iter().any(|a| a.as_ref() == "--no-crash-handler")
+    // Case-insensitive in lockstep with cli::parse_from's key folding.
+    args.into_iter().any(|a| a.as_ref().eq_ignore_ascii_case("--no-crash-handler"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1005,14 @@ pub fn self_test() -> Result<(), String> {
     }
     if disabled_by_args(["--gpu", "--no-crash"]) {
         return Err("a prefix of the flag must not disable the handler".into());
+    }
+    // The fold widens case only, never the vocabulary: mixed case matches,
+    // a mixed-case PREFIX still does not.
+    if !disabled_by_args(["--No-Crash-Handler"]) {
+        return Err("--No-Crash-Handler must fold to the kill lever".into());
+    }
+    if disabled_by_args(["--NO-CRASH"]) {
+        return Err("a folded prefix of the flag must not disable the handler".into());
     }
 
     #[cfg(windows)]

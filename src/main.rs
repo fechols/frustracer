@@ -159,13 +159,25 @@ mod sh;
 // sky call site in the renderer.
 mod sky;
 mod sphcell;
+// What a compiled SPIR-V module ASKS FOR, read back out of its own words. Not
+// under `vk/` (where it lived until the SPIR-V arm reached Windows) for exactly
+// the reason `spirv` below is not: it names no `ash` type, and its third
+// consumer — `--check-spirv`'s device-free S0 — must run where `vk/` does not
+// build. `vk::reflect` re-exports it, so every existing call site is unchanged.
+#[cfg(any(unix, windows))]
+mod reflect;
 // HLSL -> SPIR-V: the corpus's SECOND code generator, beside `gpu/dxc.rs`'s
 // DXIL. Not under `vk/` (where it lived until `--check-msl` arrived) because
-// it names no backend type and now has two consumers — Vulkan eats the SPIR-V
-// directly, Metal eats it through spirv-cross. `vk::spirv` re-exports it, so
-// every existing call site is unchanged. unix-only for the one reason its
-// header gives: DXC's `LPCWSTR` is a 4-byte `wchar_t` off Windows.
-#[cfg(unix)]
+// it names no backend type and now has THREE consumers — Vulkan eats the
+// SPIR-V directly, Metal eats it through spirv-cross, and `--check-spirv` gates
+// the corpus with no backend at all. `vk::spirv` re-exports it, so every
+// existing call site is unchanged.
+//
+// NO LONGER unix-only: DXC's `LPCWSTR` is a 4-byte `wchar_t` off Windows and a
+// 2-byte one on it, and both arms now exist. The cfg spelled here is "a
+// platform with a DXC drop and a dynamic loader" — which is what a wasm target
+// will fail, deliberately and by name, rather than by a link error.
+#[cfg(any(unix, windows))]
 mod spirv;
 mod stats;
 mod prof;
@@ -788,14 +800,18 @@ fn main() {
     if opts.exposure_bias != 0.0 {
         eprintln!("exposure-bias: {:+} EV", opts.exposure_bias);
     }
-    // DLSS-RR emissive demodulation (gfx::frame::FLAG_EMIS_DEMOD). Default ON;
-    // only a DEPARTURE prints, and it earns a line because the off arm
-    // reinstates a measured whole-frame artifact that no gate can see.
+    // DLSS-RR emissive demodulation (gfx::frame::FLAG_EMIS_DEMOD). Default OFF
+    // since 2026-08-18 (emission rides RR's temporal integration; the
+    // near-emitter whole-frame lift is the default's known-accept). Only a
+    // DEPARTURE prints — the loud line moved to the other arm with the
+    // default — and it earns one because the armed arm routes emitters
+    // AROUND temporal integration, which no gate can see.
     crate::gfx::frame::set_rr_emis_demod(opts.rr_emis_demod);
-    if !opts.rr_emis_demod {
+    if opts.rr_emis_demod {
         eprintln!(
-            "rr-emis-demod: OFF — emissive goes into DLSS-RR's colour input undemodulated \
-             (the pre-fix feed; an on-screen emitter lifts the whole frame)"
+            "rr-emis-demod: ON — primary emission is demodulated out of DLSS-RR's colour \
+             input and re-added post-RR (emitters bypass temporal integration; kills the \
+             on-screen-emitter frame lift)"
         );
     }
     autoexp::set_mode(opts.autoexp_mode);
@@ -1367,22 +1383,13 @@ fn main() {
         }
     }
     if check_spirv {
-        #[cfg(unix)]
-        {
-            let code = run_check_spirv(&scene);
-            std::process::exit(code);
-        }
-        #[cfg(not(unix))]
-        {
-            // Said, not silently skipped: the SPIR-V path is one `wchar_t`
-            // width and one library name away from working here — see the
-            // header in src/spirv.rs.
-            eprintln!(
-                "--check-spirv is unix-only today (the corpus's SPIR-V \
-                 compiler); see src/spirv.rs for what the Windows arm needs"
-            );
-            std::process::exit(2);
-        }
+        // No platform cfg any more: this gate's subject is the CORPUS, not a
+        // backend, and it now runs wherever a DXC drop does. Running it beside
+        // `gpu/dxc.rs` on Windows is the point — a front-end divergence between
+        // the tree's two code generators becomes a same-box comparison instead
+        // of a cross-CI one.
+        let code = run_check_spirv(&scene);
+        std::process::exit(code);
     }
     if check_msl {
         #[cfg(target_os = "macos")]
@@ -4918,6 +4925,33 @@ fn dn_kind(opts: &Opts) -> Option<gpu::DnKind<'_>> {
     }
 }
 
+/// Fold a possible device removal into a gate's own verdict.
+///
+/// A failure that coincides with the device going away is ambiguous, so ask
+/// the device why (see `HeadlessGpu::removal` for the mapping and the
+/// reasoning). A healthy device leaves `gate_code` untouched, so this is safe
+/// to wrap around any failure path: it can only speak when the device is
+/// actually gone.
+///
+/// Exit 2 is not a new convention here — `run_check_gpu` already answers 2 for
+/// a missing DXC and for a device that never opened. This extends the same
+/// answer to a device that opened and then vanished for a reason that was not
+/// ours.
+#[cfg(windows)]
+fn removal_verdict(hg: &gpu::trace::HeadlessGpu, gate_code: i32) -> i32 {
+    match hg.removal() {
+        None => gate_code,
+        Some((hr, why, code)) => {
+            eprintln!(
+                "check-gpu: device removed — {why}, HRESULT 0x{:08X} → exit {code} ({})",
+                hr as u32,
+                if code == 2 { "ENVIRONMENT, not a gate failure" } else { "GATE FAILURE" }
+            );
+            code
+        }
+    }
+}
+
 /// Headless GPU-tracer gate suite (M1: toolchain + dispatch plumbing).
 /// Unlike --check/--check-dlss/--check-xess this needs real hardware: a
 /// D3D12 device with RT tier 1.1 and the DXC DLL drop. Exit codes: 0 = all
@@ -7329,28 +7363,45 @@ fn run_check_gpu(
             };
             tg.write_cb(0, &p);
             if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, true)) {
-                eprintln!("check-gpu: FAIL spp wavefront dispatch: {e}");
-                return 1;
+                eprintln!("check-gpu: FAIL spp wavefront dispatch (spp={spp} probe={probe}): {e}");
+                return removal_verdict(&hg, 1);
             }
             let (wt4, wa4) =
                 match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
                     (Ok(a), Ok(b)) => (a, b),
-                    _ => {
-                        eprintln!("check-gpu: FAIL spp wavefront readback");
-                        return 1;
+                    // Name WHICH plane failed, at WHICH probe, and why. The two
+                    // dispatch arms either side of this one already print `{e}`;
+                    // swallowing it here cost a full rerun to learn anything, and
+                    // the probe list ends with the heaviest (spp=MAX_SPP) point,
+                    // so the identifying detail is exactly what got dropped.
+                    (t, a) => {
+                        let e = |r: Result<Vec<f32>, String>| r.err().unwrap_or_else(|| "ok".into());
+                        eprintln!(
+                            "check-gpu: FAIL spp wavefront readback (spp={spp} probe={probe}) — \
+                             tbuf: {} | accum: {}",
+                            e(t),
+                            e(a)
+                        );
+                        return removal_verdict(&hg, 1);
                     }
                 };
             tg.write_cb(0, &p);
             if let Err(e) = hg.run(|l| tg.record_reference(l, 0)) {
-                eprintln!("check-gpu: FAIL spp reference dispatch: {e}");
-                return 1;
+                eprintln!("check-gpu: FAIL spp reference dispatch (spp={spp} probe={probe}): {e}");
+                return removal_verdict(&hg, 1);
             }
             let (rt4, ra4) =
                 match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
                     (Ok(a), Ok(b)) => (a, b),
-                    _ => {
-                        eprintln!("check-gpu: FAIL spp reference readback");
-                        return 1;
+                    (t, a) => {
+                        let e = |r: Result<Vec<f32>, String>| r.err().unwrap_or_else(|| "ok".into());
+                        eprintln!(
+                            "check-gpu: FAIL spp reference readback (spp={spp} probe={probe}) — \
+                             tbuf: {} | accum: {}",
+                            e(t),
+                            e(a)
+                        );
+                        return removal_verdict(&hg, 1);
                     }
                 };
             // Same rules as the spp=1 wavefront/reference gate above, and for
@@ -14084,7 +14135,6 @@ fn run_check_gpu(
 /// `--no-ftree`, `--heightfield`, the `FR_*` family): they are read through
 /// `OnceLock`s, so one process is one configuration. Re-run the gate under
 /// them — the same rule `tools/dump-hlsl.ps1` states for the same reason.
-#[cfg(unix)]
 /// Every compute entry point an assembled unit declares: a `[numthreads(...)]`
 /// attribute followed by the function it decorates.
 ///
@@ -14093,7 +14143,7 @@ fn run_check_gpu(
 /// than it thinks. Deliberately narrow: it must not match the many ordinary
 /// `void foo(` helpers these units paste in, which are not entry points and
 /// fail to compile as one.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn compute_entries(src: &str) -> Vec<String> {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
@@ -14120,7 +14170,7 @@ fn compute_entries(src: &str) -> Vec<String> {
 }
 
 /// A compile unit: how to target it, and how to find its entry points.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum Shape {
     /// Compute: entries scanned out of the assembled source.
     Compute(&'static str),
@@ -14141,7 +14191,7 @@ enum Shape {
 ///
 /// `Err` is the vendor-arm anti-vacuity failure, which belongs here rather
 /// than in either caller because it is a property of the ASSEMBLY.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, String> {
     use gfx::shaders as sh;
     use gfx::vocab::Vendor;
@@ -14279,7 +14329,7 @@ fn corpus_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, St
 /// The (entry, target) jobs a unit yields, or `Err` if a compute unit yields
 /// none — anti-vacuity shared by both gates, because a unit that compiled
 /// nothing reads exactly like a unit that compiled cleanly.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn corpus_jobs(name: &str, src: &str, shape: &Shape) -> Result<Vec<(String, String)>, String> {
     use gfx::shaders as sh;
     Ok(match shape {
@@ -14303,7 +14353,12 @@ fn corpus_jobs(name: &str, src: &str, shape: &Shape) -> Result<Vec<(String, Stri
     })
 }
 
-#[cfg(unix)]
+// `any(unix, windows)`, not `unix`: the corpus's SPIR-V arm reached Windows
+// once `crate::spirv` grew its 2-byte-`wchar_t` half, and this gate's subject
+// was never the Vulkan backend — it is the corpus. The cfg names what it
+// actually needs (a DXC drop and a dynamic loader), so a wasm target fails it
+// by name rather than at link time. Same cfg on the four helpers above.
+#[cfg(any(unix, windows))]
 fn run_check_spirv(scene: &scene::Scene) -> i32 {
     let mut ok = true;
 
@@ -14322,9 +14377,14 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     // The reflector is pure SPIR-V and belongs to the same stage: it reads
     // what a module DECLARES, which is the half of the descriptor story
     // `spirv-val` cannot see (it validates a module, and knows nothing about
-    // the layout that module will be bound against). It IS Vulkan-owned,
-    // unlike the compiler above — the descriptor-set layout it feeds is.
-    match vk::reflect::self_test() {
+    // the layout that module will be bound against).
+    //
+    // `crate::reflect`, not `vk::reflect`, and this line is why: S0 is a
+    // device-free gate that now runs on Windows, where `vk/` does not build at
+    // all. It was never Vulkan-owned — what is Vulkan-owned is `vk::layout`,
+    // the one place `DescKind` meets an `ash` type. The `vk::reflect`
+    // re-export stays for the backend's own call sites.
+    match crate::reflect::self_test() {
         Ok(()) => println!("check-spirv: S0 descriptor reflection OK"),
         Err(e) => {
             eprintln!("check-spirv: FAIL S0 reflect: {e}");
@@ -26252,8 +26312,10 @@ fn run_cinematic(
     let center = (scene.content_min + scene.content_max) * 0.5;
     let radius = ((scene.content_max - scene.content_min).length() * 0.5).max(1e-3) * 2.2;
 
-    let shots = if cinematic::is_preset(sel) {
-        match cinematic::resolve_shots(sel, cine, world, cam0, center, radius) {
+    // canonical_preset folds case (`--cinematic Hero` → "hero") — the else
+    // branch keeps `sel` verbatim, because a non-preset value is a PATH.
+    let shots = if let Some(preset) = cinematic::canonical_preset(sel) {
+        match cinematic::resolve_shots(preset, cine, world, cam0, center, radius) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("cinematic: {e}");
@@ -31196,7 +31258,9 @@ fn run_spin(
     warmup_override: Option<u32>,
     opts: &Opts,
 ) -> i32 {
-    let moving = match mode {
+    // ASCII-case-insensitive; the --spin vocabulary folds HERE (cli.rs stores
+    // the value verbatim).
+    let moving = match mode.to_ascii_lowercase().as_str() {
         "still" => false,
         "path" => true,
         _ => {
