@@ -3396,3 +3396,92 @@ mod nrd_clean_room_tests {
         );
     }
 }
+
+/// `hud.hlsl`'s three source claims, pinned (B6b rung 4 — V21 is the first
+/// gate to DRAW this shader, and these are the statements V21 cannot see):
+///
+/// * its `cbuffer Params` mirrors `tonemap.hlsl`'s member for member, in
+///   order — `vk::display::Params::words` writes ONE UBO both draws read, and
+///   `gpu/hud.rs` records it through the tonemap root signature, so a member
+///   added to one and not the other is a silently misrouted `mode` (invisible
+///   on the SDR wires, where `scale` and `mode` are both 1.0);
+/// * `psmain` reads `mode` and `scale` and NEVER `exposure`,
+///   `guard_strength` or `inv_samples` — the HUD is authored in display space
+///   and must not dim with the scene (the header's own rule);
+/// * the `mode > 1.5` literal is the same test `tonemap.hlsl` makes — the
+///   "mode literals move together" note in `vk::display::Params::new`.
+#[cfg(test)]
+mod hud_shader_source_tests {
+    use super::{HUD_HLSL, TONEMAP_HLSL};
+
+    /// The member list of the FIRST `cbuffer Params { … }` block: `(type,
+    /// name)` pairs in declaration order, comments stripped.
+    fn params_members(src: &str) -> Vec<(String, String)> {
+        let start = src.find("cbuffer Params").expect("no cbuffer Params");
+        let body_start = src[start..].find('{').expect("no {") + start + 1;
+        let body_end = src[body_start..].find('}').expect("no }") + body_start;
+        let mut out = Vec::new();
+        for line in src[body_start..body_end].lines() {
+            let code = line.split("//").next().unwrap_or("").trim();
+            let Some(decl) = code.strip_suffix(';') else { continue };
+            let mut it = decl.split_whitespace();
+            let (Some(ty), Some(name)) = (it.next(), it.next()) else { continue };
+            out.push((ty.to_string(), name.to_string()));
+        }
+        out
+    }
+
+    fn psmain_body(src: &str) -> &str {
+        let start = src.find("psmain(").expect("no psmain");
+        let open = src[start..].find('{').expect("no psmain body") + start;
+        // The body ends at the matching brace — count depth.
+        let mut depth = 0i32;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("psmain body never closes");
+    }
+
+    #[test]
+    fn hud_params_block_mirrors_tonemap() {
+        let h = params_members(HUD_HLSL);
+        let t = params_members(TONEMAP_HLSL);
+        assert!(h.len() >= 9, "hud.hlsl Params has {} members — the parse is vacuous: {h:?}", h.len());
+        assert_eq!(
+            h, t,
+            "hud.hlsl's cbuffer Params must mirror tonemap.hlsl's member for member, in order \
+             (one UBO, one root-constant block, serves both draws)"
+        );
+    }
+
+    #[test]
+    fn hud_ps_reads_mode_and_scale_and_never_the_aperture() {
+        let body = psmain_body(HUD_HLSL);
+        // Strip comments before scanning — the header mentions `exposure`.
+        let code: String = body.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        assert!(code.contains("mode"), "hud psmain no longer reads `mode`");
+        assert!(code.contains("scale"), "hud psmain no longer reads `scale`");
+        for forbidden in ["exposure", "guard_strength", "inv_samples", "bloom_strength", "knee", "headroom"] {
+            assert!(
+                !code.contains(forbidden),
+                "hud psmain reads `{forbidden}` — the HUD is authored in display space and must not \
+                 take the scene's aperture or curve"
+            );
+        }
+    }
+
+    #[test]
+    fn hud_and_tonemap_test_the_same_mode_literal() {
+        assert!(HUD_HLSL.contains("mode > 1.5"), "hud.hlsl lost the `mode > 1.5` test");
+        assert!(TONEMAP_HLSL.contains("mode > 1.5"), "tonemap.hlsl lost the `mode > 1.5` test");
+    }
+}

@@ -211,9 +211,11 @@ pub fn compute_pipeline(
 ///   correct on D3D12 would discard it outright here. `gpu/tonemap.rs` sets
 ///   `D3D12_CULL_MODE_NONE` for these same shaders, so this is agreement with
 ///   the other backend, not a workaround for this one.
-/// * **No depth, no stencil, no blend.** The display stage overwrites its
-///   target. The one D3D12 pass that blends is the HUD's premultiplied arm,
-///   which is not part of this stage.
+/// * **No depth, no stencil; blend per `Blend`.** The display stage overwrites
+///   its target (`Blend::Opaque`, this wrapper's fixed choice). The one pass
+///   that blends is the HUD's premultiplied arm, `graphics_pipeline_blend`
+///   with `Blend::Premultiplied` — `gpu/tonemap.rs`'s `premultiplied_blend`
+///   mirrored: src ONE, dst ONE_MINUS_SRC_ALPHA, both colour and alpha, ADD.
 /// * **Viewport and scissor DYNAMIC**, so one pipeline serves every target
 ///   size — which is what lets a gate sweep resolutions without recompiling.
 ///
@@ -231,6 +233,34 @@ pub fn graphics_pipeline(
     ps: &[u32],
     ps_entry: &str,
     fmt: vk::Format,
+) -> Result<vk::Pipeline, String> {
+    graphics_pipeline_blend(vkd, layouts, vs, vs_entry, ps, ps_entry, fmt, Blend::Opaque)
+}
+
+/// The colour-attachment blend state a fullscreen pipeline is built with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blend {
+    /// Overwrite — every display pass but one.
+    Opaque,
+    /// Premultiplied source-over: `dst = src + dst * (1 - src.a)` for colour
+    /// AND alpha, which is `gpu/tonemap.rs::premultiplied_blend` exactly
+    /// (`SrcBlend = ONE`, not `SRC_ALPHA`: Slint hands us premultiplied
+    /// texels, and `cinematic::over_sdr` is the CPU twin of this equation).
+    Premultiplied,
+}
+
+/// `graphics_pipeline` with the blend state chosen — see that function for
+/// every other fixed choice; this one differs from it in exactly one struct.
+#[allow(clippy::too_many_arguments)]
+pub fn graphics_pipeline_blend(
+    vkd: &Vk,
+    layouts: &Layouts,
+    vs: &[u32],
+    vs_entry: &str,
+    ps: &[u32],
+    ps_entry: &str,
+    fmt: vk::Format,
+    blend: Blend,
 ) -> Result<vk::Pipeline, String> {
     let d = &vkd.device;
     let mk = |words: &[u32]| unsafe {
@@ -272,9 +302,20 @@ pub fn graphics_pipeline(
         .line_width(1.0);
     let ms = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let atts = [vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(false)
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let atts = [match blend {
+        Blend::Opaque => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(false)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
+        Blend::Premultiplied => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
+    }];
     let cb = vk::PipelineColorBlendStateCreateInfo::default().attachments(&atts);
     let dynstate = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dy = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynstate);

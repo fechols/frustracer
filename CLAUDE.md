@@ -81,7 +81,7 @@ not documentation.
 ## Gates — the test suite
 
 **There are essentially no unit tests.** `--check*` is the suite. The one exception is
-`cargo test`: 25 shader-source gates in `src/gfx/shaders.rs` plus a field-coherence probe in
+`cargo test`: 29 shader-source gates in `src/gfx/shaders.rs` plus a field-coherence probe in
 `src/gfx/guides.rs`, asserting ordering statements inside the HLSL that no CPU-only gate can
 reach — and including a clean-room **licence** scan that our assembled shaders contain none
 of NVIDIA's NRD entry names.
@@ -91,7 +91,7 @@ of NVIDIA's NRD entry names.
 | `--check` | nothing (DLL-free) | the CPU suite + every module `self_test`; writes the goldens |
 | `--check-gpu` | real GPU + DXC | the wavefront tracer — **not in CI** |
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
-| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V20 |
+| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V21 |
 | `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
 | `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip (W0 is DXC-free) |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |

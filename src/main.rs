@@ -83,7 +83,12 @@ mod hemi;
 // headless (--check, --check-dlss) stays cross-platform.
 #[cfg(windows)]
 mod gpu;
-#[cfg(windows)]
+// The SDL3 edge drain (toggle keys, the pause menu's two-mode routing). Since
+// B6b rung 4 it is "the platforms with a window" rather than Windows: the
+// Vulkan window's render thread runs the SAME drain over the events its pump
+// forwards (`Edges::feed`), so the routing table has one copy. The cfg is
+// FORCED — input.rs imports sdl3, which macOS and wasm32 do not carry.
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 mod input;
 // 500 Hz wall-clock input integrator thread (keyboard/mouse/pad -> the shared
 // camera). NOT platform-gated since B6b rung 2: the integrator is one
@@ -92,8 +97,11 @@ mod input;
 // that cannot compile the Windows half.
 mod flycam;
 // Slint-software-rendered HUD (compass/clock/keymap) + pause menu, dirty-rect
-// composited over every present arm by gpu/hud.rs.
-#[cfg(windows)]
+// composited over every present arm by gpu/hud.rs (D3D12) and vk/hud.rs
+// (Vulkan, B6b rung 4). Same cfg as `input` and the slint dependency table in
+// Cargo.toml: the platforms with a window. The CPU→GPU wire it emits
+// (`HudFrame`) lives in `gfx::hud_frame`, which is cfg-free.
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 mod hud;
 mod matclass;
 // OIDN loads its DLLs through the Win32 loader; the denoiser itself is
@@ -15617,6 +15625,17 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V21: the HUD composite, over V18's target. ----
+    //
+    // Beside V18 and BEFORE V19/V20 rather than after them, because it shares
+    // V18's two SKIP facts and none of the surface ones: it draws into an
+    // offscreen image, so it runs wherever V18 does — llvmpipe included, and
+    // therefore in CI, where V19/V20 cannot. Numbered after them because it
+    // landed after them (B6b rung 4); the order here is by what each needs.
+    if !run_check_vk_hud(&hg, &sp) {
+        ok = false;
+    }
+
     // ---- V19: the same pipeline, into a SWAPCHAIN image. ----
     //
     // Beside V18 rather than inside it: it owns a surface and a swapchain and
@@ -16000,6 +16019,660 @@ fn run_check_vk_display(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
     let ve = vk::device::validation_errors() - ve0;
     if ve > 0 {
         eprintln!("check-vk: FAIL V18 {ve} validation error(s) in the display stage");
+        ok = false;
+    }
+    ok
+}
+
+/// V21 — the HUD composite: `hud.hlsl` drawn premultiplied-over V18's
+/// tonemapped target through `vk::hud::HudVk`'s dirty-rect uploads, and scored.
+/// B6b rung 4.
+///
+/// THE FIRST GATE ANYWHERE TO SCORE THE HUD COMPOSITE. `hud.hlsl` has been in
+/// the corpus since the Windows HUD shipped, `--check-spirv` compiles it, and
+/// no stage on any backend ever DREW it and compared: the D3D12 half has no
+/// M-stage and `cinematic::over_sdr`'s own header said "no gate compares them
+/// and none is wanted". This one does, on Vulkan, at ≤ 1 LSB.
+///
+/// SYNTHETIC, AND SLINT-FREE BY DESIGN: the `HudFrame` is built from
+/// `gfx::hud_frame`'s types with hashed premultiplied texels — no font, no
+/// `slint::platform::set_platform` (once per process), no main thread — which
+/// is what lets it run headless on llvmpipe in CI. Three rects plus one STALE
+/// (over-range) rect the GPU half must clamp: R0 opaque (a = 255, so the
+/// result must equal the source bytes exactly, background-independent), R1 a
+/// mid-alpha field with per-texel alpha in {0, 0x40, 0x80, 0xC0} (the blend
+/// itself, and the a = 0 texels where the background must pass through
+/// exactly), R2 touching the right AND bottom edges (x+w == W, y+h == H).
+///
+/// V18's THREE WIRES, and hdr10 is MANDATORY for the reason `display::Params`'
+/// doc records: `ToneParams::SDR` has `scale` and `mode` both 1.0, so a HUD
+/// draw whose UBO is zeroed or whose `mode` slot is misrouted is INVISIBLE on
+/// both SDR wires (`mode > 1.5` is false for 0.0 and 1.0 alike) and only the
+/// PQ arm detects it — the exact class V20 caught on its first run.
+///
+/// FIVE FRAMES per wire, each a claim:
+///  1. hidden — the composite is STRUCTURALLY absent: byte identity with the
+///     tonemap-only render (the off-state rule; `record_to` is the wrapper).
+///  2. visible but never uploaded (once, before any stage) — `drawable()` is
+///     false, so again identity, and zero validation errors: an image read
+///     before its first upload is what the layer would name.
+///  3. full stage — inside the rects, `over_sdr`'s equation at the wire's
+///     depth, ≤ 1 LSB per channel, with the EXACT fraction and worst LSB
+///     REPORTED; where a = 0 and a = 255, exact; OUTSIDE every rect,
+///     byte-identical to frame 1 (a CLEAR-then-composite, or the HUD set
+///     clobbering the tonemap draw's t0, both fail here); upload stats equal
+///     the rect count and byte sum after clamping.
+///  4. idle — an empty stage: stats (0, 0) and byte identity with frame 3
+///     (persistence + no re-upload: the dirty-rect discipline's promise).
+///  5. partial — one sub-rect of R1 at an odd offset: stats (1, w·h·4), the
+///     new texels inside, frame 3's bytes everywhere else. A wrong
+///     `imageOffset`, a `bufferRowLength` shear, or an `UNDEFINED` old layout
+///     letting the driver discard the rest of the image all fail here — the
+///     last only on compressing hardware (RADV/DCC), which llvmpipe cannot
+///     see: a RADV-proven tooth, recorded as such.
+///
+/// ANTI-VACUITY, EVERY RUN (the M12/V18 "assert the ramp gets there" shape):
+/// three PERTURBED references are computed beside the real one and each must
+/// FAIL the same bar over the same fixture — straight-alpha over (SRC_ALPHA
+/// instead of ONE) on ≥ 50% of R1's mid-alpha texels, a one-texel x-shift on
+/// ≥ 90% of the rect texels, and on hdr10 a mode-1 passthrough on ≥ 90%. The
+/// counts print beside the pass line, so a fixture that stopped being able to
+/// see the failure it was built for reads red rather than green.
+///
+/// ≤ 1 LSB rather than exact, and measured rather than assumed: the blender's
+/// `s + d·(1−a)` is exact on a round-to-nearest implementation (the fractional
+/// parts are m/255 and never within 1e-5 of a .5 boundary), so 100% exact is
+/// expected and printed — but a driver that rounds `1−a` to the attachment's
+/// depth before the multiply is conformant and would be a false red under an
+/// exact bar. hdr10 carries V18's own 2.5e-3 (~2.5 ten-bit LSBs + the
+/// ST 2084 pair's `pow` slop).
+#[cfg(unix)]
+fn run_check_vk_hud(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use ash::vk as avk;
+    use gfx::hud_frame::{pack_rects, DirtyRect, HudFrame};
+    use vk::display::{self, Draw};
+
+    if !hg.vk.info.dynamic_rendering {
+        println!("check-vk: SKIP V21 (no dynamicRendering — see V18)");
+        return true;
+    }
+    if !hg.vk.info.graphics_queue {
+        println!("check-vk: SKIP V21 (the chosen queue family is compute-only — see V18)");
+        return true;
+    }
+
+    let ve0 = vk::device::validation_errors();
+    let mut ok = true;
+    let vkd = &hg.vk;
+
+    // ---- V18's fixture: the ramp is the background. ----
+    const TW: u32 = 64;
+    const TH: u32 = 32;
+    const RAMP_LO: f32 = 1e-3;
+    const RAMP_HI: f32 = 6.0e4;
+    let n = (TW * TH) as usize;
+    let span = (n - 3) as f32;
+    let radiance = |i: usize| -> f32 {
+        match i {
+            0 => 0.0,
+            1 => 1.0,
+            _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+        }
+    };
+    let ramp: Vec<f32> = (0..n * 3).map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3]).collect();
+    // V18's mixer, for hashed HUD payloads: uncorrelated neighbours, so a
+    // one-texel slip disagrees at essentially every texel.
+    let pat_byte = |i: usize, c: usize| -> u8 {
+        let mut h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(c as u32 * 40_503);
+        h ^= h >> 15;
+        h = h.wrapping_mul(2_246_822_519);
+        h ^= h >> 13;
+        (h & 0xff) as u8
+    };
+
+    // ---- The synthetic HUD. ----
+    // Payload of texel (x, y) under `seed`: premultiplied by construction.
+    const R0: DirtyRect = DirtyRect { x: 0, y: 0, w: 16, h: 8 };
+    const R1: DirtyRect = DirtyRect { x: 13, y: 7, w: 29, h: 11 };
+    const R2: DirtyRect = DirtyRect { x: 59, y: 27, w: 5, h: 5 };
+    const STALE: DirtyRect = DirtyRect { x: 60, y: 30, w: 10, h: 10 };
+    const PART: DirtyRect = DirtyRect { x: 15, y: 9, w: 7, h: 5 };
+    let inside = |r: DirtyRect, x: u32, y: u32| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+    let payload = |x: u32, y: u32, seed: usize| -> [u8; 4] {
+        let i = (y as usize * 131 + x as usize) * 7 + seed * 100_003;
+        let a = if inside(R0, x, y) && seed == 0 {
+            255u8
+        } else {
+            [0x00u8, 0x40, 0x80, 0xC0][(pat_byte(i, 3) % 4) as usize]
+        };
+        let c = |ch: usize| ((pat_byte(i, ch) as u32 * a as u32) / 255) as u8;
+        [c(0), c(1), c(2), a]
+    };
+    // Rasterise a rect list into a full-window model (rects in order) and
+    // return the model plus the frame `pack_rects` would ship for it.
+    let rasterise = |model: &mut Vec<[u8; 4]>, rects: &[DirtyRect], seed: usize| -> HudFrame {
+        for r in rects {
+            for y in r.y..(r.y + r.h).min(TH) {
+                for x in r.x..(r.x + r.w).min(TW) {
+                    model[(y * TW + x) as usize] = payload(x, y, seed);
+                }
+            }
+        }
+        let bytes: Vec<u8> = model.iter().flatten().copied().collect();
+        pack_rects(&bytes, TW, TH, rects.to_vec()).expect("non-empty synthetic frame")
+    };
+    // The full frame: R0, R1, R2 via the packer, PLUS the stale rect hand-built
+    // UNCLAMPED (10x10 rows of its own payload), so the GPU half's defensive
+    // clamp is the thing under test rather than the packer's.
+    let mut model_full: Vec<[u8; 4]> = vec![[0; 4]; n];
+    let mut full = rasterise(&mut model_full, &[R0, R1, R2], 0);
+    {
+        full.rects.push(STALE);
+        for y in STALE.y..STALE.y + STALE.h {
+            for x in STALE.x..STALE.x + STALE.w {
+                let p = payload(x, y, 0);
+                full.bytes.extend_from_slice(&p);
+                if x < TW && y < TH {
+                    model_full[(y * TW + x) as usize] = p;
+                }
+            }
+        }
+    }
+    let stale_cl = DirtyRect { x: 60, y: 30, w: 4, h: 2 };
+    let area = |r: DirtyRect| (r.w * r.h * 4) as usize;
+    let want_full = vk::hud::UploadStats {
+        rects: 4,
+        bytes: area(R0) + area(R1) + area(R2) + area(stale_cl),
+    };
+    let mut model_part = model_full.clone();
+    let part = rasterise(&mut model_part, &[PART], 1);
+    let want_part = vk::hud::UploadStats { rects: 1, bytes: area(PART) };
+    let in_any = |x: u32, y: u32| inside(R0, x, y) || inside(R1, x, y) || inside(R2, x, y) || inside(stale_cl, x, y);
+
+    // ---- Source, HUD image, passes per wire. ----
+    let src = match display::Image::new(
+        vkd,
+        TW,
+        TH,
+        avk::Format::R16G16B16A16_SFLOAT,
+        avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V21 source image: {e}");
+            return false;
+        }
+    };
+    if let Err(e) = display::upload_rgba16f(hg, &src, &ramp) {
+        eprintln!("check-vk: FAIL V21 ramp upload: {e}");
+        src.destroy(vkd);
+        return false;
+    }
+    let mut hud = match vk::hud::HudVk::new(hg, TW, TH) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("check-vk: FAIL V21 hud image: {e}");
+            src.destroy(vkd);
+            return false;
+        }
+    };
+    let wires: [(&str, avk::Format, tone::ToneParams); 3] = [
+        ("sdr", avk::Format::B8G8R8A8_UNORM, tone::ToneParams::SDR),
+        ("sdr10", avk::Format::A2B10G10R10_UNORM_PACK32, tone::ToneParams::SDR),
+        ("hdr10", avk::Format::A2B10G10R10_UNORM_PACK32, tone::ToneParams::hdr10(200.0, 1000.0)),
+    ];
+    let mut built: Vec<(avk::Format, display::Passes, display::Image)> = Vec::new();
+    for (_, fmt, _) in wires {
+        if built.iter().any(|(f, _, _)| *f == fmt) {
+            continue;
+        }
+        let r = display::Passes::new(hg, sp, fmt).and_then(|p| {
+            p.bind_source(vkd, src.view);
+            p.bind_overlay(vkd, hud.image.view);
+            display::Image::new(
+                vkd,
+                TW,
+                TH,
+                fmt,
+                avk::ImageUsageFlags::COLOR_ATTACHMENT | avk::ImageUsageFlags::TRANSFER_SRC,
+            )
+            .map(|t| (fmt, p, t))
+        });
+        match r {
+            Ok(b) => built.push(b),
+            Err(e) => {
+                eprintln!("check-vk: FAIL V21 display passes ({fmt:?}): {e}");
+                for (_, p, t) in &built {
+                    p.destroy(vkd);
+                    t.destroy(vkd);
+                }
+                hud.destroy(vkd);
+                src.destroy(vkd);
+                return false;
+            }
+        }
+    }
+    let find = |fmt: avk::Format| built.iter().find(|(f, _, _)| *f == fmt).unwrap();
+
+    // Decode one texel of a wire to its integer channels at the wire's depth.
+    let depth = |fmt: avk::Format| if fmt == avk::Format::B8G8R8A8_UNORM { 255u32 } else { 1023 };
+    let chans = |px: &[u8], fmt: avk::Format| -> [u32; 3] {
+        let d = display::decode(px, fmt);
+        let m = depth(fmt) as f32;
+        [(d[0] * m).round() as u32, (d[1] * m).round() as u32, (d[2] * m).round() as u32]
+    };
+    // The oracle: premultiplied over at the wire's depth (the GPU blender's
+    // equation, `cinematic::over_sdr`'s twin), in float, rounded once.
+    let over = |bg: [u32; 3], p: [u8; 4], fmt: avk::Format| -> [u32; 3] {
+        let m = depth(fmt) as f32;
+        let a = p[3] as f32 / 255.0;
+        let mut o = [0u32; 3];
+        for c in 0..3 {
+            let s = p[c] as f32 / 255.0;
+            let d = bg[c] as f32 / m;
+            o[c] = ((s + d * (1.0 - a)) * m).round().min(m) as u32;
+        }
+        o
+    };
+    // hud.hlsl's PQ arm, `tone`'s twins: un-premultiply, 2.2, scale, 2020, PQ,
+    // re-premultiply, then the same over — in float, compared in float.
+    let over_pq = |bg: [f32; 3], p: [u8; 4], scale: f32| -> [f32; 3] {
+        let a = p[3] as f32 / 255.0;
+        let rgb = if a > 0.0 {
+            glam::Vec3A::new(p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0) / a
+        } else {
+            glam::Vec3A::ZERO
+        };
+        let lin = rgb.max(glam::Vec3A::ZERO).powf(2.2) * scale;
+        let e = tone::m709_to_2020(lin);
+        let pq = [tone::pq_encode(e.x), tone::pq_encode(e.y), tone::pq_encode(e.z)];
+        let mut o = [0f32; 3];
+        for c in 0..3 {
+            o[c] = pq[c] * a + bg[c] * (1.0 - a);
+        }
+        o
+    };
+
+    // One recorded frame: optional upload, the tonemap, optional overlay.
+    let mut render = |passes: &display::Passes,
+                      target: &display::Image,
+                      hud: &mut vk::hud::HudVk,
+                      tp: tone::ToneParams,
+                      draw: Draw|
+     -> Result<(Vec<u8>, vk::hud::UploadStats), String> {
+        passes.set_params(vkd, display::Params::new(tp, 1.0, (0.0, 0.0, 0.0)))?;
+        let mut st = vk::hud::UploadStats::default();
+        hg.run(|d, cmd| {
+            st = hud.record_upload(d, cmd);
+            // `drawable()` AFTER the upload, the presenter's own order: the
+            // first staged frame uploads and composites in one recording.
+            let overlay = hud.drawable();
+            passes.record_frame(d, cmd, target.img, target.view, target.w, target.h, draw, overlay);
+        })?;
+        Ok((display::read_target(hg, target, 4)?, st))
+    };
+
+    // ---- Frame 2, once: visible but never uploaded → structurally absent. ----
+    {
+        let (fmt, passes, target) = find(avk::Format::B8G8R8A8_UNORM);
+        hud.visible = true;
+        if hud.drawable() {
+            eprintln!("check-vk: FAIL V21 drawable() before any upload");
+            ok = false;
+        }
+        hud.visible = false;
+        let bg = render(passes, target, &mut hud, tone::ToneParams::SDR, Draw::Tonemap);
+        hud.visible = true;
+        let f2 = render(passes, target, &mut hud, tone::ToneParams::SDR, Draw::Tonemap);
+        match (bg, f2) {
+            (Ok((bg, _)), Ok((f2, st))) => {
+                if st != vk::hud::UploadStats::default() {
+                    eprintln!("check-vk: FAIL V21 an unstaged frame uploaded {st:?}");
+                    ok = false;
+                } else if f2 != bg {
+                    eprintln!("check-vk: FAIL V21 ({fmt:?}) unuploaded HUD changed the frame");
+                    ok = false;
+                } else {
+                    println!("check-vk: V21 unuploaded HUD is structurally absent (byte identity, {} texels)", n);
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("check-vk: FAIL V21 frame 2 render: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    // ---- Frames 1, 3, 4, 5 per wire. ----
+    let hdr_scale = tone::ToneParams::hdr10(200.0, 1000.0).scale;
+    for (label, fmt, tp) in wires {
+        let (_, passes, target) = find(fmt);
+        let is_pq = tp.mode == tone::ToneMode::Pq;
+        let tol_pq = 2.5e-3f32;
+
+        // 1. hidden (overlay off) and the tonemap-only wrapper: identical.
+        hud.visible = false;
+        let f1 = render(passes, target, &mut hud, tp, Draw::Tonemap);
+        let plain = (|| -> Result<Vec<u8>, String> {
+            passes.set_params(vkd, display::Params::new(tp, 1.0, (0.0, 0.0, 0.0)))?;
+            hg.run(|d, cmd| passes.record(d, cmd, target, true))?;
+            display::read_target(hg, target, 4)
+        })();
+        let bg = match (f1, plain) {
+            (Ok((f1, _)), Ok(plain)) => {
+                if f1 != plain {
+                    eprintln!("check-vk: FAIL V21 ({label}) hidden HUD is not byte-identical to the tonemap-only render");
+                    ok = false;
+                }
+                f1
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("check-vk: FAIL V21 ({label}) frame 1: {e}");
+                ok = false;
+                continue;
+            }
+        };
+
+        // 3. full stage.
+        hud.visible = true;
+        hud.stage(HudFrame { rects: full.rects.clone(), bytes: full.bytes.clone() });
+        let (f3, st3) = match render(passes, target, &mut hud, tp, Draw::Tonemap) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("check-vk: FAIL V21 ({label}) frame 3: {e}");
+                ok = false;
+                continue;
+            }
+        };
+        if st3 != want_full {
+            eprintln!(
+                "check-vk: FAIL V21 ({label}) full-stage upload stats {st3:?}, want {want_full:?} \
+                 (the stale rect must clamp to 4x2, never drop and never overrun)"
+            );
+            ok = false;
+        }
+        // Score frame 3 against the model.
+        let score = |got: &[u8], model: &[[u8; 4]], prev: &[u8], tag: &str, ok: &mut bool| -> (usize, usize, u32) {
+            let mut exact = 0usize;
+            let mut blended = 0usize;
+            let mut worst = 0u32;
+            let mut worst_pq = 0f32;
+            let mut bad = 0usize;
+            let mut outside_bad = 0usize;
+            let mut alpha_bad = 0usize;
+            let mut first: Option<String> = None;
+            for i in 0..n {
+                let (x, y) = (i as u32 % TW, i as u32 / TW);
+                let px = &got[i * 4..i * 4 + 4];
+                let p = model[i];
+                if !in_any(x, y) || p[3] == 0 {
+                    // Background must pass through BYTE-IDENTICAL.
+                    if px != &prev[i * 4..i * 4 + 4] {
+                        outside_bad += 1;
+                        if first.is_none() {
+                            first = Some(format!("background texel ({x},{y}) changed"));
+                        }
+                    }
+                    continue;
+                }
+                if display::decode_alpha(px, fmt) < 1.0 {
+                    alpha_bad += 1;
+                }
+                if is_pq {
+                    let want = over_pq(display::decode(&prev[i * 4..i * 4 + 4], fmt), p, hdr_scale);
+                    let have = display::decode(px, fmt);
+                    let d = (0..3).map(|c| (have[c] - want[c]).abs()).fold(0f32, f32::max);
+                    if d > worst_pq {
+                        worst_pq = d;
+                    }
+                    if d > tol_pq {
+                        bad += 1;
+                        if first.is_none() {
+                            first = Some(format!("({x},{y}) a={} want {want:?} got {have:?}", p[3]));
+                        }
+                    } else {
+                        blended += 1;
+                    }
+                } else {
+                    let want = over(chans(&prev[i * 4..i * 4 + 4], fmt), p, fmt);
+                    let have = chans(px, fmt);
+                    let d = (0..3).map(|c| have[c].abs_diff(want[c])).max().unwrap();
+                    if d > worst {
+                        worst = d;
+                    }
+                    // Opaque texels must be EXACT on the 8-bit wire (an 8-bit
+                    // source into an 8-bit target, no arithmetic) — and only
+                    // there: MEASURED on RADV, the same source expanded into
+                    // the 10-bit wire lands 1 LSB low on ~10% of opaque
+                    // texels (the fragment export quantises before the 10-bit
+                    // write), so at ten bits the bar is ≤ 1 LSB like every
+                    // other texel, and the x-shift tooth covers the mapping.
+                    let exact_required = p[3] == 255 && fmt == avk::Format::B8G8R8A8_UNORM;
+                    if d == 0 {
+                        exact += 1;
+                    }
+                    if (exact_required && d != 0) || d > 1 {
+                        bad += 1;
+                        if first.is_none() {
+                            first = Some(format!("({x},{y}) a={} want {want:?} got {have:?}", p[3]));
+                        }
+                    } else if !exact_required {
+                        blended += 1;
+                    }
+                }
+            }
+            if bad > 0 || outside_bad > 0 || alpha_bad > 0 {
+                eprintln!(
+                    "check-vk: FAIL V21 ({label}) {tag}: {bad} texel(s) off, {outside_bad} \
+                     background texel(s) changed, {alpha_bad} with alpha below max — first: {}",
+                    first.unwrap_or_default()
+                );
+                *ok = false;
+            }
+            (exact, blended, if is_pq { (worst_pq * 1e4) as u32 } else { worst })
+        };
+        let (exact, blended, worst) = score(&f3, &model_full, &bg, "full stage", &mut ok);
+        if is_pq {
+            println!(
+                "check-vk: V21 hud composite ({label}) == PQ-over within {tol_pq:.1e} over {blended} texels \
+                 (worst {:.2e}); background byte-identical outside the rects; stats {st3:?}",
+                worst as f32 / 1e4
+            );
+        } else {
+            let total = exact + blended;
+            println!(
+                "check-vk: V21 hud composite ({label}) == premultiplied over at ≤ 1 LSB, {:.1}% exact \
+                 ({exact}/{total}), worst {worst} LSB; background byte-identical outside the rects; stats {st3:?}",
+                100.0 * exact as f32 / total.max(1) as f32
+            );
+        }
+        // The `over_sdr` pin, on the 8-bit wire only: the cinematic CPU
+        // composite and this draw agree to ≤ 1 LSB on every blended texel.
+        // Beside it, REPORTED rather than asserted, which rounding the
+        // blender on this device actually matches exactly — float-round (the
+        // oracle above), float-truncate, or `over_sdr`'s integer +127 — so the
+        // write-up can say what "≤ 1 LSB" is hiding on each ICD.
+        if fmt == avk::Format::B8G8R8A8_UNORM {
+            let mut off = 0usize;
+            let (mut ex_round, mut ex_trunc, mut ex_127, mut mid) = (0usize, 0usize, 0usize, 0usize);
+            for i in 0..n {
+                let p = model_full[i];
+                if p[3] == 0 {
+                    continue;
+                }
+                let b = &bg[i * 4..i * 4 + 4];
+                let packed = ((b[2] as u32) << 16) | ((b[1] as u32) << 8) | b[0] as u32;
+                let o = cinematic::over_sdr(packed, p[0], p[1], p[2], p[3]);
+                let want = [(o >> 16) & 0xff, (o >> 8) & 0xff, o & 0xff];
+                let g = &f3[i * 4..i * 4 + 4];
+                let have = [g[2] as u32, g[1] as u32, g[0] as u32];
+                if (0..3).any(|c| have[c].abs_diff(want[c]) > 1) {
+                    off += 1;
+                }
+                if p[3] != 255 {
+                    mid += 1;
+                    let bgc = [b[2] as u32, b[1] as u32, b[0] as u32];
+                    let a = p[3] as f32 / 255.0;
+                    let f = |c: usize| p[c] as f32 + bgc[c] as f32 * (1.0 - a);
+                    let r: Vec<u32> = (0..3).map(|c| f(c).round() as u32).collect();
+                    let t: Vec<u32> = (0..3).map(|c| f(c) as u32).collect();
+                    if have[..] == r[..] {
+                        ex_round += 1;
+                    }
+                    if have[..] == t[..] {
+                        ex_trunc += 1;
+                    }
+                    if have == want {
+                        ex_127 += 1;
+                    }
+                }
+            }
+            if off > 0 {
+                eprintln!("check-vk: FAIL V21 (sdr) {off} texel(s) differ from cinematic::over_sdr by > 1 LSB");
+                ok = false;
+            } else {
+                println!(
+                    "check-vk: V21 (sdr) cinematic::over_sdr agrees to ≤ 1 LSB on every blended texel; \
+                     exact matches over {mid} mid-alpha texels: float-round {ex_round}, float-trunc {ex_trunc}, \
+                     over_sdr(+127) {ex_127} (reported, not asserted — which rounding this ICD's blender runs)"
+                );
+            }
+        }
+
+        // Anti-vacuity: the perturbed references must FAIL the same bar.
+        {
+            let mut mid = 0usize;
+            let mut straight_off = 0usize;
+            let mut rect = 0usize;
+            let mut shift_off = 0usize;
+            let mut pass_off = 0usize;
+            for i in 0..n {
+                let (x, y) = (i as u32 % TW, i as u32 / TW);
+                let p = model_full[i];
+                if p[3] == 0 || !in_any(x, y) {
+                    continue;
+                }
+                let px = &f3[i * 4..i * 4 + 4];
+                let prev = &bg[i * 4..i * 4 + 4];
+                rect += 1;
+                if is_pq {
+                    // mode-1 passthrough: the raw premultiplied texel over PQ.
+                    let a = p[3] as f32 / 255.0;
+                    let b = display::decode(prev, fmt);
+                    let want: Vec<f32> = (0..3).map(|c| p[c] as f32 / 255.0 + b[c] * (1.0 - a)).collect();
+                    let have = display::decode(px, fmt);
+                    if (0..3).map(|c| (have[c] - want[c]).abs()).fold(0f32, f32::max) > tol_pq {
+                        pass_off += 1;
+                    }
+                } else {
+                    let have = chans(px, fmt);
+                    if p[3] != 255 {
+                        mid += 1;
+                        // Straight alpha: s·a + d·(1−a) with s the premultiplied
+                        // bytes read as straight.
+                        let m = depth(fmt) as f32;
+                        let a = p[3] as f32 / 255.0;
+                        let bgc = chans(prev, fmt);
+                        let want: Vec<u32> = (0..3)
+                            .map(|c| ((p[c] as f32 / 255.0 * a + bgc[c] as f32 / m * (1.0 - a)) * m).round() as u32)
+                            .collect();
+                        if (0..3).any(|c| have[c].abs_diff(want[c]) > 1) {
+                            straight_off += 1;
+                        }
+                    }
+                    // One-texel x-shift: the model at (x−1, y) composited here.
+                    if x > 0 {
+                        let q = model_full[i - 1];
+                        let want = over(chans(prev, fmt), q, fmt);
+                        if (0..3).any(|c| have[c].abs_diff(want[c]) > 1) {
+                            shift_off += 1;
+                        }
+                    }
+                }
+            }
+            if is_pq {
+                if pass_off * 10 < rect * 9 {
+                    eprintln!("check-vk: FAIL V21 ({label}) VACUOUS — a mode-1 passthrough reference differs on only {pass_off}/{rect} texels");
+                    ok = false;
+                } else {
+                    println!("check-vk: V21 ({label}) teeth: passthrough reference differs on {pass_off}/{rect}");
+                }
+            } else {
+                if straight_off * 2 < mid {
+                    eprintln!("check-vk: FAIL V21 ({label}) VACUOUS — a straight-alpha reference differs on only {straight_off}/{mid} mid-alpha texels");
+                    ok = false;
+                }
+                if shift_off * 10 < rect * 9 {
+                    eprintln!("check-vk: FAIL V21 ({label}) VACUOUS — a one-texel shifted reference differs on only {shift_off}/{rect} rect texels");
+                    ok = false;
+                }
+                println!("check-vk: V21 ({label}) teeth: straight-alpha {straight_off}/{mid}, x-shift {shift_off}/{rect} differ");
+            }
+        }
+
+        // 4. idle: nothing staged → (0, 0) and byte identity with frame 3.
+        match render(passes, target, &mut hud, tp, Draw::Tonemap) {
+            Ok((f4, st4)) => {
+                if st4 != vk::hud::UploadStats::default() {
+                    eprintln!("check-vk: FAIL V21 ({label}) idle frame uploaded {st4:?}");
+                    ok = false;
+                } else if f4 != f3 {
+                    eprintln!("check-vk: FAIL V21 ({label}) idle frame differs from the staged one — the image did not persist");
+                    ok = false;
+                } else {
+                    println!("check-vk: V21 ({label}) idle: 0 rects, 0 bytes, byte identity");
+                }
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V21 ({label}) frame 4: {e}");
+                ok = false;
+            }
+        }
+
+        // 5. partial: one sub-rect; inside new, outside frame 3's bytes.
+        hud.stage(HudFrame { rects: part.rects.clone(), bytes: part.bytes.clone() });
+        match render(passes, target, &mut hud, tp, Draw::Tonemap) {
+            Ok((f5, st5)) => {
+                if st5 != want_part {
+                    eprintln!("check-vk: FAIL V21 ({label}) partial upload stats {st5:?}, want {want_part:?}");
+                    ok = false;
+                }
+                let mut outside_bad = 0usize;
+                for i in 0..n {
+                    let (x, y) = (i as u32 % TW, i as u32 / TW);
+                    if !inside(PART, x, y) && f5[i * 4..i * 4 + 4] != f3[i * 4..i * 4 + 4] {
+                        outside_bad += 1;
+                    }
+                }
+                if outside_bad > 0 {
+                    eprintln!(
+                        "check-vk: FAIL V21 ({label}) partial upload touched {outside_bad} texel(s) outside its rect \
+                         (offset/row-length shear, or an UNDEFINED old layout discarding the image)"
+                    );
+                    ok = false;
+                }
+                let _ = score(&f5, &model_part, &bg, "partial", &mut ok);
+                if outside_bad == 0 {
+                    println!("check-vk: V21 ({label}) partial: 1 rect, {} bytes, the rest untouched", want_part.bytes);
+                }
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V21 ({label}) frame 5: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    for (_, p, t) in &built {
+        p.destroy(vkd);
+        t.destroy(vkd);
+    }
+    hud.destroy(vkd);
+    src.destroy(vkd);
+
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!("check-vk: FAIL V21 {ve} validation error(s) in the HUD composite");
         ok = false;
     }
     ok
@@ -29289,9 +29962,9 @@ fn cine_write_frame(
         // Exposure 1.0 — cinematic's own `-exposure` is applied to the LINEAR
         // radiance upstream (the one-write-site rule), never through the curve.
         render::resolve_hdr(hdr, info, shot.overlay, 1.0, None, present, rw, rh, rw, rh);
-        #[cfg(windows)]
+        #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
         cine_composite_hud(present, shot, fs, rw, rh, mode);
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
         let _ = (fs, mode);
         save_png(&cine_frame_path(dir, shot, f), present, rw, rh);
     }
@@ -30663,7 +31336,12 @@ fn run_cinematic_gpu(
 /// frame would be caught mid-fade-in. `moving`/`tod_moved` are passed true to
 /// hold every element awake, and `Hud::settle` runs the animation to rest
 /// before the first captured frame.
-#[cfg(windows)]
+///
+/// CPU compositing over the present buffer every capture arm produces, so it is
+/// the platforms-with-a-window cfg rather than Windows: on Linux it rides the
+/// Vulkan capture arm (and, incidentally, is the cheapest headless proof that
+/// Slint + fontconfig rasterise on the box).
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 fn cine_composite_hud(
     present: &mut [u32],
     shot: &cinematic::Shot,
@@ -33184,6 +33862,49 @@ fn run_check(
             eprintln!("flycam self-test: FAIL — {e}");
             false
         }
+    };
+
+    // The HUD's CPU→GPU wire (`gfx::hud_frame`, B6b rung 4): the packer's
+    // byte count, row content, edge exactness, clamp-then-drop and rect-ORDER
+    // contracts — the layout both `gpu/hud.rs` and `vk/hud.rs` compute their
+    // source offsets from. cfg-free, so it runs on every platform.
+    let hud_frame_ok = match gfx::hud_frame::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("hud-frame self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // The SDL3 routing table (`input::Edges::feed`) in both menu modes, and the
+    // SDL→Slint translation (`hud::events::translate`) including its negative
+    // (a letter KeyDown translates to nothing). Neither needs a window, a
+    // font or a Slint instance — hand-built events through the pure halves —
+    // so they run wherever the modules compile: the platforms with a window.
+    // macOS has neither module (no sdl3 there), and SAYS so rather than
+    // reporting a gate that never ran (the `quin_ok` rule below).
+    #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+    let (input_ok, hud_events_ok) = (
+        match input::self_test() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("input self-test: FAIL — {e}");
+                false
+            }
+        },
+        match hud::events::self_test() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("hud-events self-test: FAIL — {e}");
+                false
+            }
+        },
+    );
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    let (input_ok, hud_events_ok) = {
+        eprintln!("input self-test: SKIP (no window on this platform — input.rs is not compiled)");
+        eprintln!("hud-events self-test: SKIP (no window on this platform — hud/ is not compiled)");
+        (true, true)
     };
 
     // Foliage sway (the v0 leaf-sway prototype): the leaf-mask anchors, the
@@ -36063,6 +36784,9 @@ fn run_check(
         ("dual-gpu-transfer", dual_ok),
         ("shadeclass", shadeclass_ok),
         ("flycam", flycam_ok),
+        ("hud-frame", hud_frame_ok),
+        ("input", input_ok),
+        ("hud-events", hud_events_ok),
         ("foliage", foliage_ok),
         ("sway-mv", sway_mv_ok),
         ("reproject", reproj_ok),
@@ -36115,7 +36839,7 @@ fn run_check(
 /// descriptor (settings::menu_items) rendered against the live session state
 /// + the persisted file. Control tags mirror settings::Control for the
 /// markup's row dispatch.
-#[cfg(windows)]
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 fn build_menu_rows(
     cfg: &settings::Settings,
     live: &settings::LiveView,

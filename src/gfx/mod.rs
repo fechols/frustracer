@@ -46,6 +46,7 @@
 pub mod denoise;
 pub mod frame;
 pub mod guides;
+pub mod hud_frame;
 pub mod scene;
 pub mod shaders;
 pub mod texweb;

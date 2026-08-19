@@ -1,6 +1,6 @@
 # The Vulkan backend
 
-The `--check-vk` gate suite, stages V0 through V20 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths (V19), and the present path across a swapchain rebuild (V20). The single largest entry in the notebook.
+The `--check-vk` gate suite, stages V0 through V21 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths (V19), the present path across a swapchain rebuild (V20), and the HUD composite over the display stage (V21). The single largest entry in the notebook.
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 

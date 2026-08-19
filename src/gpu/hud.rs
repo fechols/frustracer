@@ -26,7 +26,7 @@ use super::d3d12::{
     UploadBuffer, FRAMES_IN_FLIGHT,
 };
 use super::tonemap::{self, Passes};
-use crate::hud::{DirtyRect, HudFrame};
+use crate::gfx::hud_frame::{DirtyRect, HudFrame};
 use std::cell::{Cell, RefCell};
 use windows::core::s;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;

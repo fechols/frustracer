@@ -56,21 +56,10 @@ const HUD_LINGER: std::time::Duration = std::time::Duration::from_millis(4000);
 const GRAPH_BARS: usize = 40;
 const GRAPH_TICK: std::time::Duration = std::time::Duration::from_millis(125);
 
-/// One changed region of the HUD buffer, in pixels.
-#[derive(Clone, Copy, Debug)]
-pub struct DirtyRect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-/// A frame's changed pixels: each rect's rows tightly packed (`w*4` bytes per
-/// row), concatenated in rect order. `gpu/hud.rs` consumes this layout.
-pub struct HudFrame {
-    pub rects: Vec<DirtyRect>,
-    pub bytes: Vec<u8>,
-}
+// The CPU→GPU wire MOVED to `gfx::hud_frame` (B6b rung 4) so the Vulkan half
+// and its headless gate can name it without this module's slint/sdl3 cfg;
+// re-exported here so every existing call site is untouched (gfx's rule).
+pub use crate::gfx::hud_frame::{DirtyRect, HudFrame};
 
 /// Menu events for the session loop, queued by the Slint callbacks during
 /// event dispatch (inside `input::Input::poll`'s forwarding mode) and drained
@@ -832,9 +821,10 @@ impl Hud {
 
     /// Advance Slint timers/animations, re-rasterize only the dirty region,
     /// and pack it into a `HudFrame` (or `None` when nothing changed). The
-    /// pack layout is a cross-module contract with gpu/hud.rs — the ONE copy,
-    /// shared by `frame` (the session HUD) and `loading_frame` (the loading
-    /// screen), so the two can never disagree about a row's byte length.
+    /// pack layout is a cross-module contract with the backend hud modules —
+    /// `gfx::hud_frame::pack_rects` is the ONE copy, shared by `frame` (the
+    /// session HUD), `loading_frame` (the loading screen) and V21's synthetic
+    /// fixture, so none of them can disagree about a row's byte length.
     fn raster(&mut self) -> Option<HudFrame> {
         slint::platform::update_timers_and_animations();
 
@@ -859,32 +849,31 @@ impl Hud {
             self.force_full = false;
             rects = vec![DirtyRect { x: 0, y: 0, w: self.w, h: self.h }];
         }
-        // Clamp to the buffer FIRST so the packed bytes and the rect list can
-        // never disagree about a row's length (Slint shouldn't produce
-        // out-of-bounds rects, but the packing layout is a cross-module
-        // contract with gpu/hud.rs — make it true by construction).
-        for r in &mut rects {
-            r.x = r.x.min(self.w);
-            r.y = r.y.min(self.h);
-            r.w = r.w.min(self.w - r.x);
-            r.h = r.h.min(self.h - r.y);
-        }
-        rects.retain(|r| r.w > 0 && r.h > 0);
-        if rects.is_empty() {
-            return None;
-        }
-
-        // Pack each rect's rows tightly, in rect order (gpu/hud.rs's layout).
-        let bytes_len: usize = rects.iter().map(|r| (r.w * r.h * 4) as usize).sum();
+        // Clamp to the buffer, drop empties and pack each rect's rows tightly
+        // in rect order — `gfx::hud_frame::pack_rects`, the one writer of the
+        // layout (Slint shouldn't produce out-of-bounds rects, but the packer
+        // clamps FIRST so the bytes and the rect list agree by construction).
+        let src: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.buf.len() * 4)
+        };
+        let frame = crate::gfx::hud_frame::pack_rects(src, self.w, self.h, rects)?;
         // FRUSTRACER_HUD_STATS=1: one line per NON-EMPTY upload — the
         // dirty-rect acceptance probe. A still HUD must print nothing at all
         // between clock-minute ticks; a ticking digit is a few KB, never a
         // window-sized copy.
         static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *STATS.get_or_init(|| std::env::var_os("FRUSTRACER_HUD_STATS").is_some()) {
-            let list: Vec<String> =
-                rects.iter().map(|r| format!("{}x{}+{}+{}", r.w, r.h, r.x, r.y)).collect();
-            eprintln!("hud: {} dirty rect(s), {} bytes [{}]", rects.len(), bytes_len, list.join(" "));
+            let list: Vec<String> = frame
+                .rects
+                .iter()
+                .map(|r| format!("{}x{}+{}+{}", r.w, r.h, r.x, r.y))
+                .collect();
+            eprintln!(
+                "hud: {} dirty rect(s), {} bytes [{}]",
+                frame.rects.len(),
+                frame.bytes.len(),
+                list.join(" ")
+            );
             // FRUSTRACER_HUD_STATS also dumps the CPU buffer (straight alpha)
             // each dirty frame — the ground truth for "what did Slint render".
             let px: Vec<u8> = self
@@ -905,17 +894,7 @@ impl Hud {
                 image::ColorType::Rgba8,
             );
         }
-        let mut bytes = Vec::with_capacity(bytes_len);
-        let src: &[u8] = unsafe {
-            std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.buf.len() * 4)
-        };
-        for r in &rects {
-            for row in r.y..r.y + r.h {
-                let o = (row as usize * self.w as usize + r.x as usize) * 4;
-                bytes.extend_from_slice(&src[o..o + r.w as usize * 4]);
-            }
-        }
-        Some(HudFrame { rects, bytes })
+        Some(frame)
     }
 
     /// Composite the HUD over an SDR `0x00RRGGBB` present buffer, premultiplied
