@@ -66,9 +66,9 @@
 //! rather than five `Option`s on `Trio` precisely because of that un-share
 //! condition — its own doc gives the argument.
 //!
-//! `msl`, `bind` and `smoke` are the modules here that are not G-buffer
-//! consumers. They are the tracer's first two rungs rather than more arms
-//! beside the others:
+//! `msl`, `bind`, `smoke` and `texprobe` are the modules here that are not
+//! G-buffer consumers. They are the tracer's first three rungs rather than more
+//! arms beside the others:
 //!
 //! * `msl` (C1) — the corpus's third code generator, HLSL -> SPIR-V -> MSL ->
 //!   `.metallib`, gated by `--check-msl`. It renders nothing and binds nothing
@@ -84,6 +84,11 @@
 //!   fill, the same `smoke.hlsl` D3D12 and Vulkan each run as their own first
 //!   dispatch. Gated by `--check-mtl`, which is to `--check-msl` what
 //!   `--check-vk` is to `--check-spirv`.
+//! * `texprobe` (C3) — the list `bind.rs` used to name as out of scope, bound
+//!   and DISPATCHED: a texture, samplers, a second and third descriptor set,
+//!   and the tier-2 unbounded `texs[]` array. Its subject `mtlbind.hlsl` had
+//!   been in the shared corpus and executed by nothing, which is the exact gap
+//!   the `samp_lin` miscompile hid in for eight months. `--check-mtl` K6/K7/K8.
 //!
 //! It also retired the premise the tracer plan was written on: **spirv-cross
 //! lowers `RayQuery` to Metal**, so `leaf`/`reference`/`leaf_fb`/`hemi_leaf`
@@ -106,3 +111,4 @@ pub mod mfxfi;
 pub mod msl;
 pub mod planes;
 pub mod smoke;
+pub mod texprobe;

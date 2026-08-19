@@ -857,9 +857,11 @@ jobs:
       # TOOLCHAIN (spirv-cross + `xcrun metal`, both already installed above for
       # FidelityFX) and no GPU at all, so the paravirtual device that makes
       # MetalFX skip is irrelevant to it. It compiles the whole shipping corpus
-      # to `.metallib` — 65 of 78 modules, the other 13 being two NAMED classes
-      # its M5 line reports — so a break in the assembly, the arg set, or the
-      # Metal front end fails here on every push.
+      # to `.metallib` — 78 of 83 modules, the other 5 being the ONE named class
+      # its M5 line reports (`dxr-lib`, which Metal has no analogue for) — so a
+      # break in the assembly, the arg set, or the Metal front end fails here on
+      # every push. (Was "65 of 78 … two NAMED classes": C3 added the mtlbind
+      # probe's three entry points and retired `Expect::ToolDefect`.)
       #
       # GUARDED ON M3/M4, not just on PASSED: the gate SKIPs (exit 0) when the
       # toolchain is absent, so PASSED alone would go green on an image that
@@ -888,10 +890,19 @@ jobs:
       # it is a separate flag from --check-msl rather than more M-stages — that
       # gate's whole value here is that it needs no GPU at all.
       #
-      # GUARDED ON K4, not just on PASSED, for the reason the two above already
-      # carry: K1/K2 SKIP (exit 0) when the device or the toolchain is absent,
-      # so PASSED alone would go green on a runner that lost either. K4 is the
-      # line only a real dispatch prints. WHAT IS UNMEASURED ON THIS RUNNER is
+      # GUARDED ON K4 AND K8, not just on PASSED, for the reason the two above
+      # already carry: K1/K2 SKIP (exit 0) when the device or the toolchain is
+      # absent, so PASSED alone would go green on a runner that lost either. K4
+      # is the line only a real dispatch prints.
+      #
+      # K8 IS THE SECOND GUARD AND IT IS K8 RATHER THAN K6 ON PURPOSE. C3 added
+      # three stages; K8 is the LAST of them and the only one that proves the
+      # multi-set derivation ran, so a K6-only guard would go green on a build
+      # where K7 and K8 had been commented out. Both greps are kept: a K8-only
+      # guard would miss the smoke chain silently skipping, and the two stages
+      # fail for entirely different reasons.
+      #
+      # WHAT IS UNMEASURED ON THIS RUNNER is
       # argument-buffer tier 2 — K1 SKIPs on tier 1, which is an environment
       # fact rather than a failure, and the K4 guard is what turns that skip
       # into a red job instead of a quiet pass. If the first run reports tier 1,
@@ -926,6 +937,8 @@ jobs:
             || { echo "::error::--check-mtl did not pass"; rc=1; }
           grep -q "check-mtl: K4" mtl.log \
             || { echo "::error::--check-mtl dispatched nothing — a stage skipped:"; grep -E "SKIP K[0-9]" mtl.log || true; rc=1; }
+          grep -q "check-mtl: K8" mtl.log \
+            || { echo "::error::--check-mtl bound no textures, samplers or second set — the C3 stages skipped:"; grep -E "SKIP K[0-9]" mtl.log || true; rc=1; }
           exit $rc
 
       - uses: actions/upload-artifact@v4
