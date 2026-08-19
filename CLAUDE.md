@@ -94,6 +94,7 @@ of NVIDIA's NRD entry names.
 | `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V20 |
 | `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
 | `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip (W0 is DXC-free) |
+| `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe + the indirect smoke (J0 is pure) |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
 | `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |
@@ -106,7 +107,7 @@ Each takes an optional scene and composes with `--stress N`. Exit **2** = enviro
 
 **CI** (`.github/workflows/ci.yml`, 5 jobs, all `--profile quick`): Windows/Linux/macOS run
 `--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-nrd`; a Vulkan job runs
-`--check-spirv` + `--check-wgsl` + `--check-vk` with anti-vacuity greps; a Metal job runs
+`--check-spirv` + `--check-wgsl` + `--check-wgpu` + `--check-vk` with anti-vacuity greps; a Metal job runs
 the four Metal gates; a wasm job holds `cargo check --target wasm32-unknown-unknown` green
 from a bare checkout. No clippy or fmt job.
 
@@ -291,7 +292,7 @@ lights|tonemap` `--exposure-bias EV` `--autoexp-spike-guard` / `-strength`
 `--no-vsync` · `--move-ease S` / `--no-move-ease` · `--no-audio` · `--no-settings` ·
 `--prefer-nvidia|amd|intel`
 
-**Headless modes** — the 15 `--check*` gates · `--spin still|path` + `--spin-frames|-warmup|
+**Headless modes** — the 16 `--check*` gates · `--spin still|path` + `--spin-frames|-warmup|
 -hybrid|-plain` · `--cinematic <preset>` + the `--cinematic-*` family (res/fps/frames/samples/
 island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `--frd-lab-*` ·
 `--bloom-lab [wobble]` (glare shift-variance probe; scene-free, GPU-free) · `--qa [port]`
@@ -309,7 +310,8 @@ ablation and probes: `FR_ABL` `FR_BALLAST` `FR_WIDTH` `FR_ORACLE` `FR_RANGE` `FR
 tuning sweeps: `FR_LEAF` `FR_LGROUP` `FR_LSTACK` `FR_WIDE` `FR_STACK_LAYOUT` `FR_FRD_GROUP` ·
 per-feature A/B: `FR_NGXFG_*` `FR_NGXRR_*` `FR_NRD_*` `FR_FRD_*` `FR_MFX*` `FR_AEXP_*`
 `FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` · Vulkan: `FR_VK_*`
-(device pick, validation, res parity, drop-binding teeth, the window's pump arm) · dumps: `FR_DUMP_HLSL`
+(device pick, validation, res parity, drop-binding teeth, the window's pump arm) · WebGPU:
+`FR_WGPU_ADAPTER` (adapter pick, index or name substring; `WGPU_BACKEND` rides along free) · dumps: `FR_DUMP_HLSL`
 `FR_SPIRV_DUMP|LIST` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:
 `FR_CRASH_TEST|FULLDUMP|VERIFY` `FR_NO_CRASH` · plus `FRUSTRACER_STAB` (inter-frame
 stability readout) and `FRUSTRACER_HUD_STATS`.

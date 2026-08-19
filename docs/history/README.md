@@ -66,7 +66,7 @@ prefix to the suite that owns it and the file where its story lives:
 | `K0`–`K5` | `--check-mtl` | metal-backend.md |
 | `G1`–`G14` | `clouds::self_test` | sky-lighting-clouds.md |
 | `W0`–`W7` | `--check-wgsl` (the browser corpus; W5–W7 not yet built) | web-backend.md |
-| `J*` | reserved: `--check-wgpu` (the WebGPU recorder, not yet built — `U*` being taken is why it is not that) | web-backend.md |
+| `J0`–`J3` | `--check-wgpu` (the WebGPU host; more stages join at Stage C2 — `U*` being taken is why it is not that) | web-backend.md |
 
 **Two hazards.** The `M` prefix is genuinely ambiguous — `--check-gpu` and `--check-msl` both
 use it, so `M1` means different things in `gpu-and-dxr.md` and `shader-toolchains.md`. And a
