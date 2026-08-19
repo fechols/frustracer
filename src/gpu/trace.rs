@@ -145,6 +145,26 @@ pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
 /// this const no longer appears in its range's `BaseShaderRegister`. One
 /// meaning, not two.
 pub const TEX_TABLE_BUFS: u32 = 10;
+/// The FR_WEB_TEX bucket ceiling — the size of the STATIC root-signature
+/// range for the browser texture plan's substitutes (meta + texels + one
+/// `Texture2DArray` per bucket, space1 t10.., see `gfx::texweb`). Static
+/// because range sizes and heap offsets in a root signature cannot follow the
+/// scene, and the unbounded `texs[]` range must stay LAST; a scene whose plan
+/// exceeds the ceiling falls back to bindless with one loud line (never a
+/// dead session — the work-graph refusal shape). 64 is far above any curated
+/// scene's bucket count; W5's budget audit owns the real number.
+pub const WEB_TEX_MAX_BUCKETS: u32 = 64;
+/// Heap slots the WEB_TEX slice occupies between the buffer SRVs and the
+/// `texs[]` slice: meta + texels + the bucket ceiling. Everyone pays these
+/// slots (descriptors are 32 B); unarmed sessions never write OR access them,
+/// which RS 1.0's volatile descriptors make legal.
+pub const WEB_TEX_SLOTS: u32 = 2 + WEB_TEX_MAX_BUCKETS;
+// The buffer-SRV range must end exactly where texweb's registers begin — the
+// generated block declares t10/t11/t12.. and the root-signature range below
+// reads the same consts.
+const _: () = assert!(TEX_TABLE_BUFS == crate::gfx::texweb::META_REG);
+const _: () = assert!(crate::gfx::texweb::TEXELS_REG == crate::gfx::texweb::META_REG + 1);
+const _: () = assert!(crate::gfx::texweb::BUCKET_REG0 == crate::gfx::texweb::META_REG + 2);
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -472,22 +492,36 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
             RegisterSpace: 1,
             OffsetInDescriptorsFromTableStart: 0,
         },
+        // The FR_WEB_TEX slice (meta + texels + the bucket ceiling), STATIC —
+        // a range cannot follow the scene's bucket count and the unbounded
+        // range below must stay last, so everyone carries the ceiling. A
+        // descriptor table costs 1 root DWORD however many ranges it holds,
+        // so the signature stays at 64/64. Unarmed shaders never declare
+        // these registers, so the unwritten slots are never accessed (legal
+        // under RS 1.0's volatile descriptors).
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: WEB_TEX_SLOTS,
+            BaseShaderRegister: crate::gfx::texweb::META_REG,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: TEX_TABLE_BUFS,
+        },
         D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: u32::MAX,
             // t0 of a FRESH space, not t10 of the previous one — register
             // numbering restarts per space, so this is deliberately no longer
-            // `TEX_TABLE_BUFS`. The heap offset below still is.
+            // `TEX_TABLE_BUFS`. The heap offset below still tracks it.
             BaseShaderRegister: 0,
             RegisterSpace: 2,
-            OffsetInDescriptorsFromTableStart: TEX_TABLE_BUFS,
+            OffsetInDescriptorsFromTableStart: TEX_TABLE_BUFS + WEB_TEX_SLOTS,
         },
     ];
     params.push(D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
             DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                NumDescriptorRanges: 2,
+                NumDescriptorRanges: 3,
                 pDescriptorRanges: tex_ranges.as_ptr(),
             },
         },
@@ -935,6 +969,40 @@ pub fn wave_probe(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<Vec<(u
 pub(crate) fn work_graph_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FR_WORKGRAPH").map(|v| v == "1").unwrap_or(false))
+}
+
+/// `FR_WEB_TEX=1` — the wavefront tracer binds the browser texture plan
+/// (`gfx::texweb` buckets) instead of the bindless `texs[]`, on native D3D12.
+/// The env lever seeds this once (loud when armed, loud on an illegal value —
+/// the FR_WIDE rule); `set_web_tex` exists so the M15 byte-gate can flip arms
+/// inside one process. **Snapshotted at `TraceGpu::new`** — the define, the
+/// bucket resources and the descriptors are one constructor-scope decision
+/// (the FR_DXR_LEAN shape: no CB bit, no `TraceKeys` field — nothing reads
+/// this per-frame), so a flip only affects LATER constructions, exactly the
+/// `set_sky_lod` contract the cloud-cache A/B gate relies on.
+static WEB_TEX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn web_tex() -> bool {
+    web_tex_env();
+    WEB_TEX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_web_tex(on: bool) {
+    web_tex_env(); // the env seed must not overwrite a gate's later set_web_tex
+    WEB_TEX.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn web_tex_env() {
+    static SEED: std::sync::Once = std::sync::Once::new();
+    SEED.call_once(|| {
+        let Ok(v) = std::env::var("FR_WEB_TEX") else { return };
+        if v == "1" {
+            eprintln!("gpu: FR_WEB_TEX=1 — wavefront trace units will sample texweb buckets");
+            WEB_TEX.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if !v.is_empty() {
+            eprintln!("gpu: FR_WEB_TEX={v:?} illegal (only 1 arms) — off");
+        }
+    });
 }
 
 /// queues.hlsli's `ROOT_CUT_SLOT` — the sentinel meaning "the root cut [0]".
@@ -2733,7 +2801,11 @@ impl SceneGpu {
     /// longer `TEX_TABLE_BUFS`; only the HEAP offset below still is.
     /// `TEX_TABLE_BUFS`'s doc calls that split "one meaning, not two" —
     /// this comment is the other file it had to hold in). The heap must
-    /// be sized `base + TEX_TABLE_BUFS + textures.len()`.
+    /// be sized `base + TEX_TABLE_BUFS + WEB_TEX_SLOTS + textures.len()` —
+    /// the WEB_TEX slice sits between the buffer SRVs and the texs[]
+    /// descriptors and is written by the wavefront's own
+    /// `write_web_tex_descriptors`, NEVER here: DXR shares this function and
+    /// must not gain the browser plan's bindings.
     pub fn write_scene_descriptors(
         &self,
         device: &ID3D12Device,
@@ -2814,13 +2886,387 @@ impl SceneGpu {
                 device.CreateShaderResourceView(
                     tex,
                     Some(&desc),
-                    slot(TEX_TABLE_BUFS + i as u32),
+                    slot(TEX_TABLE_BUFS + WEB_TEX_SLOTS + i as u32),
                 )
             };
         }
     }
 }
 
+
+/// The FR_WEB_TEX resources — the native D3D12 binding of `gfx::texweb`'s
+/// plan, owned by the WAVEFRONT tracer (never `SceneGpu`: the plan is a
+/// wavefront-only lever and `SceneGpu` is shared with DXR — the `SwTreesGpu`
+/// precedent). One exact-size `Texture2DArray` per bucket, always RGBA8
+/// (_SRGB per the bucket key — an array resource is ONE format, and
+/// `should_compress` varies within a bucket key, so BC7 is structurally
+/// unreachable here; under `--no-bc7` the layer bytes equal the bindless
+/// textures' bytes, which is what the M15 byte-gate compares).
+pub(crate) struct WebTexGpu {
+    /// `web_tex_meta` (t10 space1): one 16-B row per scene texture.
+    pub meta: ID3D12Resource,
+    /// `web_texels` (t11 space1): the mip-0 Load-path payload words.
+    pub texels: ID3D12Resource,
+    /// `web_bucket_i` (t12+i space1), plan order.
+    pub buckets: Vec<ID3D12Resource>,
+    pub plan: crate::gfx::texweb::WebTexPlan,
+}
+
+impl WebTexGpu {
+    /// Upload the plan: the two StructuredBuffers through `stream_buffer`,
+    /// then every bucket layer's full mip chain through the band loop —
+    /// `SceneGpu::new_uploaded`'s RGBA arm transposed, with the subresource
+    /// index `layer * levels + mip` instead of `mip`.
+    pub(crate) fn new_uploaded(
+        device: &ID3D12Device,
+        scene: &Scene,
+        plan: crate::gfx::texweb::WebTexPlan,
+        sub: &mut dyn d3d12::Submit,
+    ) -> Result<Self> {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        };
+        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        // Ring sizing: the widest bucket row is the one unit that must fit
+        // whole (the max_tex_pitch discipline); the total is a cap heuristic.
+        let max_pitch =
+            plan.buckets.iter().map(|b| d3d12::aligned_pitch(b.w as usize * 4)).max().unwrap_or(0);
+        let total_bytes: usize = plan.meta.len() * 16
+            + plan.texels.len() * 4
+            + plan
+                .buckets
+                .iter()
+                .map(|b| {
+                    let ti0 = b.layers.first().map(|&t| t as usize);
+                    let per_layer: usize = match ti0 {
+                        Some(t) => std::iter::once((b.w, b.h))
+                            .chain(scene.textures[t].mips.iter().map(|m| (m.w, m.h)))
+                            .map(|(w, h)| d3d12::aligned_pitch(w as usize * 4) * h as usize)
+                            .sum(),
+                        None => 0,
+                    };
+                    per_layer * b.layers.len()
+                })
+                .sum::<usize>();
+        let ring =
+            d3d12::UploadBuffer::new(device, STAGE_CHUNK.min(total_bytes.max(4096)).max(max_pitch))?;
+        let mut batch = Batch::new(&ring);
+        let ring_ref = batch.ring();
+
+        // Empty-plan dummies must still satisfy their view's stride × 1
+        // element (an over-long view takes the device out at heap-write time —
+        // the blas_tri lesson), so the 16-B meta dummy is created by hand
+        // rather than through stream_buffer's 4-byte one.
+        let meta = if plan.meta.is_empty() {
+            committed_buffer(device, 16, D3D12_RESOURCE_FLAG_NONE, srv)?
+        } else {
+            stream_buffer(device, sub, &mut batch, &plan.meta, |m| [m.w, m.h, m.bl, m.ofs], srv)?
+        };
+        let texels = stream_buffer(device, sub, &mut batch, &plan.texels, |t| *t, srv)?;
+
+        let mut buckets_v = Vec::with_capacity(plan.buckets.len());
+        for b in &plan.buckets {
+            let fmt =
+                if b.srgb { DXGI_FORMAT_R8G8B8A8_UNORM_SRGB } else { DXGI_FORMAT_R8G8B8A8_UNORM };
+            let dst = d3d12::committed_tex_array(
+                device,
+                b.w,
+                b.h,
+                b.levels as u16,
+                b.layers.len() as u16,
+                fmt,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            // The COPY_DEST → NPSR transition rides the last band of the last
+            // subresource OF THIS BUCKET (each bucket is its own resource).
+            let total_subs = b.levels as usize * b.layers.len();
+            let mut done_subs = 0usize;
+            for (layer, &ti) in b.layers.iter().enumerate() {
+                let t = &scene.textures[ti as usize];
+                for mip in 0..b.levels as usize {
+                    let (mw, mh, mip_texels): (u32, u32, &[[u8; 4]]) = if mip == 0 {
+                        (t.w, t.h, &t.texels)
+                    } else {
+                        let m = &t.mips[mip - 1];
+                        (m.w, m.h, &m.texels)
+                    };
+                    let pitch = d3d12::aligned_pitch(mw as usize * 4);
+                    let sub_idx = (layer * b.levels as usize + mip) as u32;
+                    done_subs += 1;
+                    let band = (batch.chunk_cap() / pitch).max(1).min(mh as usize);
+                    let mut r0 = 0usize;
+                    while r0 < mh as usize {
+                        let rows = band.min(mh as usize - r0);
+                        let stage = batch.reserve(rows * pitch, sub)?;
+                        let base = unsafe { ring_ref.ptr.add(stage) };
+                        for r in 0..rows {
+                            let y = r0 + r;
+                            let row = &mip_texels[y * mw as usize..(y + 1) * mw as usize];
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    row.as_flattened().as_ptr(),
+                                    base.add(r * pitch),
+                                    mw as usize * 4,
+                                )
+                            };
+                        }
+                        let last = done_subs == total_subs && r0 + rows == mh as usize;
+                        let dst_op = dst.clone();
+                        batch.push(move |l| {
+                            let fp = d3d12::footprint(fmt, mw, rows as u32, 4, stage as u64);
+                            unsafe {
+                                l.CopyTextureRegion(
+                                    &d3d12::loc_subresource_mip(&dst_op, sub_idx),
+                                    0,
+                                    r0 as u32,
+                                    0,
+                                    &d3d12::loc_footprint(&ring_ref.resource, fp),
+                                    None,
+                                )
+                            };
+                            if last {
+                                unsafe {
+                                    l.ResourceBarrier(&[transition(
+                                        &dst_op,
+                                        D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    )])
+                                };
+                            }
+                            Ok(())
+                        });
+                        r0 += rows;
+                    }
+                }
+            }
+            buckets_v.push(dst);
+        }
+        batch.flush(sub)?;
+        Ok(Self { meta, texels, buckets: buckets_v, plan })
+    }
+
+    /// Write the WEB_TEX slice's descriptors into `heap` at slots
+    /// `base + TEX_TABLE_BUFS ..` — the middle range of the RP_SCENE_TEX
+    /// table. Wavefront-only by construction: `write_scene_descriptors` never
+    /// writes these, so DXR's heap keeps the slots reserved-and-unwritten.
+    pub(crate) fn write_descriptors(
+        &self,
+        device: &ID3D12Device,
+        heap: &ID3D12DescriptorHeap,
+        base: u32,
+    ) {
+        let inc = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let slot = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + ((base + TEX_TABLE_BUFS + i) as usize * inc as usize),
+        };
+        let buf_srv = |res: &ID3D12Resource, stride: u32, elems: u32, at: u32| {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: 0,
+                        NumElements: elems.max(1),
+                        StructureByteStride: stride,
+                        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                    },
+                },
+            };
+            unsafe { device.CreateShaderResourceView(res, Some(&desc), slot(at)) };
+        };
+        buf_srv(&self.meta, 16, self.plan.meta.len() as u32, 0);
+        buf_srv(&self.texels, 4, self.plan.texels.len() as u32, 1);
+        for (i, (res, b)) in self.buckets.iter().zip(&self.plan.buckets).enumerate() {
+            let tex_desc = unsafe { res.GetDesc() };
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: tex_desc.Format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: b.levels,
+                        FirstArraySlice: 0,
+                        ArraySize: b.layers.len() as u32,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            unsafe { device.CreateShaderResourceView(res, Some(&desc), slot(2 + i as u32)) };
+        }
+    }
+}
+
+impl TraceGpu {
+    /// Did this tracer compile + bind the FR_WEB_TEX plan? The M15 gate's
+    /// probe-reach assertion — a byte-identical A/B where the armed arm never
+    /// actually armed would be the FR_ABL trap all over again.
+    pub(crate) fn web_tex_armed(&self) -> bool {
+        self.web_tex.is_some()
+    }
+
+    /// The plan's meta row for texture `ti` (the poison teeth restore from
+    /// this — the plan is the CPU truth the buffer was streamed from).
+    pub(crate) fn web_tex_meta_row(&self, ti: usize) -> Option<crate::gfx::texweb::MetaRow> {
+        self.web_tex.as_ref()?.plan.meta.get(ti).copied()
+    }
+
+    /// Byte-compare every (texture, mip) between the bindless resources and
+    /// the bucket layers that claim to carry the same bytes — the M15/M15b
+    /// upload-identity audit. Separates "the upload wrote different bytes"
+    /// from "the hardware filters the two resource types differently": an
+    /// image diff with a CLEAN audit is a filtering divergence to record; a
+    /// dirty audit is our upload bug, localized to its first (texture, mip).
+    /// One blocking submit per texture (the batching lesson — never one per
+    /// subresource). Returns (differing bytes, first differing (ti, mip)).
+    pub(crate) fn web_tex_audit(
+        &self,
+        device: &ID3D12Device,
+        sub: &mut dyn d3d12::Submit,
+        textures: &[ID3D12Resource],
+    ) -> Result<(u64, Option<(u32, u32)>)> {
+        let wt = self.web_tex.as_ref().ok_or("web_tex_audit: not armed")?;
+        let mut diff = 0u64;
+        let mut first: Option<(u32, u32)> = None;
+        for (ti, row) in wt.plan.meta.iter().enumerate() {
+            let b = &wt.plan.buckets[(row.bl >> 16) as usize];
+            let layer = row.bl & 0xffff;
+            let bind = &textures[ti];
+            let bucket = &wt.buckets[(row.bl >> 16) as usize];
+            // Mip dims from the RESOURCE truth (D3D12's floor-halving), and
+            // per-mip footprints packed into one readback pair per texture.
+            let desc = unsafe { bind.GetDesc() };
+            {
+                // The 4-B/px pitch math below is RGBA8-only — this audit
+                // reads Bc7Mode::Off cores (the M15/M15b shape); a BC7
+                // bindless resource here is a caller bug, never a byte diff.
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                };
+                if desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM
+                    && desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                {
+                    return Err(format!(
+                        "web_tex_audit: texture {ti} is {:?}, not RGBA8 — the audit \
+                         only reads Bc7Mode::Off cores",
+                        desc.Format
+                    ));
+                }
+            }
+            let mut fps = Vec::with_capacity(b.levels as usize);
+            let mut ofs = 0u64;
+            for mip in 0..b.levels {
+                let mw = (desc.Width as u32 >> mip).max(1);
+                let mh = (desc.Height >> mip).max(1);
+                let pitch = d3d12::aligned_pitch(mw as usize * 4) as u64;
+                fps.push((mip, mw, mh, ofs));
+                ofs += pitch * mh as u64;
+            }
+            let rb_bind = d3d12::ReadbackBuffer::new(device, ofs as usize)?;
+            let rb_buck = d3d12::ReadbackBuffer::new(device, ofs as usize)?;
+            let (bind_c, buck_c) = (bind.clone(), bucket.clone());
+            let fmt = desc.Format;
+            let fps_c = fps.clone();
+            let levels = b.levels;
+            sub.run_list(&mut |l| {
+                unsafe {
+                    let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    let cs = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    l.ResourceBarrier(&[transition(&bind_c, npsr, cs), transition(&buck_c, npsr, cs)]);
+                    for &(mip, mw, mh, at) in &fps_c {
+                        let fp = d3d12::footprint(fmt, mw, mh, 4, at);
+                        l.CopyTextureRegion(
+                            &d3d12::loc_footprint(&rb_bind.resource, fp),
+                            0, 0, 0,
+                            &d3d12::loc_subresource_mip(&bind_c, mip),
+                            None,
+                        );
+                        let fp2 = d3d12::footprint(fmt, mw, mh, 4, at);
+                        l.CopyTextureRegion(
+                            &d3d12::loc_footprint(&rb_buck.resource, fp2),
+                            0, 0, 0,
+                            &d3d12::loc_subresource_mip(&buck_c, layer * levels + mip),
+                            None,
+                        );
+                    }
+                    l.ResourceBarrier(&[transition(&bind_c, cs, npsr), transition(&buck_c, cs, npsr)]);
+                }
+                Ok(())
+            })?;
+            let map = |r: &d3d12::ReadbackBuffer| -> Result<*const u8> {
+                let mut p = std::ptr::null_mut();
+                unsafe { r.resource.Map(0, None, Some(&mut p)) }
+                    .map_err(|e| format!("web_tex_audit Map: {e}"))?;
+                Ok(p as *const u8)
+            };
+            let (pa, pb) = (map(&rb_bind)?, map(&rb_buck)?);
+            for &(mip, mw, mh, at) in &fps {
+                let pitch = d3d12::aligned_pitch(mw as usize * 4);
+                for y in 0..mh as usize {
+                    let o = at as usize + y * pitch;
+                    let (ra, rbw) = unsafe {
+                        (
+                            std::slice::from_raw_parts(pa.add(o), mw as usize * 4),
+                            std::slice::from_raw_parts(pb.add(o), mw as usize * 4),
+                        )
+                    };
+                    let d = ra.iter().zip(rbw).filter(|(x, y)| x != y).count();
+                    if d > 0 {
+                        diff += d as u64;
+                        first.get_or_insert((ti as u32, mip));
+                    }
+                }
+            }
+            unsafe {
+                rb_bind.resource.Unmap(0, None);
+                rb_buck.resource.Unmap(0, None);
+            }
+        }
+        Ok((diff, first))
+    }
+
+    /// Overwrite one 16-B `web_tex_meta` row on the GPU — the M15 poison
+    /// teeth ("the poison did not change the image" is the failure it
+    /// exists to catch). NPSR → COPY_DEST → copy → NPSR, one blocking submit;
+    /// never called outside the gate.
+    pub(crate) fn web_tex_poke_meta(
+        &self,
+        device: &ID3D12Device,
+        sub: &mut dyn d3d12::Submit,
+        ti: usize,
+        row: crate::gfx::texweb::MetaRow,
+    ) -> Result<()> {
+        let wt = self.web_tex.as_ref().ok_or("web_tex_poke_meta: not armed")?;
+        let up = d3d12::UploadBuffer::new(device, 16)?;
+        unsafe {
+            let words = [row.w, row.h, row.bl, row.ofs];
+            std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, up.ptr, 16);
+        }
+        let meta = wt.meta.clone();
+        sub.run_list(&mut |l| {
+            unsafe {
+                l.ResourceBarrier(&[transition(
+                    &meta,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                l.CopyBufferRegion(&meta, ti as u64 * 16, &up.resource, 0, 16);
+                l.ResourceBarrier(&[transition(
+                    &meta,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+            Ok(())
+        })
+    }
+}
 
 /// The sway-MV arming pair: `Some((t_cur, t_prev))` iff this frame renders an
 /// animated pose AND holds a paired prev pose to reproject into — sway clock
@@ -3586,6 +4032,11 @@ impl NrdRes {
 pub struct TraceGpu {
     pub root_sig: ID3D12RootSignature,
     pub cmd_sig: ID3D12CommandSignature,
+    /// The FR_WEB_TEX resources (`Some` iff this tracer's kernels were
+    /// compiled with the texweb block) — held for resource lifetime; the
+    /// descriptors were written into `uav_heap`'s WEB_TEX slice at
+    /// construction. `web_tex_armed()` is the gate's probe-reach accessor.
+    web_tex: Option<WebTexGpu>,
     pso_reference: ID3D12PipelineState,
     pso_resolve: ID3D12PipelineState,
     pso_seed: ID3D12PipelineState,
@@ -3833,7 +4284,7 @@ impl TraceGpu {
         // values while the buffers below are SIZED against them, and reading
         // the statics a second time here is exactly the desync
         // `record_cloud_shadow` documents as a device hang.
-        let srcs = crate::gfx::shaders::trace_sources(&crate::gfx::shaders::TraceKeys {
+        let mut srcs = crate::gfx::shaders::trace_sources(&crate::gfx::shaders::TraceKeys {
             scene,
             // THIS device's vendor, never `picked_vendor()` — see `cand_defs`.
             vendor,
@@ -3845,6 +4296,62 @@ impl TraceGpu {
         });
         let (cloud_shadow_v, sky_lod_v, ftree_on) =
             (srcs.cloud_shadow_n, srcs.sky_lod, srcs.ftree_on);
+        // FR_WEB_TEX (snapshotted HERE — see `web_tex`'s doc): prepend the
+        // generated texweb block to the browser corpus's nine trace units —
+        // the same set `web_units` wraps (main.rs, LOCKSTEP), and the same
+        // collection-shape prepend (`texweb::hlsl` carries its own
+        // `#define WEB_TEX 1`; `web_defs()`'s WEB must NOT come along — that
+        // macro rewrites layouts natively too). feed/nrd_bridge/nppd keep
+        // `texs[]` deliberately: they are not in the browser corpus, and the
+        // bindless table stays resident either way. The off-state is a
+        // structural branch — nothing is pasted, sources byte-identical.
+        let web_tex_plan = if web_tex() {
+            let plan = crate::gfx::texweb::plan(scene);
+            if plan.buckets.len() as u32 > WEB_TEX_MAX_BUCKETS {
+                eprintln!(
+                    "gpu: FR_WEB_TEX — {} buckets exceeds the root-signature ceiling \
+                     {WEB_TEX_MAX_BUCKETS}; FALLING BACK to bindless texs[]",
+                    plan.buckets.len()
+                );
+                None
+            } else {
+                Some(plan)
+            }
+        } else {
+            None
+        };
+        if let Some(plan) = &web_tex_plan {
+            let block = crate::gfx::texweb::hlsl(plan);
+            for s in [
+                &mut srcs.reference,
+                &mut srcs.resolve,
+                &mut srcs.wavefront,
+                &mut srcs.sky,
+                &mut srcs.leaf,
+                &mut srcs.leaf_fb,
+                &mut srcs.hemi_wave,
+                &mut srcs.hemi_leaf,
+                &mut srcs.compose,
+            ] {
+                *s = format!("{block}\n{s}");
+            }
+        }
+        let web_tex_gpu = match web_tex_plan {
+            Some(plan) => {
+                let layers: usize = plan.buckets.iter().map(|b| b.layers.len()).sum();
+                let wt = WebTexGpu::new_uploaded(device, scene, plan, sub)?;
+                // The probe-reach announce (the abl_announce discipline): what
+                // was built and which units consume it, once per construction.
+                eprintln!(
+                    "gpu: FR_WEB_TEX — {} buckets ({layers} layers, RGBA8), {} payload words; \
+                     9 trace units sample buckets (texs[] stays resident for feed/DXR)",
+                    wt.buckets.len(),
+                    wt.plan.texels.len(),
+                );
+                Some(wt)
+            }
+            None => None,
+        };
         let pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
@@ -4143,6 +4650,7 @@ impl TraceGpu {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                 NumDescriptors: TEX_HEAP_BASE
                     + TEX_TABLE_BUFS
+                    + WEB_TEX_SLOTS
                     + scene_gpu.textures.len() as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
@@ -4151,6 +4659,9 @@ impl TraceGpu {
         .map_err(|e| format!("CreateDescriptorHeap(trace UAV): {e}"))?;
         write_resolve_uavs(device, &uav_heap, &hdr);
         scene_gpu.write_scene_descriptors(device, &uav_heap, TEX_HEAP_BASE);
+        if let Some(wt) = &web_tex_gpu {
+            wt.write_descriptors(device, &uav_heap, TEX_HEAP_BASE);
+        }
         let tex_table = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
                 + TEX_HEAP_BASE as u64
@@ -4233,6 +4744,7 @@ impl TraceGpu {
         Ok(Self {
             root_sig,
             cmd_sig,
+            web_tex: web_tex_gpu,
             pso_reference,
             pso_resolve,
             pso_seed,

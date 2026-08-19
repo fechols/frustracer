@@ -277,3 +277,85 @@ future — a dropped guard EATS the error, so the block_on is load-bearing.
 
 Next: FR_WEB_TEX native byte-gate, W5–W7, Stage C2 (the tracer recorder over
 per-entry layouts — now a measured requirement, see above).
+
+## Round 3 (2026-08-19): FR_WEB_TEX — the native runtime half, `--check-gpu` M15/M15b
+
+The upload/binding half of F2, on native D3D12, with the gate that proves the
+browser texture path renders right without a browser.
+
+**The machinery** (all in gpu/trace.rs unless noted):
+
+- Root signature: a STATIC middle SRV range in the RP_SCENE_TEX table —
+  space1 `texweb::META_REG..` (t10 meta, t11 texels, t12.. buckets), sized
+  `WEB_TEX_SLOTS = 2 + WEB_TEX_MAX_BUCKETS (64)`; the unbounded space2
+  `texs[]` range stays last, its heap offset shifted by WEB_TEX_SLOTS. A
+  range costs zero root DWORDs, so the signature stays 64/64. Registers are
+  pinned three ways: texweb.rs consts are the single source, `hlsl()`
+  formats from them, `texweb::self_test` string-pins the emitted text, and
+  trace.rs carries a const assert.
+- The lever: `FR_WEB_TEX=1` (loud, FR_WIDE-rule) seeds a process global with
+  `set_web_tex`/`web_tex` for the gate's in-process A/B — snapshotted at
+  `TraceGpu::new` (the set_sky_lod contract). No CB bit, no TraceKeys field:
+  define + resources + descriptors are one constructor-scope decision
+  (the FR_DXR_LEAN shape), off-state structural (a conditional prepend).
+- Armed `TraceGpu::new`: prepends `texweb::hlsl(&plan)` to exactly the NINE
+  units `web_units` wraps, at the srcs→pso seam (the collection shape —
+  probe-reach-immune; feed/nrd/nppd keep texs[], which stays resident);
+  `WebTexGpu::new_uploaded` (the SwTreesGpu model) streams meta/texels and
+  band-uploads every bucket layer's full mip chain (subresource =
+  layer*levels+mip) through `d3d12::committed_tex_array`; descriptors land in
+  the wavefront's own heap slice — never `write_scene_descriptors`, so DXR is
+  structurally unmoved. >64 buckets falls back to bindless with one loud line.
+- BC7: an array resource is ONE format and `should_compress` varies within a
+  bucket key, so buckets are always RGBA8; the gates run both arms over one
+  `Bc7Mode::Off` core so binding topology is the only delta.
+
+**The gate.** M15 brings its own scene (`scene::texweb_check_scene` — the
+default check scene is texture-free and would be vacuous): a multi-layer
+bucket + a second bucket + a cutout + an h2n heightfield + a grazing floor
+tile (the SampleGrad arm). M15b repeats the A/B on the session scene.
+Verdicts are TWO-TIER: EXACT on tbuf/info/counters (geometry + the byte-exact
+Load paths) and on the uploaded bytes (`web_tex_audit` — a per-(texture, mip)
+readback compare of every bucket layer against its bindless resource);
+ULP-BOUNDED on accum (violation = |a−b| > max(1e-6, 1e-5·max|·|)). Teeth are
+same-program (arm-B-vs-arm-B, where bit-identity IS structural): a bl
+layer-swap poison and an ofs+1 payload poison must each push the image past
+the bound and restore to bit-identity; a planted `web_tex_a8 → 0` break made
+M15 FAIL 5198/19266/3 (tbuf/accum/counters) — both ways proven.
+
+**Why accum is bounded, measured (bistro, RTX 4090):** the first run's
+"byte-identical" claim failed by 43 of 1.44M accum channels — and every
+discriminator said *not our bytes*: identical 43 with `--aniso 1` (not the
+SampleGrad path), 408 with `--no-mips` (not mip filtering — level-0 bilinear
+only), and the upload audit read back ALL 187 textures × every mip (≈1 GB)
+byte-identical. The diffs are 1–8 ulp on small radiance values in one screen
+region: the texweb preamble changes DXC's instruction fusing and the shading
+math rounds differently at the last bit — the FR_NOPRECISE class, recorded by
+Stage 0 as low-risk. The bound sits ~100× above that noise and ~1000× below
+any routing bug (a wrong layer/lod/offset moves channels O(0.01..1) — the
+poisons prove the bound catches exactly that).
+
+**Measured green:** procedural (M15: 3 buckets/4 layers/2048 payload words,
+all-exact, poisons bit; M15b skips loudly), bistro (M15b: 21 buckets/187
+layers/250M payload words — a 1 GB `web_texels` buffer works — tbuf/info/
+counters exact, audit 0 bytes, accum 43 bits / 0 violations), san-miguel
+(M15 green; M15b = the >64-bucket loud fallback, exercised live: 165 bucket
+keys — a W5 datum, though san-miguel is outside the web ring; bistro's 21 is
+the browser-bound number). Per vendor: RTX 4090 as above; **Arc Pro B70
+all-exact including accum** (0 bits — Intel's compiler fuses identically);
+AMD iGPU UNMEASURED — the suite DEVICE_HUNGs at the spp=128 wavefront probe
+before M15, IDENTICALLY on unmodified master (a TDR on the 22×-slower iGPU;
+pre-existing, not the port's). Bistro also fails N9 (nrd residual-sign) —
+verified IDENTICAL on unmodified master, the helmet-N9 class: pre-existing,
+scene-keyed, not the port's.
+
+Closing ladder, all green: cargo test 39/39, `--check-dxr` PASS (the heap
+gained WEB_TEX_SLOTS), `--check-wgsl` 34/34 (the texweb consts refactor kept
+the emitted block byte-stable — self_test pins the registers),
+`FR_WEB_TEX=1 --gpu --spin still` on bistro (both announce lines, 30 frames),
+`cargo check --target wasm32-unknown-unknown`, and plain `--check` LAST with
+`check.png`/`check_gi.png` byte-identical.
+
+Next: W5 (limits/budget audit — now with two measured anchors: 21 buckets on
+bistro, 165 on san-miguel), W6, W7, Stage C2 (the tracer recorder over
+per-entry layouts).

@@ -1435,6 +1435,10 @@ impl DxrGpu {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                 NumDescriptors: TEX_HEAP_BASE
                     + TEX_TABLE_BUFS
+                    // The FR_WEB_TEX slice's reserved slots — DXR never writes
+                    // or accesses them, but the shared root signature's texs[]
+                    // range now starts past them, so the heap carries the gap.
+                    + trace::WEB_TEX_SLOTS
                     + scene_gpu.textures.len() as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
