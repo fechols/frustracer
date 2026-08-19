@@ -63,7 +63,7 @@ prefix to the suite that owns it and the file where its story lives:
 | `F0`–`F10` | FRD gates (`--check-gpu`) | denoisers.md |
 | `U0`–`U4` | `--check-fsr3` | metal-backend.md |
 | `X0`–`X6` | `--check-metalfx` | metal-backend.md |
-| `K0`–`K5` | `--check-mtl` | metal-backend.md |
+| `K0`–`K8` | `--check-mtl` (K5 is the VERDICT and stays last-numbered-first — K6–K8 came later and renumbering it would strand this table's own references) | metal-backend.md |
 | `G1`–`G14` | `clouds::self_test` | sky-lighting-clouds.md |
 | `W0`–`W7` | `--check-wgsl` (the browser corpus; W5–W7 not yet built) | web-backend.md |
 | `J0`–`J3` | `--check-wgpu` (the WebGPU host; more stages join at Stage C2 — `U*` being taken is why it is not that) | web-backend.md |

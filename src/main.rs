@@ -22998,11 +22998,77 @@ fn run_check_fsr3(
     // ---- U1: the transpiled metallib table ----------------------------------
     #[cfg(ffx_fsr3_metal)]
     {
+        // THE BUILD-TIME LEVER, ANNOUNCED IN THE `Plant::line()` SHAPE. This is
+        // the first one in this tree that is armed at BUILD time rather than at
+        // run time, so the gate cannot read the environment to discover it —
+        // `build.rs` states what it did through `cargo:rustc-env` and this reads
+        // the answer back. `option_env!`, not `env!`: a tree where the FSR3 arm
+        // never built still has to compile.
+        let built = option_env!("FR_FFX_MSL_BUILT").unwrap_or("?");
+        // COMPARED AGAINST WHAT THE BUILD CALLS DEFAULT, never against a
+        // literal. `build.rs::MSL_VERSION` would otherwise be a constant with a
+        // second unpinned copy here, and the failure is quiet in the wrong
+        // direction: promoting the pin (D1 may) would leave this announcing a
+        // PLANT — "at 30000 this run MUST fail" — on every clean run forever.
+        let dflt = option_env!("FR_FFX_MSL_DEFAULT").unwrap_or("?");
+        if built != dflt {
+            println!(
+                "check-fsr3: PLANT FR_FFX_MSL={built} armed (default {dflt}) — a BUILD-time \
+                 lever, so `cargo build` and this run must both see it; at 30000 this run \
+                 MUST fail and a pass is the finding"
+            );
+        }
+        // ---- the emulation is gone, and this is what says so ----------------
+        //
+        // `build.rs::count_atomic_emulation` scans the emitted MSL for
+        // spvImage2DAtomicCoord / spvLinearTextureAlignment / function
+        // constant 65535 — the three markers of the buffer-backed image-atomic
+        // emulation that `shim/ffx_fsr3_metal.mm` no longer implements.
+        //
+        // IT IS A COUPLING CHECK, not a tidiness one. The shader half and the
+        // shim half must move together: MSL emitted at 30000 expects a
+        // companion `device atomic_uint*` at the texture's slot and a pipeline
+        // specialized on the device's row alignment, and this file's shim
+        // provides neither. `FR_FFX_MSL=30000` is the tooth — MEASURED to put
+        // 20 of the 80 permutations back, so this assertion is provably not
+        // vacuous.
+        //
+        // ABSENT IS A FAILURE, NOT A ZERO. `cfg(ffx_fsr3_metal)` is only set on
+        // the path that emits this, so `None` is unreachable today — which is
+        // exactly why the default matters: the day a `return` moves above the
+        // emission, an `unwrap_or(0)` would turn this gate into a green line
+        // that checked nothing, and a count no one produced is the vacuous pass
+        // it exists to prevent.
+        let sites: Option<usize> =
+            option_env!("FR_FFX_ATOMIC_SITES").and_then(|s| s.parse().ok());
+        match sites {
+            Some(0) => {}
+            Some(n) => fail(format!(
+                "U1 {n} of the emitted permutations still carry spirv-cross's image-atomic \
+                 EMULATION, which this shim stopped implementing in D2 — the MSL version \
+                 and shim/ffx_fsr3_metal.mm are out of step (built at MSL {built}; 30100 \
+                 is the measured threshold for native image atomics)"
+            )),
+            None => fail(
+                "U1 build.rs published no usable FR_FFX_ATOMIC_SITES — the image-atomic \
+                 emulation count is UNKNOWN, which is a failure rather than a zero"
+                    .into(),
+            ),
+        }
         match mtl::fsr3::table_self_test() {
+            // THE COUNT IS ON THE OK LINE AND `--check-fsr3`'s CI GUARD GREPS FOR
+            // IT WITH ITS LEADING COMMA — `", 0 image-atomic emulation sites"`.
+            // The bare number is a SUBSTRING of any larger one ("20 image-atomic
+            // emulation sites" contains "0 image-atomic emulation sites"), and 20
+            // is exactly what the FR_FFX_MSL=30000 tooth produces, so an
+            // unanchored guard would go green on its own test case. Do not
+            // reword this without re-reading .github/workflows/ci.yml.
             Ok(()) => eprintln!(
-                "check-fsr3: U1 metallib table OK — {} permutations, {} KiB",
+                "check-fsr3: U1 metallib table OK — {} permutations, {} KiB, MSL {built}, \
+                 {} image-atomic emulation sites",
                 mtl::fsr3::metallibs().len(),
-                mtl::fsr3::metallibs().iter().map(|(_, b)| b.len()).sum::<usize>() / 1024
+                mtl::fsr3::metallibs().iter().map(|(_, b)| b.len()).sum::<usize>() / 1024,
+                sites.map_or_else(|| "UNKNOWN".to_string(), |n| n.to_string())
             ),
             Err(e) => fail(format!("U1 {e}")),
         }
@@ -23130,9 +23196,10 @@ fn run_check_fsr3(
     {
         eprintln!(
             "check-fsr3: NOTE MTL_DEBUG_LAYER / MTL_SHADER_VALIDATION unset — the \
-             validation-only failure class (padded constant buffers, image-atomic buffer \
-             aliasing, clear-on-buffer-backed, RenderTarget usage) is INVISIBLE in this run. \
-             Re-run with both =1."
+             validation-only failure class (padded constant buffers, RenderTarget usage) \
+             is INVISIBLE in this run. Re-run with both =1. NOTE the list is SHORTER since \
+             D2: image-atomic buffer aliasing and clear-on-buffer-backed were GOTCHA 2 and \
+             3, and native image atomics retired both."
         );
     }
 

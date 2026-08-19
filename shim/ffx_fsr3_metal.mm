@@ -26,11 +26,27 @@
 //   - Scratch sub-allocation -> a real C++ object. We own ffxGetInterfaceMetal,
 //     so FFX never touches the scratch except through these callbacks.
 //
-// THE FOUR VALIDATION-ONLY BUGS. Every one of the four marked GOTCHA below was
+// THE VALIDATION-ONLY BUGS — FOUR ORIGINALLY, TWO NOW. Every one of them was
 // found ONLY under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, and each masks
 // the next (the layer aborts on the first error per command buffer), so a green
-// run without them proves considerably less than it appears to. They are
+// run without them proves considerably less than it appears to. They were
 // carried here verbatim rather than re-derived.
+//
+// GOTCHA 1 (16-byte-padded constant-buffer binds) and GOTCHA 4 (RenderTarget is
+// not optional) are LIVE and marked below. GOTCHA 2 (image-atomic surfaces must
+// be buffer-backed, every pipeline specialized with function constant 65535)
+// and GOTCHA 3 (CLEAR_FLOAT is illegal on a buffer-backed texture) were
+// retired in D2 by `build.rs::MSL_VERSION` 30100 — spirv-cross emits native
+// image atomics, so nothing is buffer-backed and neither bug has a subject.
+// Their sites carry a comment saying what left, because the numbering is cited
+// from `src/mtl/smoke.rs`, `src/main.rs` and `docs/history/metal-backend.md`
+// and a silently renumbered list would strand every one of those references.
+//
+// GOTCHA 4 GOT WIDER WHEN GOTCHA 2 LEFT, which is the one thing here that is
+// not a deletion: R32_UINT surfaces could not carry RenderTarget while they
+// were buffer-backed (Metal forbids the combination — that is what GOTCHA 3
+// existed to work around), so they were the exception to GOTCHA 4. They are
+// ordinary textures now and take the usage bit like everything else.
 
 #import <Metal/Metal.h>
 
@@ -194,17 +210,22 @@ struct BackendContext_Metal {
     std::vector<uint8_t> cbRing;
     size_t cbCursor = 0;
 
-    // GOTCHA 2 (validation-only), and the one with the longest reach:
-    // spirv-cross EMULATES Metal image atomics with a plain MTLBuffer aliased
-    // over the texture's memory, bound at the SAME slot number in buffer space
-    // and addressed `alignedWidth*y + x`, where `alignedWidth` comes from the
-    // `spvLinearTextureAlignment` function constant. So every R32_UINT surface
+    // GOTCHA 2 IS GONE, AND ITS ABSENCE IS THE REASON THIS COMMENT EXISTS.
+    // spirv-cross used to EMULATE Metal image atomics with a plain MTLBuffer
+    // aliased over the texture's memory, bound at the same slot number in
+    // buffer space and addressed `alignedWidth*y + x` from the
+    // `spvLinearTextureAlignment` function constant — so every R32_UINT surface
     // FFX uses for atomics (the SPD global counter; reconstructed-prev-depth)
-    // must be BUFFER-BACKED at that row stride, and every pipeline must be
-    // specialized with function constant 65535 set to the device's alignment.
-    // Miss either and the atomic argument is simply left unbound.
-    uint32_t linearTexAlign = 64;
-    std::vector<std::pair<id<MTLTexture>, id<MTLBuffer>>> aliases;
+    // had to be BUFFER-BACKED at that row stride, every pipeline specialized
+    // with function constant 65535, and missing either left the atomic argument
+    // silently unbound. `build.rs::MSL_VERSION` is 30100 and spirv-cross emits
+    // `texture2d<uint, access::read_write>` with a real `atomic_fetch_max`, so
+    // the alias, the stride, the constant and GOTCHA 3 below all went with it.
+    //
+    // THE TWO HALVES ARE COUPLED AND THE COUPLING IS GATED: shaders emitted at
+    // 30000 against this file cannot work, which is exactly what
+    // `FR_FFX_MSL=30000` proves (--check-fsr3 U1 must then fail on the
+    // emulation-site count). Do not lower that version without restoring this.
 
     // How many compute pipeline states CreatePipelineMetal actually built. The
     // gate asserts a floor on it, because a create that returned FFX_OK having
@@ -213,11 +234,6 @@ struct BackendContext_Metal {
     // context creation covers (see ffx_fsr3_metal.h: eleven of eighty).
     uint32_t pipelinesBuilt = 0;
 
-    id<MTLBuffer> aliasFor(id<MTLTexture> t) {
-        for (auto& a : aliases)
-            if (a.first == t) return a.second;
-        return nil;
-    }
 };
 
 BackendContext_Metal* ctx(FfxInterface* bi) {
@@ -238,6 +254,11 @@ id<MTLTexture> makeTexture(BackendContext_Metal* bc, const FfxResourceDescriptio
     // FFX_GPU_JOB_CLEAR_FLOAT on these, which the executor services with a
     // render-pass load-clear — a path Metal's validation layer aborts on
     // without this usage bit.
+    //
+    // THIS NOW COVERS R32_UINT TOO. Those took their own buffer-backed arm in
+    // the caller until D2 and could not carry the bit at all; native image
+    // atomics fold them back in here, which is what keeps the reset-frame clear
+    // of reconstructed-prev-depth legal without GOTCHA 3's blit fork.
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                MTLTextureUsageRenderTarget;
     id<MTLTexture> t = [bc->device newTextureWithDescriptor:td];
@@ -391,46 +412,16 @@ static FfxErrorCode CreateResourceMetal(FfxInterface* bi,
             memcpy([r.buffer contents], init.buffer, init.size);
         else if (init.type == FFX_RESOURCE_INIT_DATA_TYPE_VALUE)
             memset([r.buffer contents], init.value, size);
-    } else if (mtlFormat(desc->resourceDescription.format) == MTLPixelFormatR32Uint) {
-        // GOTCHA 2, FFX's own side of it: R32_UINT is the image-atomic format
-        // (the SPD global-atomic counter, reconstructed-prev-depth), so these
-        // MUST be buffer-backed or spirv-cross's emulated atomic argument is
-        // left unbound and Metal rejects the dispatch. Setting `r.buffer` is
-        // sufficient — the UAV-texture bind in the executor reads it directly.
-        // The row stride uses the device's linear-texture alignment so it
-        // agrees with the shaders' spvLinearTextureAlignmentOverride constant.
-        uint32_t w = desc->resourceDescription.width;
-        uint32_t h = desc->resourceDescription.height;
-        uint32_t align = bc->linearTexAlign;
-        uint32_t bytesPerRow = ((w * 4 + align - 1) / align) * align;
-        r.buffer = [bc->device newBufferWithLength:(NSUInteger)bytesPerRow * h
-                                           options:MTLResourceStorageModePrivate];
-        if (!r.buffer) return FFX_ERROR_BACKEND_API_ERROR;
-        MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
-        td.pixelFormat = MTLPixelFormatR32Uint;
-        td.width = w;
-        td.height = h;
-        td.storageMode = MTLStorageModePrivate;
-        // NO RenderTarget: Metal forbids it on a buffer-backed texture. That is
-        // precisely why GOTCHA 3 exists below — the clear path must not be the
-        // render-pass one for these.
-        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        r.texture = [r.buffer newTextureWithDescriptor:td offset:0 bytesPerRow:bytesPerRow];
-        [td release];
-        if (!r.texture) return FFX_ERROR_BACKEND_API_ERROR;
-        if (init.type == FFX_RESOURCE_INIT_DATA_TYPE_VALUE) {
-            // Private storage, so fill the backing buffer by blit rather than a
-            // host write.
-            id<MTLCommandBuffer> cb = [bc->initQueue commandBuffer];
-            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-            [blit fillBuffer:r.buffer
-                       range:NSMakeRange(0, [r.buffer length])
-                       value:init.value];
-            [blit endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
-        }
     } else {
+        // R32_UINT USED TO TAKE ITS OWN ARM HERE (GOTCHA 2): the image-atomic
+        // format had to be buffer-backed at the device's linear-texture stride,
+        // which cost it `MTLTextureUsageRenderTarget` and forced its own
+        // blit-based value init. With native image atomics it is an ORDINARY
+        // TEXTURE, so it falls through to `makeTexture` — and that is not
+        // merely a simplification, it is what re-arms GOTCHA 4 on this surface.
+        // `makeTexture` sets RenderTarget; the deleted arm could not, and FFX
+        // issues FFX_GPU_JOB_CLEAR_FLOAT on reconstructed-prev-depth at reset.
+        // It also regains the mipCount/textureType the special arm dropped.
         r.texture = makeTexture(bc, desc->resourceDescription);
         if (!r.texture) return FFX_ERROR_BACKEND_API_ERROR;
         if (init.type == FFX_RESOURCE_INIT_DATA_TYPE_VALUE)
@@ -487,11 +478,6 @@ static FfxErrorCode RegisterResourceMetal(FfxInterface* bi, const FfxResource* i
         r.buffer = (id<MTLBuffer>)in->resource;
     } else {
         r.texture = (id<MTLTexture>)in->resource;
-        // GOTCHA 2 again: if this is a buffer-backed image-atomic target,
-        // attach its alias so the UAV bind also binds the atomic buffer. This
-        // is what makes the SHIM-owned reconstructed-prev-depth work when FFX
-        // registers it as an external resource each frame.
-        r.buffer = bc->aliasFor(r.texture);
     }
     out->internalIndex = (int32_t)index;
     return FFX_OK;
@@ -618,15 +604,20 @@ static FfxErrorCode CreatePipelineMetal(FfxInterface* bi, FfxEffect effect, FfxP
         return FFX_ERROR_BACKEND_API_ERROR;
     }
 
-    // ALWAYS the specialized variant, never newFunctionWithName: alone. Some
-    // permutations declare spirv-cross's optional `spvLinearTextureAlignment`
-    // function constant, and Metal then REFUSES the plain variant at pipeline
-    // creation. Passing empty values would leave the constant undefined, which
-    // is why 65535 is set below for every pipeline; permutations that do not
-    // declare it ignore it.
+    // STILL THE SPECIALIZED VARIANT, AND DELIBERATELY WITH NOTHING SET. Metal
+    // REFUSES the plain `newFunctionWithName:` on any function that declares a
+    // function constant, so the specialized form is the one that survives a
+    // spirv-cross change; what went away is the VALUE. This used to set
+    // constant 65535 to the device's linear-texture alignment for
+    // `spvLinearTextureAlignment` (GOTCHA 2) — measured at MSL 30100, the
+    // emitted corpus declares ZERO function constants, so an empty value set is
+    // correct today.
+    //
+    // EMPTY RATHER THAN A PLACEHOLDER, because the two fail differently. If
+    // spirv-cross ever reintroduces a constant, empty values make this fail
+    // LOUDLY here ("function constant not defined") instead of silently
+    // specializing it to a number that no longer means what it did.
     MTLFunctionConstantValues* fcv = [[MTLFunctionConstantValues alloc] init];
-    uint32_t align = bc->linearTexAlign;
-    [fcv setConstantValue:&align type:MTLDataTypeUInt atIndex:65535];
     id<MTLFunction> fn = [mtllib newFunctionWithName:@"main0" constantValues:fcv error:&nerr];
     [fcv release];
     if (!fn) {
@@ -836,13 +827,13 @@ static FfxErrorCode ExecuteGpuJobsMetal(FfxInterface* bi, FfxCommandList command
                     uint32_t slot = c.pipeline.uavTextureBindings[i].slotIndex;
                     id<MTLTexture> t = nil;
                     texFromIndex(bc, idx, &t);
+                    // ONE BIND, not two. This used to be followed by a
+                    // `setBuffer:atIndex:slot` of the texture's aliased backing
+                    // buffer, because spirv-cross's emulated atomics took the
+                    // pixels through `device atomic_uint*` at the same slot in
+                    // buffer space (GOTCHA 2). A native `atomic_fetch_max` on
+                    // the texture needs no second binding.
                     [enc setTexture:t atIndex:slot];
-                    // GOTCHA 2's bind side: spirv-cross also expects the
-                    // texture's backing buffer at the SAME slot in buffer space
-                    // for atomic_*_explicit. Non-atomic UAVs have no alias and
-                    // skip this.
-                    id<MTLBuffer> alias = bufFromIndex(bc, idx);
-                    if (alias) [enc setBuffer:alias offset:0 atIndex:slot];
                 }
                 for (uint32_t i = 0; i < c.pipeline.srvBufferCount; ++i) {
                     id<MTLBuffer> b = bufFromIndex(bc, c.srvBuffers[i].resource.internalIndex);
@@ -899,35 +890,34 @@ static FfxErrorCode ExecuteGpuJobsMetal(FfxInterface* bi, FfxCommandList command
                 id<MTLTexture> t = nil;
                 texFromIndex(bc, idx, &t);
                 if (!t) break;
-                // GOTCHA 3 (validation-only): a buffer-backed image-atomic
-                // texture CANNOT carry MTLTextureUsageRenderTarget (Metal
-                // forbids the combination), so the render-pass load-clear below
-                // is illegal on exactly those surfaces. FFX only ever
-                // zero-clears them (the reset reconstructed-depth init), and
-                // every byte of a 0.0f fill is zero, so a blit fill of the
-                // backing buffer is EXACT rather than an approximation.
-                id<MTLBuffer> backing = bufFromIndex(bc, idx);
-                if (backing && !(t.usage & MTLTextureUsageRenderTarget)) {
-                    // A byte fill can only express a clear whose every byte is
-                    // the same, and zero is the only such float FFX asks for.
-                    // Checked rather than assumed: the assumption holds today
-                    // and the code cannot notice if it stops, and what it would
-                    // become is a SILENTLY wrong clear — a nonzero request
-                    // serviced as zero.
-                    if (cl.color[0] != 0.0f || cl.color[1] != 0.0f || cl.color[2] != 0.0f ||
-                        cl.color[3] != 0.0f) {
-                        std::fprintf(stderr,
-                                     "[fsr3-metal] CLEAR_FLOAT(%g,%g,%g,%g) on a buffer-backed "
-                                     "image-atomic target, which only a byte fill can service "
-                                     "— cleared to ZERO instead\n",
-                                     cl.color[0], cl.color[1], cl.color[2], cl.color[3]);
-                        std::fflush(stderr);
-                    }
-                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                    [blit fillBuffer:backing range:NSMakeRange(0, [backing length]) value:0];
-                    [blit endEncoding];
-                    break;
-                }
+                // GOTCHA 3 IS GONE WITH GOTCHA 2, and the render pass below is
+                // now the ONLY arm. A buffer-backed image-atomic texture cannot
+                // carry MTLTextureUsageRenderTarget (Metal forbids the
+                // combination), so this clear used to fork: those surfaces were
+                // serviced by a blit fill of the backing buffer, which is exact
+                // only because FFX zero-clears them and every byte of 0.0f is
+                // zero. Native image atomics leave no buffer-backed textures at
+                // all, so the guard `backing && !(t.usage & RenderTarget)`
+                // became unsatisfiable and the fork was dead code.
+                //
+                // WHAT MUST HOLD FOR THIS TO BE SAFE, stated because it is a
+                // real widening rather than a deletion: every FFX texture now
+                // carries RenderTarget (GOTCHA 4, `makeTexture` and
+                // `makeShimTex`), INCLUDING the R32_UINT ones that were
+                // previously excluded from it. A clear on a uint attachment
+                // converts MTLClearColorMake's doubles to the integer format, so
+                // the 0.0f FFX asks for still lands as 0 — exactly what the byte
+                // fill delivered, and the only value measured because it is the
+                // only one FFX requests.
+                //
+                // WHAT IS NOT CLAIMED: that a NONZERO CLEAR_FLOAT would now be
+                // serviced *correctly*. It would be serviced as an INTEGER
+                // conversion of the float, which is not obviously what a caller
+                // asking for a float clear of a uint image-atomic surface means,
+                // and no such request exists to measure against. The old blit
+                // fork at least printed a warning when it saw one; this arm
+                // would take it silently. If FFX ever starts issuing one, that
+                // is the thing to go and check, not a line to assume is fine.
                 MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
                 rp.colorAttachments[0].texture = t;
                 rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1047,7 +1037,6 @@ void ffx_message(FfxMsgType type, const wchar_t* message) {
 
 struct ShimTex {
     id<MTLTexture> tex = nil;
-    id<MTLBuffer> backing = nil;  // non-nil only for buffer-backed image-atomic targets
     uint32_t w = 0, h = 0;
 };
 
@@ -1080,33 +1069,6 @@ ShimTex makeShimTex(id<MTLDevice> dev, uint32_t w, uint32_t h, MTLPixelFormat fm
                MTLTextureUsageRenderTarget;
     ShimTex s;
     s.tex = [dev newTextureWithDescriptor:td];
-    s.w = w;
-    s.h = h;
-    [td release];
-    return s;
-}
-
-// A buffer-backed texture for an image-atomic target: the texture and its
-// MTLBuffer share memory, so the shader's `texture2d<uint>` view and its
-// `device atomic_uint*` alias address the same pixels. The row stride MUST use
-// the device's linear-texture alignment so it agrees with spvImage2DAtomicCoord,
-// which computes its address from the spvLinearTextureAlignment constant that
-// CreatePipelineMetal sets from the same number.
-ShimTex makeBufferBackedTex(id<MTLDevice> dev, uint32_t w, uint32_t h, MTLPixelFormat fmt,
-                            uint32_t bpp, uint32_t align) {
-    uint32_t bytesPerRow = ((w * bpp + align - 1) / align) * align;
-    ShimTex s;
-    id<MTLBuffer> buf = [dev newBufferWithLength:(NSUInteger)bytesPerRow * h
-                                         options:MTLResourceStorageModePrivate];
-    if (!buf) return s;
-    MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
-    td.pixelFormat = fmt;
-    td.width = w;
-    td.height = h;
-    td.storageMode = MTLStorageModePrivate;
-    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    s.tex = [buf newTextureWithDescriptor:td offset:0 bytesPerRow:bytesPerRow];
-    s.backing = buf;  // owned by the ShimTex; released in destroy
     s.w = w;
     s.h = h;
     [td release];
@@ -1173,27 +1135,27 @@ extern "C" int32_t frshim_fsr3_metal_create(void* device, uint32_t max_render_w,
     bc->initQueue = [dev newCommandQueue];
     bc->libs = libs;
     bc->libCount = lib_count;
-    bc->linearTexAlign =
-        (uint32_t)[dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatR32Uint];
-    if (bc->linearTexAlign < 4) bc->linearTexAlign = 4;
     s->backend = bc;
     if (!bc->initQueue) {
         frshim_fsr3_metal_destroy(s);
         return FRSHIM_FSR3MTL_ERR_METAL;
     }
 
-    // The temporals FIRST, so the recon-prev-depth alias is registered before
-    // ffxFsr3UpscalerContextCreate can register any resource against it.
+    // ALL THREE THROUGH makeShimTex NOW. recon_prev_depth used to need
+    // `makeBufferBackedTex` — an MTLBuffer with a linear-texture-aligned row
+    // stride, a texture created over it, and an entry in the backend's alias
+    // table so the UAV bind could also bind the buffer (GOTCHA 2). With native
+    // image atomics it is an ordinary R32_UINT texture, which also means it now
+    // carries MTLTextureUsageRenderTarget like every other one (GOTCHA 4), and
+    // the "temporals first so the alias is registered before FFX can register
+    // against it" ordering constraint is gone with the alias table.
     s->dilated_depth = makeShimTex(dev, max_render_w, max_render_h, MTLPixelFormatR32Float);
     s->dilated_motion = makeShimTex(dev, max_render_w, max_render_h, MTLPixelFormatRG16Float);
-    s->recon_prev_depth = makeBufferBackedTex(dev, max_render_w, max_render_h,
-                                              MTLPixelFormatR32Uint, 4, bc->linearTexAlign);
-    if (!s->dilated_depth.tex || !s->dilated_motion.tex || !s->recon_prev_depth.tex ||
-        !s->recon_prev_depth.backing) {
+    s->recon_prev_depth = makeShimTex(dev, max_render_w, max_render_h, MTLPixelFormatR32Uint);
+    if (!s->dilated_depth.tex || !s->dilated_motion.tex || !s->recon_prev_depth.tex) {
         frshim_fsr3_metal_destroy(s);
         return FRSHIM_FSR3MTL_ERR_METAL;
     }
-    bc->aliases.emplace_back(s->recon_prev_depth.tex, s->recon_prev_depth.backing);
 
     // NOT ZEROED, and that is the SDK's declared contract rather than an
     // omission: ffx_fsr3upscaler.cpp creates all three of these with
@@ -1347,7 +1309,6 @@ extern "C" void frshim_fsr3_metal_destroy(void* handle) {
     if (s->dilated_depth.tex) [s->dilated_depth.tex release];
     if (s->dilated_motion.tex) [s->dilated_motion.tex release];
     if (s->recon_prev_depth.tex) [s->recon_prev_depth.tex release];
-    if (s->recon_prev_depth.backing) [s->recon_prev_depth.backing release];
     if (s->backend) {
         if (s->backend->initQueue) [s->backend->initQueue release];
         delete s->backend;

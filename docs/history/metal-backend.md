@@ -1162,4 +1162,208 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # it is recorded in smoke::Plant rather than fixed, and the
                                       # run-list means each lever, and SEPARATELY the layers on a
                                       # clean run -- not the cross product.
+
+                                      # D2 -- THE IMAGE-ATOMIC EMULATION DIES (2026-08-19, Apple M1,
+                                      # macOS 26.5.1, Xcode 26.6, spirv-cross 2026-07-06). The one rung
+                                      # of the Metal 4 ladder that needs no Metal 4 API at all, and its
+                                      # product is a DELETION: build.rs::MSL_VERSION 30000 -> 30100 makes
+                                      # spirv-cross emit NATIVE Metal image atomics, which retires GOTCHA
+                                      # 2 and GOTCHA 3 of the four in ffx_fsr3_metal.mm along with the
+                                      # buffer-backed emulation itself.
+                                      #
+                                      # 83 LINES OF CODE, COUNTED RATHER THAN ESTIMATED. The plan said
+                                      # "~150-200 lines" and that was an estimate that would have
+                                      # shipped as a measurement. ffx_fsr3_metal.mm is -143/+95, but 58
+                                      # of the deletions and 93 of the additions are comment or blank:
+                                      # 85 lines of code out, 2 in. mtl::device::linear_tex_align adds 7
+                                      # more. The comment count going UP while the code count goes down
+                                      # is the intended shape -- every deleted site keeps a note saying
+                                      # what left, because GOTCHA numbering is cited from smoke.rs,
+                                      # main.rs and this file.
+                                      #
+                                      # MEASURED FIRST, over all 80 committed permutations, because the
+                                      # plan this rung was written from got two things wrong.
+                                      #
+                                      #   30000 -> 30100  20 of 80 permutations change
+                                      #                   binding names REMOVED : 20, all *_atomic BUFFERs
+                                      #                   binding names ADDED   : 0
+                                      #                   indices MOVED         : 0
+                                      #
+                                      # THE CHANGE IS PURELY SUBTRACTIVE ON THE BINDING SURFACE, and that
+                                      # is what made it safe for ffx_metal's discrete binds: the companion
+                                      # `device atomic_uint*` disappears and every surviving resource keeps
+                                      # its index. Two FFX resources are involved --
+                                      # rw_reconstructed_previous_nearest_depth (16 permutations) and
+                                      # rw_spd_global_atomic (4, the SPD passes).
+                                      #
+                                      # THE PLAN SAID 30100/30200/40000 WERE BYTE-IDENTICAL. They are not.
+                                      # 3.1 is the exact threshold where the emulation dies; 4.0 ALSO
+                                      # rewrites nine barrier sites in the four SPD permutations --
+                                      # threadgroup_barrier(mem_device|mem_threadgroup|mem_texture) becomes
+                                      # atomic_thread_fence(..., seq_cst, thread_scope_threadgroup) plus a
+                                      # narrow threadgroup_barrier -- and adds memory_coherence_device. SPD
+                                      # is a CROSS-THREADGROUP reduction and U4's quality comparison is
+                                      # report-only, so a subtly wrong reduction there is the
+                                      # silent-failure class. The pin is the threshold, and 4.0 became
+                                      # FR_FFX_MSL=40000, a measurement rather than a bundled assumption.
+                                      #
+                                      # THE PLAN ALSO SAID RECIPE MUST BE BUMPED. It must not.
+                                      # SPIRV_CROSS_ARGS rides the .toolstamp VERBATIM, so editing the
+                                      # version token wipes all 80 metallibs by construction (confirmed:
+                                      # the first build after the change reported "0 cached"). RECIPE is
+                                      # for changes to build.rs's own Rust that alter emitted bytes
+                                      # INVISIBLY -- the 12-byte header format and the -1000 sampler remap.
+                                      # Bumping it anyway would have taught the next reader the wrong rule.
+                                      #
+                                      # EACH EMISSION IMPLIES A -std FLOOR, which matters because
+                                      # transpile_ffx_metallib passes NO -std and takes the SDK default
+                                      # (__METAL_VERSION__ 400 on SDK 26):
+                                      #
+                                      #   emit 30000   compiles at -std=metal3.0 and up
+                                      #   emit 30100   needs 3.1  "no member named 'atomic_fetch_add'"
+                                      #   emit 40000   needs 3.2  "undeclared identifier
+                                      #                            'memory_coherence_device'"
+                                      #
+                                      # So 30100 raises the implicit floor one step and stays independent
+                                      # of D1's coming -std pin; 40000 would couple them.
+                                      #
+                                      # GOTCHA 4 GOT WIDER, AND THAT IS THE ONLY NON-DELETION HERE. R32_UINT
+                                      # surfaces could not carry MTLTextureUsageRenderTarget while they were
+                                      # buffer-backed (Metal forbids the combination -- which is what GOTCHA
+                                      # 3 existed to work around), so they were the standing exception to
+                                      # GOTCHA 4. As ordinary textures they take the usage bit like
+                                      # everything else, and FFX's reset-frame CLEAR_FLOAT on
+                                      # reconstructed-prev-depth goes through the render pass rather than a
+                                      # blit fill of a backing buffer. This was the rung's predicted risk
+                                      # and it is invisible without the validation layers.
+                                      #
+                                      # THE C2 DEBT IS DISCHARGED, and the answer retired the hypothesis
+                                      # this rung was written on. The recorded --check-fsr3 U4 verdict
+                                      # "uniformly zero under validation" (above) was the reason to suspect
+                                      # GOTCHA 2 of causing it. Measured BEFORE any change, on this M1:
+                                      #
+                                      #   config                    exit  energy  history    vs-bilinear
+                                      #   plain                     0     1.000x  2.197e-2   2.962e-2
+                                      #   MTL_DEBUG_LAYER=1         0     1.000x  2.197e-2   2.962e-2
+                                      #   MTL_SHADER_VALIDATION=1   0     1.000x  2.197e-2   2.962e-2
+                                      #
+                                      # --check-fsr3 PASSES under both layers on real silicon, U4 producing
+                                      # identical numbers -- it does NOT read "the dispatch wrote nothing".
+                                      # That verdict is PARAVIRTUAL-RUNNER-SPECIFIC, not a property of the
+                                      # FSR3 arm, which resolves the confound C2 recorded and C3 narrowed.
+                                      # The layers' only visible effect is on the accumulating-frame f16 ULP
+                                      # count: 1800 ch plain, 132 under DEBUG_LAYER, 0 under
+                                      # SHADER_VALIDATION -- monotone, and the last one is exactly the
+                                      # "drops to EXACTLY ZERO" corroboration that
+                                      # main.rs::fsr3_upscale_check already records (grep the phrase --
+                                      # cited by NAME because this rung's own edits above it moved the
+                                      # line number by 60 between writing this entry and reviewing it).
+                                      # --check-mtl also passes under each layer separately.
+                                      #
+                                      # AFTER, same box, same session (the metallib table shrank 1148 KiB
+                                      # -> 1121 KiB): plain / DEBUG_LAYER / SHADER_VALIDATION all PASSED,
+                                      # every U4 number identical to four significant figures -- energy
+                                      # 1.000x, history 2.197e-2, vs-bilinear 2.962e-2, jitter 2.592e-2,
+                                      # depth 1.218e-2, motion 3.502e-2, 11 pipelines.
+                                      #
+                                      # AND THE FINDING THE TOOTH TURNED UP, which is why U1 gained an
+                                      # assertion rather than the rung trusting U4. Armed at FR_FFX_MSL=30000
+                                      # -- the emulation back in the shaders, gone from the shim -- U4 STILL
+                                      # PASSES ALL NINE OF ITS ASSERTIONS:
+                                      #
+                                      #   metric        correct (30100)   mismatched (30000)   U4 bound
+                                      #   energy        1.000x            0.999x               0.5..2.0
+                                      #   history       2.197e-2          2.579e-2             >= 1e-3
+                                      #   vs-bilinear   2.962e-2          3.090e-2             >= 5e-3
+                                      #   jitter        2.592e-2          2.303e-2             >= 1e-3
+                                      #   depth         1.218e-2          9.688e-3             >= 1e-3
+                                      #
+                                      # An unbound atomic argument does not crash and does not zero the
+                                      # output; it DEGRADES it, by 17% on history and 20% on depth, well
+                                      # inside every bound U4 has. This is the invariants-that-fail-silently
+                                      # class exactly, and the only thing that catches it is U1's
+                                      # emulation-site count -- which is why that count is asserted and why
+                                      # CI greps for it as a third fsr3 guard.
+                                      #
+                                      # FR_FFX_MSL IS THIS TREE'S FIRST BUILD-TIME LEVER and needs two
+                                      # things a runtime one does not. cargo:rerun-if-env-changed=FR_FFX_MSL
+                                      # (build.rs had exactly one such line before, Windows-only, for
+                                      # FRUSTRACER_DLSS_SDK) or cargo never re-runs the script and the lever
+                                      # is inert -- the FR_ABL probe-reach trap in build-script currency. And
+                                      # cargo:rustc-env, because a gate cannot read the environment to
+                                      # discover what the BUILD did; build.rs states FR_FFX_MSL_BUILT and
+                                      # FR_FFX_ATOMIC_SITES, and U1 reads them back with option_env!.
+                                      #
+                                      # It is a TWO-STEP tooth -- rebuild, then run -- and the run-list says
+                                      # so. The vacuity hazard specific to the class is why the tooth is a
+                                      # VERSION rather than a failure: a lever that made spirv-cross fail
+                                      # outright would empty the table, unset cfg(ffx_fsr3_metal), and U1
+                                      # would SKIP and exit 0. At 30000 the transpile still succeeds, the
+                                      # table stays full, and the assertion fires.
+                                      #
+                                      #   lever              class        observable
+                                      #   FR_FFX_MSL=30000   TOOTH        20 sites; FAIL U1; exit 1
+                                      #   FR_FFX_MSL=40000   MEASUREMENT  0 sites; PASSED; every U4 number
+                                      #                                   IDENTICAL to 30100 (table 1122 KiB
+                                      #                                   vs 1121). Evidence for a future
+                                      #                                   promotion, not a reason to promote:
+                                      #                                   one box, one scene, and the SPD
+                                      #                                   barrier rewrite is what it would buy.
+                                      #   FR_FFX_MSL=31337   (illegal)    loud, reverts to 30100, serves cache
+                                      #
+                                      # FR_FFX_BUFBACK was DESIGNED AND NOT TAKEN -- the FR_MTL_SET_SWAP
+                                      # precedent. Keeping the emulation alive behind a branch forfeits the
+                                      # deletion, which is the whole product, and FR_FFX_MSL=30000 already
+                                      # covers the claim structurally. FR_FFX_FCV65535 was dropped too: the
+                                      # plan predicted "pipeline creation must fail", and the emitted corpus
+                                      # at 30100 declares ZERO function constants, so setting one Metal
+                                      # ignores proves nothing. The specialized
+                                      # newFunctionWithName:constantValues: form STAYS, with an EMPTY value
+                                      # set -- Metal refuses the plain variant on any function that declares
+                                      # a constant, and empty values fail LOUDLY if spirv-cross reintroduces
+                                      # one instead of silently specializing it to a stale number.
+                                      #
+                                      # WHAT REVIEWING THIS RUNG FOUND, recorded because three of the four
+                                      # are the failure classes this file spends its length on and they
+                                      # were shipped BY the person who wrote those warnings down.
+                                      #
+                                      #   * THE CI GUARD WAS VACUOUS ON ITS OWN TEST CASE. `grep -q "0
+                                      #     image-atomic emulation sites"` matches "20 image-atomic
+                                      #     emulation sites" as a SUBSTRING, and 20 is precisely what
+                                      #     FR_FFX_MSL=30000 produces. U1 prints its table line whether or
+                                      #     not the assertion fired, so the guard went green on the exact
+                                      #     input it was written for. The leading ", " is now load-bearing
+                                      #     and both ends say so.
+                                      #   * THE GATE FAILED OPEN ON A MISSING COUNT. `option_env!(...)
+                                      #     .unwrap_or(0)` reads an absent FR_FFX_ATOMIC_SITES as a clean
+                                      #     zero. Unreachable today -- cfg(ffx_fsr3_metal) is only set on
+                                      #     the path that emits it -- and unreachable is not a reason to
+                                      #     pick the wrong default. Absent is now a FAIL.
+                                      #   * MSL_VERSION HAD AN UNPINNED SECOND COPY. U1 compared `built !=
+                                      #     "30100"` against a literal, so promoting the pin in D1 would
+                                      #     have left every clean run announcing a PLANT that says "this
+                                      #     run MUST fail". build.rs now publishes FR_FFX_MSL_DEFAULT and
+                                      #     the gate compares against that.
+                                      #   * A LINE CITATION ROTTED BEFORE THE COMMIT. This entry cited
+                                      #     main.rs:22715; the same rung's edits to that file had already
+                                      #     moved the text to :22775. Cited by name now -- the identical
+                                      #     repair this rung made to smoke.rs's GOTCHA 1 reference.
+                                      #
+                                      # And one over-claim removed rather than fixed: the CLEAR_FLOAT arm
+                                      # said a nonzero clear "would now be serviced correctly". It would be
+                                      # serviced as an INTEGER conversion of the float, which is not
+                                      # obviously the same thing, and FFX issues no such request to measure
+                                      # against. Zero -- the only value asked for -- is exact either way.
+                                      #
+                                      # Touch build.rs::MSL_VERSION / spirv_cross_args / count_atomic_emulation
+                                      # / shim/ffx_fsr3_metal.mm's GOTCHA sites / mtl::device::line ->
+                                      # run --check-fsr3 clean, then FR_FFX_MSL=30000 REBUILD + run (must
+                                      # exit 1 on U1), then FR_FFX_MSL=40000 rebuild + run (reported, not
+                                      # asserted), then rebuild at the default -- the lever is a BUILD-time
+                                      # one and a stale binary measures the wrong arm; --check-fsr3 AND
+                                      # --check-mtl once under MTL_DEBUG_LAYER=1 and once under
+                                      # MTL_SHADER_VALIDATION=1 SEPARATELY (GOTCHA 4 widened and the layers
+                                      # are the only thing that sees it); --check-msl on the procedural scene
+                                      # AND san-miguel-low-poly AND --sw-rays; --check-spirv; --check-metalfx;
+                                      # --check + cargo test; then restore the Windows goldens.
 ```

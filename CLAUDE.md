@@ -309,6 +309,9 @@ island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `
 ablation and probes: `FR_ABL` `FR_BALLAST` `FR_WIDTH` `FR_ORACLE` `FR_RANGE` `FR_REF` ·
 tuning sweeps: `FR_LEAF` `FR_LGROUP` `FR_LSTACK` `FR_WIDE` `FR_STACK_LAYOUT` `FR_FRD_GROUP` ·
 per-feature A/B: `FR_NGXFG_*` `FR_NGXRR_*` `FR_NRD_*` `FR_FRD_*` `FR_MFX*` `FR_AEXP_*`
+`FR_MTL_*` (the `--check-mtl` plants: eight teeth and measurements over the argument-buffer
+map, the threadgroup size and residency) · `FR_FFX_MSL` — **the one BUILD-time lever**, so it
+needs `cargo build` and the gate run to see it alike, and a stale binary measures the other arm
 `FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` `FR_WEB_TEX`
 (the wavefront samples texweb buckets — the browser texture plan on native D3D12;
 `--check-gpu` M15 owns it) · Vulkan: `FR_VK_*`

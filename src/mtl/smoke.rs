@@ -259,7 +259,9 @@ pub fn build(m: &Mtl, msl: &Msl, sp: &Spirv) -> Result<Pipes, String> {
 pub fn pass(m: &Mtl, p: &Pipes, n: u32, plant: Plant) -> Result<Pass, String> {
     let words = (FILL_N + TAIL) as usize;
 
-    // `Push` is 4 uints = 16 B. GOTCHA 1 (`ffx_fsr3_metal.mm:862-878`):
+    // `Push` is 4 uints = 16 B. GOTCHA 1 (grep `GOTCHA 1` in
+    // `shim/ffx_fsr3_metal.mm` — cited by NAME rather than by line, because D2
+    // deleted GOTCHA 2 and 3 out from under the old `:862-878`):
     // spirv-cross rounds an MSL constant-buffer struct up to 16-byte alignment,
     // so a bind must cover the PADDED size. 16 is already a multiple of 16 here
     // — the rule is inert for this kernel and stated because `FrameCb` is
