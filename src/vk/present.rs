@@ -570,8 +570,9 @@ impl Win {
 }
 
 /// The four pad buttons the integrator knows, in `Mirror`'s bit order.
-/// Everything else on the pad is deliberately unbound here — face buttons
-/// belong to a menu this backend has no peer of yet.
+/// Everything else on the pad is deliberately unbound HERE — Start, the face
+/// buttons and the D-pad's menu role are `input::Edges::feed`'s (the pump
+/// forwards every event, and the render thread routes them; rung 4).
 fn pad_button(m: &crate::flycam::Mirror, b: sdl3::gamepad::Button, down: bool) {
     use sdl3::gamepad::Button;
     let i = match b {

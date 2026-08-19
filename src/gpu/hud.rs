@@ -1,8 +1,10 @@
-//! GPU half of the HUD/menu overlay (the CPU half — Slint software
-//! rendering — is `crate::hud`): a window-sized premultiplied RGBA8 texture,
-//! dirty-rect uploads, and a premultiplied-alpha fullscreen composite drawn
-//! inside `fullscreen_to_backbuffer` after the tonemap pass — ONE insertion
-//! point, so every present arm (CPU, GPU, DXR, every upscaler) gets the HUD.
+//! GPU half of the HUD/menu overlay on D3D12 (the CPU half — Slint software
+//! rendering — is `crate::hud`; the Vulkan peer is `vk/hud.rs`, B6b rung 4,
+//! and `gfx::hud_frame` is the wire both consume): a window-sized
+//! premultiplied RGBA8 texture, dirty-rect uploads, and a premultiplied-alpha
+//! fullscreen composite drawn inside `fullscreen_to_backbuffer` after the
+//! tonemap pass — ONE insertion point, so every present arm (CPU, GPU, DXR,
+//! every upscaler) gets the HUD.
 //!
 //! TRUE dirty rectangles, all three layers: Slint only re-rasterizes the
 //! dirty region (ReusedBuffer), `crate::hud` packs only those rects' bytes,

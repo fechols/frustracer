@@ -326,7 +326,7 @@ src/               117 .rs, ~150k lines  (main.rs alone is 39k — session loop,
   gpu/           D3D12: wavefront tracer, DXR pipeline, upscaler/denoiser/FG wiring
   vk/            Vulkan backend (unix)          mtl/   Metal backend (macOS)
   gfx/           backend-neutral core: shader assembly, FrameCb, denoiser vocabulary
-  hud/           Slint software-rendered HUD and pause menu
+  hud/           Slint software-rendered HUD and pause menu (both windows; gpu/hud.rs + vk/hud.rs composite it)
   shaders/       43 HLSL files — the corpus all three backends compile
   bin/frqa.rs    the --qa socket driver
 shim/            15 C++/ObjC++ shims (DLSS-D/G, FFX FSR3 D3D12/VK/Metal, NGX)

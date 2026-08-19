@@ -28096,7 +28096,9 @@ fn run_cinematic_cpu(
 /// It carries the D3D12 arm's shape with the parts that have no peer here
 /// dropped rather than emulated: ONE upscaler (FSR3 — see the vendor survey;
 /// XeSS ships no Linux library and DLSS has no Vulkan NGX at all), ONE denoiser
-/// (NRD, which is the compiled default), no dual-GPU, no HUD.
+/// (NRD, which is the compiled default), no dual-GPU. The HUD overlay
+/// (`--cinematic-hud`) DOES ride this arm since B6b rung 4 — it is a CPU
+/// composite over the present buffer, so it never needed a GPU peer.
 ///
 /// TWO ARMS PER SHOT, exactly as on D3D12:
 ///   * RECONSTRUCTION — every sub-frame is a fresh jittered frame the temporal
