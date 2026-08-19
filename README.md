@@ -284,10 +284,14 @@ split SDL forces (its event entry points are main-thread-only and Wayland has
 no off-thread keyboard state) is what makes it possible: the main thread pumps
 and forwards, the render thread owns Vulkan, the menu and the present, and the
 flycam integrates. The present cadence is reported (mean/p50/p99 — p99 because
-a mean is exactly the statistic that cannot see a hitch). What it does not yet
-do: audio, a screenshot key, `--lock-res`, and the settings rows that answer to
-arms this backend has not got (one tracer, one upscaler, one denoiser — those
-rows wear an "n/a" badge rather than disappearing).
+a mean is exactly the statistic that cannot see a hitch). The quality levers
+are live: **1/2/3** picks the preset, **U** cycles samples per pixel and **V**
+toggles relief where a heightfield is armed — each declaring its own
+discontinuity to the FSR3/NRD histories. What it does not yet do: audio, a
+screenshot key, `--lock-res`, hemisphere bounces (**H** — a still-frame
+feature the upscaler sub-mode refuses on Windows too), and the settings rows
+that answer to arms this backend has not got (one tracer, one upscaler, one
+denoiser — those rows wear an "n/a" badge rather than disappearing).
 
 There is also a picture without a window: `--cinematic` has a
 Vulkan arm, so the GPU tracer renders stills and camera-spline sequences

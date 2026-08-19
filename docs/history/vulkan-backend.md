@@ -3058,6 +3058,49 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # --check-spirv (loud + exempt), tools/win-cross-check.sh, and the window over
                                       # --qa: resize twice, read the split line's "memo N hit(s)" and `pos`'s
                                       # rebuilds/render fields.
+                                      #
+                                      # B6C RUNG 2 — PRESET, SPP AND RELIEF GO LIVE (2026-08-19; CineVk.force_reset
+                                      # + CineVk.spp + the window's quality-key consumer + the MenuFx::Quality/
+                                      # CycleSpp/ToggleHeight arms + VK_INERT_LIVE minus three). The cheapest three
+                                      # un-badges, because all three ride the SHARED FrameCb (gfx/frame.rs's
+                                      # with_frame — the vk tracer calls the same function D3D12 does), so "live" is
+                                      # a cbuffer write, not a rebuild.
+                                      # ONE CONSUMER FOR KEY AND MENU: the MenuFx arms synthesize the key's edge
+                                      # (edges.quality / cycle_spp / toggle_height), D3D12's own shape, and a single
+                                      # block in the window loop consumes both. The un-swallowing is part of the
+                                      # rung: the real 1/2/3/U/V presses used to be silently discarded; --qa key
+                                      # accepts them now and the LiveView reports the real values — which
+                                      # menu_adjust's preset/spp cycles READ, so the truth is load-bearing, not
+                                      # cosmetic.
+                                      # THE RESET IS ONE LATCH, TWO CONSUMERS BY CONSTRUCTION: force_reset ORs into
+                                      # st.reset before either reader, so FSR3's Dispatch.reset and NRD's
+                                      # CommonSettings reset cannot disagree ("both halves" in temporal form). It is
+                                      # consumed by the FIRST sub-frame only — ORing into every sub-frame would
+                                      # re-reset the history a still shot is integrating. Replay stays licensed
+                                      # across a quality flip (tracer.rs:1900's contract: quality rides the
+                                      # cbuffer), so a parked camera keeps its -43%-class win through a preset
+                                      # change while the histories restart.
+                                      # BOUNCE STAYS BADGED — THE PLAN SAID OTHERWISE, THE CODE WON: the design had
+                                      # H going live on the strength of "the hemi units are compiled and V8-gated".
+                                      # They are — but D3D12's OWN upscaler sub-mode refuses H ("still-frame
+                                      # feature": the hemi tiers converge over parked accumulation, which a jittered
+                                      # 1-frame temporal integrator is not), and this window is ALWAYS that
+                                      # sub-mode. Wiring it would have shipped GI in exactly the configuration the
+                                      # reference backend declines to. The refusal is now NAMED for that reason
+                                      # (--qa key h says "still-frame feature", not "missing arm").
+                                      # spp is CineVk state, not Opts: opts.spp seeds it at build and the U key
+                                      # cycles it (next_spp, now both windows' — its not-windows dead_code allowance
+                                      # retired); the capture arm never cycles, so --spp's CLI contract is
+                                      # byte-identical.
+                                      # Touch VK_INERT_LIVE / settings::self_test's want complement / the window's
+                                      # quality consumer + LiveView + MenuFx arms + qa key table / CineVk's
+                                      # force_reset+spp + render_frame's st.reset OR -> run --check (LAST; settings
+                                      # + cli among the roster), cargo test, --check-vk on RADV AND llvmpipe,
+                                      # tools/win-cross-check.sh, and the window over --qa in BOTH pump arms:
+                                      # key 1/3 ("quality preset N" on stderr), key u twice ("spp 2"/"spp 4"),
+                                      # key v (the unarmed refusal, by name), key h (the still-frame refusal),
+                                      # key x (the inert refusal).
+                                      # Verified: all of the above green, goldens byte-identical.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism
