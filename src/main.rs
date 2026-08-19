@@ -14629,18 +14629,25 @@ fn web_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, Strin
             .into());
     }
     let web = |src: String| format!("{}\n{}", sh::web_defs(), src);
+    // Trace units additionally take the generated WEB_TEX block (the
+    // bindless texs[] replacement — gfx::texweb): pasted BETWEEN the define
+    // prelude and the unit, so its helpers are declared before trace_common
+    // and shade consume them. Non-trace units never touch textures and stay
+    // on the bare prelude.
+    let texweb = gfx::texweb::hlsl(&gfx::texweb::plan(scene));
+    let webt = |src: String| format!("{}\n{}\n{}", sh::web_defs(), texweb, src);
     let t = sh::trace_sources(&sh::TraceKeys { scene, vendor: Vendor::Nvidia, sway_armed: false });
     let f = sh::frd_sources();
     Ok(vec![
-        ("reference".into(), web(t.reference), Shape::Compute("cs_6_5")),
-        ("resolve".into(), web(t.resolve), Shape::Compute("cs_6_5")),
-        ("wavefront".into(), web(t.wavefront), Shape::Compute("cs_6_5")),
-        ("sky".into(), web(t.sky), Shape::Compute("cs_6_5")),
-        ("leaf".into(), web(t.leaf), Shape::Compute("cs_6_5")),
-        ("leaf_fb".into(), web(t.leaf_fb), Shape::Compute("cs_6_5")),
-        ("hemi_wave".into(), web(t.hemi_wave), Shape::Compute("cs_6_5")),
-        ("hemi_leaf".into(), web(t.hemi_leaf), Shape::Compute("cs_6_5")),
-        ("compose".into(), web(t.compose), Shape::Compute("cs_6_5")),
+        ("reference".into(), webt(t.reference), Shape::Compute("cs_6_5")),
+        ("resolve".into(), webt(t.resolve), Shape::Compute("cs_6_5")),
+        ("wavefront".into(), webt(t.wavefront), Shape::Compute("cs_6_5")),
+        ("sky".into(), webt(t.sky), Shape::Compute("cs_6_5")),
+        ("leaf".into(), webt(t.leaf), Shape::Compute("cs_6_5")),
+        ("leaf_fb".into(), webt(t.leaf_fb), Shape::Compute("cs_6_5")),
+        ("hemi_wave".into(), webt(t.hemi_wave), Shape::Compute("cs_6_5")),
+        ("hemi_leaf".into(), webt(t.hemi_leaf), Shape::Compute("cs_6_5")),
+        ("compose".into(), webt(t.compose), Shape::Compute("cs_6_5")),
         ("frd-temporal".into(), web(f.temporal), Shape::Compute("cs_6_5")),
         ("frd-blur".into(), web(f.blur), Shape::Compute("cs_6_5")),
         ("bloom".into(), web(sh::BLOOM_HLSL.to_string()), Shape::Compute("cs_6_0")),
@@ -33229,6 +33236,20 @@ fn run_check(
         }
     };
 
+    // WEB_TEX plan/codegen self-test (the browser texture buckets):
+    // grouping, remap injectivity, payload byte layout, generated-block
+    // shape, and the zero-texture arm.
+    let texweb_ok = match gfx::texweb::self_test() {
+        Ok(()) => {
+            eprintln!("texweb self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("texweb self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Material-classifier self-test — deterministic spot checks over the
     // real San Miguel naming patterns (keyword precedence, whole-token
     // safety, the name/Ns/illum fallback tiers).
@@ -36046,6 +36067,7 @@ fn run_check(
         ("sway-mv", sway_mv_ok),
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
+        ("texweb", texweb_ok),
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
         ("surface-point", surfpt_ok),

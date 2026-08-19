@@ -27,6 +27,7 @@ block still works as a complete flag index.
 | [tooling-and-capture.md](tooling-and-capture.md) | 30 KB | Tracy, `--quinlight`, `--spin`, `--cinematic`, settings, HDR, GPU timing |
 | [profiling.md](profiling.md) | 41 KB | the `## Profiling` section — Tracy, PIX, timestamp queries, the perf campaigns |
 | [intel-arc-xe2.md](intel-arc-xe2.md) | 38 KB | the `## Intel Arc / Xe2` section — what the hardware does and does not offer |
+| [web-backend.md](web-backend.md) | 9 KB | the browser port (WASM + WebGPU): the wasm compile guard, `--check-wgsl`, naga's measured verdict. NOT an extraction — written live as the campaign runs |
 
 Two entries sit in a topically adjacent file rather than their own, because the extraction
 preserved the original document order exactly: **`--no-audio`** is in `sky-lighting-clouds.md`
@@ -64,6 +65,8 @@ prefix to the suite that owns it and the file where its story lives:
 | `X0`–`X6` | `--check-metalfx` | metal-backend.md |
 | `K0`–`K5` | `--check-mtl` | metal-backend.md |
 | `G1`–`G14` | `clouds::self_test` | sky-lighting-clouds.md |
+| `W0`–`W7` | `--check-wgsl` (the browser corpus; W5–W7 not yet built) | web-backend.md |
+| `J*` | reserved: `--check-wgpu` (the WebGPU recorder, not yet built — `U*` being taken is why it is not that) | web-backend.md |
 
 **Two hazards.** The `M` prefix is genuinely ambiguous — `--check-gpu` and `--check-msl` both
 use it, so `M1` means different things in `gpu-and-dxr.md` and `shader-toolchains.md`. And a

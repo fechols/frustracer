@@ -620,6 +620,26 @@ jobs:
           cargo run --profile quick -- --check-spirv 2>&1 | tee spirv.log
           grep -q "CHECK-SPIRV PASSED" spirv.log \
             || { echo "::error::--check-spirv did not run (no summary line — it skipped)"; exit 1; }
+          # The BROWSER corpus (WASM/WebGPU port): same DXC drop, then naga.
+          # The guards assert the positive, per this step's doctrine: W1 must
+          # have loaded the compiler (W0-only is the wasm degrade, not this
+          # job's claim), spirv-val must have run (it is what checks the
+          # wgsl::normalize rewrite — it caught a corruption once), and the
+          # normalization must have touched SOMETHING (the probe-reach alarm:
+          # +0 ids means the passes stopped reaching the corpus).
+          cargo run --profile quick -- --check-wgsl 2>&1 | tee wgsl.log
+          grep -q "CHECK-WGSL PASSED" wgsl.log \
+            || { echo "::error::--check-wgsl failed (or printed no summary)"; exit 1; }
+          grep -q "check-wgsl: W1 " wgsl.log \
+            || { echo "::error::--check-wgsl ran W0-only (no DXC) — this job installs the drop precisely so W2-W4 gate"; exit 1; }
+          if grep -q "SKIP W2 spirv-val" wgsl.log; then
+            echo "::error::--check-wgsl ran without spirv-val — the reference validator is the check on the normalization rewrite"
+            exit 1
+          fi
+          if grep -q "normalize +0 ids" wgsl.log; then
+            echo "::error::--check-wgsl's normalization touched nothing — the probe-reach alarm"
+            exit 1
+          fi
           cargo run --profile quick -- --check-vk 2>&1 | tee vk.log
           grep -q "CHECK-VK PASSED" vk.log \
             || { echo "::error::--check-vk did not run (no summary line — it skipped)"; exit 1; }
@@ -641,6 +661,7 @@ jobs:
           name: check-vulkan-logs
           path: |
             spirv.log
+            wgsl.log
             vk.log
           if-no-files-found: warn
 
