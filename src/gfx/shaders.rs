@@ -769,7 +769,21 @@ pub const NRD_BRIDGE_HLSL: &str = include_str!("../shaders/nrd_bridge.hlsl");
 /// WHAT WE ACTUALLY USE OUT OF IT: `NRD_SG_ReJitter` and the private helpers it
 /// needs. See `cs_nrd_out` for why the SG *resolve* half is deliberately not
 /// used (a convention mismatch, not an oversight).
+///
+/// NOT ON WASM — the first `cfg` in this file, and it is the license posture
+/// itself that forces it: the wasm build compiles from a BARE checkout (the
+/// check-wasm CI job holds that property with `submodules: false`, and the
+/// first tree to violate it was this very include — caught by that job on its
+/// own introducing commit's merge), and a web bundle must never ship NVIDIA's
+/// header anyway — the web corpus excludes `nrd_bridge` and FRD owns the
+/// browser denoiser slot. The stub is a `#error` line, not `""`: the off-state
+/// stays structural, so a future wasm path that reaches a bridge assembly
+/// fails NAMED at the compiler instead of silently pasting an empty header.
+#[cfg(not(target_arch = "wasm32"))]
 const NRD_HLSLI_RAW: &str = include_str!("../../SDKs/NRD-src/Shaders/NRD.hlsli");
+#[cfg(target_arch = "wasm32")]
+const NRD_HLSLI_RAW: &str =
+    "#error NRD.hlsli is native-only (submodule-acquired; the web corpus excludes nrd_bridge)\n";
 
 /// The line `NRD.hlsli` opens with, and the ONE thing we rewrite.
 const NRD_CONFIG_INCLUDE: &str = "#include \"NRDConfig.hlsli\"";
