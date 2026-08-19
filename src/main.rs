@@ -14541,6 +14541,10 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 
     // ---- compile + validate ----
     let (mut compiled, mut validated, mut failed) = (0usize, 0usize, 0usize);
+    // The determinism arm below runs ONCE, on the first unit through — a
+    // per-unit recompile would double the gate's wall clock to restate one
+    // claim.
+    let mut det_done = false;
     for (name, src, shape) in &units {
         // (entry, target) pairs for this unit. Anti-vacuity — a unit that
         // yields no entries compiled nothing, and a silent zero reads exactly
@@ -14570,6 +14574,72 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
                 }
             };
             compiled += 1;
+            // ---- the determinism arm (once) ----
+            // Nothing in this tree ever asserted DXC is bit-reproducible for a
+            // fixed (args, source) — every compile-memo claim rests on it, and
+            // an assumption a gate never states is one a toolchain bump can
+            // silently retire. The `compile` above went through the memo (a
+            // miss — first sight of the key); `compile_args(.., &[])` never
+            // memoizes, so `fresh` is provably a second trip through DXC; the
+            // third call is a memo HIT by construction. One byte-compare each:
+            // fresh != words is DXC nondeterminism, hit != words is a memo
+            // serving something it was not given.
+            if !det_done {
+                det_done = true;
+                let mut det_ok = true;
+                match dxc.compile_args(src, &entry, &target, &what, false, &[]) {
+                    Ok(fresh) if fresh == words => {}
+                    Ok(fresh) => {
+                        eprintln!(
+                            "check-spirv: FAIL S2 {what}: DXC is NONDETERMINISTIC — two \
+                             compiles of one source differ ({} vs {} words)",
+                            words.len(),
+                            fresh.len()
+                        );
+                        det_ok = false;
+                    }
+                    Err(e) => {
+                        eprintln!("check-spirv: FAIL S2 {what} (determinism recompile): {e}");
+                        det_ok = false;
+                    }
+                }
+                match dxc.compile(src, &entry, &target, &what, false) {
+                    Ok(hit) if hit == words => {}
+                    Ok(_) => {
+                        eprintln!(
+                            "check-spirv: FAIL S2 {what}: a memo hit returned words the \
+                             first compile did not produce"
+                        );
+                        det_ok = false;
+                    }
+                    Err(e) => {
+                        eprintln!("check-spirv: FAIL S2 {what} (memo-hit recompile): {e}");
+                        det_ok = false;
+                    }
+                }
+                if crate::spirv::memo_enabled() && dxc.memo_stats().0 == 0 {
+                    eprintln!(
+                        "check-spirv: FAIL S2 {what}: the compile memo never fired on a \
+                         repeated key — the anti-vacuity half of the determinism arm"
+                    );
+                    det_ok = false;
+                }
+                if det_ok {
+                    println!(
+                        "check-spirv: S2 determinism: {what} recompiled byte-identical \
+                         ({} words){}",
+                        words.len(),
+                        if crate::spirv::memo_enabled() {
+                            ", memo hit equals both"
+                        } else {
+                            " (FR_SPIRV_NOMEMO — both arms fresh)"
+                        }
+                    );
+                } else {
+                    ok = false;
+                    failed += 1;
+                }
+            }
             if val.is_none() && dump.is_none() {
                 continue;
             }
@@ -16141,6 +16211,22 @@ fn run_check_vk(
     // stands down on the same environment facts, and folding it in would let a
     // box that cannot present take V19's claim down with it.
     if !run_check_vk_rebuild(&hg, &sp) {
+        ok = false;
+    }
+
+    // The compile memo, suite-wide. V5 compiled every tracer unit and the
+    // V6/V12/V13 tracers re-requested the same keys, so a memo that never
+    // fires cannot get here green — the anti-vacuity half — while the
+    // exact-zero render gates above scored modules SERVED from it, the
+    // fidelity half at device strength. Exempt only when FR_SPIRV_NOMEMO
+    // asked for exactly that.
+    let (mhits, mmisses) = sp.memo_stats();
+    println!("check-vk: spirv memo {mhits} hit(s) / {mmisses} miss(es)");
+    if mhits == 0 && crate::spirv::memo_enabled() {
+        eprintln!(
+            "check-vk: FAIL the spirv compile memo never fired across the whole suite — \
+             V6's tracer alone re-requests every key V5 compiled"
+        );
         ok = false;
     }
 
@@ -18473,6 +18559,50 @@ fn run_check_vk_layout(
     for c in map.class_violations() {
         eprintln!("check-vk: FAIL V5 {c}");
         ok = false;
+    }
+
+    // ---- the compile memo's device-suite tooth ----
+    //
+    // Every module above was a memo MISS (first sight of each key), and the
+    // tracers V6/V12/V13 build later re-request the same keys — so the render
+    // scoring downstream runs on memo-SERVED modules, which is the fidelity
+    // half at device strength. What V5 itself owes is the LOUD half, here
+    // where the sources are still in hand: one key re-requested (a hit by
+    // construction) and one forced fresh (`compile_args` never memoizes),
+    // both byte-compared against the first compile. `hit != first` is the
+    // memo serving something it was not given; `fresh != first` is DXC
+    // nondeterminism, the assumption the whole memo rests on.
+    if crate::spirv::memo_enabled() {
+        if let Some((name, e, words)) = modules.first() {
+            let src = units
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, s)| s.as_str())
+                .expect("modules[0] came from units");
+            let what = format!("{name}:{e}");
+            let hit = sp.compile(src, e, "cs_6_5", &what, false);
+            let fresh = sp.compile_args(src, e, "cs_6_5", &what, false, &[]);
+            match (hit, fresh) {
+                (Ok(h), Ok(f)) if h == *words && f == *words => println!(
+                    "check-vk: V5 memo: {what} hit == fresh == first compile ({} words)",
+                    words.len()
+                ),
+                (Ok(h), Ok(f)) => {
+                    eprintln!(
+                        "check-vk: FAIL V5 memo: {what} diverges — first {} / hit {} / \
+                         fresh {} words",
+                        words.len(),
+                        h.len(),
+                        f.len()
+                    );
+                    ok = false;
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    eprintln!("check-vk: FAIL V5 memo recompile: {err}");
+                    ok = false;
+                }
+            }
+        }
     }
 
     // `FR_VK_MAP=1` — the derived register map itself. The read-only-probe
@@ -28672,14 +28802,17 @@ fn run_cinematic_cpu(
 /// the commit rebuilds the swapchain and the tracer at the new extent while the
 /// scene, its uploads, the flycam and the socket all survive.
 ///
-/// IT COSTS ~7.8 s PER COMMIT, and that number is the rung's own argument for
-/// what comes next: MEASURED as swapchain 2.0-2.9 ms, teardown 2.1-3.8 ms,
-/// tracer+upscaler+denoiser 7.5-8.5 s — of which the DXC compile of the 24
-/// kernel units is 7.3-7.8 s (~92%) and reflection is ~1 ms. The compiled
-/// SPIR-V does not depend on the resolution at all (`gs::TraceKeys` is scene,
-/// vendor and sway), so a memo keyed on (source, entry) would return nearly all
-/// of it — a cheaper slice than splitting `VkTracer` into sized and unsized
-/// halves, and the one this rung recommends.
+/// A COMMIT USED TO COST ~7.8 s, and that number bought the memo: rung 3
+/// MEASURED swapchain 2.0-2.9 ms, teardown 2.1-3.8 ms, tracer+upscaler+
+/// denoiser 7.5-8.5 s — of which the DXC compile of the 24 kernel units was
+/// 7.3-7.8 s (~92%) and reflection ~1 ms — and, since `gs::TraceKeys` is
+/// scene, vendor and sway with NO resolution term, recommended a memo keyed
+/// on (source, entry) over splitting `VkTracer` into sized and unsized
+/// halves. B6c rung 1 is that memo (`spirv::Memo` — see its doc for the key
+/// and the kill lever), so every rebuild after the first re-costs as
+/// allocation + reflection, the split line reports the hits, and `--check-vk`
+/// asserts suite-wide that the memo actually fires (its own zero-hit run
+/// would otherwise read exactly like a pass).
 ///
 /// THE PUMP DOES NOT NOTICE, which is rung 2's design being tested rather than
 /// trusted: through every one of those multi-second blocks the pump gap stayed
@@ -29003,13 +29136,20 @@ fn rebuild_at(
     }
     let ms_down = t_down.elapsed().as_secs_f64() * 1000.0;
 
+    // The memo delta rides the split line: hits gained across THIS build is
+    // the number that justified the memo (24 units, ~7.3 s of the old ~7.8 s),
+    // and a rebuild that stopped hitting — a key that grew a resolution
+    // dependence, say — would announce itself here as a return to seconds.
+    let (h0, _) = sp.memo_stats();
     let t_up = std::time::Instant::now();
     *cv = Some(CineVk::build(hg, sp, scene, vs, vt, bvh, gw, gh, true, want_dn, opts)?);
     let ms_up = t_up.elapsed().as_secs_f64() * 1000.0;
+    let (h1, _) = sp.memo_stats();
 
     eprintln!(
         "vk: rebuild split — swapchain {ms_sc:.1} ms | teardown {ms_down:.1} ms | \
-         tracer+upscaler+denoiser {ms_up:.0} ms"
+         tracer+upscaler+denoiser {ms_up:.0} ms | memo {} hit(s)",
+        h1 - h0
     );
     window_bind_upscaler(hg, pres, cv.as_ref().unwrap())
 }
@@ -35135,6 +35275,21 @@ fn run_check(
     #[cfg(not(unix))]
     let vk_device_ok = true;
 
+    // The SPIR-V side's PURE logic — the binding scheme's injectivity, the
+    // word/local-size parsers, and (B6c rung 1) the compile memo's hit/miss/
+    // full-key-discrimination semantics on synthetic data. Platform-neutral
+    // since the module grew its Windows arm, and DXC-free by construction.
+    // ALSO `--check-spirv`'s S0 and `--check-mtl`'s K0, for `vk_device_ok`'s
+    // reason: CI's per-OS jobs run `--check` and neither of those, so without
+    // this row the memo a resize leans on would be covered by exactly one job.
+    let spirv_ok = match crate::spirv::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("spirv self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Presentation-curve self-test — the SDR degeneracy (bit-for-bit against
     // the pre-HDR curve: the guard that --hdr did not move the default), the
     // paper-white anchor, monotonicity, the headroom asymptote, and C¹ at the
@@ -37818,6 +37973,7 @@ fn run_check(
         ("camera", camera_ok),
         ("qa", qa_ok),
         ("vk-device", vk_device_ok),
+        ("spirv", spirv_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),

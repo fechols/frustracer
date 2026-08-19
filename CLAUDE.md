@@ -312,7 +312,7 @@ per-feature A/B: `FR_NGXFG_*` `FR_NGXRR_*` `FR_NRD_*` `FR_FRD_*` `FR_MFX*` `FR_A
 `FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` · Vulkan: `FR_VK_*`
 (device pick, validation, res parity, drop-binding teeth, the window's pump arm) · WebGPU:
 `FR_WGPU_ADAPTER` (adapter pick, index or name substring; `WGPU_BACKEND` rides along free) · dumps: `FR_DUMP_HLSL`
-`FR_SPIRV_DUMP|LIST` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:
+`FR_SPIRV_DUMP|LIST` `FR_SPIRV_NOMEMO` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:
 `FR_CRASH_TEST|FULLDUMP|VERIFY` `FR_NO_CRASH` · plus `FRUSTRACER_STAB` (inter-frame
 stability readout) and `FRUSTRACER_HUD_STATS`.
 
