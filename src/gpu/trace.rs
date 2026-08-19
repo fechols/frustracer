@@ -135,9 +135,15 @@ pub const RP_GBUF_EXT: u32 = RP_SCENE_TEX + 1;
 pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
 /// Buffer-SRV descriptors preceding the Texture2D array in the table
 /// (t0..t9 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
-/// positions alias, mat_height, mat_shadow, blas_tri, chunk_base, sway_dmv —
-/// texs[] starts at t10). Must stay in lockstep with trace_common.hlsli's
-/// space1 declarations: this const IS the texs[] base register.
+/// positions alias, mat_height, mat_shadow, blas_tri, chunk_base, sway_dmv).
+/// Must stay in lockstep with trace_common.hlsli's space1 declarations.
+///
+/// A HEAP OFFSET ONLY, since C3 moved `texs[]` into space2 (see
+/// `create_root_signature`). It used to be the texs[] BASE REGISTER as well —
+/// the array sat at t10 of this same space — and that second job is gone:
+/// register numbering restarts per space, so the array now starts at t0 and
+/// this const no longer appears in its range's `BaseShaderRegister`. One
+/// meaning, not two.
 pub const TEX_TABLE_BUFS: u32 = 10;
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
@@ -441,10 +447,23 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         });
     }
-    // RP_SCENE_TEX: scene textures + UV stream, all in space1 (see the const
-    // note). The Texture2D range is unbounded (NumDescriptors u32::MAX, legal
-    // as the last range) — the heap slice is sized per scene at init.
-    // `tex_ranges` must outlive serialization below.
+    // RP_SCENE_TEX: the UV stream in space1, the scene textures in space2. ONE
+    // table spanning two spaces — legal, and the ranges' spaces are independent
+    // of their heap offsets, which is what makes this cost nothing here: the
+    // heap slice, its sizing and `write_scene_descriptors` are all unchanged,
+    // because `OffsetInDescriptorsFromTableStart` is a heap fact and
+    // `RegisterSpace` is a shader fact.
+    //
+    // THE SPLIT IS METAL'S, AND IT IS NOT ARBITRARY. `texs[]` is the corpus's
+    // one unbounded array, and a Metal argument buffer cannot hold one beside
+    // anything else — spirv-cross drops whatever shares the set and casts this
+    // array's storage in its place. `trace_common.hlsli` carries the rule.
+    // D3D12 neither notices nor cares, but the second range is now the whole of
+    // space2 and nothing may join it.
+    //
+    // The Texture2D range is still unbounded (NumDescriptors u32::MAX, legal as
+    // the last range) — the heap slice is sized per scene at init. `tex_ranges`
+    // must outlive serialization below.
     let tex_ranges = [
         D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -456,8 +475,11 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
         D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: u32::MAX,
-            BaseShaderRegister: TEX_TABLE_BUFS,
-            RegisterSpace: 1,
+            // t0 of a FRESH space, not t10 of the previous one — register
+            // numbering restarts per space, so this is deliberately no longer
+            // `TEX_TABLE_BUFS`. The heap offset below still is.
+            BaseShaderRegister: 0,
+            RegisterSpace: 2,
             OffsetInDescriptorsFromTableStart: TEX_TABLE_BUFS,
         },
     ];
@@ -2706,9 +2728,12 @@ impl SceneGpu {
     /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
     /// `base..`: 10 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
     /// positions, mat_height, mat_shadow, blas_tri, chunk_base, sway_dmv —
-    /// t0..t9 space1) then one Texture2D SRV per scene texture (t10..
-    /// space1). The heap must be sized `base + TEX_TABLE_BUFS +
-    /// textures.len()`.
+    /// t0..t9 space1) then one Texture2D SRV per scene texture (t0..
+    /// space2 — a FRESH space, so the register restarts at 0 and is no
+    /// longer `TEX_TABLE_BUFS`; only the HEAP offset below still is.
+    /// `TEX_TABLE_BUFS`'s doc calls that split "one meaning, not two" —
+    /// this comment is the other file it had to hold in). The heap must
+    /// be sized `base + TEX_TABLE_BUFS + textures.len()`.
     pub fn write_scene_descriptors(
         &self,
         device: &ID3D12Device,
@@ -4682,7 +4707,7 @@ impl TraceGpu {
                 _ => s.tlas.GetGPUVirtualAddress(),
             };
             list.SetComputeRootShaderResourceView(RP_SRV0 + SRV_TLAS, tlas_va);
-            // The scene-texture table (t0..t3 + texs[] in space1). The heap
+            // The scene-texture table (t0..t3 in space1 + texs[] in space2). The heap
             // must be set before the table; resolve/feed re-setting the same
             // heap later is redundant-but-legal.
             list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);

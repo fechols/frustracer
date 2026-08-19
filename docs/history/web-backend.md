@@ -209,3 +209,71 @@ Round 3 (the remaining F2 half + the ladder): the native `FR_WEB_TEX`
 byte-gate (SceneGpu bucket upload + A/B vs the bindless arm, `--no-bc7` on
 both so the binding topology is the only delta), then W5–W7, then Stage C1
 (the wgpu device probe).
+
+## Stage C1 (2026-08-19): the wgpu host lands — `--check-wgpu` J0–J3
+
+wgpu 30 + pollster 1 under `[target.'cfg(any(unix, windows))'.dependencies]`
+(compute-only features: std/parking_lot/wgsl/vulkan/dx12/metal — no gles, no
+webgpu until Stage D). The lockstep held with zero effort: wgpu-core 30 wants
+naga ^30, so `cargo tree -i naga` shows ONE naga node shared by the gate and
+the runtime. New modules `src/webgpu/{mod,device,headless}.rs`; the gate is
+J0 (pure pick/limits self-test) | J1 (adapter + device + the granted-limits
+probe) | J2 (SMOKE_HLSL through DXC -> vulkan1.1 SPIR-V -> wgsl::normalize ->
+spv_to_wgsl -> ShaderModule — spv_to_wgsl's first live consumer) | J3 (the
+indirect-dispatch smoke, verdicts verbatim from the Vulkan twin). "Three
+backends, one kernel" is now four. In the check-vulkan CI job after
+--check-wgsl (lavapipe + the DXC drop are already there), positive greps
+PASSED + a J0–J3 line loop.
+
+**The finding the first run bought** (the gate caught the design being
+wrong): a dispatch's usage scope is computed from the pipeline LAYOUT, not
+the shader's static use. The Vulkan twin's one-layout-for-everything shape is
+ILLEGAL in WebGPU — the shared layout carried `args` as read-write storage,
+STORAGE_READ_WRITE is exclusive, and the fill dispatch's scope (layout
+bindings + the INDIRECT buffer) conflicted with itself:
+
+    Attempted to use Buffer with 'smoke args' label with conflicting usages.
+    Current usage BufferUses(STORAGE_READ_WRITE) and new usage
+    BufferUses(INDIRECT).
+
+Layouts are now PER PIPELINE, cut (with the bind groups) from one
+`SMOKE_USES` table — which independently confirms Stage C2's planned
+per-entry-point layout shape by measurement rather than by reading the spec.
+The uncaptured-error handler did its job on the same run: the error became a
+FAIL line + a counted sweep instead of wgpu's default native PANIC.
+
+**The day-one limits probe, answered for native** (the reason C1 exists):
+every adapter on the dev box grants the raised `max_bindings_per_bind_group
+= 2003` ask (derived `binding_of(U,2)+1` — the DXC shifts put u0 at 2000),
+and every limit the tracer needs has orders-of-magnitude headroom. Measured
+7/7 arms green, `FR_WGPU_ADAPTER` x `WGPU_BACKEND`:
+
+| adapter | backend | max bind/group | storage buf/stage | storage tex/stage | sampled tex/stage |
+|---|---|---|---|---|---|
+| RTX 4090 | Vulkan | 4294967295 | 524288 | 524288 | 524288 |
+| RTX 4090 | Dx12 | 4294967295 | 262144 | 262144 | 393212 |
+| Arc Pro B70 | Vulkan | 33554432 | 3355442 | 3355442 | 3355441 |
+| Arc Pro B70 | Dx12 | 4294967295 | 262144 | 262144 | 393212 |
+| Radeon iGPU | Vulkan | 4294967295 | 429391872 | 429391872 | 429391871 |
+| Radeon iGPU | Dx12 | 4294967295 | 262144 | 262144 | 393212 |
+| WARP (software) | Dx12 | 4294967295 | 262144 | 262144 | 393212 |
+
+(WebGPU defaults, what a browser grants before any ask: 1000 / 8 / 4 / 16.)
+So the binding-ceiling question is a BROWSER question only — whether Dawn/
+WebKit grant a raised maxBindingsPerBindGroup decides C2's compact-or-ask
+choice, and nothing native constrains us meanwhile. WARP running the whole
+indirect chain correctly is a pleasant extra: a zero-GPU Windows box still
+exercises J3.
+
+Traps for the next stage: wgpu enumerates each physical GPU once per backend
+(the same 4090 twice), so candidate names carry the backend and a bare
+`FR_WGPU_ADAPTER=radeon` on a dual-backend box is CORRECTLY ambiguous;
+`InstanceDescriptor` lost its `Default` in wgpu 30 (use
+`new_without_display_handle_from_env`, which also honors `WGPU_BACKEND`
+free); the sentinel poison must be `queue.write_buffer` (clear_buffer only
+writes zeros — the opposite of a poison); `entry_point: None` survives naga
+renaming the sole @compute entry; and the error-scope guard's `pop()` is a
+future — a dropped guard EATS the error, so the block_on is load-bearing.
+
+Next: FR_WEB_TEX native byte-gate, W5–W7, Stage C2 (the tracer recorder over
+per-entry layouts — now a measured requirement, see above).

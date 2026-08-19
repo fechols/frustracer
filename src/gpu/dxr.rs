@@ -2069,7 +2069,7 @@ impl DxrGpu {
                     _ => s.tlas.GetGPUVirtualAddress(),
                 },
             );
-            // The scene-texture table (t0..t3 + texs[] in space1) — heap
+            // The scene-texture table (t0..t3 in space1 + texs[] in space2) — heap
             // before table, same as the tracer's bind_common.
             list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
             list.SetComputeRootDescriptorTable(RP_SCENE_TEX, self.tex_table);

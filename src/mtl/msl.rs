@@ -20,7 +20,7 @@
 //! ```text
 //! --msl --msl-version 30000
 //! --msl-argument-buffers --msl-argument-buffer-tier 2
-//! --msl-device-argument-buffer 1
+//! --msl-device-argument-buffer 2
 //! ```
 //!
 //! **`--msl-decoration-binding` is ABSENT**, and it is the one flag `build.rs`
@@ -52,12 +52,19 @@
 //! `vk::reflect` derives the Vulkan one rather than transcribing it. The shift
 //! constants in `crate::spirv` stay a VULKAN choice and are free to stay one.
 //!
-//! **`--msl-device-argument-buffer 1` is derived, not magic.** `texs[]` is
-//! `register(t10, space1)`, the register SPACE becomes the descriptor SET, and
+//! **`--msl-device-argument-buffer 2` is derived, not magic.** `texs[]` is
+//! `register(t0, space2)`, the register SPACE becomes the descriptor SET, and
 //! spirv-cross requires runtime-sized arrays to live in *device* storage
 //! argument buffers ("Runtime sized variables must be in device storage
 //! argument buffers" is the exact refusal without it). Tier 2 is required for
 //! the unsized array at all and is supported on every Apple silicon GPU.
+//!
+//! **THE FLAG'S ARGUMENT IS THE SET NUMBER, so it moved when `texs[]` did.**
+//! It read `1` — with `register(t10, space1)` beside it — until C3 moved the
+//! array alone into space2 to stop spirv-cross dropping a member beside it
+//! (`overlap_check` below). `self_test` pins the flag's argument against
+//! `UNBOUNDED_ARRAY_SET`, so the CODE could not go stale here; only this
+//! paragraph could, and it did.
 //!
 //! **`-ffp-contract=off` is NOT needed, and that surprised the plan.**
 //! spirv-cross preserves `NoContraction`: it emits
@@ -69,10 +76,69 @@
 //!
 //! # What compiles, measured
 //!
-//! **65 of 78 modules reach AIR under one uniform recipe**, no per-unit
-//! conditionals. The 13 that do not are exactly two classes, and `Expect`
-//! below names both — see its doc for why a gate that merely skipped them
-//! would be worse than useless.
+//! **78 of 83 modules reach AIR under one uniform recipe**, no per-unit
+//! conditionals. The 5 that do not are one class — `dxr-lib`, `Expect::
+//! NoAnalogue` — and `Expect`'s doc says why a gate that merely skipped them
+//! would be worse than useless. 83 − 78 = 5 is the whole remaining gap, so the
+//! count is self-checking against that class's size.
+//!
+//! The denominators below are pre-C3 and stay as written: `mtlbind.hlsl`'s
+//! three entry points took every arm up by 3 (80 → 83, 68 → 71) without
+//! touching the gap, which is itself the check that the probe added coverage
+//! and not exceptions.
+//!
+//! AND "REACHES AIR" IS NOT "IS CORRECT", which C3 learned the hard way and
+//! which `overlap_check` now covers. For eight months 19 of these modules —
+//! `leaf`, `leaf_fb`, `reference`, `hemi_leaf` across every vendor and sway
+//! arm — were counted as PASSES while `samp_lin` was not bound at all:
+//! spirv-cross cannot lay out a descriptor set holding an unsized array beside
+//! anything else, so it dropped the sampler behind an `// Overlapping binding:`
+//! comment and reinterpret_cast the texture array's storage in its place. That
+//! COMPILES. Nothing in a compile gate can see it.
+//!
+//! Two things came out of that and both are load-bearing. `texs[]` now lives
+//! ALONE in `space2` (`trace_common.hlsli` carries the rule), and
+//! `overlap_check` refuses the pattern outright, so the gate can no longer
+//! count a silently-wrong module. The general lesson is the one worth keeping:
+//! `--check-msl` asks "did it compile" and `--check-mtl` asks "is it bound",
+//! and the distance between those two questions is exactly where this hid.
+//! See `docs/history/metal-backend.md`'s C3 record.
+//!
+//! # The spirv-cross scoping defect, and how it was retired (C3)
+//!
+//! Until C3 a second class, `Expect::ToolDefect`, held exactly one unit. The
+//! record is kept here because the variant is gone:
+//!
+//! `hemi_wave.hlsl::check_empty_cell` called `occluded_q` six times under
+//! `[unroll]`. Each call declares its own `RayQuery`, but SPIR-V requires every
+//! `OpVariable` in a function's FIRST block, so the six unrolled bodies shared
+//! one function-scope variable — and spirv-cross then declared it inside a
+//! `do{}while(false)` and referenced it after that block closed, giving `use of
+//! undeclared identifier '_194'`. **Eight modules.** It needed the OPAQUE
+//! `occluded_q` (`rt.hlsli`'s `#else` arm), so it was configuration-dependent —
+//! which is why the class was REPORTED rather than required:
+//!
+//! * procedural scene, hardware rays: 8 modules failed (67/80)
+//! * a scene arming `ALPHA_CUTOUT`/`TRANS_SHADOW` (san-miguel): the
+//!   candidate-loop arm is structured differently and compiled (75/80)
+//! * `--sw-rays`: `rt_sw.hlsli` has no `RayQuery`, so nothing to mis-scope (63/68)
+//!
+//! MEASURED IDENTICAL on spirv-cross 1.4.350.1 and 1.4.357.0 — not a stale-tool
+//! artifact. The fix is `[loop]` for `[unroll]` plus a `switch`-returning weight
+//! helper, shipped in the SHARED corpus (a per-backend arm would mean this gate
+//! stops covering the program D3D12 and Vulkan actually ship). The procedural
+//! arm then lands on 75/80 — **exactly san-miguel's existing number**, which is
+//! the check that it changed what it meant to and nothing else.
+//!
+//! It cost the two backends that were already fine nothing, and the way that was
+//! established is worth carrying: in DXIL `dx.op.allocateRayQuery` goes 7 → 2 —
+//! the layer spirv-cross consumes, and why this works at all — but on RDNA4 the
+//! `image_bvh*_intersect_ray` sites stay 6 and 12 in BOTH arms, because the AMD
+//! backend re-rolls to its own taste regardless of the attribute. **An HLSL loop
+//! attribute is a statement to the FRONT end.** VGPR/waves/scratch unmoved; see
+//! `docs/history/profiling.md`. `cargo test`'s rolled-grid pin is what keeps a
+//! revert to `[unroll]` — which reads faster and looks better — from landing
+//! green on the two platforms that cannot run `--check-msl`.
 //!
 //! # The finding that overturned the plan: hardware ray tracing WORKS
 //!
@@ -117,32 +183,89 @@ pub const CROSS_ARGS: &[&str] = &[
     "--msl-argument-buffer-tier",
     "2",
     "--msl-device-argument-buffer",
-    "1",
+    "2",
 ];
+
+/// spirv-cross's announcement that it dropped an argument-buffer member.
+const OVERLAP_MARK: &str = "// Overlapping binding:";
+/// The cast it emits in the dropped member's place. Named separately because
+/// the two can appear apart: the comment is emitted at the struct, the cast at
+/// each use, and a member that is dropped but never used produces only the
+/// first. Either one alone is the failure.
+const OVERLAP_CAST: &str = "reinterpret_cast<const device sampler";
+
+/// Refuse generated MSL in which spirv-cross resolved an argument-buffer id
+/// collision by DROPPING a member and casting another in its place.
+///
+/// THIS IS NOT A TOOL BUG, and the message has to say so or the next reader
+/// will go looking for one. SPIRV-Cross PR #2292 ("MSL: Add support for
+/// overlapping bindings") added the behaviour deliberately, and the README
+/// states the rule it follows: *"arrays of resources consume multiple ids,
+/// where Vulkan does not… This can be worked around either from shader
+/// authoring stage or remapping bindings as needed to avoid the overlap."* An
+/// UNSIZED array cannot reserve the ids it will consume, so whatever shares its
+/// set collides, and the overlapping-bindings feature resolves the collision by
+/// reinterpret_cast. The output COMPILES and reaches AIR reading texture
+/// descriptor bytes as a sampler.
+///
+/// WHICH IS WHY THIS EXISTS AT ALL. `--check-msl` asks "did it compile", and
+/// for eight months the answer for `leaf` and `reference` was yes while
+/// `samp_lin` — the trilinear sampler every colour / normal / rough-metal read
+/// goes through — was not bound at all. A gate that counts a miscompile as a
+/// pass is the vacuity class this suite is built to rule out, and the C3 probe
+/// found it only because a human read the generated code.
+///
+/// Kept a free function over `&str` rather than a method so the pure `self_test`
+/// can exercise it with no spirv-cross, no device and no macOS.
+pub fn overlap_check(msl: &str) -> Result<(), String> {
+    let hit = msl.lines().find(|l| l.contains(OVERLAP_MARK) || l.contains(OVERLAP_CAST));
+    let Some(line) = hit else { return Ok(()) };
+    Err(format!(
+        "spirv-cross dropped an argument-buffer member to resolve an [[id]] \
+         collision: `{}`. This is DELIBERATE (SPIRV-Cross PR #2292) and not a \
+         bug to report: an unsized descriptor array consumes ids it cannot \
+         reserve, so anything sharing its descriptor set collides and is \
+         replaced by a reinterpret_cast of the array's storage — which compiles, \
+         reaches AIR, and reads the wrong descriptor. The fix is at the shader \
+         authoring stage, which the tool's own README names: give the unsized \
+         array its own register space, alone. Do NOT silence this by relaxing \
+         the check.",
+        line.trim()
+    ))
+}
 
 /// The descriptor set `--msl-device-argument-buffer` names, as a derivation
 /// rather than a literal: `texs[]` is the corpus's one unbounded array, it
-/// lives in `space1`, and the register space IS the descriptor set under the
+/// lives in `space2`, and the register space IS the descriptor set under the
 /// `-fvk-*-shift` scheme. `self_test` pins that the arg set carries this.
-pub const UNBOUNDED_ARRAY_SET: u32 = 1;
+///
+/// IT NAMES ONE SET, WHICH IS THE WHOLE REASON THIS IS DERIVED. The flag is
+/// per-set and repeatable, and `texs[]` moved from space1 to space2 the day C3
+/// found it could not share a set (`trace_common.hlsli` carries the rule). A
+/// literal `1` left behind would not have failed loudly — spirv-cross throws
+/// "Runtime sized variables must be in device storage argument buffers", which
+/// reads as a capability problem rather than as a stale constant. The gate's
+/// FIRST run of that experiment counted zero overlaps in that exception's
+/// output and read it as clean; see the archive.
+pub const UNBOUNDED_ARRAY_SET: u32 = 2;
 
 /// What a unit is expected to do, and why.
 ///
 /// A gate that only checked "did the expected-to-work units work" would go
 /// green while the known-failing list silently rotted — a workaround could
 /// land, or spirv-cross could fix the bug, and nothing would say so. So the
-/// two failing classes carry teeth against staleness as well; **what differs
-/// is how hard, and the asymmetry is deliberate rather than an oversight.**
+/// failing class carries teeth against staleness as well.
 ///
 /// * `NoAnalogue` is a CAPABILITY claim, so it is hard in BOTH directions: it
 ///   must still be reached, and one compiling is a FAIL with an instruction in
 ///   it. Metal either has an analogue for a DXIL ray-tracing library or it
 ///   does not, and that answer cannot vary with the scene.
-/// * `ToolDefect` is a BUG-PRESENCE claim, which is a property of the
-///   configuration and the tool version — so it is REPORTED, never required.
-///   Demanding it fire would fail the gate on exactly the configurations where
-///   the corpus does BETTER; see the variant's own doc for the three measured
-///   arms.
+///
+/// **There were two failing classes, and `ToolDefect` was RETIRED in C3 rather
+/// than left with no members** — an unreachable variant makes the sentence above
+/// false, which is the staleness this enum exists to prevent. It held exactly
+/// one unit, `hemi_wave`, and the finding is kept in the module header rather
+/// than deleted with the code.
 ///
 /// Read `run_check_msl`'s M5 block with this: the verdict is per class, and
 /// the only unconditional failure is an `Expect::Metallib` unit that refused.
@@ -158,39 +281,6 @@ pub enum Expect {
     /// nothing, because what is being ported is the wavefront tracer, and the
     /// wavefront's own ray-shooting kernels compile WITH hardware ray tracing.
     NoAnalogue,
-    /// An upstream spirv-cross scoping defect, not a corpus problem.
-    ///
-    /// `hemi_wave.hlsl::check_empty_cell` calls `occluded_q` six times under
-    /// `[unroll]`. Each call declares its own `RayQuery`, but SPIR-V requires
-    /// every `OpVariable` in a function's FIRST block, so the six unrolled
-    /// bodies share one function-scope variable — and spirv-cross then
-    /// declares it inside a `do{}while(false)` block and references it after
-    /// that block closes, giving `use of undeclared identifier '_194'`.
-    ///
-    /// IT IS CONFIGURATION-DEPENDENT, and that is why this class is REPORTED
-    /// rather than required (see `run_check_msl`'s verdict). The defect needs
-    /// the OPAQUE `occluded_q` — `rt.hlsli`'s `#else` arm — so:
-    ///
-    /// * procedural scene, hardware rays: 8 modules fail (65/78)
-    /// * a scene arming `ALPHA_CUTOUT`/`TRANS_SHADOW` (san-miguel): the
-    ///   candidate-loop arm is structured differently and compiles (73/78)
-    /// * `--sw-rays`: `rt_sw.hlsli` has no `RayQuery` at all, so there is no
-    ///   function-scope query variable to mis-scope (61/66)
-    ///
-    /// A bug's PRESENCE is a property of the configuration and the tool
-    /// version, unlike `NoAnalogue`'s capability claim — so demanding that it
-    /// still reproduce would make the gate fail on exactly the scenes where
-    /// the corpus does BETTER.
-    ///
-    /// MEASURED IDENTICAL on spirv-cross 1.4.350.1 and 1.4.357.0, so it is not
-    /// a stale-tool artifact. A workaround is measured and NOT shipped:
-    /// `[loop]` instead of `[unroll]` takes the corpus to 73/78. It is a
-    /// codegen change to a path D3D12 and Vulkan both compile and neither is
-    /// verifiable from a macOS box, for code that only runs under a verify
-    /// probe — so it belongs to the milestone that needs `hemi_wave` to
-    /// actually RUN, with those two suites re-run, rather than to a gate whose
-    /// product is a measurement.
-    ToolDefect,
 }
 
 /// Classify a unit by the name `--check-spirv` gives it (`hemi_wave[Nvidia]`,
@@ -201,7 +291,6 @@ pub fn expect_of(unit: &str) -> Expect {
     let base = unit.split('[').next().unwrap_or(unit);
     match base {
         "dxr-lib" => Expect::NoAnalogue,
-        "hemi_wave" => Expect::ToolDefect,
         _ => Expect::Metallib,
     }
 }
@@ -314,7 +403,10 @@ impl Msl {
                 first.strip_prefix("SPIRV-Cross threw an exception: ").unwrap_or(first)
             ));
         }
-        String::from_utf8(out.stdout).map_err(|e| format!("spirv-cross emitted non-UTF-8: {e}"))
+        let msl = String::from_utf8(out.stdout)
+            .map_err(|e| format!("spirv-cross emitted non-UTF-8: {e}"))?;
+        overlap_check(&msl)?;
+        Ok(msl)
     }
 
     /// MSL -> AIR -> `.metallib`, returning the library bytes.
@@ -461,13 +553,69 @@ pub fn self_test() -> Result<(), String> {
         }
     }
 
+    // `overlap_check` both ways, on VERBATIM spirv-cross output rather than on
+    // a paraphrase — a detector tested against a string this file also wrote is
+    // testing its own spelling. The positive case is the shipping `leaf`
+    // set-1 struct as it was emitted before `texs[]` moved to its own space;
+    // the negative is the same struct after.
+    const DROPPED: &str = "\
+struct spvDescriptorSetBuffer1
+{
+    device type_StructuredBuffer_uint* chunk_base [[id(3)]];
+    spvDescriptor<texture2d<float>> texs [[id(4)]][1] /* unsized array hack */;
+    // Overlapping binding: sampler samp_lin [[id(4)]];
+    sampler samp_aniso [[id(5)]];
+};
+    const device auto &samp_lin = reinterpret_cast<const device sampler &>(spvDescriptorSet1.texs);";
+    const CLEAN: &str = "\
+struct spvDescriptorSetBuffer1
+{
+    device type_StructuredBuffer_uint* chunk_base [[id(3)]];
+    sampler samp_lin [[id(4)]];
+    sampler samp_aniso [[id(5)]];
+};
+struct spvDescriptorSetBuffer2
+{
+    spvDescriptor<texture2d<float>> texs [[id(0)]][1] /* unsized array hack */;
+};";
+    match overlap_check(DROPPED) {
+        Err(e) if e.contains("samp_lin") => {}
+        Err(e) => return Err(format!("overlap_check fired but did not name the member: {e}")),
+        Ok(()) => {
+            return Err("overlap_check PASSED the dropped-member MSL — the marker it \
+                        scans for no longer matches what spirv-cross emits, so the \
+                        check is silent on the exact failure it was written for"
+                .into())
+        }
+    }
+    // The two markers must be independently sufficient: a dropped member that
+    // is never USED emits the comment and no cast, and a check that demanded
+    // both would miss it.
+    for (only, what) in [(OVERLAP_MARK, "the struct comment"), (OVERLAP_CAST, "the cast")] {
+        if overlap_check(&format!("    {only} sampler x [[id(0)]];")).is_ok() {
+            return Err(format!("overlap_check needs BOTH markers — {what} alone is silent"));
+        }
+    }
+    if let Err(e) = overlap_check(CLEAN) {
+        return Err(format!(
+            "overlap_check rejected MSL with the array in its OWN set, which is the \
+             arrangement the corpus now uses — it would fail every run: {e}"
+        ));
+    }
+
     // The classification. Both non-Metallib arms must be reachable, or the
     // gate's both-directions teeth are scoring an empty set.
     let cases: [(&str, Expect); 6] = [
         ("dxr-lib[0]", Expect::NoAnalogue),
         ("dxr-lib[3]", Expect::NoAnalogue),
-        ("hemi_wave[Nvidia]", Expect::ToolDefect),
-        ("hemi_wave[Amd+sway]", Expect::ToolDefect),
+        // POSITIVE pins, and they are the retired class's replacement. Under
+        // `ToolDefect` a regression was merely REPORTED; as `Metallib` a revert
+        // to `[unroll]` — or a spirv-cross change that reintroduces the
+        // mis-scope — is a hard `FAIL M4` on every arm. Both vendor spellings,
+        // because `expect_of` prefix-matches and a change to that split would
+        // otherwise reclassify one arm silently.
+        ("hemi_wave[Nvidia]", Expect::Metallib),
+        ("hemi_wave[Amd+sway]", Expect::Metallib),
         ("leaf[Nvidia]", Expect::Metallib),
         ("bloom", Expect::Metallib),
     ];

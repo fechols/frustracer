@@ -104,11 +104,58 @@ pub struct Pass {
 /// ```text
 ///  FR_MTL_SEED_MAP       K3/K4  "no argument-buffer member named `args`"
 ///  FR_MTL_ARGBUF_INDEX   K4     "indirect args [3, 3, 3], expected [9, 1, 1]"
+///                               — but ABORTS under MTL_DEBUG_LAYER=1, below
 ///  FR_MTL_SWAP_MEMBERS   K4     "indirect args [3, 3, 3], expected [9, 1, 1]"
 ///  FR_MTL_TG_ONE         K4     "outbuf[9] = 0xeeeeeeee ... (never written)"
-///  FR_MTL_NO_RESIDENCY   —      bit-identical to a clean run, plain AND under
-///                               MTL_DEBUG_LAYER=1 AND MTL_SHADER_VALIDATION=1
+///  FR_MTL_NO_RESIDENCY   —      bit-identical plain and under
+///                               MTL_DEBUG_LAYER=1; OBSERVABLE under
+///                               MTL_SHADER_VALIDATION=1 (re-measured, below)
 /// ```
+///
+/// **THE RESIDENCY LINE WAS RE-MEASURED AND CHANGED**, 2026-08-19, Apple M1,
+/// macOS 26.5.1, 3/3 reproducible. It used to read *"bit-identical to a clean
+/// run, plain AND under MTL_DEBUG_LAYER=1 AND MTL_SHADER_VALIDATION=1"*. Under
+/// `MTL_SHADER_VALIDATION=1` it is not: `cs_prep` never writes `args`, so K4
+/// reports `indirect args [3, 3, 3], expected [9, 1, 1]` — the poison intact.
+///
+/// Two things about HOW it is observable matter more than the fact:
+///
+/// * **The command buffer reports no error.** `device::run` checks `cb.error()`
+///   and gets `None`; the writes simply do not land. So the layer does not
+///   diagnose this — the DATA does, which is the argument this whole gate is
+///   built on, arriving from a direction it did not expect.
+/// * `mtl::texprobe` measured the same reversal for TEXTURES on the same day,
+///   so this is a property of the layer and not of the resource class.
+///
+/// Which measurement was wrong is not recoverable — C2's was taken on this
+/// machine and this OS is a point release newer. The rule the tree keeps is
+/// the one that survives either way: **the omission is not reliably
+/// unobservable, so residency stays structural** rather than checked. The
+/// `Expect`-style asymmetry below is unaffected — this lever still makes a
+/// claim about the PLATFORM, and a platform whose answer moved is exactly why
+/// it is reported rather than asserted.
+///
+/// **`ARGBUF_INDEX` IS THE ONE LEVER HERE THAT CANNOT BE RUN UNDER
+/// `MTL_DEBUG_LAYER=1`**, measured 2026-08-19 alongside the residency
+/// re-measurement:
+///
+/// ```text
+/// validateComputeFunctionArguments:1038: failed assertion `Compute
+///   Function(cs_seed): missing Buffer binding at index 0 for
+///   spvDescriptorSet0[0].'                                      exit 134
+/// ```
+///
+/// Unlike `texprobe`'s `ARR_STRIDE` — whose first draft aborted because the
+/// plant carried a SECOND, gratuitous defect (an out-of-bounds write) beyond
+/// the one it meant to plant, and was fixed — this one is inherent. The defect
+/// being planted IS "nothing is bound at the index the function reads", which
+/// is precisely what that layer exists to catch, and its way of reporting is to
+/// abort. There is no valid-but-wrong index for a single-set kernel to move to.
+///
+/// So it is recorded rather than fixed, and the run-list means "each lever, and
+/// separately the layers on a CLEAN run" — not the cross product. A future
+/// reader who arms this one under the layer and gets a SIGABRT is seeing the
+/// documented behaviour, not a regression.
 ///
 /// `SEED_MAP` failing in K3/K4 rather than in a readback is the strongest of
 /// the four: binding `cs_prep`'s resources through `cs_seed`'s map is what a
@@ -298,24 +345,29 @@ pub fn pass(m: &Mtl, p: &Pipes, n: u32, plant: Plant) -> Result<Pass, String> {
             // The UNPLANTED run goes through `bind`, the shipping entry point,
             // rather than through the option form with neutral arguments —
             // otherwise the gate would exercise a path no caller uses.
+            // `bind_opts` refuses an index override on a multi-set ArgBuf
+            // since C3 — every kernel here is single-set (`smoke.hlsl` uses
+            // only space0), so the `?` is the refusal travelling rather than a
+            // path this gate can take.
             if plant.argbuf_index || plant.no_residency {
                 let index = plant.argbuf_index.then_some(1);
-                ab.bind_opts(enc, index, !plant.no_residency);
+                ab.bind_opts(enc, index, !plant.no_residency)
             } else {
                 ab.bind(enc);
+                Ok(())
             }
         };
 
         enc.setComputePipelineState(p.seed.pipeline());
-        bind_ab(enc, &ab_seed);
+        bind_ab(enc, &ab_seed)?;
         enc.dispatchThreadgroups_threadsPerThreadgroup(one, tg(&p.seed));
 
         enc.setComputePipelineState(p.prep.pipeline());
-        bind_ab(enc, &ab_prep);
+        bind_ab(enc, &ab_prep)?;
         enc.dispatchThreadgroups_threadsPerThreadgroup(one, tg(&p.prep));
 
         enc.setComputePipelineState(p.fill.pipeline());
-        bind_ab(enc, &ab_fill);
+        bind_ab(enc, &ab_fill)?;
         // THE INDIRECT DISPATCH — the whole point of the chain. The grid comes
         // from the buffer `cs_prep` just wrote; `threadsPerThreadgroup` still
         // comes from the host, which is the Metal-specific half.

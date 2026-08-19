@@ -769,7 +769,21 @@ pub const NRD_BRIDGE_HLSL: &str = include_str!("../shaders/nrd_bridge.hlsl");
 /// WHAT WE ACTUALLY USE OUT OF IT: `NRD_SG_ReJitter` and the private helpers it
 /// needs. See `cs_nrd_out` for why the SG *resolve* half is deliberately not
 /// used (a convention mismatch, not an oversight).
+///
+/// NOT ON WASM — the first `cfg` in this file, and it is the license posture
+/// itself that forces it: the wasm build compiles from a BARE checkout (the
+/// check-wasm CI job holds that property with `submodules: false`, and the
+/// first tree to violate it was this very include — caught by that job on its
+/// own introducing commit's merge), and a web bundle must never ship NVIDIA's
+/// header anyway — the web corpus excludes `nrd_bridge` and FRD owns the
+/// browser denoiser slot. The stub is a `#error` line, not `""`: the off-state
+/// stays structural, so a future wasm path that reaches a bridge assembly
+/// fails NAMED at the compiler instead of silently pasting an empty header.
+#[cfg(not(target_arch = "wasm32"))]
 const NRD_HLSLI_RAW: &str = include_str!("../../SDKs/NRD-src/Shaders/NRD.hlsli");
+#[cfg(target_arch = "wasm32")]
+const NRD_HLSLI_RAW: &str =
+    "#error NRD.hlsli is native-only (submodule-acquired; the web corpus excludes nrd_bridge)\n";
 
 /// The line `NRD.hlsli` opens with, and the ONE thing we rewrite.
 const NRD_CONFIG_INCLUDE: &str = "#include \"NRDConfig.hlsli\"";
@@ -822,6 +836,36 @@ pub fn nrd_bridge_tail() -> String {
 }
 pub const WAVEPROBE_HLSL: &str = include_str!("../shaders/waveprobe.hlsl");
 pub const WORKGRAPH_HLSL: &str = include_str!("../shaders/workgraph.hlsl");
+// The Metal backend's C3 probe — textures, samplers, a second descriptor set
+// and an unbounded array, in the smallest subject that holds all four. It is
+// in the SHARED corpus rather than in `src/mtl/` on `waveprobe`'s precedent,
+// and the shader's own header says why. `mtlbind_space1_matches_trace_common`
+// below pins its space1 block against `trace_common.hlsli`'s.
+pub const MTLBIND_HLSL: &str = include_str!("../shaders/mtlbind.hlsl");
+
+// THE PROBE'S HOST-SIDE CONSTANTS LIVE BESIDE THE SHADER, and that is
+// `smoke.rs:42-50`'s recorded regret, not repeated. Its `FILL_N` / `TAIL` /
+// `SENTINEL` are properties of `smoke.hlsl` and belong here, but hoisting them
+// would touch `gpu::trace::smoke_test`, which no macOS box can re-run — so they
+// were duplicated and the hoist deferred to a Windows author. `mtlbind.hlsl`
+// has no D3D12 or Vulkan host consumer, so that constraint does not apply and
+// the duplication does not have to happen a second time. `mtl::texprobe` is the
+// only reader; the `mtlbind_*` tests below pin each against the HLSL, which is
+// what makes these a contract rather than a second copy.
+//
+// The texel payload is `MTLBIND_PAYLOAD | i`, all below 2^24 so exactly
+// representable in fp32 and exactly recoverable through a uint cast. The low
+// byte is the INDEX, so a rotated or short-written descriptor array reads back
+// as a wrong index rather than as garbage — the failure names its own cause.
+pub const MTLBIND_PAYLOAD: u32 = 0x00C3_0000;
+/// `#define TEX_N` in the shader. Deliberately not a power of two: a stride or
+/// rotation bug that happened to be a multiple of the count would alias back to
+/// correct on 4 or 8.
+pub const MTLBIND_TEX_N: usize = 5;
+/// `src` is `MTLBIND_SRC_W` x 1, so `MTLBIND_SRC_U` is outside [0,1] and clamp
+/// and repeat resolve to DIFFERENT texels with no filter weights involved.
+pub const MTLBIND_SRC_W: usize = 2;
+pub const MTLBIND_SRC_U: f32 = 1.25;
 
 // The DXR pipeline's own three units. They live here with the rest of the
 // corpus because the shader-source gates below pin rt.hlsli and rt_dxr.hlsli
@@ -3393,6 +3437,495 @@ mod nrd_clean_room_tests {
             raw[1].contains("nrd_header()"),
             "the second use is not nrd_bridge_tail's join: {:?}",
             raw[1]
+        );
+    }
+}
+
+/// `hemi_wave.hlsl`'s verify oracle carries one ordering statement that no
+/// CPU-only gate can reach and that only ONE backend's toolchain punishes —
+/// see `check_empty_cells_ray_grid_stays_rolled` for why it lives here rather
+/// than behind a Metal define.
+#[cfg(test)]
+mod hemi_verify_shader_source_tests {
+    /// Drops prose, keeps code, on the same line. Duplicated per test module
+    /// in this file by convention — the alternative is a shared helper that
+    /// every module's assertions then depend on in lockstep.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The brace-balanced body of the first function whose signature line
+    /// contains `sig`. Scoping an assertion to ONE function is what keeps it
+    /// honest here: `hemi_wave.hlsl` carries other `[unroll]` loops that are
+    /// correct (the 4-octant `hemi_add3` fan, for one), so a file-wide
+    /// `contains` would confidently answer about the wrong loop.
+    fn fn_body(src: &str, sig: &str) -> String {
+        let at = src.find(sig).unwrap_or_else(|| panic!("no function matching `{sig}`"));
+        let open = at + src[at..].find('{').expect("function has no body");
+        let mut depth = 0i32;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in `{sig}`");
+    }
+
+    /// `check_empty_cell`'s 6-direction grid must stay ROLLED, and the reason
+    /// is a tool defect rather than taste. Each `occluded_q` declares its own
+    /// `RayQuery`; SPIR-V requires every `OpVariable` in a function's FIRST
+    /// block, so six unrolled bodies share one function-scope variable —
+    /// spirv-cross then declares it inside a `do{}while(false)` and references
+    /// it after that block closes, emitting `use of undeclared identifier`.
+    /// Eight modules were lost to it (`--check-msl` 67/80 → 75/80).
+    ///
+    /// THE SYMPTOM IS METAL-ONLY BUT THE PIN IS NOT, which is the whole point
+    /// of putting it here. `--check-msl` is macOS-gated and not in CI, so on
+    /// Windows and Linux a well-meaning revert to `[unroll]` — the form that
+    /// reads faster and looks obviously better — would land green and break a
+    /// backend the author cannot run. `cargo test` runs everywhere.
+    ///
+    /// AND IT IS NOT AN OCCUPANCY TRADE, so nobody should revert it for one:
+    /// measured on RDNA4 (gfx1201, RGA 2.14.2, `-HV 2021 -O3`), `cs_hemi_cell`
+    /// is 89/96 VGPR before AND after on the default scene and 89/96 → 87/88
+    /// on san-miguel, `cs_hemi_root` 77/80 and 75/80 unmoved, LDS 4096 and
+    /// scratch 640 B identical in every arm — 16 of 16 waves/SIMD throughout,
+    /// i.e. the kernel is not VGPR-limited and the `[loop]` costs nothing.
+    /// (`docs/history/profiling.md` carries the table and the DXIL-vs-ISA
+    /// split behind it.)
+    #[test]
+    fn check_empty_cells_ray_grid_stays_rolled() {
+        let body = fn_body(&code_only(super::HEMI_WAVE_HLSL), "void check_empty_cell(");
+        assert!(
+            body.contains("[loop]"),
+            "check_empty_cell's 6-direction grid lost its `[loop]` — six unrolled \
+             RayQuery bodies share one SPIR-V function-scope OpVariable and \
+             spirv-cross scopes it into a do{{}}while(false), costing 8 modules \
+             under --check-msl. See this test's doc comment."
+        );
+        assert!(
+            !body.contains("[unroll]"),
+            "check_empty_cell carries an `[unroll]` again — the RayQuery grid must \
+             stay rolled (see this test's doc comment); if a DIFFERENT loop was \
+             added to this function, scope the pin rather than deleting it."
+        );
+        // The weights must stay a CALL, not a local array. Under `[unroll]` the
+        // two were identical (a literal index folds the array away); under
+        // `[loop]` a dynamically indexed local array becomes an `internal
+        // constant [18 x float]` global plus a load per component, where the
+        // switch folds to phis and touches no memory at all.
+        assert!(
+            body.contains("check_dir_w("),
+            "the grid weights are no longer read through `check_dir_w` — a locally \
+             indexed array under `[loop]` reintroduces a constant global and a \
+             per-component load that the switch form provably avoids."
+        );
+        assert!(
+            !body.contains("float3 W[6]"),
+            "the `const float3 W[6]` local array is back; see above."
+        );
+    }
+
+    /// TEETH, and the stripper is the load-bearing half. `check_empty_cell`'s
+    /// own prose explains why `[loop]` replaced `[unroll]`, so BOTH tokens
+    /// appear in that function's comments — a pin written against the raw text
+    /// passes on the reverted file and proves exactly nothing. This is the
+    /// vacuity class every gate in this tree is required to rule out.
+    #[test]
+    fn hemi_wave_loop_pin_has_teeth() {
+        const REVERTED: &str = "\
+void check_empty_cell(float3 o, float3 a, float3 b, float3 c, float t_lim) {
+    // [loop], NOT [unroll] — prose that must not satisfy the pin, and
+    // check_dir_w named here so the weights assertion is exercised too.
+    const float3 W[6] = { float3(1, 1, 1), float3(1, 3, 3) };
+    [unroll] for (uint i = 0; i < 6; ++i) {
+        if (occluded_q(o, normalize(a * W[i].x), 0.0, tmax)) { }
+    }
+}";
+        let reverted = fn_body(&code_only(REVERTED), "void check_empty_cell(");
+        // Every assertion the pin makes must FAIL on the reverted form.
+        assert!(!reverted.contains("[loop]"), "the comment stripper let `[loop]` prose through");
+        assert!(reverted.contains("[unroll]"), "the planted revert lost its `[unroll]`");
+        assert!(!reverted.contains("check_dir_w("), "the stripper let `check_dir_w` prose through");
+        assert!(reverted.contains("float3 W[6]"), "the planted revert lost its local array");
+        // And the stripper must not GUT the shipping function — an empty
+        // haystack would satisfy the two negative assertions above for free.
+        let live = fn_body(&code_only(super::HEMI_WAVE_HLSL), "void check_empty_cell(");
+        assert!(
+            live.contains("occluded_q(") && live.contains("CTR_V_FALSE_EMPTY"),
+            "code_only over-stripped hemi_wave: the live check_empty_cell body no \
+             longer carries the ray call and the counter it bumps"
+        );
+    }
+}
+
+/// `mtlbind.hlsl` — the C3 argument-buffer probe — is only worth compiling if
+/// it still has the two properties it was written for. Both are the kind a
+/// tidy-up destroys silently: one is a copied declaration that could drift
+/// from its original, the other is a deliberately ugly ordering that reads
+/// like an oversight.
+///
+/// CPU-ONLY AND CROSS-PLATFORM ON PURPOSE. The gate that consumes this probe
+/// is `--check-mtl`, which needs macOS and a Metal device and is not in CI. A
+/// Windows or Linux author editing `trace_common.hlsli`'s `texs[]` table, or
+/// sorting this probe's declarations into the order they obviously "should"
+/// be in, cannot run that gate — so the pin lives where `cargo test` reaches
+/// them. Same argument as `hemi_verify_shader_source_tests` above.
+#[cfg(test)]
+mod mtlbind_probe_shader_source_tests {
+    use crate::spirv::{SHIFT_B, SHIFT_S, SHIFT_T, SHIFT_U};
+
+    /// The three scene-texture declarations `mtlbind.hlsl` copies verbatim from
+    /// `trace_common.hlsli`'s RP_SCENE_TEX table. Byte-identical is the claim,
+    /// so they are written here as bytes rather than as a pattern.
+    ///
+    /// `texs[]` IS IN A DIFFERENT SPACE FROM THE SAMPLERS, and that is the
+    /// single most load-bearing byte in this array. It is the corpus's only
+    /// unbounded array, and a Metal argument buffer cannot hold one beside
+    /// anything else — spirv-cross drops whatever shares the set and
+    /// reinterpret_casts the array's storage in its place, which compiles and
+    /// reads the wrong descriptor. Folding it back into space1 to tidy the
+    /// table would silently break 19 modules on Metal and nothing anywhere
+    /// else. `trace_common.hlsli` carries the full rule.
+    const SCENE_TEX_DECLS: [&str; 3] = [
+        "Texture2D<float4>        texs[]     : register(t0, space2);",
+        "SamplerState             samp_lin   : register(s0, space1);",
+        "SamplerState             samp_aniso : register(s1, space1);",
+    ];
+
+    /// PROPERTY 3. The probe stands in for the real scene-texture table, and a
+    /// stand-in that has drifted from its subject is worse than no stand-in:
+    /// `--check-mtl` would keep passing while proving something about a
+    /// declaration the tracer no longer makes. Pinning against BOTH files —
+    /// rather than just asserting the probe contains some `texs[]` — is what
+    /// makes a change to either one a failure.
+    ///
+    /// The unbounded `texs[]` is the whole subject of C3's second-set half: it
+    /// is the tier-2 argument-buffer feature, the thing `count == 0` means in
+    /// `vk::reflect`, and the one member whose host-side layout spirv-cross
+    /// does not fully describe. Losing its exact spelling loses the milestone.
+    #[test]
+    fn mtlbind_scene_tex_matches_trace_common() {
+        for decl in SCENE_TEX_DECLS {
+            assert!(
+                super::TRACE_COMMON_HLSLI.contains(decl),
+                "trace_common.hlsli no longer declares `{decl}` — if the scene-texture \
+                 table changed on purpose, copy the new line into mtlbind.hlsl and update \
+                 SCENE_TEX_DECLS. Do NOT relax this to a pattern: the probe's job is to be \
+                 byte-identical to what the tracer declares."
+            );
+            assert!(
+                super::MTLBIND_HLSL.contains(decl),
+                "mtlbind.hlsl drifted from trace_common.hlsli: `{decl}` is missing. The C3 \
+                 probe stands in for the real RP_SCENE_TEX table and stops standing for \
+                 anything the moment it declares something else."
+            );
+        }
+    }
+
+    /// The array and the samplers must be in DIFFERENT spaces, in both files.
+    ///
+    /// Separate from the byte-identity pin above on purpose. That one fails if
+    /// either file drifts from the other; this one fails if they drift TOGETHER
+    /// — a single edit that folded `texs[]` back beside the samplers would keep
+    /// them byte-identical and still break 19 modules on Metal, silently, on a
+    /// gate the editor most likely cannot run. The property is the split, so it
+    /// needs its own assertion.
+    #[test]
+    fn unbounded_array_is_alone_in_its_space() {
+        for (name, src) in
+            [("trace_common.hlsli", super::TRACE_COMMON_HLSLI), ("mtlbind.hlsl", super::MTLBIND_HLSL)]
+        {
+            let arr = declarations(src, Some("space2"));
+            assert_eq!(
+                arr.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+                vec!["texs[]"],
+                "{name}: space2 must hold `texs[]` and NOTHING else. A Metal argument \
+                 buffer cannot express an unsized array beside another resource — \
+                 spirv-cross drops the neighbour and reinterpret_casts the array's \
+                 storage in its place, which compiles and reads the wrong descriptor. \
+                 See trace_common.hlsli's declaration for the full rule."
+            );
+            assert!(
+                declarations(src, Some("space1")).iter().any(|&(n, _)| n == "samp_lin"),
+                "{name}: `samp_lin` left space1, so this test no longer proves the array \
+                 and the samplers are separated — it would pass on a file that put both \
+                 in space2 together"
+            );
+        }
+    }
+
+    /// PROPERTY 1, and it is the anti-vacuity half of C3's corrected id pin.
+    ///
+    /// spirv-cross assigns argument-buffer `[[id(n)]]` in DECLARATION order,
+    /// not binding order (`mtl::bind::cross_check` carries the measured
+    /// table). C2 pinned binding order and passed anyway, because `smoke.hlsl`
+    /// declares b1,u0,u1,u2 — where the two orders coincide. This probe exists
+    /// to be a case where they CANNOT coincide, so if a future edit sorts
+    /// these four declarations the corrected pin quietly goes back to proving
+    /// nothing. That is the failure this test exists to make loud.
+    ///
+    /// Derived from `spirv::SHIFT_*` rather than from literal 1000/2000/3000,
+    /// so a shift that moved would be a compile-time-visible change here
+    /// instead of a stale comment.
+    /// Every `: register(...)` DECLARATION in `src`, in file order, as
+    /// `(name, binding)` — the binding computed from the register class with
+    /// `spirv::SHIFT_*`, exactly as DXC's `-fvk-*-shift` flags do it.
+    ///
+    /// It parses declarations rather than searching for names, and that is the
+    /// load-bearing part: the first draft of this module walked the file for
+    /// bare identifiers, and `outbuf` appears in `cs_tex`'s BODY as well as in
+    /// its declaration. A planted reorder passed — the walk found the body
+    /// reference further down and read the order as unchanged. A pin that
+    /// cannot see the edit it exists to catch is the vacuity class this
+    /// codebase keeps re-learning; anchoring on `: register(` is what fixes it.
+    fn declarations<'a>(src: &'a str, space: Option<&str>) -> Vec<(&'a str, u32)> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let line = line.split_once("//").map_or(line, |(code, _)| code);
+            let Some((lhs, reg)) = line.split_once(": register(") else { continue };
+            let Some((reg, _)) = reg.split_once(')') else { continue };
+            // `t10, space1` vs `t0` — the space suffix selects the set.
+            let (reg, sp) = match reg.split_once(", ") {
+                Some((r, s)) => (r, Some(s)),
+                None => (reg, None),
+            };
+            if sp != space {
+                continue;
+            }
+            let name = lhs.split_whitespace().last().expect("declaration has no name");
+            let (class, num) = reg.split_at(1);
+            let num: u32 = num.parse().expect("register number");
+            let shift = match class {
+                "b" => SHIFT_B,
+                "t" => SHIFT_T,
+                "u" => SHIFT_U,
+                "s" => SHIFT_S,
+                other => panic!("unknown register class `{other}` in `{line}`"),
+            };
+            out.push((name, shift + num));
+        }
+        out
+    }
+
+    #[test]
+    fn mtlbind_declaration_order_disagrees_with_binding_order() {
+        let declared = declarations(super::MTLBIND_HLSL, None);
+        // Anti-vacuity for the parser itself: it must have FOUND the block.
+        // An empty or one-element list agrees with its own sort for free.
+        assert_eq!(
+            declared.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            vec!["src", "samp_clamp", "samp_repeat", "outbuf"],
+            "mtlbind.hlsl's set-0 block is not the four declarations this pin was \
+             written against (or the parser stopped seeing them). If a resource was \
+             added on purpose, keep the two orders disagreeing and update this list."
+        );
+        let mut by_binding = declared.clone();
+        by_binding.sort_by_key(|&(_, b)| b);
+        assert_ne!(
+            declared.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            by_binding.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            "mtlbind.hlsl's set-0 declarations are now in binding order, so the probe \
+             can no longer tell declaration order from binding order — which is the \
+             ONE thing it was added to prove. It looks like a tidy-up and it silently \
+             re-creates the accident that let C2's false id pin ship. Put the \
+             declarations back as t, s, s, u."
+        );
+    }
+
+    /// TEETH for the test above, both ways.
+    ///
+    /// The discriminator has to be capable of answering "they agree", or its
+    /// `assert_ne!` is decoration. `smoke.hlsl`'s three UAVs are that layout —
+    /// and they are not a synthetic example, they are the historical one: the
+    /// reason C2's binding-order pin measured "true" is that `u0,u1,u2` are
+    /// declared in the order they are numbered.
+    #[test]
+    fn declaration_order_check_can_say_agree() {
+        let smoke = declarations(super::SMOKE_HLSL, None);
+        assert_eq!(
+            smoke.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            vec!["Push", "counters", "args", "outbuf"],
+            "smoke.hlsl's registers changed — this test reads it as the historical \
+             coincidence C2's pin passed on, so a change here needs the note in \
+             `mtl::bind::cross_check` re-read, not just this list updated"
+        );
+        let mut sorted = smoke.clone();
+        sorted.sort_by_key(|&(_, b)| b);
+        assert_eq!(
+            smoke.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            sorted.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            "the comparison used by the pin above cannot report agreement, so its \
+             assert_ne! proves nothing"
+        );
+    }
+
+    /// The parser must also see the SECOND set, and see it separately — the
+    /// set-1 block is where C3's real work is, and a `declarations` that
+    /// silently dropped `space1` would make the pin above look complete while
+    /// covering half the probe.
+    #[test]
+    fn mtlbind_higher_sets_are_reachable_and_unbounded() {
+        let set1 = declarations(super::MTLBIND_HLSL, Some("space1"));
+        assert_eq!(
+            set1.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+            vec!["samp_lin", "samp_aniso", "set1_out"],
+            "mtlbind.hlsl's space1 block changed shape"
+        );
+        // `texs[]` keeps its brackets through the parse, which is the only
+        // textual trace of the unbounded array — `vk::reflect` reports it as
+        // `count == 0` and K7 asserts that, but this is the cheap half and it
+        // runs on boxes with no Metal. `t0` of a fresh space, not `t10`:
+        // register numbering restarts, which is why `gpu::trace::TEX_TABLE_BUFS`
+        // stopped doubling as the array's base register.
+        assert_eq!(declarations(super::MTLBIND_HLSL, Some("space2")).as_slice(), [("texs[]", SHIFT_T)]);
+    }
+
+    /// Drops prose, keeps code, on the same line. Duplicated per test module in
+    /// this file by convention.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The brace-balanced body of the first function whose signature line
+    /// contains `sig` — `hemi_verify_shader_source_tests`' helper, for its
+    /// reason: an assertion scoped to the whole file confidently answers about
+    /// the wrong function.
+    fn fn_body(src: &str, sig: &str) -> String {
+        let at = src.find(sig).unwrap_or_else(|| panic!("no function matching `{sig}`"));
+        let open = at + src[at..].find('{').expect("function has no body");
+        let mut depth = 0i32;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in `{sig}`");
+    }
+
+    /// `TEX_N` is duplicated between the shader and the host BY NECESSITY — the
+    /// HLSL cannot read a Rust const — so CLAUDE.md's rule applies: the pair
+    /// moves in lockstep and gets pinned. `--check-mtl` would catch a
+    /// divergence, but it needs a Metal device and is not in CI, so this is the
+    /// half that runs where the edit would be made.
+    #[test]
+    fn mtlbind_tex_n_matches_the_host() {
+        let src = code_only(super::MTLBIND_HLSL);
+        let at = src.find("#define TEX_N").expect("mtlbind.hlsl declares no TEX_N");
+        let n: usize = src[at + "#define TEX_N".len()..]
+            .lines()
+            .next()
+            .expect("TEX_N has no value")
+            .trim()
+            .parse()
+            .expect("TEX_N is not a number");
+        assert_eq!(
+            n,
+            super::MTLBIND_TEX_N,
+            "mtlbind.hlsl's TEX_N and gfx::shaders::MTLBIND_TEX_N disagree — mtl::texprobe \
+             sizes its texture array and its expected readback from the Rust one, so a \
+             shader-only edit makes K7 assert against the wrong element count"
+        );
+    }
+
+    /// K6's whole diagnostic value rests on the SAMPLE COORDINATE and on the
+    /// `.Load` texel, and both are edits a tidy-up could make without noticing.
+    ///
+    /// `u` outside [0,1] on a 2-wide texture is what makes clamp and repeat
+    /// resolve to DIFFERENT texels with no filter weights; and `.Load` hitting
+    /// the SAME texel the clamp sample resolves to is what makes a sampler swap
+    /// (words 0 and 1 move, word 2 does not) distinguishable from an unbound
+    /// texture (all three move). Change either and K6 still passes while
+    /// diagnosing nothing.
+    #[test]
+    fn mtlbind_sample_coordinate_resolves_to_the_texels_k6_expects() {
+        let body = fn_body(&code_only(super::MTLBIND_HLSL), "void cs_tex");
+        assert!(!body.is_empty() && body.contains("outbuf"), "cs_tex's body did not extract");
+        let u = super::MTLBIND_SRC_U;
+        let w = super::MTLBIND_SRC_W;
+        assert!(
+            !(0.0..=1.0).contains(&u),
+            "MTLBIND_SRC_U = {u} is inside [0,1], so clamp and repeat resolve to the SAME \
+             texel and K6's sampler tooth cannot tell them apart"
+        );
+        let coord = format!("float2({u}, 0.5)");
+        assert_eq!(
+            body.matches(&coord).count(),
+            2,
+            "cs_tex must sample at {coord} through BOTH samplers — that coordinate is what \
+             MTLBIND_SRC_U promises mtl::texprobe::tex_expect"
+        );
+        // Clamp resolves to the last texel; `.Load` must name that same one.
+        let load = format!("int3({}, 0, 0)", w - 1);
+        assert!(
+            body.contains(&load),
+            "cs_tex's .Load must read {load} — the texel the CLAMP sample resolves to. \
+             Reading a different one makes a sampler swap and an unbound texture produce \
+             the same readback."
+        );
+    }
+
+    /// **K8's entire premise.** `cs_set1` must reference nothing in space0, or
+    /// it gains an argument buffer at `[[buffer(0)]]` and the one unit in the
+    /// corpus that can refute `BUFFER_INDEX = 0` stops refuting it — while the
+    /// stage still passes.
+    #[test]
+    fn cs_set1_references_nothing_in_space0() {
+        let body = fn_body(&code_only(super::MTLBIND_HLSL), "void cs_set1");
+        // Anti-vacuity, and the trap this module already fell into once: the
+        // negative assertions below hold for free on an empty extract.
+        assert!(
+            body.contains("set1_out") && body.contains("texs"),
+            "cs_set1's body did not extract — the negative assertions would pass on nothing"
+        );
+        for name in ["src", "samp_clamp", "samp_repeat", "outbuf"] {
+            assert!(
+                !body.contains(name),
+                "cs_set1 references `{name}`, which is in space0 — it would then declare an \
+                 argument buffer at [[buffer(0)]], and K8's `expected [1, 2] with NOTHING at \
+                 0` would be asserting about a kernel that no longer has that shape"
+            );
+        }
+    }
+
+    /// K7's array walk must stay DYNAMIC. `mtlbind.hlsl:114-117` says why:
+    /// unrolled literal indices let spirv-cross emit distinct descriptors, and
+    /// the argument-index stride this milestone measured stops being exercised.
+    #[test]
+    fn cs_arr_walks_the_array_dynamically() {
+        let body = fn_body(&code_only(super::MTLBIND_HLSL), "void cs_arr");
+        assert!(body.contains("texs["), "cs_arr's body did not extract");
+        assert!(
+            body.contains("for (uint i = 0; i < TEX_N;"),
+            "cs_arr must walk texs[] under a loop over TEX_N — an unrolled chain would let \
+             the compiler fold the walk into distinct descriptors and K7's stride would \
+             never be exercised"
+        );
+        // The two SampleLevel sites index literally on purpose (they are the
+        // sampler probes, not the walk); the WALK must not.
+        assert!(
+            !body.contains("texs[2]") && !body.contains("texs[3]") && !body.contains("texs[4]"),
+            "cs_arr indexes texs[] with literals — the dynamic walk was unrolled"
         );
     }
 }

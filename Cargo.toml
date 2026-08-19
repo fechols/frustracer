@@ -100,6 +100,28 @@ tracy = ["dep:tracy-client"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
+# The WebGPU host (Stage C of the browser plan): the `wgpu` crate, so the
+# recorder that will drive the browser ALSO runs natively — over Vulkan on
+# the CI runner (lavapipe), over Vulkan/D3D12/Metal on real boxes — and the
+# `--check-wgpu` gate exists at all. Compute-only feature set: no `gles`
+# (four backends is enough to keep honest), no `webgpu` (the wasm arm joins
+# at Stage D under the wasm target table). `wgsl` must be spelled because
+# default-features = false removes it, and it is the only shader front end
+# the gate feeds. VERSION LOCKSTEP with naga (the note above): wgpu 30 ->
+# wgpu-core 30 -> naga ^30 — one naga in the graph, one translator; check
+# with `cargo tree -i naga` after any bump of either. wgpu links no DLL
+# (its backends dlopen the loader/D3D12 like our own gpu/vk modules do), so
+# every --check* stays DLL-free. Not on wasm32 here — matching
+# `mod webgpu`'s cfg(any(unix, windows)).
+[target.'cfg(any(unix, windows))'.dependencies]
+wgpu = { version = "30", default-features = false, features = [
+    "std", "parking_lot", "wgsl", "vulkan", "dx12", "metal",
+] }
+# wgpu's adapter/device requests are futures with no blocking helpers;
+# pollster is the idiomatic executor (wgpu's own examples use it). Pure
+# Rust, zero deps, no DLL.
+pollster = "1"
+
 # BC7 block compression of OPAQUE scene textures at load (src/bc7.rs, --bc7).
 # Intel's ISPC texture compressor: an ordinary static crate dep — it ships
 # prebuilt ISPC binaries, so no ISPC toolchain and no runtime DLL, which is
@@ -277,9 +299,36 @@ slint = { version = "1", default-features = false, features = [
 # own `MTLDevice` feature pulls `MTLLibrary`, `MTLResource` and `MTLGPUAddress`,
 # so it has been in the build from the first commit. Naming it is the same
 # invisible-widening complaint the MetalFX block below already makes about
-# itself. `MTLSampler`, `MTLHeap`, `MTLIndirectCommandBuffer` (which is
-# GPU-encoded command LISTS, a different thing from indirect dispatch — do not
-# add it on the name) and every MTL4* stay out.
+# itself.
+#
+# `MTLSampler` USED TO BE ON THE STAY-OUT LIST AND IS NOW REQUIRED, which is a
+# scope change and is recorded rather than quietly edited. C3 binds the corpus's
+# own `SamplerState`s (`trace_common.hlsli`'s samp_lin/samp_aniso, and the
+# mtlbind probe's clamp/repeat pair), and an argument-buffer sampler is an
+# `MTLSamplerState` object on this backend exactly as it is a `vk::Sampler` on
+# Vulkan — D3D12's static-sampler spelling has no Metal analogue. The feature
+# gates `MTLArgumentEncoder::setSamplerState:atIndex:` itself, so without it the
+# method does not exist. It pulls nothing new: `MTLSamplerDescriptor` needs only
+# NSObject/NSString, both already in the graph.
+#
+# `MTLHeap` and `MTLIndirectCommandBuffer` (which is GPU-encoded command LISTS,
+# a different thing from indirect dispatch — do not add it on the name) stay
+# out.
+#
+# THIS USED TO SAY "and every MTL4* stay out", AND IT WAS FALSE THE DAY IT WAS
+# WRITTEN — refuted by this same file, in the `objc2-metal-fx` block below.
+# The dates are the whole lesson: B3 (`d88fd05`) added `objc2-metal-fx`, which
+# additively enables `objc2-metal/MTL4Compiler` for the entire graph, AND wrote
+# the note below admitting it. C2 (`756441a`) then wrote "every MTL4* stay out"
+# HERE, one screen above that note and well after it (`git log
+# d88fd05..756441a` is 38 commits long). Nobody lied and nothing regressed; a
+# stay-out list states an INTENTION, an invisible widening does not ask its
+# permission, and the two statements never had to meet.
+#
+# Corrected rather than deleted, because the wrong one is the one a reader
+# reaches first. What is true is the narrower claim: `grep -rn MTL4 src/ shim/`
+# is EMPTY, so no MTL4 API is called anywhere in our own code — `MTL4Compiler`
+# is in the build without a caller.
 #
 # NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
 # are pulled in and compile there); this is additive and touches neither.
@@ -326,6 +375,9 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLArgument",
     "MTLDataType",
     "MTLFunctionConstantValues",
+    # C3 — the corpus's own samplers, encoded INTO those argument buffers. See
+    # the scope-change note above; this line replaces a "stays out" claim.
+    "MTLSampler",
 ] }
 # Named directly as of C2, which overturns the note this replaces ("deliberately
 # NOT a direct dependency: nothing under src/ names it"). Rust-side pipeline

@@ -856,6 +856,16 @@ pub struct Cli {
     /// the `--sw-rays` corpus BY DEFINITION (WebGPU has no ray query), so
     /// the gate arms that lever itself.
     pub check_wgsl: bool,
+    /// `--check-wgpu`: the WebGPU host, one claim past `--check-wgsl` —
+    /// bring up a real `wgpu` adapter and device (Vulkan/D3D12/Metal
+    /// natively; the browser is the same API's other arm), print the
+    /// granted limits (the binding-ceiling probe the DXC register shifts
+    /// make load-bearing), route the smoke kernel through the browser's
+    /// whole shader chain (DXC -> SPIR-V -> wgsl::normalize -> WGSL), and
+    /// run the indirect-dispatch smoke on it — the same kernel and the same
+    /// verdicts as the D3D12/Vulkan/Metal smokes. Stages J0.. ; J0 is pure
+    /// (no GPU). NOT scene-keyed — the smoke is one file.
+    pub check_wgpu: bool,
     /// `--check-msl`: take that same corpus one generator further — SPIR-V ->
     /// MSL (spirv-cross) -> AIR -> `.metallib` (`xcrun metal`). The first rung
     /// of a Metal tracer, and macOS-only because the Apple tools are.
@@ -1178,6 +1188,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_metalfx = false;
     let mut check_spirv = false;
     let mut check_wgsl = false;
+    let mut check_wgpu = false;
     let mut check_msl = false;
     let mut check_mtl = false;
     let mut check_vk = false;
@@ -1249,6 +1260,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
             "--check-wgsl" => check_wgsl = true,
+            "--check-wgpu" => check_wgpu = true,
             "--check-msl" => check_msl = true,
             "--check-mtl" => check_mtl = true,
             "--check-vk" => check_vk = true,
@@ -2625,6 +2637,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_metalfx,
         check_spirv,
         check_wgsl,
+        check_wgpu,
         check_msl,
         check_mtl,
         check_vk,
@@ -2828,6 +2841,12 @@ pub fn usage() {
                 eprintln!("                ops by construction) through the browser's whole generator chain —");
                 eprintln!("                SPIR-V (DXC) -> naga validate at the WebGPU-core floor -> WGSL text ->");
                 eprintln!("                re-parse. W0 is pure and runs anywhere; W1+ need a DXC drop; no GPU");
+                eprintln!("  --check-wgpu  headless: a real wgpu device EXECUTING what that chain emits — adapter");
+                eprintln!("                probe with the granted-limits table, then the indirect-dispatch smoke");
+                eprintln!("                (the same kernel the D3D12/Vulkan/Metal smokes prove). J0 is pure; J1+");
+                eprintln!("                need an adapter (llvmpipe counts); J2+ need a DXC drop.");
+                eprintln!("                FR_WGPU_ADAPTER=<index|name> forces the adapter; WGPU_BACKEND=<vulkan|");
+                eprintln!("                dx12|metal> forces the backend");
                 eprintln!("  --check-msl   headless (macOS): the same corpus one generator further — SPIR-V ->");
                 eprintln!("                MSL (spirv-cross) -> .metallib (xcrun metal). The first rung of a Metal");
                 eprintln!("                tracer: it compiles and nothing else, so what refuses IS the product.");

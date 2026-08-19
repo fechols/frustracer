@@ -135,7 +135,7 @@ Two instruments came out of it and are IN. **`FR_DUMP_HLSL=<dir>`** (dxc.rs) wri
 ```text
   kernel        grp  VGPR   LDS   waves/SIMD (VGPR-limited, of 16)
   leaf-fb        32   240   2048    6      <- the arm LEAF_NO_FB compiles out
-  hemi_cell      32   240  10240    6
+  hemi_cell      32   240  10240    6      <- STALE, see the 2026-08-14 re-read below
   leaf           32   216   2048    7      <- 44% occupancy, the hot kernel
   reference       8   214   4096    7
   level          32    65   8192   16
@@ -146,6 +146,26 @@ Two instruments came out of it and are IN. **`FR_DUMP_HLSL=<dir>`** (dxc.rs) wri
 (The LDS column is at the then-shipping `LANE_STACK` = 64 — `32 x 64 x 4 B` = the 8192 on `cs_level` — which is what this table then went on to change; at today's 16 those two rows read 2048/2560. Kept as measured, since it is the evidence for the change rather than a description of the result.)
 
 So "VGPR count sets occupancy directly on RDNA" is measured, not asserted: `cs_leaf` runs at 7 of 16 waves and `leaf-fb`'s extra 24 VGPRs cost a whole wave slot — the mechanism behind `LEAF_NO_FB`'s documented -11%. It also **refutes** the natural follow-on guess: the level kernels are nowhere near register-bound, so anything throttling the ladder is the LDS slab, not registers.
+
+**THE `hemi_cell` ROW IS STALE — re-read 2026-08-14, and the premise it kept being cited for is gone.** The row was quoted to argue that `cs_hemi_cell` sits in `leaf-fb`'s regime, where +24 VGPRs cost a whole wave slot, and therefore that anything added to the verify oracle is expensive. Re-measured on the current tree (RGA **2.14.2**, `-c gfx1201`, sources via `FR_DUMP_HLSL`, `--dxc-opt "-HV 2021 -O3"`), it is not: `cs_hemi_cell` allocates **96** VGPRs, so 1536/96 = **16 of 16 waves/SIMD — the cap. The kernel is not VGPR-limited at all**, and neither is `cs_hemi_root` at 80. The arithmetic is the same one that maps the old row's 240 to its "6 of 16" (1536/240 = 6.4), so the instrument is calibrated; the input moved. LDS moved for a documented reason and is NOT evidence of drift: 10240 → **4096** is exactly `LANE_STACK` 64 → 16 (`32 x 16 x 4 B` + 2048), the same substitution the parenthetical above already makes for the `level` rows.
+
+Measured as the before/after of the `[unroll]` → `[loop]` change in `check_empty_cell` (`hemi_wave.hlsl`), on both the procedural `--check-gpu` scene and san-miguel-lp — the second because a cutout-free scene compiles the light `occluded_q` and was the obvious confound. It reads the same 89 either way:
+
+```text
+  kernel / scene                VGPR used/alloc   waves/SIMD   SGPR   LDS   scratch   ISA instrs
+  cs_hemi_cell  procedural         89/96 -> 89/96   16 -> 16    51     4096    640     4356 -> 4387
+  cs_hemi_cell  san-miguel-lp      89/96 -> 87/88   16 -> 16    72     4096    640     7010 -> 7046
+  cs_hemi_root  procedural         77/80 -> 77/80   16 -> 16    39     4096    640     7897 -> 7907
+  cs_hemi_root  san-miguel-lp      75/80 -> 75/80   16 -> 16    64     4096    640     8902 -> 8921
+```
+
+Nothing rises anywhere; the ISA delta is scheduling (+8 `s_nop`, ±2 VALU, zero new memory ops), and `internal constant` is **0 in both arms** — the `switch`-form weight table adds no `[18 x float]` global and scratch stays 640 B, which is the claim the change was made on.
+
+**THE PREDICTED MECHANISM IS RIGHT IN DXIL AND WRONG IN ISA, and that is the reusable part.** The change was expected to cut inlined `RayQuery` bodies (`cs_hemi_root` ~24 → 4, `cs_hemi_cell` 6 → 1). In DXIL it does exactly that — `dx.op.allocateRayQuery` **7 → 2** — which is the layer spirv-cross consumes and is why the Metal fix works. It does **not** survive to RDNA4 machine code: `image_bvh*_intersect_ray` sites stay **6 and 12 in both arms**, because the AMD backend re-rolls or re-unrolls to its own taste regardless of the HLSL attribute. **An HLSL loop attribute is a statement to the FRONT end; do not infer a machine-code shape from it** — count the ISA. Timing was therefore skipped on purpose: waves/SIMD is unmoved in all four arms, and a `--spin` sweep cannot see what a static read already answered.
+
+**Recipe corrections, both of which cost a run to discover.** RGA has **no `dxil` mode** — DX12 compute is `-s dx12` with `--cs / --cs-entry / --cs-model / --dxc-opt`, not `--function / -p / --additional-args`. And **RGA needs no Radeon installed**: it auto-generates a root signature by reflection and compiles for `gfx1201` offline, so the occupancy question is answerable on any box (this one has no discrete AMD). `SDKs/rga` is gitignored and `install-prerequisites` does not fetch it, so a fresh clone has to install it by hand before any of this reproduces.
+
+**STILL OWED: the AMD RUNTIME arm.** `--check-gpu --prefer-amd` and the san-miguel candidate-loop arm were NOT run — this box has only a 2-CU Ryzen iGPU (`DEV_164E`, gfx1036), not the R9700. The gates ran green on the 4090 and the B70 with every soundness counter at 0 and `empty-cells` bit-identical to master (2360/2912 procedural, 2712/4168 san-miguel), and the RDNA4 *occupancy* half is covered by the offline read above — what is missing is only the RDNA4 *runtime* gate.
 
 **FIXED 2026-07-31: the AMD candidate-loop TMin defect — an AMD-only, textured-scene-only wavefront bug that was also costing 2x.** `san-miguel-low-poly.obj --check-gpu --prefer-amd` had failed for as long as the box had a discrete AMD adapter to run it on, always with the same signature (`tmin-overshoot 341393` = every hit pixel, `max rel t err 8.70e-1`, `mv_selftest` median 8.428e-1, 6 distinct GPU albedos), while the same command passed on NVIDIA and the GPU *reference* kernel agreed with the CPU perfectly. Diagnosis, in the order the evidence arrived: the culprit dump showed `wave_t − ref_t` constant at **6.4993** to five decimals while `ref_t` varied over five units, and the tile's inherited `t_start` was **6.49935** — arithmetic, not geometry, so the wavefront was reporting `t_true + t_start`. Arming `--heightfield`, which forces the hardware `TMin` to 0 and re-checks the interval logically, made it vanish outright (`max rel t err 0.00e0`). **The defect: on RDNA4, an inline RayQuery driven by a `Proceed()` candidate loop with a NONZERO `r.TMin` returns the hit distance offset by +TMin.** AMD re-origins the ray at TMin (long documented here, normally invisible); on this path the driver adds that offset back to a value that already carried it. Only the wavefront's leaf primaries pass a materially large TMin — the tile's inherited `t_start` — so only they show it; every other candidate-loop ray passes an eps-scale tmin, which is why `--check-dxr --prefer-amd` reads a clean `8.70e-6` on the same scene and the DXR pipeline is deliberately NOT armed.
 
