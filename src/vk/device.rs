@@ -236,7 +236,7 @@ pub struct DeviceInfo {
     pub accel_struct: bool,
     pub rt_pipeline: bool,
     /// The descriptor-indexing half the corpus needs, and needs UNCONDITIONALLY
-    /// — these are not features a session opts into. `texs[]` (`t10, space1`)
+    /// — these are not features a session opts into. `texs[]` (`t0, space2`)
     /// is an unbounded `Texture2D` array, which is `OpTypeRuntimeArray` on a
     /// descriptor; every sample through it goes through
     /// `NonUniformResourceIndex`, which becomes a `NonUniform` decoration; and

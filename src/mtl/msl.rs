@@ -20,7 +20,7 @@
 //! ```text
 //! --msl --msl-version 30000
 //! --msl-argument-buffers --msl-argument-buffer-tier 2
-//! --msl-device-argument-buffer 1
+//! --msl-device-argument-buffer 2
 //! ```
 //!
 //! **`--msl-decoration-binding` is ABSENT**, and it is the one flag `build.rs`
@@ -52,12 +52,19 @@
 //! `vk::reflect` derives the Vulkan one rather than transcribing it. The shift
 //! constants in `crate::spirv` stay a VULKAN choice and are free to stay one.
 //!
-//! **`--msl-device-argument-buffer 1` is derived, not magic.** `texs[]` is
-//! `register(t10, space1)`, the register SPACE becomes the descriptor SET, and
+//! **`--msl-device-argument-buffer 2` is derived, not magic.** `texs[]` is
+//! `register(t0, space2)`, the register SPACE becomes the descriptor SET, and
 //! spirv-cross requires runtime-sized arrays to live in *device* storage
 //! argument buffers ("Runtime sized variables must be in device storage
 //! argument buffers" is the exact refusal without it). Tier 2 is required for
 //! the unsized array at all and is supported on every Apple silicon GPU.
+//!
+//! **THE FLAG'S ARGUMENT IS THE SET NUMBER, so it moved when `texs[]` did.**
+//! It read `1` — with `register(t10, space1)` beside it — until C3 moved the
+//! array alone into space2 to stop spirv-cross dropping a member beside it
+//! (`overlap_check` below). `self_test` pins the flag's argument against
+//! `UNBOUNDED_ARRAY_SET`, so the CODE could not go stale here; only this
+//! paragraph could, and it did.
 //!
 //! **`-ffp-contract=off` is NOT needed, and that surprised the plan.**
 //! spirv-cross preserves `NoContraction`: it emits
