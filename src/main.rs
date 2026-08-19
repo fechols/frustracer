@@ -28827,18 +28827,18 @@ fn run_cinematic_cpu(
 /// shows the last frame.
 ///
 /// WHAT IS STILL NOT HERE, each deferred for a reason rather than forgotten:
-/// audio; a screenshot verb (it wants the capture arm's resolve+PNG path, its
-/// own slice — `P` and `--qa screenshot` say so); `--lock-res` (the trace
-/// extent follows the swapchain 1:1 here, where D3D12's re-entry re-derives a
-/// LOCKED render res); the toggle keys that answer to arms this window has not
-/// got (SPACE/F/R/T/O/B/G/X/K/N/J/I/C/Y/Z — one tracer, one upscaler, one
-/// denoiser; their settings rows are the "n/a" ones; H is refused for D3D12's
-/// own upscaler-sub-mode reason, not for a missing arm — the quality keys
-/// U/V/1-3 went LIVE in B6c rung 2); and held-repeat on the gamepad's D-pad
-/// in the menu (SDL buttons do not auto-repeat — `pad.rs`'s repeat core is
-/// XInput-bound). The mid-compile repaint that used to close this list landed
-/// with B6c rung 1: the memo made rebuilds instant and `VkTracer::new`'s tick
-/// made the one remaining cold pass repaint per unit.
+/// audio; `--lock-res` (the trace extent follows the swapchain 1:1 here,
+/// where D3D12's re-entry re-derives a LOCKED render res); the toggle keys
+/// that answer to arms this window has not got (SPACE/F/R/T/O/B/G/X/K/N/J/I/
+/// C/Y/Z — one tracer, one upscaler, one denoiser; their settings rows are
+/// the "n/a" ones; H is refused for D3D12's own upscaler-sub-mode reason, not
+/// for a missing arm — the quality keys U/V/1-3 went LIVE in B6c rung 2); and
+/// held-repeat on the gamepad's D-pad in the menu (SDL buttons do not
+/// auto-repeat — `pad.rs`'s repeat core is XInput-bound). Two entries this
+/// list used to carry have landed: the mid-compile repaint (B6c rung 1 — the
+/// memo made rebuilds instant, the tick made the cold pass repaint per unit)
+/// and the screenshot verb (B6c rung 3 — P and `--qa screenshot <path>`, the
+/// capture arm's readback through `resolve_hdr_plain` + `save_png`).
 ///
 /// THE SCENE IS THE WORLD, because `req` already says so: a bare invocation
 /// sets `world_wanted`, and nothing about this path changes it.
@@ -29549,7 +29549,7 @@ fn window_frames(
                     eprintln!(
                         "qa: control socket listening on 127.0.0.1:{port} — drive it with \
                          `frqa` (pos | tp | look | tod | drive | drive stop | resize | key \
-                         | sync | quit; screenshot is a later slice's)"
+                         | screenshot | sync | quit)"
                     );
                     Some((q, qflag))
                 }
@@ -29574,6 +29574,15 @@ fn window_frames(
     // stops guarding a minute into the session.
     let mut qa_pend: Vec<(u64, u64, std::time::Instant, std::sync::mpsc::SyncSender<String>)> =
         Vec::new();
+    // The screenshot's pending (B6c rung 3) — at most ONE outstanding (the
+    // Windows rule), held apart from the sync tuples because it resolves on
+    // the SAVE, not on an iteration count. The 30 s backstop matters on a
+    // hidden window, whose loop `continue`s before the consumer runs.
+    let mut qa_shot_pend: Option<(std::time::Instant, std::sync::mpsc::SyncSender<String>)> = None;
+    let mut qa_shot: Option<String> = None;
+    // The auto-name counter — bumped only when a shot was NOT `--qa`-named,
+    // the Windows contract (`screenshot_{n}.png`, CWD).
+    let mut shot_n: u32 = 0;
     // The resize debounce (rung 3). `pending` is armed by a size that differs
     // from the one we are rendering at and RE-armed by every further change, so
     // a drag commits once, at the end. `rebuilds` is the tally measurement 2
@@ -29743,6 +29752,13 @@ fn window_frames(
         // missing verb rather than answering a generic "unknown verb".
         if let Some((qq, _)) = &qa_ctl {
             qa_iter += 1;
+            if qa_shot_pend.as_ref().is_some_and(|(t, _)| t.elapsed().as_secs() > 30) {
+                let (_, reply) = qa_shot_pend.take().expect("checked is_some");
+                let _ = reply.send(qa::err_reply(
+                    "timed out after 30s waiting for the screenshot (is the window hidden?)",
+                ));
+                qa_shot = None;
+            }
             qa_pend.retain(|(target, asked, started, reply)| {
                 if qa_iter >= *target {
                     let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -30027,6 +30043,7 @@ fn window_frames(
                             "back" | "b" => edges.menu_back = true,
                             "u" => edges.cycle_spp = true,
                             "v" => edges.toggle_height = true,
+                            "p" => edges.screenshot = true,
                             "1" => edges.quality = Some(1),
                             "2" => edges.quality = Some(2),
                             "3" => edges.quality = Some(3),
@@ -30035,13 +30052,9 @@ fn window_frames(
                         match n.as_str() {
                             "esc" | "escape" | "f1" | "f11" | "up" | "down" | "left" | "right"
                             | "enter" | "return" | "a" | "start" | "back" | "b" | "u" | "v"
-                            | "1" | "2" | "3" => {
+                            | "p" | "1" | "2" | "3" => {
                                 qa::info_reply(&format!("key {n} queued"))
                             }
-                            "p" => qa::err_reply(
-                                "the Vulkan window has no screenshot verb yet — it wants the \
-                                 capture arm's resolve+PNG path, which is its own slice",
-                            ),
                             "h" => qa::err_reply(
                                 "hemi bounces are a still-frame feature the upscaler sub-mode \
                                  refuses on D3D12 too — and this window is always that sub-mode",
@@ -30061,18 +30074,27 @@ fn window_frames(
                         }
                     }
                     ["key", ..] => qa::err_reply("key needs one name"),
-                    // A NAMED refusal, not a generic "unknown verb": the verb
-                    // exists on Windows and its absence here is a slice, not a
-                    // typo, so the driver is told which one.
-                    ["screenshot", ..] => qa::err_reply(
-                        "the Vulkan window has no screenshot verb yet — it wants the capture \
-                         arm's resolve+PNG path, which is its own slice",
+                    // Paths can carry spaces — rejoin everything after the
+                    // verb rather than demanding a single token (the Windows
+                    // arm's rule).
+                    ["screenshot", path_words @ ..] if !path_words.is_empty() => {
+                        if qa_shot_pend.is_some() {
+                            qa::err_reply("a screenshot is already pending")
+                        } else {
+                            edges.screenshot = true;
+                            qa_shot = Some(path_words.join(" "));
+                            qa_shot_pend = Some((t0, req.reply.clone()));
+                            continue; // answered by the save below
+                        }
+                    }
+                    ["screenshot"] => qa::err_reply(
+                        "screenshot needs a path (the P key writes screenshot_N.png in the CWD)",
                     ),
                     [] => qa::err_reply("empty request"),
                     _ => qa::err_reply(&format!(
                         "unknown verb {:?} — pos | tp x y z [yaw pitch] | look yaw pitch | \
-                         tod H | drive x y z ticks | drive stop | resize W H | key NAME | sync N \
-                         | quit (screenshot is a later slice's)",
+                         tod H | drive x y z ticks | drive stop | resize W H | key NAME | \
+                         screenshot PATH | sync N | quit",
                         words[0]
                     )),
                 };
@@ -30571,6 +30593,70 @@ fn window_frames(
                 eprintln!("window: {e}");
                 code = 1;
                 break;
+            }
+        }
+
+        // ── The screenshot (B6c rung 3): P, or `--qa screenshot <path>`. The
+        // capture arm's resolve+PNG path, exactly as the old refusals
+        // promised: FSR3's persistent readback (linear f32 RGB at output res)
+        // through the CPU tonemap. `resolve_hdr_plain`, NOT `resolve_hdr`:
+        // this window presents with the glare tap structurally dead, and a
+        // screenshot records what the swapchain showed — adding CPU glare the
+        // screen never drew would make the instrument lie (move to
+        // `resolve_hdr` when the vk bloom pyramid lands). No HUD baked — the
+        // Windows P contract; `--cinematic` is the arm that composites one.
+        // SDR 8-bit. The readback fence-waits once — the same cost the
+        // presenter pays every frame, so a shot is one frame's hitch. Under
+        // the menu HOLD the FSR3 output still holds the last rendered frame,
+        // which is also what the swapchain is showing — so a held shot is
+        // consistent, not stale.
+        if edges.screenshot {
+            let cap = cv
+                .as_ref()
+                .expect("the tracer is Some outside a failed rebuild")
+                .up
+                .as_ref()
+                .ok_or_else(|| "no upscaler output to read".to_string())
+                .and_then(|up| up.read_output(hg));
+            let qa_path = qa_shot.take();
+            match cap {
+                Ok(hdr) => {
+                    // A zeroed info plane: `overlay_on` is false (no quadtree
+                    // overlay arm here) and the tonemap never reads it then,
+                    // but the slice must be shaped for the signature.
+                    let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+                    let mut present = vec![0u32; rw * rh];
+                    render::resolve_hdr_plain(
+                        &hdr,
+                        &info,
+                        false,
+                        1.0,
+                        None,
+                        &mut present,
+                        rw,
+                        rh,
+                        rw,
+                        rh,
+                    );
+                    let name =
+                        qa_path.clone().unwrap_or_else(|| format!("screenshot_{shot_n}.png"));
+                    save_png(&name, &present, rw, rh);
+                    eprintln!("saved {name}");
+                    if qa_path.is_none() {
+                        shot_n += 1;
+                    }
+                    if let Some((started, reply)) = qa_shot_pend.take() {
+                        let ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let _ = reply
+                            .send(qa::reply_json(&[(1, format!("screenshot written: {name}"))], ms));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("screenshot: readback failed ({e})");
+                    if let Some((_, reply)) = qa_shot_pend.take() {
+                        let _ = reply.send(qa::err_reply(&format!("screenshot failed: {e}")));
+                    }
+                }
             }
         }
         last_ms = frame_start.elapsed().as_secs_f64() * 1000.0;

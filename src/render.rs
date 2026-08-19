@@ -2276,6 +2276,30 @@ pub fn resolve_hdr(
     });
 }
 
+/// `resolve_hdr` WITHOUT the glare pass — the Vulkan window's screenshot
+/// entry (B6c rung 3). That window presents `tonemap.hlsl` with the glare tap
+/// structurally dead (no bloom pyramid on that backend yet), and a screenshot
+/// exists to record what the swapchain showed: adding CPU glare the screen
+/// never drew would make the instrument lie. When the vk pyramid lands, its
+/// screenshot site should move to `resolve_hdr` so file and swapchain agree
+/// again — this wrapper is that site's one caller and goes with it.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_hdr_plain(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    exposure: f32,
+    guard: Option<&[f32]>,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    crate::zone!("resolve-hdr-plain");
+    tonemap_to(hdr, info, overlay_on, exposure, guard, present, rw, rh, ww, wh);
+}
+
 /// Tonemap + overlay + upscale an HDR image into the present buffer. The one
 /// CPU present loop, shared by `resolve` and `resolve_hdr`; glare is the
 /// caller's business, so this can never apply it twice. `exposure` is the
