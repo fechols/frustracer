@@ -179,8 +179,9 @@ use objc2_foundation::{NSString, NSURL};
 #[allow(deprecated)]
 use objc2_metal::MTLArgument;
 use objc2_metal::{
-    MTLArgumentEncoder, MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice,
-    MTLFunction, MTLLibrary, MTLResourceUsage, MTLSamplerState, MTLTexture,
+    MTLAllocation, MTLArgumentEncoder, MTLBuffer, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary, MTLResourceUsage,
+    MTLSamplerState, MTLTexture,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -779,6 +780,44 @@ impl ArgBuf {
     /// `set_sampler`.
     pub fn resident_count(&self) -> usize {
         self.resident.len()
+    }
+
+    /// Every set's argument buffer paired with the bind point it was DERIVED
+    /// for — the same `(index, buffer)` pairs `bind_at` feeds to
+    /// `setBuffer:offset:atIndex:`.
+    ///
+    /// Exists for `mtl::mtl4`, which must express the identical binding through
+    /// `MTL4ArgumentTable::setAddress:atIndex:` — an API that takes a raw
+    /// `MTLGPUAddress` and therefore cannot be handed the buffer. **The index
+    /// comes from the same `map.buffer_index` either way**, which is the point:
+    /// the two paths must not be able to disagree about where a set lives, and
+    /// they cannot if neither of them writes the number down.
+    pub fn set_binds(&self) -> Vec<(u32, &ProtocolObject<dyn MTLBuffer>)> {
+        self.sets.values().map(|sb| (sb.map.buffer_index, &*sb.buf)).collect()
+    }
+
+    /// The residency list as `MTLAllocation`s, plus the argument buffers
+    /// themselves.
+    ///
+    /// **THE ARGUMENT BUFFERS ARE IN THIS LIST AND ARE NOT IN `resident`**, and
+    /// the asymmetry is real rather than an oversight in either place. On the
+    /// Metal 3 path `bind_at` passes the argument buffer to
+    /// `setBuffer:offset:atIndex:` BY OBJECT, so Metal makes it resident
+    /// itself and `useResource:` is needed only for what the buffer POINTS AT.
+    /// MTL4 takes an address, so nothing makes the argument buffer resident
+    /// implicitly and it has to be declared like everything else.
+    ///
+    /// So `resident_count()` and `self.resident_allocations().len()` differ by
+    /// the set count BY CONSTRUCTION. A gate comparing the two paths' numbers
+    /// must expect that difference rather than treat it as a discrepancy.
+    pub fn resident_allocations(&self) -> Vec<&ProtocolObject<dyn MTLAllocation>> {
+        let mut out: Vec<&ProtocolObject<dyn MTLAllocation>> =
+            self.sets.values().map(|sb| ProtocolObject::from_ref(&*sb.buf)).collect();
+        out.extend(self.resident.iter().map(|(r, _)| match r {
+            Resident::Buffer(b) => ProtocolObject::from_ref(&**b),
+            Resident::Texture(t) => ProtocolObject::from_ref(&**t),
+        }));
+        out
     }
 
     /// The argument buffer's own encoded words.

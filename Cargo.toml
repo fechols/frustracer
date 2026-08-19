@@ -305,9 +305,18 @@ sdl3 = { version = "0.18", features = ["build-from-source-static", "ash"] }
 # permission, and the two statements never had to meet.
 #
 # Corrected rather than deleted, because the wrong one is the one a reader
-# reaches first. What is true is the narrower claim: `grep -rn MTL4 src/ shim/`
-# is EMPTY, so no MTL4 API is called anywhere in our own code — `MTL4Compiler`
-# is in the build without a caller.
+# reaches first. What was true at C2 is the narrower claim: `grep -rn MTL4 src/
+# shim/` was EMPTY, so no MTL4 API was called anywhere in our own code —
+# `MTL4Compiler` was in the build without a caller.
+#
+# AND THAT IS NO LONGER TRUE EITHER, as of D4. `src/mtl/mtl4.rs` runs the smoke
+# chain through MTL4CommandQueue / MTL4CommandBuffer / MTL4CommandAllocator /
+# MTL4ArgumentTable / MTLResidencySet, so the grep now answers. Kept in place
+# and dated rather than rewritten to the present tense: the lesson above is
+# about a stay-out list going stale without anyone lying, and a reader who
+# arrives with that expectation needs to see BOTH the intention and the two
+# separate days it stopped holding. `MTL4Compiler` remains the one MTL4 feature
+# in the graph with no caller of ours — see the D4 block in the feature list.
 #
 # NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
 # are pulled in and compile there); this is additive and touches neither.
@@ -357,6 +366,39 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     # C3 — the corpus's own samplers, encoded INTO those argument buffers. See
     # the scope-change note above; this line replaces a "stays out" claim.
     "MTLSampler",
+    # D4 — THE METAL 4 SUBMISSION PATH (`src/mtl/mtl4.rs`). This block is what
+    # turns "no MTL4 API is called anywhere in our own code" from true to false;
+    # the note above the dependency table is corrected rather than deleted.
+    #
+    # MTL4Compiler is NOT here, and its absence is a measurement rather than an
+    # omission: `MTL4ComputeCommandEncoder::setComputePipelineState:` takes a
+    # plain `MTLComputePipelineState` — the object `bind::Kernel` already builds
+    # through the Metal 3 route — so the new path SHARES the pipeline with the
+    # old one and the byte-compare between them has one fewer variable. (It is
+    # in the graph anyway, pulled in by `objc2-metal-fx`; see the note below.)
+    "MTL4CommandQueue",
+    "MTL4CommandBuffer",
+    "MTL4CommandAllocator",
+    "MTL4CommandEncoder",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ArgumentTable",
+    # MANDATORY, not optional bookkeeping. MTL4 has NO `useResource:` on any
+    # encoder — checked against every `MTL4*` binding in the crate — so
+    # residency is expressible only through this, and `MTL4ArgumentTable`'s
+    # `setAddress:atIndex:` takes a RAW GPU ADDRESS rather than a buffer
+    # object, which is why: Metal can no longer infer residency from what was
+    # bound. A resource bound but not resident is a use-after-free on this
+    # path, not a validation message.
+    "MTLResidencySet",
+    # `MTLBuffer::gpuAddress()` and the argument table's `setAddress:` both
+    # live behind it — the type, not a capability.
+    "MTLGPUAddress",
+    # There is no `waitUntilCompleted` in MTL4. The CPU waits by having the
+    # queue signal a shared event and blocking on
+    # `waitUntilSignaledValue:timeoutMS:`, which returns a BOOL — so a submit
+    # that never lands is a gate failure with a message rather than a gate that
+    # hangs.
+    "MTLEvent",
 ] }
 # Named directly as of C2, which overturns the note this replaces ("deliberately
 # NOT a direct dependency: nothing under src/ names it"). Rust-side pipeline
