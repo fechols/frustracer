@@ -186,6 +186,13 @@ mod stats;
 // the wasm session runs this same module at page load, so the gate and the
 // page share one translator by construction.
 mod wgsl;
+// The WebGPU backend (Stage C of the browser port): the wgpu recorder that
+// will drive the browser, run natively so it is testable — `--check-wgpu`.
+// cfg like `mod spirv`, and for the same reason: the gate's shader stages
+// load DXC through a dynamic loader wasm does not have; the browser session
+// is a later stage's arm, not this module's.
+#[cfg(any(unix, windows))]
+mod webgpu;
 mod prof;
 mod replay;
 mod temporal;
@@ -390,6 +397,7 @@ fn main() {
         check_metalfx,
         check_spirv,
         check_wgsl,
+        check_wgpu,
         check_msl,
         check_mtl,
         check_vk,
@@ -1073,11 +1081,12 @@ fn main() {
         // Scene-keyed for the line above's reason, and it is the SAME corpus:
         // both gates enumerate it through `corpus_units`.
         || check_msl
-        // NOT scene-keyed, either of them: the smoke kernel is one file with no
-        // scene-derived defines, so both gates are a pure function of the
+        // NOT scene-keyed, any of these: the smoke kernel is one file with no
+        // scene-derived defines, so each gate is a pure function of the
         // device.
         || check_mtl
         || check_vk
+        || check_wgpu
         || check_gpu
         || check_dxr;
     // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites run
@@ -1421,6 +1430,21 @@ fn main() {
         // wasm included; W1+ skip loudly where no DXC drop can load.
         let code = run_check_wgsl(&scene);
         std::process::exit(code);
+    }
+    if check_wgpu {
+        #[cfg(any(unix, windows))]
+        {
+            let code = run_check_wgpu();
+            std::process::exit(code);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            eprintln!(
+                "--check-wgpu needs a native wgpu device and a dynamic loader for DXC — \
+                 the browser session is a later stage's arm, not this gate's"
+            );
+            std::process::exit(2);
+        }
     }
     if check_msl {
         #[cfg(target_os = "macos")]
@@ -14927,6 +14951,103 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
         println!("CHECK-WGSL {}", if ok { "PASSED" } else { "FAILED" });
         i32::from(!ok)
     }
+}
+
+/// `--check-wgpu`: the WebGPU host, stages J0..J3 (`J*` — `U*` is taken by
+/// `--check-fsr3`). `--check-wgsl` proves the browser corpus VALIDATES;
+/// this proves a wgpu device EXECUTES what the translator emits, and those
+/// are different claims — the same distinction `--check-vk` draws against
+/// `--check-spirv`.
+///
+/// J0 pure (adapter-pick semantics + the limits math; no GPU) | J1 a real
+/// adapter + device, printing the granted limits — THE DAY-ONE RISK PROBE:
+/// DXC's register shifts put bindings at 2000+, above WebGPU's default
+/// 1000-per-group ceiling, and whether adapters (and one day browsers)
+/// grant more decides Stage C2's layout strategy | J2 the smoke kernel
+/// through the browser's real chain (DXC -> normalize -> spv_to_wgsl ->
+/// ShaderModule) | J3 the indirect-dispatch smoke, the same two-pass
+/// verdict the D3D12/Vulkan/Metal twins assert — "three backends, one
+/// kernel" becomes four.
+///
+/// NOT scene-keyed and NO --sw-rays arming: smoke.hlsl pastes nothing.
+#[cfg(any(unix, windows))]
+fn run_check_wgpu() -> i32 {
+    let mut ok = true;
+
+    // ---- J0: the pure half — meaningful on a box with no GPU at all. ----
+    match webgpu::device::self_test() {
+        Ok(()) => println!("check-wgpu: J0 adapter pick + limits ask OK"),
+        Err(e) => {
+            eprintln!("check-wgpu: FAIL J0 {e}");
+            ok = false;
+        }
+    }
+
+    // ---- J1: a real adapter. Absence is a normal condition; a mis-set
+    // FR_WGPU_ADAPTER (or a refused request on a chosen adapter) is not —
+    // reporting "you typoed the lever" as "this box has no GPU" exits 0 on
+    // a run that gated nothing.
+    let hg = match webgpu::headless::WgpuHeadless::new() {
+        Ok(h) => h,
+        Err(e) if e.absent => {
+            println!("check-wgpu: SKIP J1 ({e})");
+            return i32::from(!ok);
+        }
+        Err(e) => {
+            eprintln!("check-wgpu: FAIL J1 {e}");
+            println!("CHECK-WGPU FAILED");
+            return 2;
+        }
+    };
+    println!("check-wgpu: J1 {}", hg.dev.line());
+    for r in hg.dev.limits_risks() {
+        println!("check-wgpu: J1 limit {r}");
+    }
+    if hg.dev.info.device_type == wgpu::DeviceType::Cpu {
+        println!(
+            "check-wgpu: NOTE this is a SOFTWARE adapter — correct, and useless for any timing"
+        );
+    }
+
+    // ---- J2: the browser's shader chain, live. A missing DXC drop is an
+    // environment fact (the W1/V2 shape), not a corpus verdict.
+    let dir = crate::spirv::default_dir();
+    let sp = match crate::spirv::Spirv::load(&dir) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("check-wgpu: SKIP J2 ({e})");
+            return i32::from(!ok);
+        }
+    };
+    let pipes = match webgpu::headless::build_pipes(&hg.dev, &sp) {
+        Ok(p) => {
+            println!(
+                "check-wgpu: J2 smoke kernel -> SPIR-V -> normalize -> WGSL ({} B) -> 3 pipelines",
+                p.wgsl_bytes
+            );
+            p
+        }
+        Err(e) => {
+            eprintln!("check-wgpu: FAIL J2 {e}");
+            println!("CHECK-WGPU FAILED");
+            return 1;
+        }
+    };
+
+    // ---- J3: the point. ----
+    match webgpu::headless::smoke_run(&hg, &pipes) {
+        Ok(()) => println!(
+            "check-wgpu: J3 uniform constants + storage buffers + GPU-written indirect args + \
+             dispatch_workgroups_indirect OK"
+        ),
+        Err(e) => {
+            eprintln!("check-wgpu: FAIL J3 {e}");
+            ok = false;
+        }
+    }
+
+    println!("CHECK-WGPU {}", if ok { "PASSED" } else { "FAILED" });
+    i32::from(!ok)
 }
 
 /// `--check-msl`: the Metal shader toolchain — the corpus's THIRD code

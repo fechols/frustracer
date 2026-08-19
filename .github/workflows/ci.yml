@@ -640,6 +640,19 @@ jobs:
             echo "::error::--check-wgsl's normalization touched nothing — the probe-reach alarm"
             exit 1
           fi
+          # The WebGPU host (Stage C1): a wgpu device EXECUTING what that
+          # chain emits — over the same lavapipe this job already installs
+          # (wgpu's Vulkan backend finds the ICD the way ash does), with the
+          # same DXC drop feeding J2. Positive assertions per the doctrine
+          # below; the J-loop's trailing space is load-bearing (J1 must not
+          # match a future J18).
+          cargo run --profile quick -- --check-wgpu 2>&1 | tee wgpu.log
+          grep -q "CHECK-WGPU PASSED" wgpu.log \
+            || { echo "::error::--check-wgpu failed (or printed no summary)"; exit 1; }
+          for s in J0 J1 J2 J3; do
+            grep -q "check-wgpu: $s " wgpu.log \
+              || { echo "::error::--check-wgpu printed no $s line at all — that stage did not run and did not say so"; exit 1; }
+          done
           cargo run --profile quick -- --check-vk 2>&1 | tee vk.log
           grep -q "CHECK-VK PASSED" vk.log \
             || { echo "::error::--check-vk did not run (no summary line — it skipped)"; exit 1; }
@@ -662,6 +675,7 @@ jobs:
           path: |
             spirv.log
             wgsl.log
+            wgpu.log
             vk.log
           if-no-files-found: warn
 

@@ -100,6 +100,28 @@ tracy = ["dep:tracy-client"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
+# The WebGPU host (Stage C of the browser plan): the `wgpu` crate, so the
+# recorder that will drive the browser ALSO runs natively — over Vulkan on
+# the CI runner (lavapipe), over Vulkan/D3D12/Metal on real boxes — and the
+# `--check-wgpu` gate exists at all. Compute-only feature set: no `gles`
+# (four backends is enough to keep honest), no `webgpu` (the wasm arm joins
+# at Stage D under the wasm target table). `wgsl` must be spelled because
+# default-features = false removes it, and it is the only shader front end
+# the gate feeds. VERSION LOCKSTEP with naga (the note above): wgpu 30 ->
+# wgpu-core 30 -> naga ^30 — one naga in the graph, one translator; check
+# with `cargo tree -i naga` after any bump of either. wgpu links no DLL
+# (its backends dlopen the loader/D3D12 like our own gpu/vk modules do), so
+# every --check* stays DLL-free. Not on wasm32 here — matching
+# `mod webgpu`'s cfg(any(unix, windows)).
+[target.'cfg(any(unix, windows))'.dependencies]
+wgpu = { version = "30", default-features = false, features = [
+    "std", "parking_lot", "wgsl", "vulkan", "dx12", "metal",
+] }
+# wgpu's adapter/device requests are futures with no blocking helpers;
+# pollster is the idiomatic executor (wgpu's own examples use it). Pure
+# Rust, zero deps, no DLL.
+pollster = "1"
+
 # BC7 block compression of OPAQUE scene textures at load (src/bc7.rs, --bc7).
 # Intel's ISPC texture compressor: an ordinary static crate dep — it ships
 # prebuilt ISPC binaries, so no ISPC toolchain and no runtime DLL, which is
