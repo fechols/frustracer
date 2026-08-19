@@ -78,33 +78,26 @@ impl Mtl {
         Ok(Mtl { device, queue })
     }
 
-    /// The `vk::device`-style identity line. `linear_tex_align` is on it
-    /// deliberately: it is the number the buffer-backed image-atomic textures
-    /// depend on (spirv-cross emulates Metal image atomics with a buffer
-    /// aliased over the texture's memory, addressed `alignedWidth*y + x`), so
-    /// a gate log that omits it cannot explain a failure that involves it.
+    /// The `vk::device`-style identity line.
+    ///
+    /// **`linear-tex-align` came OFF this line in D2, and its removal is the
+    /// point.** It was here deliberately — the row alignment the buffer-backed
+    /// image-atomic textures depended on, so a gate log could explain a failure
+    /// that involved it. `build.rs::MSL_VERSION` 30100 makes spirv-cross emit
+    /// native image atomics, so nothing is buffer-backed, no pipeline is
+    /// specialized on the alignment, and a number no code consumes on an
+    /// identity line is worse than absent: it reads as a live constraint.
     pub fn line(&self) -> String {
         format!(
-            "{} | unified {} | linear-tex-align {} B | arg-buffers tier {}",
+            "{} | unified {} | arg-buffers tier {}",
             self.device.name(),
             self.device.hasUnifiedMemory(),
-            self.linear_tex_align(),
             match self.arg_buffers_tier() {
                 MTLArgumentBuffersTier::Tier1 => "1",
                 MTLArgumentBuffersTier::Tier2 => "2",
                 _ => "?",
             },
         )
-    }
-
-    /// Row alignment for a buffer-backed `R32Uint` texture — the format FFX
-    /// uses for its image-atomic surfaces (`reconstructedPrevNearestDepth`,
-    /// the SPD global atomic). Fed to every pipeline as spirv-cross's
-    /// `spvLinearTextureAlignmentOverride` function constant.
-    pub fn linear_tex_align(&self) -> u32 {
-        self.device
-            .minimumLinearTextureAlignmentForPixelFormat(MTLPixelFormat::R32Uint)
-            as u32
     }
 
     /// A raw `id<MTLDevice>` for the ObjC++ shim. The `Retained` keeps it
@@ -135,8 +128,10 @@ impl Mtl {
     /// unrelated until something checks. Every Apple silicon GPU is Tier 2, but
     /// nothing in this tree had ever read the property, so a Tier-1 device would
     /// have surfaced as a pipeline that builds and then reads the wrong
-    /// resource. `line()` prints it for the reason `linear-tex-align` is there:
-    /// a gate log that omits it cannot explain a failure that involves it.
+    /// resource. `line()` prints it for the reason `linear-tex-align` USED to be
+    /// there: a gate log that omits a number a failure depends on cannot explain
+    /// that failure. The tier outlived the alignment — D2 retired the latter
+    /// with the image-atomic emulation, and this one still gates `texs[]`.
     pub fn arg_buffers_tier(&self) -> MTLArgumentBuffersTier {
         self.device.argumentBuffersSupport()
     }

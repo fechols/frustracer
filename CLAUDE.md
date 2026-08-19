@@ -308,6 +308,9 @@ island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `
 ablation and probes: `FR_ABL` `FR_BALLAST` `FR_WIDTH` `FR_ORACLE` `FR_RANGE` `FR_REF` ·
 tuning sweeps: `FR_LEAF` `FR_LGROUP` `FR_LSTACK` `FR_WIDE` `FR_STACK_LAYOUT` `FR_FRD_GROUP` ·
 per-feature A/B: `FR_NGXFG_*` `FR_NGXRR_*` `FR_NRD_*` `FR_FRD_*` `FR_MFX*` `FR_AEXP_*`
+`FR_MTL_*` (the `--check-mtl` plants: eight teeth and measurements over the argument-buffer
+map, the threadgroup size and residency) · `FR_FFX_MSL` — **the one BUILD-time lever**, so it
+needs `cargo build` and the gate run to see it alike, and a stale binary measures the other arm
 `FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` · Vulkan: `FR_VK_*`
 (device pick, validation, res parity, drop-binding teeth, the window's pump arm) · dumps: `FR_DUMP_HLSL`
 `FR_SPIRV_DUMP|LIST` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:

@@ -895,6 +895,21 @@ jobs:
       # Metal toolchain or the GPU. --check-fsr3 is guarded HARD on its U4 line,
       # because U1-U4 are PROVEN to run here.
       #
+      # ITS THIRD GUARD IS A COUPLING CHECK, not a duplicate of PASSED. D2
+      # raised build.rs::MSL_VERSION to 30100 so spirv-cross emits NATIVE image
+      # atomics, and deleted the buffer-backed emulation from
+      # shim/ffx_fsr3_metal.mm. Those two halves must move together, and the
+      # failure when they do not is SILENT: measured at MSL 30000 against the D2
+      # shim, U4 still passes all nine of its assertions with plausible but
+      # different numbers (history 2.579e-2 against 2.197e-2, depth 9.688e-3
+      # against 1.218e-2). U1's emulation-site count is the only thing that
+      # catches it, so a run that never prints it has not checked the coupling.
+      # THE LEADING COMMA IN THAT GREP IS LOAD-BEARING. U1 prints its table line
+      # whether or not the count assertion fired, so the bare pattern "0 image-
+      # atomic emulation sites" is a SUBSTRING of "20 image-atomic emulation
+      # sites" -- and 20 is exactly what FR_FFX_MSL=30000 produces. Without the
+      # comma this guard goes green on the one input it was written to catch.
+      #
       # --check-metalfx IS GUARDED ONLY ON PASSED, AND IT IS NEAR-VACUOUS HERE.
       # Say it plainly, because a green job printing `check-metalfx: PASSED` may
       # not otherwise read that way: run 31630969341 reports
@@ -987,6 +1002,8 @@ jobs:
             || { echo "::error::--check-fsr3 did not pass"; rc=1; }
           grep -q "check-fsr3: U4 upscale" fsr3.log \
             || { echo "::error::--check-fsr3 did not run a real upscale — the GPU half skipped:"; grep -E "SKIP U[0-9]" fsr3.log || true; rc=1; }
+          grep -q ", 0 image-atomic emulation sites" fsr3.log \
+            || { echo "::error::--check-fsr3 did not report a clean image-atomic emulation count — the shader half and shim/ffx_fsr3_metal.mm may be out of step (D2):"; grep -E "U1|PLANT" fsr3.log || true; rc=1; }
           grep -q "check-metalfx: PASSED" metalfx.log \
             || { echo "::error::--check-metalfx did not pass"; rc=1; }
           grep -q "CHECK-MSL PASSED" msl.log \
