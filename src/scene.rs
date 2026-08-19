@@ -2362,6 +2362,148 @@ pub fn procedural_scene() -> Scene {
     b.finish(default_sun())
 }
 
+/// The `--check-gpu` M15 (FR_WEB_TEX byte-gate) scene. `procedural_scene`
+/// must stay texture-free (`texweb::self_test` pins that), so the gate brings
+/// its own textures — small, deterministic, and shaped to reach every WEB_TEX
+/// choke point:
+///
+/// - two same-(w,h,mips,srgb) sampled textures → ONE multi-layer bucket (the
+///   `bl` remap is live, not just bucket 0 layer 0);
+/// - a different-size texture → a second bucket (the generated switch has
+///   more than one arm);
+/// - an alpha-masked cutout → the `web_texels` Load path (`alpha_cutout`);
+/// - an h2n heightfield on a material's `normal_tex` with `height_amp > 0` →
+///   the `height_bilinear`/`height_march` Load path;
+/// - a floor tile seen at grazing → the SampleGrad (aniso) arm of
+///   `tex_sample`, beside the SampleLevel arm the head-on quads take.
+///
+/// Mips ride `Texture::from_cached`'s own `MIPS_ENABLED` path, so the bucket
+/// key's `levels` matches what the bindless arm uploads.
+pub fn texweb_check_scene() -> Scene {
+    use crate::texture::Texture;
+    let mut b = SceneBuilder::new();
+
+    let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
+    let s = 20.0;
+    b.quad(
+        Vec3A::new(-s, 0.0, -s),
+        Vec3A::new(-s, 0.0, s),
+        Vec3A::new(s, 0.0, s),
+        Vec3A::new(s, 0.0, -s),
+        ground,
+    );
+
+    // Deterministic texel patterns — plain integer arithmetic, no rng.
+    let pat = |w: u32, h: u32, salt: u32, alpha: &dyn Fn(u32, u32) -> u8| -> Vec<[u8; 4]> {
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let v = x.wrapping_mul(31).wrapping_add(y.wrapping_mul(17)).wrapping_add(salt);
+                [
+                    v.wrapping_mul(13) as u8,
+                    v.wrapping_mul(7) as u8,
+                    v.wrapping_mul(3) as u8,
+                    alpha(x, y),
+                ]
+            })
+            .collect()
+    };
+    let opaque = |_: u32, _: u32| 255u8;
+    let t_a = b.add_texture(Texture::from_cached(
+        64, 64, pat(64, 64, 1, &opaque), false, true, "texweb-a".into(), false, false,
+    ));
+    let t_b = b.add_texture(Texture::from_cached(
+        64, 64, pat(64, 64, 2, &opaque), false, true, "texweb-b".into(), false, false,
+    ));
+    // 4x4-texel checker: half the texels below the <128 cutout threshold.
+    let checker = |x: u32, y: u32| if (x / 4 + y / 4) % 2 == 0 { 0u8 } else { 255u8 };
+    let t_c = b.add_texture(Texture::from_cached(
+        32, 32, pat(32, 32, 3, &checker), true, true, "texweb-c".into(), false, false,
+    ));
+    // A flat-blue normal map whose alpha carries a smooth height wave (the
+    // h2n convention: alpha IS the source height).
+    let hgt: Vec<[u8; 4]> = (0..32u32 * 32)
+        .map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            let t = std::f32::consts::TAU / 32.0;
+            let a = ((x as f32 * t).sin() * (y as f32 * t).cos() * 0.5 + 0.5) * 255.0;
+            [128, 128, 255, a as u8]
+        })
+        .collect();
+    let t_d = b.add_texture(Texture::from_cached(
+        32, 32, hgt, false, false, "texweb-d".into(), true, false,
+    ));
+
+    let textured = |b: &mut SceneBuilder, tex: u32| {
+        b.material_kind(Vec3A::ONE, 0.6, 0.0, 0.0, MatKind::Textured { tex })
+    };
+    let m_a = textured(&mut b, t_a);
+    let m_b = textured(&mut b, t_b);
+    let m_c = textured(&mut b, t_c);
+    let relief = Material {
+        albedo: Vec3A::new(0.55, 0.5, 0.45),
+        roughness: 0.7,
+        metallic: 0.0,
+        anisotropy: 0.0,
+        sheen: 0.0,
+        translucency: 0.0,
+        transmission: 0.0,
+        trans_tint: Vec3A::splat(-1.0),
+        ior: 1.5,
+        ripple_amp: 0.0,
+        emissive: Vec3A::ZERO,
+        normal_tex: t_d,
+        normal_scale: 1.0,
+        height_amp: 0.35,
+        rough_tex: NO_TEX,
+        metal_tex: NO_TEX,
+        emissive_tex: NO_TEX,
+        class: crate::matclass::IDX_DEFAULT as u8,
+        kind: MatKind::Diffuse,
+    };
+    let m_d = b.material_full(relief);
+
+    // Four upright 2x2 quads in a row facing +z, UV 0..1 (the third repeats
+    // 0..2 so a wrap crosses the arms too), plus a textured floor tile the
+    // camera sees at grazing incidence (the SampleGrad arm).
+    for (x, mat, uvm) in
+        [(-4.5f32, m_a, 1.0f32), (-1.5, m_b, 1.0), (1.5, m_c, 2.0), (4.5, m_d, 1.0)]
+    {
+        let p = vec![
+            Vec3A::new(x - 1.0, 0.0, 0.0),
+            Vec3A::new(x + 1.0, 0.0, 0.0),
+            Vec3A::new(x + 1.0, 2.0, 0.0),
+            Vec3A::new(x - 1.0, 2.0, 0.0),
+        ];
+        let n = vec![Vec3A::Z; 4];
+        let uv = vec![
+            Vec2::new(0.0, uvm),
+            Vec2::new(uvm, uvm),
+            Vec2::new(uvm, 0.0),
+            Vec2::new(0.0, 0.0),
+        ];
+        b.add_mesh(p, n, uv, &[[0, 1, 2], [0, 2, 3]], mat);
+    }
+    {
+        let p = vec![
+            Vec3A::new(-6.0, 0.01, 1.0),
+            Vec3A::new(6.0, 0.01, 1.0),
+            Vec3A::new(6.0, 0.01, 7.0),
+            Vec3A::new(-6.0, 0.01, 7.0),
+        ];
+        let n = vec![Vec3A::Y; 4];
+        let uv = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(6.0, 0.0),
+            Vec2::new(6.0, 3.0),
+            Vec2::new(0.0, 3.0),
+        ];
+        b.add_mesh(p, n, uv, &[[0, 1, 2], [0, 2, 3]], m_a);
+    }
+
+    b.finish(default_sun())
+}
+
 /// Verts/tris the scene loaders push before the model itself — the standard
 /// ground quad (`quad()` = two `tri()` calls = 6 duplicated verts / 2 tris).
 /// `tile_scene` relies on this layout to replicate only the model, and

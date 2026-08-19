@@ -315,7 +315,9 @@ table's bind point and the inter-dispatch barriers are TEETH, residency is a mea
 `FR_MTL4_OFF` forces the SKIP branch on a box that has MTL4) · `FR_FFX_MSL` — **the one
 BUILD-time lever**, so it needs `cargo build` and the gate run to see it alike, and a stale
 binary measures the other arm
-`FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` · Vulkan: `FR_VK_*`
+`FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` `FR_WEB_TEX`
+(the wavefront samples texweb buckets — the browser texture plan on native D3D12;
+`--check-gpu` M15 owns it) · Vulkan: `FR_VK_*`
 (device pick, validation, res parity, drop-binding teeth, the window's pump arm) · WebGPU:
 `FR_WGPU_ADAPTER` (adapter pick, index or name substring; `WGPU_BACKEND` rides along free) · dumps: `FR_DUMP_HLSL`
 `FR_SPIRV_DUMP|LIST` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:

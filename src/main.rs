@@ -13842,6 +13842,506 @@ fn run_check_gpu(
         ok = false;
     }
 
+    // --- M15: FR_WEB_TEX — the browser texture plan on native D3D12 ---
+    // The runtime half of WEB_TEX (gfx::texweb — the WebGPU replacement for
+    // the bindless texs[]): one tracer binds the Texture2DArray buckets + the
+    // meta/texel side-tables, the other the shipping bindless table, over ONE
+    // shared Bc7Mode::Off core (an array resource is one format, so buckets
+    // are always RGBA8 — with BC7 off on both arms the binding topology is
+    // the only delta). The claim is two-tier: EXACT where exactness is
+    // structural — tbuf/info/counters (geometry + the byte-exact Load paths)
+    // and the upload bytes (the audit) — and ULP-BOUNDED on accum, which
+    // crosses two DXC compilations (see `m15_viol`). Brings its own scene:
+    // the suite's default scene is texture-free, which would make this gate
+    // vacuous (`texweb_check_scene`'s doc names what each texture is FOR).
+    // Teeth: two meta-row poisons — the bucket remap (bl → the sibling
+    // layer) and the Load payload (ofs+1) — must each move the image past
+    // the bound and restore to bit-identity (same-program compares); "the
+    // poison did not change the image" is the probe-reach failure this gate
+    // exists to catch.
+    // M15/M15b's OWN readback helpers — the suite's read_f32/read_u32 closures
+    // pinned their resource lifetime to the suite tracer on first use (the
+    // cloud-cache gate's `otg` lesson), and these gates read TWO tracers each.
+    fn m15_f32(
+        hg: &mut gpu::trace::HeadlessGpu,
+        res: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let b = hg.read_buffer(res, ua, n * 4)?;
+        Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+    fn m15_u32(
+        hg: &mut gpu::trace::HeadlessGpu,
+        res: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        n: usize,
+    ) -> Result<Vec<u32>, String> {
+        let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let b = hg.read_buffer(res, ua, n * 4)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+    let m15_bits =
+        |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    // The CROSS-PROGRAM accum bound. tbuf/info/counters and the upload bytes
+    // are exact across the arms (measured 0 on bistro), but accum crosses two
+    // COMPILATIONS — the texweb block changes DXC's instruction fusing, and
+    // the shading math rounds differently at the last bit (measured: 43 of
+    // 1.44M channels at 1-8 ulp on bistro, one screen region, independent of
+    // aniso and mips, upload audit clean — the FR_NOPRECISE class). The bound
+    // sits ~100x above that noise and ~1000x below any routing bug: a wrong
+    // layer/lod/offset moves a channel by O(0.01..1), proven by the poison
+    // teeth, which this same bound must catch. Negated <= rather than >, so a
+    // NaN difference (one arm NaN, the other a number) lands on the FAILING
+    // side — `NaN > bound` is false and would count a poisoned channel as
+    // in-bound.
+    let m15_viol = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .filter(|(x, y)| !((*x - *y).abs() <= (1e-5 * x.abs().max(y.abs())).max(1e-6)))
+            .count()
+    };
+
+    'm15: {
+        println!("check-gpu: M15 web-tex bucket A/B (FR_WEB_TEX)");
+        let wscene = scene::texweb_check_scene();
+        let wplan = gfx::texweb::plan(&wscene);
+        let multi = wplan.buckets.iter().any(|b| b.layers.len() >= 2);
+        if wplan.buckets.len() < 2 || !multi || wplan.texels.is_empty() {
+            eprintln!(
+                "check-gpu: FAIL M15 the check scene lost its shape ({} buckets, \
+                 multi-layer {multi}, {} payload words)",
+                wplan.buckets.len(),
+                wplan.texels.len()
+            );
+            ok = false;
+            break 'm15;
+        }
+        let wbvh = bvh::Bvh::build(&wscene);
+        let (ww, wh) = (640usize, 480usize);
+        let wpx = ww * wh;
+        let wcam = camera::Camera::look_at(
+            glam::Vec3A::new(0.0, 1.6, 9.0),
+            glam::Vec3A::new(0.0, 1.2, 0.0),
+            55f32.to_radians(),
+        );
+        let wp = gpu::trace::FrameParams {
+            sway_prev_time: None,
+            cam: wcam.basis(ww, wh),
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            prev_cam: None,
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(wscene.diag),
+            fireflies: crate::fireflies::Fireflies::check(&wscene),
+            sway_time: None,
+            replay: false,
+        };
+        let wdev = hg.device.clone();
+        let wcore = match gpu::trace::SceneGpu::new_uploaded(
+            &wdev,
+            &wscene,
+            &wbvh,
+            &mut hg,
+            bc7::Bc7Mode::Off,
+        ) {
+            Ok(c) => std::rc::Rc::new(c),
+            Err(e) => {
+                eprintln!("check-gpu: FAIL M15 scene upload: {e}");
+                ok = false;
+                break 'm15;
+            }
+        };
+        // The lever is process-global and snapshotted at TraceGpu::new, so the
+        // arms are cut by set/restore around each construction (the set_sky_lod
+        // gate idiom). Restoring the ENTRY value keeps an FR_WEB_TEX=1 suite
+        // run honest — and arm A is forced unarmed so such a run cannot
+        // degenerate into armed-vs-armed (which would be vacuously identical).
+        let was_armed = gpu::trace::web_tex();
+        gpu::trace::set_web_tex(false);
+        let mk_tracer = |hg: &mut gpu::trace::HeadlessGpu| {
+            gpu::trace::TraceGpu::new(
+                &wdev,
+                &dxc,
+                &wscene,
+                &wbvh,
+                wcore.clone(),
+                ww as u32,
+                wh as u32,
+                false,
+                false,
+                false,
+                opts.gpu_debug,
+                hg,
+            )
+        };
+        let ta = mk_tracer(&mut hg);
+        gpu::trace::set_web_tex(true);
+        let tb = mk_tracer(&mut hg);
+        gpu::trace::set_web_tex(was_armed);
+        let (ta, tb) = match (ta, tb) {
+            (Ok(a), Ok(b)) => (a, b),
+            (a, b) => {
+                let e = a.err().or(b.err()).unwrap();
+                eprintln!("check-gpu: FAIL M15 tracer init: {e}");
+                ok = false;
+                break 'm15;
+            }
+        };
+        // Probe-reach BOTH ways: an armed bindless arm or an unarmed bucket
+        // arm each turn the byte-compare into self-vs-self.
+        if ta.web_tex_armed() || !tb.web_tex_armed() {
+            eprintln!(
+                "check-gpu: FAIL M15 probe-reach: arm A armed {}, arm B armed {} (want false/true)",
+                ta.web_tex_armed(),
+                tb.web_tex_armed()
+            );
+            ok = false;
+            break 'm15;
+        }
+        let render_read = |hg: &mut gpu::trace::HeadlessGpu,
+                           tg: &gpu::trace::TraceGpu|
+         -> Result<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>), String> {
+            tg.write_cb(0, &wp);
+            hg.run(|l| tg.record_wavefront(l, 0, &wp, true))?;
+            Ok((
+                m15_f32(hg, &tg.tbuf, wpx)?,
+                m15_u32(hg, &tg.info, wpx)?,
+                m15_f32(hg, &tg.accum, wpx * 3)?,
+                m15_u32(hg, &tg.counters, gpu::trace::CTR_COUNT as usize)?,
+            ))
+        };
+        let bits = &m15_bits;
+        let (a, b) = match (render_read(&mut hg, &ta), render_read(&mut hg, &tb)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                eprintln!("check-gpu: FAIL M15 A/B readback");
+                ok = false;
+                break 'm15;
+            }
+        };
+        let td = bits(&a.0, &b.0);
+        let id = a.1.iter().zip(&b.1).filter(|(x, y)| x != y).count();
+        let ad = bits(&a.2, &b.2);
+        let av = m15_viol(&a.2, &b.2);
+        let cd = a.3.iter().zip(&b.3).filter(|(x, y)| x != y).count();
+        let layers: usize = wplan.buckets.iter().map(|k| k.layers.len()).sum();
+        eprintln!(
+            "check-gpu: web-tex A/B: tbuf-diff {td} | info-diff {id} | accum-bits {ad} \
+             (bound-viol {av}) | counter-diff {cd} | {} buckets ({layers} layers), {} \
+             payload words",
+            wplan.buckets.len(),
+            wplan.texels.len()
+        );
+        // The upload-identity audit runs BEFORE the verdict so an image
+        // mismatch arrives already localized: dirty audit = our upload bug at
+        // its first (texture, mip); clean audit = a filtering divergence
+        // between the two resource types, to be recorded.
+        match tb.web_tex_audit(&wdev, &mut hg, &wcore.textures) {
+            Ok((d, f)) => {
+                eprintln!(
+                    "check-gpu: web-tex upload audit: {d} differing bytes{}",
+                    f.map(|(ti, mip)| format!(" (first at texture {ti} mip {mip})"))
+                        .unwrap_or_default()
+                );
+                if d != 0 {
+                    eprintln!("check-gpu: FAIL M15 bucket upload is not the bindless bytes");
+                    ok = false;
+                    break 'm15;
+                }
+            }
+            Err(e) => {
+                eprintln!("check-gpu: FAIL M15 upload audit: {e}");
+                ok = false;
+                break 'm15;
+            }
+        }
+        if td != 0 || id != 0 || av != 0 || cd != 0 {
+            eprintln!(
+                "check-gpu: FAIL M15 bucket arm diverges from bindless \
+                 (tbuf {td} info {id} accum bound-viol {av} counters {cd})"
+            );
+            ok = false;
+            break 'm15;
+        }
+        // Teeth 1 — the bucket remap: texture 0 and 1 share the multi-layer
+        // bucket by scene construction; point 0's meta at 1's layer and the
+        // sampled color must move, then restore to bit-identity.
+        let (row0, row1) = match (tb.web_tex_meta_row(0), tb.web_tex_meta_row(1)) {
+            (Some(r0), Some(r1)) if r0.bl >> 16 == r1.bl >> 16 && r0.bl != r1.bl => (r0, r1),
+            _ => {
+                eprintln!("check-gpu: FAIL M15 teeth: textures 0/1 no longer share a bucket");
+                ok = false;
+                break 'm15;
+            }
+        };
+        // The teeth compare against arm B's OWN clean frame — same program,
+        // same data, so bit-exactness is structural here (the cross-program
+        // ULP story above does not apply): the poison must move tbuf bits OR
+        // violate the accum bound — a disjunction, because each poison can
+        // only fire one tier (the bl swap leaves geometry untouched, so only
+        // the bound can see it, which is exactly what proves the bound
+        // catches routing bugs; the ofs shift moves hits, so tbuf sees it);
+        // the restore must return to bit-identity on all four buffers.
+        let poison = |hg: &mut gpu::trace::HeadlessGpu,
+                      ti: usize,
+                      row: gfx::texweb::MetaRow,
+                      what: &str|
+         -> Result<bool, String> {
+            tb.web_tex_poke_meta(&wdev, hg, ti, row)?;
+            let p = render_read(hg, &tb)?;
+            let moved =
+                bits(&b.0, &p.0) + m15_viol(&b.2, &p.2) != 0;
+            eprintln!(
+                "check-gpu: web-tex teeth ({what}): image {} under the poison",
+                if moved { "MOVED" } else { "did NOT move" }
+            );
+            Ok(moved)
+        };
+        let restore = |hg: &mut gpu::trace::HeadlessGpu,
+                       ti: usize,
+                       row: gfx::texweb::MetaRow|
+         -> Result<bool, String> {
+            tb.web_tex_poke_meta(&wdev, hg, ti, row)?;
+            let r = render_read(hg, &tb)?;
+            Ok(bits(&b.0, &r.0) + bits(&b.2, &r.2) == 0 && b.1 == r.1 && b.3 == r.3)
+        };
+        let tooth = |hg: &mut gpu::trace::HeadlessGpu,
+                         ti: usize,
+                         bad: gfx::texweb::MetaRow,
+                         good: gfx::texweb::MetaRow,
+                         what: &str|
+         -> bool {
+            match poison(hg, ti, bad, what) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "check-gpu: FAIL M15 teeth ({what}): the poison did not change the \
+                         image — the armed arm is not reading what this gate thinks it reads"
+                    );
+                    return false;
+                }
+                Err(e) => {
+                    eprintln!("check-gpu: FAIL M15 teeth ({what}): {e}");
+                    return false;
+                }
+            }
+            match restore(hg, ti, good) {
+                Ok(true) => true,
+                Ok(false) => {
+                    eprintln!(
+                        "check-gpu: FAIL M15 teeth ({what}): identity did not return after \
+                         the restore"
+                    );
+                    false
+                }
+                Err(e) => {
+                    eprintln!("check-gpu: FAIL M15 teeth ({what}): {e}");
+                    false
+                }
+            }
+        };
+        let bad0 = gfx::texweb::MetaRow { bl: row1.bl, ..row0 };
+        if !tooth(&mut hg, 0, bad0, row0, "bucket remap") {
+            ok = false;
+            break 'm15;
+        }
+        // Teeth 2 — the Load payload: shift the cutout texture's payload
+        // offset one word; the checker edge moves, so hits/misses move.
+        let row2 = match tb.web_tex_meta_row(2) {
+            Some(r) if r.ofs != gfx::texweb::NO_PAYLOAD => r,
+            _ => {
+                eprintln!("check-gpu: FAIL M15 teeth: texture 2 lost its cutout payload");
+                ok = false;
+                break 'm15;
+            }
+        };
+        let bad2 = gfx::texweb::MetaRow { ofs: row2.ofs + 1, ..row2 };
+        if !tooth(&mut hg, 2, bad2, row2, "load payload") {
+            ok = false;
+            break 'm15;
+        }
+        println!(
+            "check-gpu: M15 web-tex buckets match bindless (exact tbuf/info/counters + \
+             upload, accum in bound), both poisons bit ({} buckets, {layers} layers)",
+            wplan.buckets.len()
+        );
+    }
+
+    // --- M15b: the same identity on the SESSION scene (real texture sets) ---
+    // M15's mini scene proves the machinery with teeth; this proves the byte
+    // identity holds on whatever texture population the operator pointed the
+    // suite at (bistro's cutouts + heightfields, san-miguel's water — the
+    // touch-WEB_TEX run-list names them). Identity only: the poisons live in
+    // M15, where the scene shape is pinned. Both arms share ONE fresh
+    // Bc7Mode::Off core — buckets are RGBA8-only, so with BC7 anywhere in the
+    // bindless arm the formats (not the binding topology) would be the delta.
+    'm15b: {
+        if scene.textures.is_empty() {
+            eprintln!(
+                "check-gpu: (skip) M15b web-tex on the session scene — no textures \
+                 (run a textured scene: bistro, san-miguel, the helmet)"
+            );
+            break 'm15b;
+        }
+        println!("check-gpu: M15b web-tex A/B on the session scene");
+        let bplan = gfx::texweb::plan(scene);
+        let bdev = hg.device.clone();
+        let bcore = match gpu::trace::SceneGpu::new_uploaded(
+            &bdev,
+            scene,
+            bvh,
+            &mut hg,
+            bc7::Bc7Mode::Off,
+        ) {
+            Ok(c) => std::rc::Rc::new(c),
+            Err(e) => {
+                eprintln!("check-gpu: FAIL M15b scene upload: {e}");
+                ok = false;
+                break 'm15b;
+            }
+        };
+        let bp = gpu::trace::FrameParams {
+            sway_prev_time: None,
+            cam: basis,
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            prev_cam: None,
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: check_sway,
+            replay: false,
+        };
+        let was_armed = gpu::trace::web_tex();
+        gpu::trace::set_web_tex(false);
+        let mk_tracer = |hg: &mut gpu::trace::HeadlessGpu| {
+            gpu::trace::TraceGpu::new(
+                &bdev,
+                &dxc,
+                scene,
+                bvh,
+                bcore.clone(),
+                gw as u32,
+                gh as u32,
+                false,
+                false,
+                false,
+                opts.gpu_debug,
+                hg,
+            )
+        };
+        let ta = mk_tracer(&mut hg);
+        gpu::trace::set_web_tex(true);
+        let tb = mk_tracer(&mut hg);
+        gpu::trace::set_web_tex(was_armed);
+        let (ta, tb) = match (ta, tb) {
+            (Ok(a), Ok(b)) => (a, b),
+            (a, b) => {
+                let e = a.err().or(b.err()).unwrap();
+                eprintln!("check-gpu: FAIL M15b tracer init: {e}");
+                ok = false;
+                break 'm15b;
+            }
+        };
+        if ta.web_tex_armed() {
+            eprintln!("check-gpu: FAIL M15b probe-reach: the bindless arm armed web-tex");
+            ok = false;
+            break 'm15b;
+        }
+        if !tb.web_tex_armed() {
+            // The one legitimate unarmed arm B: the scene's plan exceeded the
+            // root-signature bucket ceiling and TraceGpu fell back loudly.
+            if bplan.buckets.len() as u32 > gpu::trace::WEB_TEX_MAX_BUCKETS {
+                eprintln!(
+                    "check-gpu: (skip) M15b — {} buckets exceeds the {} ceiling (the \
+                     fallback is the behavior under test there, and it announced itself)",
+                    bplan.buckets.len(),
+                    gpu::trace::WEB_TEX_MAX_BUCKETS
+                );
+                break 'm15b;
+            }
+            eprintln!("check-gpu: FAIL M15b probe-reach: the bucket arm did not arm");
+            ok = false;
+            break 'm15b;
+        }
+        let render_read = |hg: &mut gpu::trace::HeadlessGpu,
+                           tg: &gpu::trace::TraceGpu|
+         -> Result<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>), String> {
+            tg.write_cb(0, &bp);
+            hg.run(|l| tg.record_wavefront(l, 0, &bp, true))?;
+            Ok((
+                m15_f32(hg, &tg.tbuf, px)?,
+                m15_u32(hg, &tg.info, px)?,
+                m15_f32(hg, &tg.accum, px * 3)?,
+                m15_u32(hg, &tg.counters, gpu::trace::CTR_COUNT as usize)?,
+            ))
+        };
+        let (a, b) = match (render_read(&mut hg, &ta), render_read(&mut hg, &tb)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                eprintln!("check-gpu: FAIL M15b A/B readback");
+                ok = false;
+                break 'm15b;
+            }
+        };
+        let td = m15_bits(&a.0, &b.0);
+        let id = a.1.iter().zip(&b.1).filter(|(x, y)| x != y).count();
+        let ad = m15_bits(&a.2, &b.2);
+        let av = m15_viol(&a.2, &b.2);
+        let cd = a.3.iter().zip(&b.3).filter(|(x, y)| x != y).count();
+        let layers: usize = bplan.buckets.iter().map(|k| k.layers.len()).sum();
+        eprintln!(
+            "check-gpu: web-tex session A/B: tbuf-diff {td} | info-diff {id} | \
+             accum-bits {ad} (bound-viol {av}) | counter-diff {cd} | {} buckets \
+             ({layers} layers), {} payload words",
+            bplan.buckets.len(),
+            bplan.texels.len()
+        );
+        // Localize before judging — see M15's audit note.
+        match tb.web_tex_audit(&bdev, &mut hg, &bcore.textures) {
+            Ok((d, f)) => {
+                eprintln!(
+                    "check-gpu: web-tex session upload audit: {d} differing bytes{}",
+                    f.map(|(ti, mip)| format!(" (first at texture {ti} mip {mip})"))
+                        .unwrap_or_default()
+                );
+                if d != 0 {
+                    eprintln!("check-gpu: FAIL M15b bucket upload is not the bindless bytes");
+                    ok = false;
+                    break 'm15b;
+                }
+            }
+            Err(e) => {
+                eprintln!("check-gpu: FAIL M15b upload audit: {e}");
+                ok = false;
+                break 'm15b;
+            }
+        }
+        if td != 0 || id != 0 || av != 0 || cd != 0 {
+            eprintln!(
+                "check-gpu: FAIL M15b bucket arm diverges from bindless on the session \
+                 scene (tbuf {td} info {id} accum bound-viol {av} counters {cd})"
+            );
+            ok = false;
+            break 'm15b;
+        }
+        println!(
+            "check-gpu: M15b session-scene web-tex exact on tbuf/info/counters + upload, \
+             accum within the cross-program bound ({} buckets, {layers} layers)",
+            bplan.buckets.len()
+        );
+    }
+
     if !ok {
         eprintln!("GPU CHECK FAILED");
         return 1;
