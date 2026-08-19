@@ -14694,6 +14694,329 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
     i32::from(!ok)
 }
 
+/// K6/K7/K8 — `mtlbind.hlsl` bound and DISPATCHED: textures, samplers, an
+/// unbounded array, and the two descriptor sets C2 explicitly could not reach.
+///
+/// Its own function rather than three more blocks inside `run_check_mtl`,
+/// because the three stages share a `Pipes` and a `Res` and nothing else in
+/// that function does — and because `Res` builds four samplers and seven
+/// textures whose lifetimes should end with the stages that use them.
+///
+/// `false` on any failure; every failure is printed where it happened.
+#[cfg(target_os = "macos")]
+fn run_mtl_texprobe(
+    m: &mtl::device::Mtl,
+    msl: &mtl::msl::Msl,
+    sp: &crate::spirv::Spirv,
+    plant: mtl::texprobe::Plant,
+) -> bool {
+    use crate::gfx::shaders::{MTLBIND_PAYLOAD, MTLBIND_TEX_N};
+    let mut ok = true;
+    let show = std::env::var_os("FR_MTL_MAP").is_some();
+
+    let pipes = match mtl::texprobe::build(m, msl, sp, plant) {
+        Ok(p) => p,
+        Err(e) => {
+            // `FR_MTL_BUFFER0` lands HERE, in the derivation, before any
+            // dispatch — which is the strongest shape a tooth in this file can
+            // have (`smoke.rs`'s SEED_MAP argument).
+            eprintln!("check-mtl: FAIL K6-K8 mtlbind build: {e}");
+            return false;
+        }
+    };
+    let res = match mtl::texprobe::resources(m) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K6-K8 probe resources: {e}");
+            return false;
+        }
+    };
+
+    // Every entry point's maps cross-checked against its own SPIR-V, exactly as
+    // K3 does for the smoke chain — the two-derivations discipline does not get
+    // weaker because the subject got harder.
+    //
+    // EACH KERNEL'S FAILURES CARRY ITS OWN STAGE NUMBER. The loop is shared
+    // because the check is, but the label is not: `cs_arr`'s map disagreeing
+    // with its SPIR-V is a K7 finding, and printing it as K6 sends a reader to
+    // the wrong stage — and the CI guards grep for these very strings.
+    let mut slots_total = 0usize;
+    for (name, k) in pipes.all() {
+        let stage = match name {
+            "cs_tex" => "K6",
+            "cs_arr" => "K7",
+            _ => "K8",
+        };
+        slots_total += k.slots_total();
+        for bad in mtl::bind::cross_check(&k.maps, &k.descs) {
+            eprintln!("check-mtl: FAIL {stage} {name}: {bad}");
+            ok = false;
+        }
+        if k.local_size != [1, 1, 1] {
+            eprintln!(
+                "check-mtl: FAIL {stage} {name}: group size {:?}, mtlbind.hlsl declares \
+                 [1, 1, 1]",
+                k.local_size
+            );
+            ok = false;
+        }
+        if show {
+            println!("check-mtl:   {name} ({})", k.name);
+            for l in k.maps.values().flat_map(|mm| mm.lines()) {
+                println!("check-mtl:   {name}   {l}");
+            }
+        }
+    }
+    // Anti-vacuity, K3's `slots_total != 6` in this file's currency. The three
+    // kernels reference 4 + 4 + 3 members: `cs_tex` all of set 0; `cs_arr`
+    // outbuf + both space1 samplers + texs; `cs_set1` samp_lin + set1_out +
+    // texs. A reflection that came back empty would build empty argument
+    // buffers, dispatch nothing, and report clean.
+    if slots_total != 11 {
+        eprintln!(
+            "check-mtl: FAIL K6-K8 the three kernels reflected {slots_total} member(s) in \
+             total, expected 11 (4 + 4 + 3) — the derivation is not reading the maps"
+        );
+        ok = false;
+    }
+
+    // ---- K6: cs_tex, set 0 only. ----
+    //
+    // THE DISAGREEMENT IS ASSERTED ON WHAT METAL ACTUALLY ASSIGNED, and that is
+    // this stage's own product. `mtlbind.hlsl` declares t, s, s, u so that
+    // declaration order and BINDING order cannot coincide — the accident that
+    // let C2 record the id rule backwards and still pass on `smoke.hlsl`. The
+    // `cargo test` twin reads the HLSL; this reads the compiled function, and
+    // both are needed: the source pin cannot see spirv-cross changing its mind,
+    // and this one cannot run where most edits happen.
+    match pipes.tex.map(0) {
+        Ok(map) => {
+            let by_id: Vec<&str> = map.slots.iter().map(|s| s.name.as_str()).collect();
+            let mut by_binding: Vec<(u32, &str)> = pipes
+                .tex
+                .descs
+                .iter()
+                .map(|d| (d.binding, d.name.as_str()))
+                .collect();
+            by_binding.sort();
+            let by_binding: Vec<&str> = by_binding.into_iter().map(|(_, n)| n).collect();
+            if by_id == by_binding {
+                eprintln!(
+                    "check-mtl: FAIL K6 cs_tex's argument-buffer ids agree with BINDING order \
+                     ({by_id:?}) — mtlbind.hlsl exists to make them disagree, so either the \
+                     probe was tidied or spirv-cross changed. The corrected declaration-order \
+                     pin is vacuous until this disagrees again."
+                );
+                ok = false;
+            }
+            if map.buffer_index != 0 || map.slots.len() != 4 {
+                eprintln!(
+                    "check-mtl: FAIL K6 cs_tex has {} member(s) at [[buffer({})]], expected 4 \
+                     at 0",
+                    map.slots.len(),
+                    map.buffer_index
+                );
+                ok = false;
+            }
+            if pipes.tex.maps.len() != 1 {
+                eprintln!(
+                    "check-mtl: FAIL K6 cs_tex declares {} argument buffer(s), expected 1 — it \
+                     references only space0",
+                    pipes.tex.maps.len()
+                );
+                ok = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K6 {e}");
+            ok = false;
+        }
+    }
+    match mtl::texprobe::pass_tex(m, &pipes, &res, plant) {
+        Ok(p) => match mtl::texprobe::verify_tex(&p) {
+            Ok(()) => {
+                // Two, not four: the samplers are NOT MTLResources and take no
+                // `useResource:`. Asserting the number is what keeps that a
+                // stated rule rather than a quiet omission.
+                if p.resident != 2 {
+                    eprintln!(
+                        "check-mtl: FAIL K6 residency declared {} resource(s), expected 2 \
+                         (src + outbuf; the two samplers are not MTLResources)",
+                        p.resident
+                    );
+                    ok = false;
+                }
+                println!(
+                    "check-mtl: K6 cs_tex one texture through samp_clamp, samp_repeat and \
+                     .Load — {:#x}/{:#x}/{:#x} | {} resource(s) resident",
+                    p.out[0], p.out[1], p.out[2], p.resident
+                );
+            }
+            Err(e) => {
+                eprintln!("check-mtl: FAIL K6 cs_tex {e}");
+                ok = false;
+            }
+        },
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K6 cs_tex: {e}");
+            ok = false;
+        }
+    }
+
+    // ---- K7: cs_arr, all three sets and the unbounded array. ----
+    let arr_sets: Vec<u32> = pipes.arr.maps.keys().copied().collect();
+    if arr_sets != [0, 1, 2] {
+        eprintln!(
+            "check-mtl: FAIL K7 cs_arr's argument buffers are at {arr_sets:?}, expected \
+             [0, 1, 2] — it references all three spaces"
+        );
+        ok = false;
+    }
+    // The array's two descriptions, asserted rather than recalled. `cross_check`
+    // already refuses a disagreement; this is the positive half, and it is what
+    // makes "encodedLength budgets exactly ONE element" a measurement instead of
+    // a sentence in a history file.
+    match (pipes.arr.find("texs"), pipes.arr.map(2)) {
+        (Ok((set, slot)), Ok(map)) => {
+            let unbounded = pipes.arr.descs.iter().any(|d| d.name == "texs" && d.count == 0);
+            match slot.array_ids {
+                Some(n) if n > 0 && unbounded => {
+                    if set != 2 {
+                        eprintln!("check-mtl: FAIL K7 texs[] is in set {set}, expected 2");
+                        ok = false;
+                    }
+                    // THE ALONENESS IS ASSERTED, not assumed, and something
+                    // real rests on it: `arg_buf_n` sizes the over-allocation
+                    // as `n * encodedLength`, which is only one element's worth
+                    // BECAUSE the array is the whole set — the fix `a19e385`
+                    // took. A member joining space2 would break that sizing and
+                    // would also mean the overlapping-binding miscompile is
+                    // back; this line is where both show up.
+                    if map.slots.len() != 1 {
+                        eprintln!(
+                            "check-mtl: FAIL K7 set 2 holds {} member(s) — texs[] must be \
+                             ALONE in space2, or `arg_buf_n`'s sizing is wrong and \
+                             spirv-cross will drop a member to resolve the id collision",
+                            map.slots.len()
+                        );
+                        ok = false;
+                    }
+                    // Metal reports NO byte stride for a texture entry. Asserted
+                    // rather than merely noted: a nonzero value here would mean
+                    // the layout changed and the id-stride reading needs
+                    // re-measuring.
+                    if slot.array_stride != Some(0) {
+                        eprintln!(
+                            "check-mtl: FAIL K7 texs[] reports byte stride {:?}, measured 0 \
+                             on an M1 — an argument-buffer texture entry is addressed by \
+                             argument INDEX, and a byte stride appearing means the \
+                             placement arithmetic must be re-measured",
+                            slot.array_stride
+                        );
+                        ok = false;
+                    }
+                }
+                other => {
+                    eprintln!(
+                        "check-mtl: FAIL K7 texs[] argumentIndexStride {other:?}, SPIR-V \
+                         unbounded {unbounded} — the host has no stride to place elements with"
+                    );
+                    ok = false;
+                }
+            }
+        }
+        (a, b) => {
+            eprintln!("check-mtl: FAIL K7 texs[] not derivable: {:?} {:?}", a.err(), b.err());
+            ok = false;
+        }
+    }
+    match mtl::texprobe::pass_arr(m, &pipes, &res, plant) {
+        Ok(p) => match mtl::texprobe::verify_arr(&p) {
+            Ok(()) => {
+                // outbuf + every array element. The count is what catches an
+                // array that bound but declared only its first element.
+                // Unconditional, including under `FR_MTL_ARR_NORESIDENT`:
+                // `resident_count` is the length of the list the binder BUILT,
+                // and that lever suppresses the `useResource:` replay at
+                // dispatch without touching it. Guarding on the plant read as
+                // caution and was a condition that could not fire.
+                let want = 1 + MTLBIND_TEX_N;
+                if p.resident != want {
+                    eprintln!(
+                        "check-mtl: FAIL K7 residency declared {} resource(s), expected \
+                         {want} (outbuf + {MTLBIND_TEX_N} array elements)",
+                        p.resident
+                    );
+                    ok = false;
+                }
+                println!(
+                    "check-mtl: K7 cs_arr 3 argument buffers at [[buffer(0/1/2)]] | texs[] \
+                     unbounded, {MTLBIND_TEX_N} elements at {} id(s)/element (set 2 encodes \
+                     {} B, byte stride 0) | {} resource(s) resident",
+                    p.stride.unwrap_or(0),
+                    p.encoded_len.unwrap_or(0),
+                    p.resident
+                );
+            }
+            Err(e) => {
+                eprintln!("check-mtl: FAIL K7 cs_arr {e}");
+                ok = false;
+            }
+        },
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K7 cs_arr: {e}");
+            ok = false;
+        }
+    }
+
+    // ---- K8: cs_set1, and NOTHING at [[buffer(0)]]. ----
+    //
+    // The stage that refutes a constant. It is a POSITIVE assertion — these two
+    // indices and no other — rather than "at least one was found", because the
+    // failure it exists to catch is a scan that finds two buffers on this very
+    // kernel and pairs them with the wrong sets.
+    let set1_sets: Vec<u32> = pipes.set1.maps.keys().copied().collect();
+    if set1_sets != [1, 2] {
+        eprintln!(
+            "check-mtl: FAIL K8 cs_set1's argument buffers are at {set1_sets:?}, expected \
+             [1, 2] with NOTHING at 0 — this kernel references nothing in space0, and it is \
+             the only unit in the corpus that can refute `BUFFER_INDEX = 0` or a dense \
+             `0..n` scan"
+        );
+        ok = false;
+    }
+    match mtl::texprobe::pass_set1(m, &pipes, &res, plant) {
+        Ok(p) => match mtl::texprobe::verify_set1(&p) {
+            Ok(()) => {
+                let want = 1 + MTLBIND_TEX_N;
+                if p.resident != want {
+                    eprintln!(
+                        "check-mtl: FAIL K8 residency declared {} resource(s), expected {want}",
+                        p.resident
+                    );
+                    ok = false;
+                }
+                println!(
+                    "check-mtl: K8 cs_set1 argument buffers at [[buffer(1)]] and \
+                     [[buffer(2)]], NOTHING at 0 | set1_out {:#x}/{:#x} (texs[3], payload \
+                     base {MTLBIND_PAYLOAD:#x}) | {} resource(s) resident",
+                    p.out[0], p.out[1], p.resident
+                );
+            }
+            Err(e) => {
+                eprintln!("check-mtl: FAIL K8 cs_set1 {e}");
+                ok = false;
+            }
+        },
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K8 cs_set1: {e}");
+            ok = false;
+        }
+    }
+
+    ok
+}
+
 /// `--check-mtl`: the Metal backend actually running something.
 ///
 /// `--check-msl` proves the corpus COMPILES to `.metallib`; this proves a
@@ -14721,11 +15044,28 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
 /// * **K3** the DERIVED map: three entry points compiled, loaded and reflected,
 ///   each cross-checked against an independent read of its own SPIR-V.
 /// * **K4** the chain: seed -> prep -> indirect fill, at 555 and at 0.
+/// * **K6** (C3) `cs_tex` — a TEXTURE through two SAMPLERS and through `.Load`,
+///   and the only stage that can see the argument-buffer ids agreeing with
+///   BINDING order, which is the accident C2's id rule was measured on.
+/// * **K7** (C3) `cs_arr` — the tier-2 UNBOUNDED array walked dynamically
+///   across three descriptor sets. The only stage that exercises an element
+///   past the first, which is where both of this milestone's wrong answers
+///   about array placement showed up.
+/// * **K8** (C3) `cs_set1` — a kernel that references nothing in space0, so its
+///   argument buffers are at `[[buffer(1)]]` and `[[buffer(2)]]` with nothing
+///   at 0. The only unit in the corpus that can refute `BUFFER_INDEX = 0` or a
+///   dense `0..n` scan.
 ///
 /// K3 is the milestone's product and K4 is its proof. Neither alone is enough:
 /// K3 can only compare two derivations of a map, and K4 can only observe what a
 /// dispatch wrote — a map that is self-consistently wrong passes K3, and a
-/// binding that happens to land right passes K4.
+/// binding that happens to land right passes K4. K6-K8 repeat that pairing on
+/// the resource classes C2 could not reach.
+///
+/// **K5 stays the verdict and stays last**, numbered before K6-K8 rather than
+/// after them: the number means "did every armed tooth bite", and
+/// `docs/history/README.md` maps gate-ID prefixes, so renumbering it to K9
+/// would invalidate the existing record for no gain.
 #[cfg(target_os = "macos")]
 fn run_check_mtl(scene: &scene::Scene) -> i32 {
     let _ = scene; // Not scene-keyed: `smoke.hlsl` has no scene-derived defines.
@@ -14748,12 +15088,20 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
     }
 
     let plant = mtl::smoke::Plant::from_env();
-    if plant.any() {
+    // Two plant families, deliberately separate: `must_fail()` is per-family,
+    // so the verdict can say WHICH one failed to bite.
+    let tplant = mtl::texprobe::Plant::from_env();
+    if plant.any() || tplant.any() {
         // Loud on departure, and it says what it expects: a plant that ran and
         // PASSED is the finding, not a quiet success.
         println!(
             "check-mtl: PLANT {} armed — this run MUST fail; a pass is the finding",
-            plant.line()
+            [plant.line(), tplant.line()]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
         );
     }
 
@@ -14821,8 +15169,8 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
         let show = std::env::var_os("FR_MTL_MAP").is_some();
         let mut slots_total = 0usize;
         for (name, k) in pipes.all() {
-            slots_total += k.map.slots.len();
-            for bad in mtl::bind::cross_check(&k.map, &k.descs) {
+            slots_total += k.slots_total();
+            for bad in mtl::bind::cross_check(&k.maps, &k.descs) {
                 eprintln!("check-mtl: FAIL K3 {name}: {bad}");
                 ok = false;
             }
@@ -14853,7 +15201,7 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
             }
             if show {
                 println!("check-mtl:   {name} ({}) local_size {ls:?}", k.name);
-                for l in k.map.lines() {
+                for l in k.maps.values().flat_map(|m| m.lines()) {
                     println!("check-mtl:   {name}   {l}");
                 }
             }
@@ -14871,8 +15219,8 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
         // The measured disagreement IS the milestone's argument, so assert it:
         // if all three maps agreed, a hand-written table would have worked and
         // the per-kernel argument buffers below would be unmotivated.
-        if pipes.seed.map.slot("counters").map(|s| s.id)
-            == pipes.prep.map.slot("counters").map(|s| s.id)
+        if pipes.seed.find("counters").map(|(_, s)| s.id)
+            == pipes.prep.find("counters").map(|(_, s)| s.id)
         {
             eprintln!(
                 "check-mtl: FAIL K3 `counters` has the same [[id]] in cs_seed and cs_prep — \
@@ -14901,14 +15249,14 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
             let mut a = pipes.seed.arg_buf(&m)?;
             let mut b = pipes.seed.arg_buf(&m)?;
             b.set_buffer("Push", &r1)?;
-            let before = b.encoded_words(&m);
+            let before = b.encoded_words(&m, 0);
             // Anti-vacuity: if `b`'s own write never landed, the compare below
             // is between two empty reads and passes having proven nothing.
             if before.iter().all(|&w| w == 0) {
                 return Err("the second ArgBuf encoded nothing, so the compare is vacuous".into());
             }
             a.set_buffer("Push", &r0)?;
-            let after = b.encoded_words(&m);
+            let after = b.encoded_words(&m, 0);
             if after != before {
                 return Err(format!(
                     "writing to one ArgBuf changed another's bytes ({before:?} -> {after:?}) — \
@@ -14959,8 +15307,45 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
             }
         }
 
+        // ---- K6/K7/K8: textures, samplers, and the sets C2 could not reach. --
+        ok &= run_mtl_texprobe(&m, &msl, &sp, tplant);
+
         // ---- K5: the verdict. ----
         // A TOOTH that did not bite is a defect in the gate, so it fails here.
+        // It stays K5 rather than becoming K9: the number means "the verdict",
+        // and `docs/history/README.md` maps gate-ID prefixes, so renumbering
+        // would invalidate the existing record for no gain.
+        if tplant.must_fail() && ok {
+            eprintln!(
+                "check-mtl: FAIL K5 the plant {} did not make the gate fail — \
+                 that is the finding, not a pass",
+                tplant.line()
+            );
+            ok = false;
+        }
+        // The two texture-side MEASUREMENT levers, reported either way — the
+        // `FR_MTL_NO_RESIDENCY` shape. Neither makes a claim about our code.
+        if tplant.no_tex {
+            println!(
+                "check-mtl: K5 NOTE FR_MTL_NO_TEX {} — an argument-buffer texture slot that \
+                 was never written is {} on this device",
+                if ok { "changed nothing" } else { "changed the result" },
+                if ok { "UNOBSERVABLE" } else { "observable" }
+            );
+        }
+        if tplant.arr_noresident {
+            // "on cs_arr", not "on the array's elements": the suppression is
+            // the whole pass's `useResource:` replay, because `ArgBuf` has no
+            // per-resource residency switch and deliberately never will.
+            println!(
+                "check-mtl: K5 NOTE FR_MTL_ARR_NORESIDENT {} — a `useResource:` omission on \
+                 cs_arr, which reaches {} textures through an argument buffer, is {} on \
+                 this device",
+                if ok { "changed nothing" } else { "changed the result" },
+                crate::gfx::shaders::MTLBIND_TEX_N,
+                if ok { "UNOBSERVABLE" } else { "observable" }
+            );
+        }
         if plant.must_fail() && ok {
             eprintln!(
                 "check-mtl: FAIL K5 the plant {} did not make the gate fail — \

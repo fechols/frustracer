@@ -21,8 +21,9 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLArgumentBuffersTier, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin,
-    MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureUsage,
+    MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor,
+    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use std::ffi::c_void;
 
@@ -309,6 +310,62 @@ impl Mtl {
             .ok_or_else(|| {
                 format!("newTextureWithDescriptor {w}x{h} {format:?} {storage:?} returned nil")
             })
+    }
+
+    /// An `MTLSamplerState`, the Metal spelling of an HLSL `SamplerState`.
+    ///
+    /// `supportArgumentBuffers(true)` IS A PRECONDITION, NOT A HINT, and it is
+    /// unconditional here because every sampler this backend creates is reached
+    /// through an argument buffer — `msl::CROSS_ARGS` has no other mode. A
+    /// sampler created without it cannot be encoded into one.
+    ///
+    /// THE PARAMETERS ARE THE OTHER TWO BACKENDS', not free choices. C3's
+    /// subject copies `trace_common.hlsli`'s `samp_lin` / `samp_aniso`
+    /// verbatim, so Metal's pair must be what those already are:
+    /// `vk/tracer.rs:822-849` builds LINEAR min/mag/mip, REPEAT in every axis,
+    /// `max_anisotropy(aniso)`, unclamped LOD; `gpu/trace.rs:507-548` spells the
+    /// same pair as D3D12 STATIC samplers (`MIN_MAG_MIP_LINEAR` / `ANISOTROPIC`,
+    /// `WRAP`). Static is a root-signature spelling with no Metal analogue —
+    /// creating objects here is the faithful port, not a divergence.
+    ///
+    /// `nearest` exists for the probe's sake and is the property its exactness
+    /// rests on: `mtlbind.hlsl`'s two space0 samplers differ ONLY in address
+    /// mode, so one coordinate outside [0,1] resolves to a different TEXEL with
+    /// no filter weights — no tolerance, no undefined tie-break.
+    pub fn sampler(
+        &self,
+        nearest: bool,
+        repeat: bool,
+        aniso: u32,
+    ) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>, String> {
+        let d = unsafe { MTLSamplerDescriptor::new() };
+        let f = if nearest { MTLSamplerMinMagFilter::Nearest } else { MTLSamplerMinMagFilter::Linear };
+        d.setMinFilter(f);
+        d.setMagFilter(f);
+        // NotMipmapped for the nearest arm on purpose: the probe's textures have
+        // no mips, and a Linear mip filter over a single level is a weight
+        // computation the exact-integer readback does not need to depend on.
+        d.setMipFilter(if nearest {
+            MTLSamplerMipFilter::NotMipmapped
+        } else {
+            MTLSamplerMipFilter::Linear
+        });
+        let addr = if repeat {
+            MTLSamplerAddressMode::Repeat
+        } else {
+            MTLSamplerAddressMode::ClampToEdge
+        };
+        d.setSAddressMode(addr);
+        d.setTAddressMode(addr);
+        d.setRAddressMode(addr);
+        // Metal rejects 0 and clamps above 16; the callers pass 1 or
+        // `texture::max_aniso()`, which is the same value Vulkan and D3D12 feed
+        // their own `samp_aniso`.
+        d.setMaxAnisotropy(aniso.clamp(1, 16) as usize);
+        d.setSupportArgumentBuffers(true);
+        self.device
+            .newSamplerStateWithDescriptor(&d)
+            .ok_or_else(|| format!("newSamplerStateWithDescriptor(nearest {nearest}, repeat {repeat}, aniso {aniso}) returned nil"))
     }
 
     /// Upload a tightly- or loosely-packed image into a texture's `(0,0,w,h)`

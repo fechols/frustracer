@@ -943,4 +943,223 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # --check-spirv, --check-fsr3 and --check-metalfx (they share
                                       # the objc2-metal graph and mtl::device), --check + cargo test,
                                       # then restore the Windows goldens
+                                      # C3 STEPS 4-6 -- THE HOST HALF, K6/K7/K8 (2026-08-14, Apple M1,
+                                      # macOS 26.5, spirv-cross 2026-07-06). mtlbind.hlsl had been in
+                                      # the shared corpus since ef359d6 and EXECUTED BY NOTHING; this
+                                      # is what runs it. src/mtl/texprobe.rs is new, mtl::bind goes
+                                      # multi-set, device.rs grows samplers, Cargo.toml gains exactly
+                                      # one feature (MTLSampler). New stages: K6 cs_tex (a texture
+                                      # through two samplers and through .Load, set 0 only), K7 cs_arr
+                                      # (the unbounded array walked dynamically across three sets), K8
+                                      # cs_set1 (argument buffers at 1 and 2, NOTHING at 0). K5 stays
+                                      # the verdict and stays numbered 5.
+                                      # THE ID RULE NEEDED CORRECTING A SECOND TIME, and it is the
+                                      # same shape as e1b0abf's: the numbering is PER SET. The
+                                      # ordering is module-wide (Desc::decl is the OpVariable ordinal
+                                      # over the whole module) but each set struct restarts at
+                                      # [[id(0)]]. Measured, and mtlbind.hlsl's declaration order is
+                                      # texs(space2), samp_lin, samp_aniso, set1_out(space1):
+                                      #   cs_tex   set0 { src 0, samp_clamp 1, samp_repeat 2, outbuf 3 }
+                                      #   cs_arr   set0 { outbuf 0 } set1 { samp_lin 0, samp_aniso 1 }
+                                      #            set2 { texs 0 }
+                                      #   cs_set1  set1 { samp_lin 0, set1_out 1 } set2 { texs 0 }
+                                      # The pre-C3 cross_check sorted ALL descriptors by decl and
+                                      # expected one dense 0..n, so it would have fired on every one
+                                      # of those rows -- correct on the one-set subject it was written
+                                      # against, wrong the moment the subject gained a second set.
+                                      # Caught the same way the first correction was: on a second
+                                      # subject that disagrees.
+                                      # [[buffer(n)]] == set n, CONFIRMED on all three, including the
+                                      # cs_arr case that has set 0 AND higher sets. cs_set1 has
+                                      # nothing at buffer(0), which is what makes it the only unit in
+                                      # the corpus that can refute BUFFER_INDEX = 0.
+                                      # PLACING AN ARRAY ELEMENT TOOK THREE ANSWERS AND THE FIRST TWO
+                                      # BOTH LOOKED RIGHT. This is the milestone's finding.
+                                      #  (1) MTLArrayType::stride() is 0. The obvious reading of the
+                                      #      generated MSL says otherwise -- spvDescriptorArray's
+                                      #      operator[] is ptr[i] over &ptr_->value, a contiguous byte
+                                      #      walk -- so re-pointing the encoder base by i*stride() is
+                                      #      the natural move. Metal does not address an argument-
+                                      #      buffer texture entry by byte offset at all and has no
+                                      #      byte stride to report. Caught by a structural refusal of
+                                      #      stride 0 (`every element would land on element 0`),
+                                      #      which was written before the number was known.
+                                      #  (2) setTexture:atIndex:(id + i * argumentIndexStride) is the
+                                      #      next obvious reading and it is WRONG SILENTLY. The
+                                      #      reflected arrayLength is 1 -- the unsized-array hack --
+                                      #      so every index past slot.id is past what the encoder was
+                                      #      told it owns. All five writes aliased onto element 0 and
+                                      #      the readback was the LAST texture written, five times:
+                                      #      outbuf[0] = 0xc30004 where 0xc30000 was expected. It does
+                                      #      not error. It answers.
+                                      #  (3) WHAT WORKS: re-point the encoder's base by one element's
+                                      #      BYTES and write at slot.id every time, so the encoder
+                                      #      only ever does the one thing it agreed to. The element
+                                      #      size is encodedLength (8 B here) -- and it IS one
+                                      #      element's size only because texs[] is ALONE in its set,
+                                      #      which is the arrangement a19e385 was forced into by the
+                                      #      overlapping-binding rule. That fix paid for itself twice.
+                                      #      K7 asserts the aloneness directly, so arg_buf_n's sizing
+                                      #      rests on a checked premise rather than an assumed one.
+                                      # ASKING METAL ABOUT AN UNUSED BUFFER INDEX ABORTS THE PROCESS,
+                                      # and this one deserves to be read before anyone writes a scan:
+                                      #   -[_MTLFunction newArgumentEncoderWithBufferIndex:reflection:
+                                      #     functionReflection:]:11540: failed assertion
+                                      #     `bufferIndex 0 does not identify an argument buffer'
+                                      # SIGABRT, exit 134. It does NOT return nil. So the obvious
+                                      # "scan 0..30 and keep whatever answers" is not merely imprecise
+                                      # -- it is a crash on the first unused index, and no amount of
+                                      # nil-checking saves it. derive() therefore asks only for the
+                                      # sets the SPIR-V declares, and bind.rs's ok_or arm is recorded
+                                      # as MEASURED UNREACHABLE rather than left reading as the guard
+                                      # it is not. It also reclassifies C2's own constant: on cs_set1,
+                                      # `BUFFER_INDEX = 0` would not have mis-derived, it would have
+                                      # aborted -- a crash waiting for the corpus to grow.
+                                      # WHICH IS WHY FR_MTL_BUFFER0 SIMULATES A NIL METAL DOES NOT
+                                      # RETURN. The first version made the real call and produced a
+                                      # SIGABRT, and a plant that cannot be told from a crash is not a
+                                      # tooth. The host defect is reproduced faithfully; only the
+                                      # crash is not.
+                                      # SAMPLERS ARE NOT MTLResourceS, so set_sampler records no
+                                      # residency -- a different answer, not a missing one. usage_for
+                                      # returns Option for exactly this, and K6 asserts 2 resident for
+                                      # a kernel with 4 members, so the asymmetry is stated in the
+                                      # gate's own output rather than only in prose. MTLResourceUsage
+                                      # ::Sample is deprecated and folded into Read; the texture arms
+                                      # use Read.
+                                      # TEETH: SIX BITE AND TWO ARE MEASUREMENTS, each proven on this
+                                      # M1 with its observable recorded, because a tooth whose
+                                      # observable was not written down is one nobody can tell has
+                                      # gone vacuous:
+                                      #   FR_MTL_SWAP_SAMP   K6  outbuf[0]=0xc30000 exp 0xc30001; [2] UNMOVED
+                                      #   FR_MTL_TEX_DECOY   K6  outbuf[0]=0xc300ff -- all three move
+                                      #   FR_MTL_ARR_ROTATE  K7  outbuf[0]=0xc30001 exp 0xc30000 (wrong INDEX)
+                                      #   FR_MTL_ARR_SHORT   K7  outbuf[1]=0x0
+                                      #   FR_MTL_ARR_STRIDE  K7  outbuf[1]=0x0 (doubled element size)
+                                      #   FR_MTL_BUFFER0     K6  structural, before any dispatch
+                                      #   FR_MTL_NO_TEX      --  MEASURED: an unwritten texture slot
+                                      #                          reads 0 and is OBSERVABLE; it does
+                                      #                          not fault and does not assert
+                                      #   FR_MTL_ARR_NORESIDENT  MEASURED: UNOBSERVABLE, matching the
+                                      #                          buffer case -- unified memory again
+                                      # The first two are a designed PAIR: cs_tex's .Load deliberately
+                                      # reads the SAME texel the clamp sample resolves to, so a
+                                      # sampler swap moves words 0 and 1 and leaves word 2 alone while
+                                      # an unbound texture moves all three. The two failures are
+                                      # distinguishable from the readback with no extra instrument,
+                                      # and a cargo test pins the coordinate and the .Load texel that
+                                      # property rests on.
+                                      # FR_MTL_SET_SWAP WAS DESIGNED AND NOT TAKEN: binding set 1's
+                                      # buffer at set 2's index makes cs_set1 read a texture array as
+                                      # a sampler-plus-pointer struct, which is a plausible device
+                                      # hang rather than an error. A plant that can require a reboot
+                                      # is not a tooth, and BUFFER0 already covers K8 structurally.
+                                      # A VALIDATION NARROWING, and it is the second one --check-mtl
+                                      # has contributed: K6/K7/K8 PASS with byte-identical readbacks
+                                      # under MTL_DEBUG_LAYER=1 alone and under
+                                      # MTL_SHADER_VALIDATION=1 alone. C2 narrowed --check-fsr3's U4
+                                      # "uniformly zero under validation" for buffer compute; this
+                                      # extends it to TEXTURES, SAMPLERS and an over-allocated
+                                      # argument buffer -- the classes all four ffx_fsr3_metal.mm
+                                      # GOTCHAs live in. Still confounded with the paravirtual runner,
+                                      # so running --check-mtl under both layers THERE remains the
+                                      # cheap next step.
+                                      # CPU-ONLY TEETH, since --check-mtl needs a device and is not in
+                                      # CI: four new cargo tests, each proven to fail on a planted
+                                      # edit and then restored -- TEX_N against the host constant, the
+                                      # sample coordinate AND the .Load texel K6's diagnostic pair
+                                      # rests on, cs_set1 referencing nothing in space0 (K8's entire
+                                      # premise), and cs_arr's walk staying dynamic. cargo test 34 ->
+                                      # 38. bind::self_test gains the multi-set cases: the measured
+                                      # cs_set1 layout ACCEPTED, ids numbered densely across sets
+                                      # REJECTED, a buffer at an undeclared set REJECTED, and the
+                                      # array's two descriptions disagreeing in both directions.
+                                      # Touch src/mtl/texprobe.rs / bind.rs's multi-set half /
+                                      # device.rs's sampler half / src/shaders/mtlbind.hlsl /
+                                      # gfx::shaders::MTLBIND_* ->
+                                      # run --check-mtl clean AND each of the eight levers (six must
+                                      # exit 1; NO_TEX and ARR_NORESIDENT are reported), --check-msl
+                                      # on the procedural scene AND san-miguel-low-poly AND --sw-rays,
+                                      # --check-spirv, --check-fsr3 and --check-metalfx (they share
+                                      # the objc2-metal graph, which C3 widened by MTLSampler),
+                                      # --check + cargo test, then restore the Windows goldens; plus
+                                      # --check-mtl once under each validation layer SEPARATELY
+                                      # C3 REVIEW PASS (2026-08-19, same M1, macOS 26.5.1) --
+                                      # reviewing steps 4-6 rather than extending them. Two of four
+                                      # findings were bookkeeping; two were not.
+                                      # FR_MTL_ARR_STRIDE WAS AN OUT-OF-BOUNDS WRITE, AND UNDER
+                                      # VALIDATION IT ABORTED RATHER THAN BITING. The plant doubles
+                                      # the measured element size but the buffer was still sized for
+                                      # the real one -- 5 elements at 16 B into a 40 B allocation, so
+                                      # elements 3 and 4 ran past the end. Plain that is invisible and
+                                      # the recorded exit-1 observable holds; under MTL_DEBUG_LAYER=1
+                                      # it is
+                                      #   -[MTLDebugArgumentEncoder setArgumentBuffer:startOffset:
+                                      #     elementIndex:]:409: failed assertion `Argument Buffer
+                                      #     Validation offset (48) + encodedLength (8) should be
+                                      #     smaller or equal to the buffer length (40)'   exit 134
+                                      # -- newArgumentEncoderWithBufferIndex:'s lesson a second time:
+                                      # the API answers a placement it cannot honour by killing the
+                                      # process. It also made two of this milestone's own instructions
+                                      # contradict each other, since texprobe's run-list asks for each
+                                      # lever AND for a run under each layer, and their intersection
+                                      # was a SIGABRT. A plant that cannot be told from a crash is not
+                                      # a tooth. Fixed on both sides: texprobe::array_span sizes the
+                                      # allocation for the PLANTED stride, so the defect stays a wrong
+                                      # PLACEMENT rather than becoming a wrong LENGTH; and
+                                      # bind::set_texture_array now refuses a span past the buffer's
+                                      # own length(). Proven by reverting the sizing, which turns the
+                                      # abort into "FAIL K7 cs_arr: `texs`: 5 element(s) at 16 B each
+                                      # need 72 B, but set 2's argument buffer is 40 B -- allocate it
+                                      # with `arg_buf_n(m, 9)`", identically plain and under the
+                                      # layer. The refusal is the durable half: a future caller who
+                                      # forgets arg_buf_n gets a sentence instead of a signal.
+                                      # THE RESIDENCY MEASUREMENT REVERSED, ON BOTH RESOURCE CLASSES.
+                                      # C2 recorded FR_MTL_NO_RESIDENCY as "bit-identical to a clean
+                                      # run, plain AND under MTL_DEBUG_LAYER=1 AND
+                                      # MTL_SHADER_VALIDATION=1", and C3 wrote its texture twin
+                                      # expecting to EXTEND that. Re-measured, 3/3 each:
+                                      #   lever                  plain  DEBUG_LAYER  SHADER_VALIDATION
+                                      #   FR_MTL_NO_RESIDENCY    clean  clean        FAIL K4, args
+                                      #                                              poison intact
+                                      #   FR_MTL_ARR_NORESIDENT  clean  clean        FAIL K7, outbuf
+                                      #                                              never written
+                                      # So the LAYER decides, not the resource class, and "unobservable
+                                      # everywhere" no longer holds. Which measurement was wrong is not
+                                      # recoverable -- same machine, one OS point release later -- and
+                                      # the rule survives either way: the omission is not reliably
+                                      # unobservable, so residency stays STRUCTURAL rather than
+                                      # checked. The interesting half is HOW: neither arm produces a
+                                      # command-buffer error (device::run checks cb.error() and gets
+                                      # None both times), the writes simply do not land. The layer
+                                      # diagnoses nothing; the poison-and-read instrument is what
+                                      # catches it -- smoke.rs's per-buffer-poison argument holding on
+                                      # a class it was not written for. The previous entry's
+                                      # validation narrowing stands as written: K6/K7/K8 still pass
+                                      # byte-identically under both layers CLEAN. What changed is that
+                                      # the LEVERS no longer do.
+                                      # ALSO FIXED, none of them observable: bind_opts refuses an index
+                                      # override on a multi-set ArgBuf (one index cannot name three
+                                      # bind points, and Metal accepts the collapse silently);
+                                      # set_sampler gained set_texture's array refusal; the shared
+                                      # cross-check loop labels each kernel's failures with its own
+                                      # stage rather than printing cs_arr's as K6; and K7's residency
+                                      # assertion dropped a guard on arr_noresident that could not fire
+                                      # -- resident_count is the list the binder BUILT, which that
+                                      # lever does not touch.
+                                      # AND ONE PRE-EXISTING FINDING THE WIDENED SWEEP TURNED UP:
+                                      # C2's FR_MTL_ARGBUF_INDEX aborts under MTL_DEBUG_LAYER=1 --
+                                      #   validateComputeFunctionArguments:1038: failed assertion
+                                      #     `Compute Function(cs_seed): missing Buffer binding at
+                                      #     index 0 for spvDescriptorSet0[0].'          exit 134
+                                      # Same shape as ARR_STRIDE, opposite conclusion. ARR_STRIDE
+                                      # aborted because the plant carried a SECOND, gratuitous defect
+                                      # beyond the one it meant to plant, so it was fixed. This one
+                                      # is inherent: the defect BEING planted is "nothing is bound at
+                                      # the index the function reads", which is exactly what the layer
+                                      # exists to catch, and its way of reporting is to abort. A
+                                      # single-set kernel has no valid-but-wrong index to move to. So
+                                      # it is recorded in smoke::Plant rather than fixed, and the
+                                      # run-list means each lever, and SEPARATELY the layers on a
+                                      # clean run -- not the cross product.
 ```

@@ -790,6 +790,30 @@ pub const WORKGRAPH_HLSL: &str = include_str!("../shaders/workgraph.hlsl");
 // below pins its space1 block against `trace_common.hlsli`'s.
 pub const MTLBIND_HLSL: &str = include_str!("../shaders/mtlbind.hlsl");
 
+// THE PROBE'S HOST-SIDE CONSTANTS LIVE BESIDE THE SHADER, and that is
+// `smoke.rs:42-50`'s recorded regret, not repeated. Its `FILL_N` / `TAIL` /
+// `SENTINEL` are properties of `smoke.hlsl` and belong here, but hoisting them
+// would touch `gpu::trace::smoke_test`, which no macOS box can re-run — so they
+// were duplicated and the hoist deferred to a Windows author. `mtlbind.hlsl`
+// has no D3D12 or Vulkan host consumer, so that constraint does not apply and
+// the duplication does not have to happen a second time. `mtl::texprobe` is the
+// only reader; the `mtlbind_*` tests below pin each against the HLSL, which is
+// what makes these a contract rather than a second copy.
+//
+// The texel payload is `MTLBIND_PAYLOAD | i`, all below 2^24 so exactly
+// representable in fp32 and exactly recoverable through a uint cast. The low
+// byte is the INDEX, so a rotated or short-written descriptor array reads back
+// as a wrong index rather than as garbage — the failure names its own cause.
+pub const MTLBIND_PAYLOAD: u32 = 0x00C3_0000;
+/// `#define TEX_N` in the shader. Deliberately not a power of two: a stride or
+/// rotation bug that happened to be a multiple of the count would alias back to
+/// correct on 4 or 8.
+pub const MTLBIND_TEX_N: usize = 5;
+/// `src` is `MTLBIND_SRC_W` x 1, so `MTLBIND_SRC_U` is outside [0,1] and clamp
+/// and repeat resolve to DIFFERENT texels with no filter weights involved.
+pub const MTLBIND_SRC_W: usize = 2;
+pub const MTLBIND_SRC_U: f32 = 1.25;
+
 // The DXR pipeline's own three units. They live here with the rest of the
 // corpus because the shader-source gates below pin rt.hlsli and rt_dxr.hlsli
 // AGAINST EACH OTHER — the relief interval contract has to hold in both
@@ -3669,5 +3693,143 @@ mod mtlbind_probe_shader_source_tests {
         // register numbering restarts, which is why `gpu::trace::TEX_TABLE_BUFS`
         // stopped doubling as the array's base register.
         assert_eq!(declarations(super::MTLBIND_HLSL, Some("space2")).as_slice(), [("texs[]", SHIFT_T)]);
+    }
+
+    /// Drops prose, keeps code, on the same line. Duplicated per test module in
+    /// this file by convention.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The brace-balanced body of the first function whose signature line
+    /// contains `sig` — `hemi_verify_shader_source_tests`' helper, for its
+    /// reason: an assertion scoped to the whole file confidently answers about
+    /// the wrong function.
+    fn fn_body(src: &str, sig: &str) -> String {
+        let at = src.find(sig).unwrap_or_else(|| panic!("no function matching `{sig}`"));
+        let open = at + src[at..].find('{').expect("function has no body");
+        let mut depth = 0i32;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in `{sig}`");
+    }
+
+    /// `TEX_N` is duplicated between the shader and the host BY NECESSITY — the
+    /// HLSL cannot read a Rust const — so CLAUDE.md's rule applies: the pair
+    /// moves in lockstep and gets pinned. `--check-mtl` would catch a
+    /// divergence, but it needs a Metal device and is not in CI, so this is the
+    /// half that runs where the edit would be made.
+    #[test]
+    fn mtlbind_tex_n_matches_the_host() {
+        let src = code_only(super::MTLBIND_HLSL);
+        let at = src.find("#define TEX_N").expect("mtlbind.hlsl declares no TEX_N");
+        let n: usize = src[at + "#define TEX_N".len()..]
+            .lines()
+            .next()
+            .expect("TEX_N has no value")
+            .trim()
+            .parse()
+            .expect("TEX_N is not a number");
+        assert_eq!(
+            n,
+            super::MTLBIND_TEX_N,
+            "mtlbind.hlsl's TEX_N and gfx::shaders::MTLBIND_TEX_N disagree — mtl::texprobe \
+             sizes its texture array and its expected readback from the Rust one, so a \
+             shader-only edit makes K7 assert against the wrong element count"
+        );
+    }
+
+    /// K6's whole diagnostic value rests on the SAMPLE COORDINATE and on the
+    /// `.Load` texel, and both are edits a tidy-up could make without noticing.
+    ///
+    /// `u` outside [0,1] on a 2-wide texture is what makes clamp and repeat
+    /// resolve to DIFFERENT texels with no filter weights; and `.Load` hitting
+    /// the SAME texel the clamp sample resolves to is what makes a sampler swap
+    /// (words 0 and 1 move, word 2 does not) distinguishable from an unbound
+    /// texture (all three move). Change either and K6 still passes while
+    /// diagnosing nothing.
+    #[test]
+    fn mtlbind_sample_coordinate_resolves_to_the_texels_k6_expects() {
+        let body = fn_body(&code_only(super::MTLBIND_HLSL), "void cs_tex");
+        assert!(!body.is_empty() && body.contains("outbuf"), "cs_tex's body did not extract");
+        let u = super::MTLBIND_SRC_U;
+        let w = super::MTLBIND_SRC_W;
+        assert!(
+            !(0.0..=1.0).contains(&u),
+            "MTLBIND_SRC_U = {u} is inside [0,1], so clamp and repeat resolve to the SAME \
+             texel and K6's sampler tooth cannot tell them apart"
+        );
+        let coord = format!("float2({u}, 0.5)");
+        assert_eq!(
+            body.matches(&coord).count(),
+            2,
+            "cs_tex must sample at {coord} through BOTH samplers — that coordinate is what \
+             MTLBIND_SRC_U promises mtl::texprobe::tex_expect"
+        );
+        // Clamp resolves to the last texel; `.Load` must name that same one.
+        let load = format!("int3({}, 0, 0)", w - 1);
+        assert!(
+            body.contains(&load),
+            "cs_tex's .Load must read {load} — the texel the CLAMP sample resolves to. \
+             Reading a different one makes a sampler swap and an unbound texture produce \
+             the same readback."
+        );
+    }
+
+    /// **K8's entire premise.** `cs_set1` must reference nothing in space0, or
+    /// it gains an argument buffer at `[[buffer(0)]]` and the one unit in the
+    /// corpus that can refute `BUFFER_INDEX = 0` stops refuting it — while the
+    /// stage still passes.
+    #[test]
+    fn cs_set1_references_nothing_in_space0() {
+        let body = fn_body(&code_only(super::MTLBIND_HLSL), "void cs_set1");
+        // Anti-vacuity, and the trap this module already fell into once: the
+        // negative assertions below hold for free on an empty extract.
+        assert!(
+            body.contains("set1_out") && body.contains("texs"),
+            "cs_set1's body did not extract — the negative assertions would pass on nothing"
+        );
+        for name in ["src", "samp_clamp", "samp_repeat", "outbuf"] {
+            assert!(
+                !body.contains(name),
+                "cs_set1 references `{name}`, which is in space0 — it would then declare an \
+                 argument buffer at [[buffer(0)]], and K8's `expected [1, 2] with NOTHING at \
+                 0` would be asserting about a kernel that no longer has that shape"
+            );
+        }
+    }
+
+    /// K7's array walk must stay DYNAMIC. `mtlbind.hlsl:114-117` says why:
+    /// unrolled literal indices let spirv-cross emit distinct descriptors, and
+    /// the argument-index stride this milestone measured stops being exercised.
+    #[test]
+    fn cs_arr_walks_the_array_dynamically() {
+        let body = fn_body(&code_only(super::MTLBIND_HLSL), "void cs_arr");
+        assert!(body.contains("texs["), "cs_arr's body did not extract");
+        assert!(
+            body.contains("for (uint i = 0; i < TEX_N;"),
+            "cs_arr must walk texs[] under a loop over TEX_N — an unrolled chain would let \
+             the compiler fold the walk into distinct descriptors and K7's stride would \
+             never be exercised"
+        );
+        // The two SampleLevel sites index literally on purpose (they are the
+        // sampler probes, not the walk); the WALK must not.
+        assert!(
+            !body.contains("texs[2]") && !body.contains("texs[3]") && !body.contains("texs[4]"),
+            "cs_arr indexes texs[] with literals — the dynamic walk was unrolled"
+        );
     }
 }

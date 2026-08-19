@@ -223,9 +223,21 @@ sdl3 = { version = "0.18", features = ["build-from-source-static", "ash"] }
 # own `MTLDevice` feature pulls `MTLLibrary`, `MTLResource` and `MTLGPUAddress`,
 # so it has been in the build from the first commit. Naming it is the same
 # invisible-widening complaint the MetalFX block below already makes about
-# itself. `MTLSampler`, `MTLHeap`, `MTLIndirectCommandBuffer` (which is
-# GPU-encoded command LISTS, a different thing from indirect dispatch — do not
-# add it on the name) and every MTL4* stay out.
+# itself.
+#
+# `MTLSampler` USED TO BE ON THE STAY-OUT LIST AND IS NOW REQUIRED, which is a
+# scope change and is recorded rather than quietly edited. C3 binds the corpus's
+# own `SamplerState`s (`trace_common.hlsli`'s samp_lin/samp_aniso, and the
+# mtlbind probe's clamp/repeat pair), and an argument-buffer sampler is an
+# `MTLSamplerState` object on this backend exactly as it is a `vk::Sampler` on
+# Vulkan — D3D12's static-sampler spelling has no Metal analogue. The feature
+# gates `MTLArgumentEncoder::setSamplerState:atIndex:` itself, so without it the
+# method does not exist. It pulls nothing new: `MTLSamplerDescriptor` needs only
+# NSObject/NSString, both already in the graph.
+#
+# `MTLHeap`, `MTLIndirectCommandBuffer` (which is GPU-encoded command LISTS, a
+# different thing from indirect dispatch — do not add it on the name) and every
+# MTL4* stay out.
 #
 # NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
 # are pulled in and compile there); this is additive and touches neither.
@@ -272,6 +284,9 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLArgument",
     "MTLDataType",
     "MTLFunctionConstantValues",
+    # C3 — the corpus's own samplers, encoded INTO those argument buffers. See
+    # the scope-change note above; this line replaces a "stays out" claim.
+    "MTLSampler",
 ] }
 # Named directly as of C2, which overturns the note this replaces ("deliberately
 # NOT a direct dependency: nothing under src/ names it"). Rust-side pipeline
