@@ -1,9 +1,10 @@
 //! The CPU half of the HUD/pause-menu overlay: Slint's SOFTWARE renderer
 //! drawing into a persistent premultiplied-RGBA8 buffer behind a custom
 //! `slint::platform::Platform` (no winit, no window of its own — the SDL
-//! window and D3D12 swapchain stay exactly what they are). The GPU half
-//! (`gpu/hud.rs`) uploads the DIRTY RECTANGLES this module reports and
-//! composites them over the tonemapped frame in every present arm.
+//! window and its swapchain, D3D12 or Vulkan, stay exactly what they are).
+//! The GPU half — `gpu/hud.rs` on D3D12, `vk/hud.rs` on Vulkan (B6b rung 4)
+//! — uploads the DIRTY RECTANGLES this module reports (`gfx::hud_frame`, the
+//! wire) and composites them over the tonemapped frame in every present arm.
 //!
 //! Slint is used under its Royalty-Free license (the project is not GPL;
 //! see Cargo.toml's dependency comment).
@@ -19,9 +20,13 @@
 //! gate on the hud-live fade besides, so a FADED graph freezes (the ring
 //! keeps sampling Rust-side) and a settled HUD still uploads nothing.
 //!
-//! Lifetime: one `Hud` per PROCESS, owned by `run_window` beside `fly` — it
-//! survives session re-entries (resize/F11), so menu/HUD state needs no
-//! `Persist` mirror; `set_size` follows the window.
+//! Lifetime: one `Hud` per PROCESS, owned by `run_window` beside `fly` on
+//! Windows and by `window_frames` on the Vulkan render thread — it survives
+//! session re-entries (resize/F11), so menu/HUD state needs no `Persist`
+//! mirror; `set_size` follows the window. Slint objects are THREAD-AFFINE
+//! (`Rc`), so whichever thread builds the `Hud` is the one that feeds it
+//! events and rasterises — on Linux that is the render thread, and the pump
+//! forwards raw SDL events across (`vk::present::Ui`).
 
 pub mod events;
 mod ui;
@@ -88,6 +93,10 @@ pub struct MenuRow {
     /// "cli" badge (main computes the set once at startup from a pre-parse /
     /// post-parse Opts diff; see settings::cli_overrides).
     pub cli: bool,
+    /// This backend cannot act on the row (`settings::VK_INERT_LIVE` on the
+    /// Vulkan window) — the grey "n/a" badge, dimmed, input disabled. Shown
+    /// rather than hidden: one menu on both windows.
+    pub na: bool,
     pub control: &'static str,
 }
 
@@ -415,6 +424,7 @@ impl Hud {
                 value: r.value.as_str().into(),
                 restart: r.restart,
                 cli: r.cli,
+                na: r.na,
                 control: r.control.into(),
             })
             .collect();
@@ -591,6 +601,15 @@ impl Hud {
     }
 
     /// Window resized (session re-entry): new buffer, full repaint.
+    /// The buffer's extent — what `set_size` last set. The Vulkan window
+    /// follows its swapchain BY COMPARISON against this (`hd.size() !=
+    /// pres.hud_size()`), so no resize route can forget to call `set_size`;
+    /// the Windows session calls `set_size` at its two resize sites instead.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn size(&self) -> (u32, u32) {
+        (self.w, self.h)
+    }
+
     pub fn set_size(&mut self, w: u32, h: u32) {
         self.w = w;
         self.h = h;
@@ -601,6 +620,9 @@ impl Hud {
 
     /// A present arm failed after staging — the staged rects may be gone, so
     /// re-upload everything next frame.
+    // The Windows session's `present_again` fallback; the Vulkan hold has no
+    // failing arm that could have consumed staged rects.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn request_full_redraw(&mut self) {
         self.force_full = true;
     }
@@ -961,6 +983,9 @@ impl Hud {
     /// Is the loading page up? `session()` reads it to tell a FIRST entry (the
     /// page is still live, and its eager init must keep repainting it) from a
     /// resize re-entry, which needs no extra parameter to say so.
+    // Read by the Windows session's eager-init path; the Vulkan window tracks
+    // its page with a local.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn is_loading(&self) -> bool {
         self.ui.get_loading()
     }

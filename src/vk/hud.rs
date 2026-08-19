@@ -234,6 +234,13 @@ impl HudVk {
         self.total
     }
 
+    /// Seed the cumulative totals from a predecessor (a resize recreates the
+    /// image; the session's counter must not restart with it).
+    pub fn carry_stats(&mut self, prior: UploadStats) {
+        self.total.rects += prior.rects;
+        self.total.bytes += prior.bytes;
+    }
+
     /// Consume the staged rects: memcpy each into this frame's ring slice at
     /// its natural position and record one copy region per rect, bracketed by
     /// the two memory barriers (fragment read → transfer write → fragment

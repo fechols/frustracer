@@ -37,6 +37,10 @@ slint::slint! {
         value: string,
         restart: bool,
         cli: bool,
+        // This backend cannot act on the row (the Vulkan window's inert Live
+        // rows): grey "n/a" badge, dimmed, controls inert. Rust refuses the
+        // Adjust too — this is the visible half of one decision.
+        na: bool,
         control: string,
     }
 
@@ -605,13 +609,14 @@ slint::slint! {
                                 for row[i] in root.rows : Rectangle {
                                     height: 34px;
                                     border-radius: 6px;
+                                    opacity: row.na ? 0.5 : 1.0;
                                     background: (rta.has-hover || root.sel-row == i)
                                         ? #1c222c80 : transparent;
                                     border-width: root.sel-row == i ? 1px : 0px;
                                     border-color: #ffd24d80;
                                     rta := TouchArea {
                                         clicked => {
-                                            if (row.control == "toggle" || row.control == "cyclefwd") {
+                                            if (!row.na && (row.control == "toggle" || row.control == "cyclefwd")) {
                                                 root.row-adjust(row.id, 1);
                                             }
                                         }
@@ -643,11 +648,19 @@ slint::slint! {
                                             font-size: 11px;
                                             vertical-alignment: center;
                                         }
+                                        // The row exists on this build's other
+                                        // window and not on this one.
+                                        if row.na : Text {
+                                            text: "n/a";
+                                            color: #9aa0a8;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
                                         Rectangle {}
                                         if row.control == "cycle" || row.control == "step" : ArrowButton {
                                             glyph: "<";
                                             y: 4px;
-                                            clicked => { root.row-adjust(row.id, -1); }
+                                            clicked => { if (!row.na) { root.row-adjust(row.id, -1); } }
                                         }
                                         if row.control != "text" : Text {
                                             text: row.value;
@@ -663,7 +676,7 @@ slint::slint! {
                                             || row.control == "cyclefwd" : ArrowButton {
                                             glyph: ">";
                                             y: 4px;
-                                            clicked => { root.row-adjust(row.id, 1); }
+                                            clicked => { if (!row.na) { root.row-adjust(row.id, 1); } }
                                         }
                                         if row.control == "text" : Rectangle {
                                             width: 300px;

@@ -2184,11 +2184,78 @@ pub fn item_by_id(id: &str) -> Option<&'static MenuItem> {
     menu_items().iter().find(|i| i.id == id)
 }
 
+/// The Live-tier rows the VULKAN window cannot act on (B6b rung 4) — shown
+/// with the "n/a" badge rather than hidden, and refused at `Adjust` before
+/// `menu_adjust` can persist anything. ONE menu on both windows, the
+/// differences badged rather than disappeared (the `height_on` "unarmed"
+/// precedent). Each is here for a reason the window can name: `mode`,
+/// `hybrid`, `dynamic`, `overlay`, `gpu_tone` — one render arm and one
+/// present path; `preset`, `spp`, `bounce` — the interactive shot's quality
+/// is held at the pacing measurement's value; `height_on` — no relief arm;
+/// `dlss`/`xess`/`fsr`/`oidn`/`oidn_temporal`/`nppd` — FSR3 is the only
+/// upscaler and NRD the only denoiser there; `bloom` — no pyramid; the
+/// `autoexp*` family — the aperture controller is not ticked on that path.
+/// RESTART rows are never here: a restart row is a file edit, and the file
+/// applies on every platform through `apply_to_opts`.
+pub const VK_INERT_LIVE: &[&str] = &[
+    "overlay",
+    "gpu_tone",
+    "mode",
+    "preset",
+    "spp",
+    "bounce",
+    "hybrid",
+    "dynamic",
+    "height_on",
+    "dlss",
+    "xess",
+    "fsr",
+    "oidn",
+    "oidn_temporal",
+    "nppd",
+    "bloom",
+    "autoexp",
+    "exposure_bias",
+    "autoexp_spike_guard",
+    "autoexp_spike_strength",
+    "autoexp_mode",
+];
+
 // ---------------------------------------------------------------------------
 // Self-test (run by --check — DLL-free, pure)
 // ---------------------------------------------------------------------------
 
 pub fn self_test() -> Result<(), String> {
+    // The Vulkan window's inert list names real rows, every one of them Live:
+    // a misspelt id would badge nothing and refuse nothing (the row would act
+    // through `menu_adjust` on a backend that cannot honour it), and a Restart
+    // id would badge a file edit that in fact applies everywhere.
+    for id in VK_INERT_LIVE {
+        match item_by_id(id) {
+            None => return Err(format!("VK_INERT_LIVE names no such row: {id:?}")),
+            Some(item) if item.tier != Tier::Live => {
+                return Err(format!("VK_INERT_LIVE names a Restart row: {id:?} — restart rows apply everywhere"));
+            }
+            Some(_) => {}
+        }
+    }
+    // And the rows it leaves live on Vulkan are exactly the ones that window
+    // wires (hud, tod, clouds, fireflies, fireflies_count, emissive_lights,
+    // move_ease) — pinned, so a new Live row lands on one list or the other
+    // rather than silently acting on a backend nobody checked it against.
+    let vk_live: Vec<&str> = menu_items()
+        .iter()
+        .filter(|i| i.tier == Tier::Live && !VK_INERT_LIVE.contains(&i.id))
+        .map(|i| i.id)
+        .collect();
+    let want = ["hud", "tod", "clouds", "fireflies", "fireflies_count", "emissive_lights", "move_ease"];
+    if vk_live != want {
+        return Err(format!(
+            "the Live rows not in VK_INERT_LIVE are {vk_live:?}, expected {want:?} — a new Live row \
+             must be classified for the Vulkan window"
+        ));
+    }
+
     // Round-trip: a default (all-None) Settings survives serde bit-exactly
     // and serializes SPARSE — no "null" leaves in the file.
     let d = Settings::default();

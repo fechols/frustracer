@@ -1521,14 +1521,13 @@ fn main() {
     // world layout the load produces) are derived there, post-join.
     #[cfg(windows)]
     run_window(req, &opts, file_settings, cli_over);
-    // THE LINUX WINDOW (B6b rung 1). No settings file and no CLI-override
-    // replay: both feed the pause menu's restart tier, and there is no menu
-    // here — `settings` stays Windows-side until rung 2 gives it a session to
-    // belong to.
+    // THE LINUX WINDOW (B6b rungs 1-4). The settings file and the CLI-override
+    // set travel in since rung 4: both feed the pause menu, which this window
+    // now has — menu edits persist through the same `settings::save`, and a
+    // Live row a CLI flag overrode wears the same "cli" badge.
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = (file_settings, cli_over);
-        match run_window_vk(req, &opts) {
+        match run_window_vk(req, &opts, file_settings, cli_over) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("window: {e}");
@@ -16294,11 +16293,11 @@ fn run_check_vk_hud(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> boo
     };
 
     // One recorded frame: optional upload, the tonemap, optional overlay.
-    let mut render = |passes: &display::Passes,
-                      target: &display::Image,
-                      hud: &mut vk::hud::HudVk,
-                      tp: tone::ToneParams,
-                      draw: Draw|
+    let render = |passes: &display::Passes,
+                  target: &display::Image,
+                  hud: &mut vk::hud::HudVk,
+                  tp: tone::ToneParams,
+                  draw: Draw|
      -> Result<(Vec<u8>, vk::hud::UploadStats), String> {
         passes.set_params(vkd, display::Params::new(tp, 1.0, (0.0, 0.0, 0.0)))?;
         let mut st = vk::hud::UploadStats::default();
@@ -28108,7 +28107,8 @@ fn run_cinematic_cpu(
 /// THE TRACER IS CACHED BY RESOLUTION and not rebuilt per shot: constructing
 /// one compiles the whole kernel corpus through DXC, which is ~20 s, and the
 /// `islands` preset is seven shots at one resolution.
-/// THE WINDOW — B6b rungs 2 (the camera is yours) and 3 (and it resizes).
+/// THE WINDOW — B6b rungs 2 (the camera is yours), 3 (and it resizes) and 4
+/// (and it has the HUD, the pause menu and a loading page).
 ///
 /// Rung 1 opened a window and flew `cinematic::pose_at` on a 60 s lap, with
 /// ESC as the only key that did anything. This adds INPUT: WASD/QE and the
@@ -28130,8 +28130,26 @@ fn run_cinematic_cpu(
 /// `Win` is not `Send` and stays on the main thread; `ash` handles are, and
 /// Vulkan has no thread affinity, so presenting off-thread is legal. A free
 /// consequence, and a real one: the window stays PUMPED through the ~13 s
-/// world boot instead of being marked unresponsive. There is no loading screen
-/// behind it yet — that is the HUD rung — but it is alive.
+/// world boot instead of being marked unresponsive — and since rung 4 it shows
+/// the loading page while it waits.
+///
+/// RUNG 4 PUTS THE HUD ON THE RENDER THREAD, and the reason is `Hud` itself:
+/// Slint's objects are `Rc`-based, so ONE thread owns the menu, and the thread
+/// that has the pose, the frame time, the hour and the swapchain is the one
+/// that rasterises and uploads it. So the pump FORWARDS: every drained
+/// `sdl3::event::Event` crosses in `vk::present::Ui` (the type is `Send`, and
+/// pinned so), and this thread runs `input::Edges::feed` over them — the SAME
+/// routing table `Input::poll` loops on Windows — with the menu in hand. The
+/// three SDL calls only the window's thread may make (fullscreen, text input
+/// start/stop) cross back as requests, `WinSize::want`'s shape. `vk/hud.rs` is
+/// the GPU half, `Passes::record_frame` the one insertion point, V21 the gate.
+/// The menu's state machine, its `HudAction` drain and its settings writeback
+/// are `session()`'s, ported arm for arm; the Live rows this window cannot act
+/// on (`settings::VK_INERT_LIVE`) are badged "n/a" and refused rather than
+/// hidden — one menu on both windows. The pause HOLD is `present` without a
+/// `render_frame`: the upscaler's last output is re-read under the overlay,
+/// `frame` stops advancing (so a `--qa` driver can assert the pause), and FIFO
+/// paces it at the display rate, which is why there is no 7 ms sleep here.
 ///
 /// `FR_VK_PUMP_INLINE=1` keeps the single-threaded shape (pump once per frame,
 /// same mirror, same integrator). It is arm B of the input-age measurement —
@@ -28177,17 +28195,26 @@ fn run_cinematic_cpu(
 /// shows the last frame.
 ///
 /// WHAT IS STILL NOT HERE, each deferred for a reason rather than forgotten:
-/// the HUD and pause menu (they need a `vk/hud.rs` peer of `gpu/hud.rs`),
-/// audio, the toggle edges (`input.rs`'s `Edges`, which answer to a menu this
-/// backend has no peer of — F11 is one of them, which is why this window
-/// resizes but does not go fullscreen), a screenshot verb, and `--lock-res`:
-/// the trace extent follows the swapchain 1:1 here, where D3D12's re-entry
-/// re-derives a LOCKED render res.
+/// audio; a screenshot verb (it wants the capture arm's resolve+PNG path, its
+/// own slice — `P` and `--qa screenshot` say so); `--lock-res` (the trace
+/// extent follows the swapchain 1:1 here, where D3D12's re-entry re-derives a
+/// LOCKED render res); the toggle keys that answer to arms this window has not
+/// got (SPACE/F/R/T/O/B/G/X/K/N/J/U/V/I/C/Y/Z and 1-3 — one tracer, one
+/// upscaler, one denoiser, one quality; their settings rows are the "n/a"
+/// ones); held-repeat on the gamepad's D-pad in the menu (SDL buttons do not
+/// auto-repeat — `pad.rs`'s repeat core is XInput-bound); and a repaint of the
+/// loading page THROUGH the ~8-20 s DXC compile (no tick hook inside
+/// `VkTracer::new`; the SPIR-V memo rung 3 recommended shrinks that window).
 ///
 /// THE SCENE IS THE WORLD, because `req` already says so: a bare invocation
 /// sets `world_wanted`, and nothing about this path changes it.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
+fn run_window_vk(
+    req: SceneRequest,
+    opts: &Opts,
+    file_settings: settings::Settings,
+    cli_over: std::collections::HashMap<String, String>,
+) -> Result<i32, String> {
     // THE WINDOW OPENS BEFORE THE SCENE LOADS, and that ordering is a
     // usability decision rather than a technical one: a cold world boot is
     // ~13 s, and a terminal that prints nothing for that long looks hung. It
@@ -28237,6 +28264,9 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
     // read the first frame as a resize away from 0x0.
     let winsz = vk::present::WinSize::default();
     winsz.set(ww, wh);
+    // The pump's THIRD output and the session's requests back to it (rung 4):
+    // the forwarded events, the text-input level, the fullscreen toggle.
+    let ui = vk::present::Ui::default();
     let quit = std::sync::atomic::AtomicBool::new(false);
 
     // ARM B: one thread, pumping once per frame. Same mirror, same integrator,
@@ -28248,15 +28278,18 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
              per frame instead of every 2 ms"
         );
         return window_frames(
-            &hg, surface, (ww, wh), req, opts, &mirror, &winsz, &quit, Some(&mut win),
+            &hg, surface, (ww, wh), req, opts, file_settings, cli_over, &mirror, &winsz, &ui, &quit,
+            Some(&mut win),
         );
     }
 
     std::thread::scope(|s| {
-        let (hgr, mr, wr, qr) = (&hg, &mirror, &winsz, &quit);
+        let (hgr, mr, wr, ur, qr) = (&hg, &mirror, &winsz, &ui, &quit);
         let render = s
             .spawn(move || {
-                let r = window_frames(hgr, surface, (ww, wh), req, opts, mr, wr, qr, None);
+                let r = window_frames(
+                    hgr, surface, (ww, wh), req, opts, file_settings, cli_over, mr, wr, ur, qr, None,
+                );
                 // However the frame loop ends — quit, error, or a stale
                 // surface — the pump has to stop waiting for it.
                 qr.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -28276,7 +28309,7 @@ fn run_window_vk(req: SceneRequest, opts: &Opts) -> Result<i32, String> {
         // not set `panic = "abort"`), so the symptom was a full crash report
         // followed by a session that would not die.
         while !quit.load(std::sync::atomic::Ordering::Relaxed) && !render.is_finished() {
-            if !win.pump(&mirror, &winsz) {
+            if !win.pump(&mirror, &winsz, &ui) {
                 quit.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -28546,8 +28579,11 @@ fn window_frames(
     win_size: (u32, u32),
     req: SceneRequest,
     opts: &Opts,
+    file_settings: settings::Settings,
+    mut cli_over: std::collections::HashMap<String, String>,
     mirror: &std::sync::Arc<flycam::Mirror>,
     winsz: &vk::present::WinSize,
+    ui: &vk::present::Ui,
     quit: &std::sync::atomic::AtomicBool,
     mut pump: Option<&mut vk::present::Win>,
 ) -> Result<i32, String> {
@@ -28575,10 +28611,146 @@ fn window_frames(
     // `mut` since rung 3: the trace extent follows the swapchain 1:1 here (no
     // `--lock-res` arm on this backend yet), so a resize moves both.
     let (mut rw, mut rh) = (pres.sc.w as usize, pres.sc.h as usize);
-    let LoadedScene { mut scene, bvh, cam0, world_info } = load_scene(&req);
+
+    // THE HUD, on this thread (rung 4 — see `run_window_vk`'s header for why
+    // it is this one), built before the load so the loading page has something
+    // to draw with. ONE per process (`slint::platform::set_platform`), owned
+    // here beside `fly`, `cv` and `pres` as `run_window` owns its beside
+    // `fly`. A failure is loud and non-fatal, the Windows rule: the session
+    // runs without a HUD and ESC keeps its historical quit.
+    let mut hud = match hud::Hud::new(
+        pres.sc.w,
+        pres.sc.h,
+        file_settings.display.hud.unwrap_or(true),
+    ) {
+        Ok(mut h) => {
+            h.set_cam_readout(opts.cam_readout);
+            if opts.cam_readout {
+                eprintln!(
+                    "cam-readout: ON — the HUD's bottom-left plate carries the pose, the \
+                     aperture and a paste-ready --cam (F1 hides the HUD, and hides this too)"
+                );
+            }
+            Some(h)
+        }
+        Err(e) => {
+            eprintln!("hud: disabled — {e}");
+            None
+        }
+    };
+    // The pause menu owns the settings from here (the Windows shape): menu
+    // edits mutate + save this struct; the pre-parse apply in main() already
+    // consumed the startup values.
+    let mut cfg = file_settings;
+
+    // THE LOADING PAGE (rung 4). The scene loads on its own thread while this
+    // one keeps the swapchain fed with the page: `progress::activate()` turns
+    // the loaders' publish sites on (ONLY an interactive window may — the
+    // headless suites never reach here, `progress.rs`'s rule), and
+    // `present_page` is the display stage with `Draw::None` — a cleared image
+    // with the HUD composited over it, legal before any tracer exists.
+    // Resizes during the load reconcile the SWAPCHAIN alone (no tracer to
+    // rebuild yet); the session's own path owns any later one. Only `quit`
+    // is answered from the events: a long BLAS build cannot be interrupted
+    // cleanly, so quitting during the load exits the process and lets the OS
+    // reclaim the device — `load_tick`'s rule on Windows.
+    let mut load_last = std::time::Instant::now() - std::time::Duration::from_millis(LOAD_TICK_MS as u64);
+    let load_start = std::time::Instant::now();
+    let mut page = |hud: &mut Option<hud::Hud>,
+                    pres: &mut vk::present::Presenter,
+                    pump: &mut Option<&mut vk::present::Win>,
+                    force: bool|
+     -> Result<(), String> {
+        if let Some(w) = pump.as_deref_mut() {
+            if !w.pump(mirror, winsz, ui) {
+                eprintln!("frustracer: quit during load");
+                std::process::exit(0);
+            }
+        }
+        for ev in ui.take_events() {
+            let mut e = input::Edges::default();
+            e.feed(&ev, input::Mode::Closed, &mut |_| {});
+            if e.quit {
+                eprintln!("frustracer: quit during load");
+                std::process::exit(0);
+            }
+        }
+        if quit.load(Relaxed) {
+            eprintln!("frustracer: quit during load");
+            std::process::exit(0);
+        }
+        if !force && load_last.elapsed().as_millis() < LOAD_TICK_MS {
+            return Ok(());
+        }
+        load_last = std::time::Instant::now();
+        // The page follows the swapchain's extent by comparison, like the
+        // session's HUD block below — a resize during the load lands here.
+        let (pw, ph) = winsz.get();
+        if pw > 0 && ph > 0 && (pw, ph) != (pres.sc.w, pres.sc.h) {
+            pres.resize(hg, sp, pw, ph)?;
+        }
+        if let Some(hd) = hud.as_mut() {
+            if hd.size() != pres.hud_size() {
+                let (hw, hh) = pres.hud_size();
+                hd.set_size(hw, hh);
+            }
+            let snap = progress::snapshot().unwrap_or_default();
+            // A ~1.6 s marquee sweep for the indeterminate phases (the world
+            // BVH build) — its whole job is to show liveness there.
+            let marquee = (load_start.elapsed().as_secs_f32() / 1.6).fract();
+            if let Some(hf) = hd.loading_frame(&snap, marquee) {
+                pres.hud_stage(hf);
+            }
+        }
+        pres.set_hud_visible(true);
+        match pres.present_page(hg)? {
+            vk::present::Frame::Presented => {}
+            vk::present::Frame::Stale => {
+                let (sw, sh) = winsz.get();
+                if sw > 0 && sh > 0 {
+                    pres.resize(hg, sp, sw, sh)?;
+                }
+            }
+        }
+        Ok(())
+    };
+    progress::activate();
+    let worker = std::thread::Builder::new()
+        .name("scene-load".into())
+        .spawn(move || load_scene(&req))
+        .expect("failed to spawn scene-load thread");
+    while !worker.is_finished() {
+        if let Err(e) = page(&mut hud, pres, &mut pump, false) {
+            eprintln!("window: loading page: {e}");
+            window_teardown(hg, None, pres, None, None);
+            return Err(e);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    let LoadedScene { mut scene, bvh, cam0, world_info } = match worker.join() {
+        Ok(l) => l,
+        Err(_) => {
+            window_teardown(hg, None, pres, None, None);
+            return Err("scene load failed (loader thread panicked)".into());
+        }
+    };
     let attractors: Vec<world::TodAttractor> = match (world_info.as_ref(), opts.tod) {
         (Some(w), None) => world::attractors(w),
         _ => Vec::new(),
+    };
+
+    // The rest of the boot's blocking work, each step behind ONE forced
+    // repaint of the page (the `load_step!` shape): the uploads are seconds
+    // and the DXC compile is ~8-20 s, and a terminal is not where the user is
+    // looking any more. KNOWN-ACCEPT: the marquee STALLS through each step —
+    // there is no tick hook inside `VkScene::new` / `VkTracer::new` — so the
+    // page is live between them and frozen within.
+    let mut step = |detail: &str, hud: &mut Option<hud::Hud>, pres: &mut vk::present::Presenter, pump: &mut Option<&mut vk::present::Win>| {
+        progress::stage(0, 0, "");
+        progress::phase(progress::Phase::GpuUpload, detail, 0);
+        if let Err(e) = page(hud, pres, pump, true) {
+            eprintln!("window: loading page: {e}");
+        }
     };
 
     // EVERY BRING-UP REFUSAL FROM HERE ON TEARS DOWN WHAT EXISTS, through the
@@ -28586,6 +28758,7 @@ fn window_frames(
     // which returns past it and leaves `Vk::drop` to destroy the device under
     // a live swapchain (VUID-vkDestroyDevice-device-00378). See that
     // function's header.
+    step("uploading geometry", &mut hud, pres, &mut pump);
     let vs = match vk::scene::VkScene::new(hg, &scene, &bvh) {
         Ok(v) => v,
         Err(e) => {
@@ -28593,6 +28766,7 @@ fn window_frames(
             return Err(e);
         }
     };
+    step("uploading textures", &mut hud, pres, &mut pump);
     let vt = match vk::textures::VkTextures::new(hg, sp, &scene, opts.bc7) {
         Ok(t) => t,
         Err(e) => {
@@ -28601,6 +28775,7 @@ fn window_frames(
         }
     };
     let want_dn = opts.nrd;
+    step("compiling shaders", &mut hud, pres, &mut pump);
     // AN `Option` SINCE RUNG 3, and only because `CineVk::destroy` takes `self`
     // by value: a rebuild has to move the old one out before the new one is
     // built. `None` is reachable for the width of `rebuild_at`'s body and
@@ -28617,6 +28792,14 @@ fn window_frames(
         window_teardown(hg, cv.take(), pres, Some(&vt), Some(&vs));
         return Err(e);
     }
+    // Init is done: the page comes down (the session's first `hd.frame`
+    // uploads the reveal as a forced full-window rect) and the sink idles.
+    drop(step);
+    drop(page);
+    if let Some(hd) = hud.as_mut() {
+        hd.set_loading(false);
+    }
+    progress::phase(progress::Phase::Idle, "", 0);
 
     // ONE SHOT, still resolved through `resolve_shots` — but rung 2 takes only
     // two things from it, and NEITHER is a pose: `samples` (the interactive
@@ -28661,7 +28844,7 @@ fn window_frames(
 
     eprintln!(
         "vk: WASD/arrows + QE fly, drag to look, Ctrl/Shift slow, ,/. scrub the clock — \
-         ESC or the window's X to quit"
+         ESC opens the menu, F1 the HUD, F11 fullscreen; the window's X quits"
     );
 
     // main.rs's clock, like the Windows session's: advanced by the LAST
@@ -28694,8 +28877,8 @@ fn window_frames(
                 Ok(_h) => {
                     eprintln!(
                         "qa: control socket listening on 127.0.0.1:{port} — drive it with \
-                         `frqa` (pos | tp | look | tod | drive | drive stop | resize | sync \
-                         | quit; key and screenshot are later rungs')"
+                         `frqa` (pos | tp | look | tod | drive | drive stop | resize | key \
+                         | sync | quit; screenshot is a later slice's)"
                     );
                     Some((q, qflag))
                 }
@@ -28761,9 +28944,16 @@ fn window_frames(
     // swapchain cannot be built at it if one does.
     let mut zero_size = false;
     let mut was_hidden = false;
+    // The HUD's inputs and the menu's state (rung 4), `session()`'s names:
+    // `prev_cam` is what turns a snapshot into "the integrator wrote between
+    // frames" (a bit compare — a tap shorter than a frame lands as exactly one
+    // moved frame); `menu_rows_stale` rebuilds the settings rows on open, on a
+    // group switch and after every edit.
+    let mut prev_cam = fly.snapshot().cam;
+    let mut menu_rows_stale = true;
     loop {
         if let Some(w) = pump.as_deref_mut() {
-            if !w.pump(mirror, winsz) {
+            if !w.pump(mirror, winsz, ui) {
                 break;
             }
         }
@@ -28844,6 +29034,28 @@ fn window_frames(
         // ONE snapshot, used for everything in this iteration.
         let snap = fly.snapshot();
         pres.pacing.note_pump_gap(mirror.pump_gap());
+        let moved = snap.cam != prev_cam;
+        prev_cam = snap.cam;
+        let sun_moved = snap.tod != prev_hour;
+
+        // --- THE EDGES (rung 4): every event the pump forwarded since last
+        // iteration, through `input::Edges::feed` — the routing table
+        // `Input::poll` loops on Windows, run here because the menu it routes
+        // to lives on this thread. Mode re-read per event, `poll`'s rule: a
+        // forwarded click can focus a text field and the next key in the same
+        // drain must see that. The `--qa key` verb below SYNTHESISES into the
+        // same struct, the Windows socket's shape, so a scripted press and a
+        // real one take one code path.
+        let mut edges = input::Edges::default();
+        for ev in ui.take_events() {
+            let mode = input::Mode::of(hud.as_ref().filter(|h| h.menu_open()));
+            let mut fwd = |ev: &sdl3::event::Event| {
+                if let Some(h) = hud.as_ref() {
+                    hud::events::forward(h.slint_window(), ev);
+                }
+            };
+            edges.feed(&ev, mode, &mut fwd);
+        }
 
         // --- the QA drain, once per iteration. It runs AFTER this iteration's
         // snapshot was taken, so a pose write lands in the NEXT frame, not
@@ -28932,6 +29144,19 @@ fn window_frames(
                                 "drag": mirror.debug_state().2,
                             },
                             "pump": if pump.is_some() { "inline" } else { "threaded" },
+                            // Rung 4's readouts: the menu and the HUD as
+                            // STATE a driver asserts rather than watches, and
+                            // the overlay's cumulative upload totals — read
+                            // twice across a `sync`, an unchanged `bytes` IS
+                            // the dirty-rect discipline's "an idle HUD uploads
+                            // nothing", headlessly.
+                            "menu_open": hud.as_ref().is_some_and(|h| h.menu_open()),
+                            "hud": hud.as_ref().is_some_and(|h| h.visible()),
+                            "fullscreen": ui.fullscreen(),
+                            "hud_uploads": {
+                                "rects": pres.hud_stats().rects,
+                                "bytes": pres.hud_stats().bytes,
+                            },
                         });
                         qa::reply_json(&[(1, state.to_string())], t0.elapsed().as_secs_f64() * 1000.0)
                     }
@@ -29106,13 +29331,58 @@ fn window_frames(
                         quit.store(true, Relaxed);
                         qa::info_reply("quitting")
                     }
-                    // NAMED refusals, not a generic "unknown verb": these two
-                    // exist on Windows and their absence here is a rung, not a
+                    // `key` SYNTHESISES EDGES (rung 4), the Windows socket's
+                    // shape: the exact key-handler paths run, so a scripted
+                    // press and a real one cannot drift. The menu's navigation
+                    // names are accepted whenever — they are no-ops with the
+                    // menu closed, and driving the menu is precisely what a
+                    // headless driver is for (Windows refuses them under an
+                    // open menu because real keys route to Slint there;
+                    // synthesised edges never do, so that reason does not
+                    // apply). The keys that answer to arms this window has not
+                    // got are refused BY NAME, never swallowed.
+                    ["key", name] => {
+                        let n = name.to_ascii_lowercase();
+                        match n.as_str() {
+                            "esc" | "escape" => edges.esc = true,
+                            "f1" => edges.toggle_hud = true,
+                            "f11" => edges.toggle_fullscreen = true,
+                            "up" => edges.menu_up = true,
+                            "down" => edges.menu_down = true,
+                            "left" => edges.menu_left = true,
+                            "right" => edges.menu_right = true,
+                            "enter" | "return" | "a" => edges.menu_activate = true,
+                            "start" => edges.menu_toggle = true,
+                            "back" | "b" => edges.menu_back = true,
+                            _ => {}
+                        }
+                        match n.as_str() {
+                            "esc" | "escape" | "f1" | "f11" | "up" | "down" | "left" | "right"
+                            | "enter" | "return" | "a" | "start" | "back" | "b" => {
+                                qa::info_reply(&format!("key {n} queued"))
+                            }
+                            "p" => qa::err_reply(
+                                "the Vulkan window has no screenshot verb yet — it wants the \
+                                 capture arm's resolve+PNG path, which is its own slice",
+                            ),
+                            "space" | "f" | "r" | "t" | "o" | "g" | "x" | "k" | "n" | "m" | "j"
+                            | "h" | "u" | "v" | "i" | "c" | "y" | "z" | "1" | "2" | "3" => {
+                                qa::err_reply(&format!(
+                                    "key {n} answers to an arm the Vulkan window has not got (one \
+                                     tracer, one upscaler, one denoiser, one quality) — its \
+                                     settings row is the n/a one"
+                                ))
+                            }
+                            _ => qa::err_reply(
+                                "unknown key (esc f1 f11 up down left right enter start back; p \
+                                 and the mode/toggle keys are refused by name)",
+                            ),
+                        }
+                    }
+                    ["key", ..] => qa::err_reply("key needs one name"),
+                    // A NAMED refusal, not a generic "unknown verb": the verb
+                    // exists on Windows and its absence here is a slice, not a
                     // typo, so the driver is told which one.
-                    ["key", ..] => qa::err_reply(
-                        "the Vulkan window has no toggle edges yet — `input.rs`'s Edges arrive \
-                         with the HUD/pause-menu rung",
-                    ),
                     ["screenshot", ..] => qa::err_reply(
                         "the Vulkan window has no screenshot verb yet — it wants the capture \
                          arm's resolve+PNG path, which is its own slice",
@@ -29120,14 +29390,224 @@ fn window_frames(
                     [] => qa::err_reply("empty request"),
                     _ => qa::err_reply(&format!(
                         "unknown verb {:?} — pos | tp x y z [yaw pitch] | look yaw pitch | \
-                         tod H | drive x y z ticks | drive stop | resize W H | sync N | quit \
-                         (key and screenshot are later rungs')",
+                         tod H | drive x y z ticks | drive stop | resize W H | key NAME | sync N \
+                         | quit (screenshot is a later slice's)",
                         words[0]
                     )),
                 };
                 let _ = req.reply.send(json);
             }
         }
+
+        // F11 — a REQUEST to the pump (`SDL_SetWindowFullscreen` belongs to
+        // the window's thread); the size event it produces flows through the
+        // debounce above like any other.
+        if edges.toggle_fullscreen {
+            ui.request_fullscreen_toggle();
+        }
+
+        // ── Pause menu (ESC): `session()`'s state machine + settings-row
+        // plumbing, arm for arm. Live rows apply through the same
+        // `settings::MenuFx` table; the rows THIS window cannot act on
+        // (`settings::VK_INERT_LIVE`) are refused before `menu_adjust` can
+        // persist anything — the "n/a" badge is the visible half of that one
+        // decision. Every menu edit auto-saves; keyboard toggles never persist.
+        // Opening pauses the flycam (the pump still writes the mirror, and the
+        // paused integrator ignores it — `Mirror::look` only accumulates under
+        // a latched drag, which the paused tick drops); closing resumes it.
+        // Text input start/stop is a LEVEL the pump applies (`ui`), set after
+        // this block from the menu's final state.
+        let mut menu_live_edit = false;
+        if let Some(hd) = hud.as_mut() {
+            // Pad Start = hard toggle: opens from anywhere and dismisses
+            // OUTRIGHT from any page (the console pause-button convention).
+            if edges.menu_toggle {
+                if hd.menu_open() {
+                    hd.close_menu();
+                    fly.resume();
+                } else {
+                    hd.open_menu();
+                    menu_rows_stale = true;
+                    fly.pause();
+                }
+            }
+            // ESC, and pad East ("B") while open (B must never OPEN the menu).
+            if edges.esc || (edges.menu_back && hd.menu_open()) {
+                if hd.menu_open() {
+                    if !hd.escape() {
+                        hd.close_menu();
+                        fly.resume();
+                    }
+                } else {
+                    hd.open_menu();
+                    menu_rows_stale = true;
+                    fly.pause();
+                }
+            }
+            // Navigation cursor (keyboard arrows/WASD/Enter + the pad's D-pad
+            // and South): before the take_actions drain, so a press and the
+            // action it pushes land in the same iteration.
+            if hd.menu_open() {
+                if edges.menu_up {
+                    hd.nav(-1);
+                }
+                if edges.menu_down {
+                    hd.nav(1);
+                }
+                if edges.menu_left {
+                    hd.adjust(-1);
+                }
+                if edges.menu_right {
+                    hd.adjust(1);
+                }
+                if edges.menu_activate {
+                    hd.activate();
+                }
+            }
+            // Live state snapshot for row display + adjust baselines. The
+            // fields this window has one value for say so: one tracer
+            // (`mode` 1, the wavefront), one upscaler (FSR3), one denoiser
+            // (NRD), the interactive shot's quality — those rows are the
+            // inert ones and read as such.
+            let live = settings::LiveView {
+                mode: 1,
+                hybrid: false,
+                dynamic: false,
+                overlay: false,
+                gpu_tone: true,
+                // `cine_quality` is `Quality::preset(3)` with the shot's GI
+                // folded in — the quality row reads 3 and is inert here.
+                preset: 3,
+                spp: 1,
+                bounce: if shot.gi { 2 } else { 0 },
+                height_armed: bvh::height_armed(),
+                height_on: false,
+                dlss: false,
+                xess: false,
+                fsr: true,
+                oidn: 0,
+                oidn_temporal: false,
+                nppd: false,
+                tod: snap.tod,
+                hud: hd.visible(),
+                bloom: false,
+                autoexp: false,
+                exposure_bias: autoexp::bias(),
+                autoexp_guard: autoexp::guard(),
+                autoexp_guard_strength: autoexp::guard_strength(),
+                autoexp_mode: autoexp::mode().as_str(),
+                clouds: clouds::enabled(),
+                fireflies: fireflies::enabled(),
+                fireflies_count: fireflies::count(),
+                emissive_lights: emissive::enabled(),
+                move_ease: fly.move_ease(),
+            };
+            if hd.menu_open() && menu_rows_stale {
+                menu_rows_stale = false;
+                let group = hd.group().to_string();
+                hd.set_rows(build_menu_rows(&cfg, &live, &group, &cli_over, settings::VK_INERT_LIVE));
+            }
+            for act in hd.take_actions() {
+                match act {
+                    hud::HudAction::Resume => {
+                        hd.close_menu();
+                        fly.resume();
+                    }
+                    hud::HudAction::Quit => edges.quit = true,
+                    hud::HudAction::OpenSettings => {
+                        hd.open_settings_page();
+                        menu_rows_stale = true;
+                    }
+                    hud::HudAction::Back => hd.back_to_main(),
+                    hud::HudAction::Group(g) => {
+                        hd.set_group(&g);
+                        menu_rows_stale = true;
+                    }
+                    hud::HudAction::Adjust(id, dir) => {
+                        // The refusal, BEFORE `menu_adjust`: `Hud::adjust`
+                        // and the row's own arrows push regardless of the
+                        // badge, and a row this window cannot honour must
+                        // neither change nor persist.
+                        if settings::VK_INERT_LIVE.contains(&id.as_str()) {
+                            eprintln!(
+                                "settings: '{id}' has no arm on the Vulkan window (the n/a \
+                                 badge) — unchanged"
+                            );
+                            continue;
+                        }
+                        if let Some(item) = settings::item_by_id(&id) {
+                            // Editing a LIVE row retires its "cli" badge —
+                            // `session()`'s rule, same reason.
+                            if item.tier == settings::Tier::Live {
+                                cli_over.remove(&id);
+                            }
+                            match settings::menu_adjust(item, dir, &mut cfg, &live) {
+                                settings::MenuFx::Restart => {
+                                    eprintln!("settings: '{id}' saved — applies on next launch");
+                                }
+                                settings::MenuFx::ToggleHud => edges.toggle_hud = true,
+                                settings::MenuFx::SetTod(t) => fly.set_tod(t),
+                                settings::MenuFx::MoveEase(s) => fly.set_move_ease(s),
+                                // Shading changes land through the per-frame
+                                // `Clouds::live` / `Fireflies::live` /
+                                // `FrameCb`'s `emissive::enabled()` reads; no
+                                // `frame = 0` here — the temporal model
+                                // absorbs a shading change the way it absorbs
+                                // a TOD scrub.
+                                settings::MenuFx::ToggleClouds => {
+                                    clouds::set_enabled(!clouds::enabled());
+                                }
+                                settings::MenuFx::ToggleFireflies => {
+                                    fireflies::set_enabled(!fireflies::enabled());
+                                }
+                                settings::MenuFx::FirefliesCount(n) => fireflies::set_count(n),
+                                settings::MenuFx::ToggleEmissive => {
+                                    emissive::set_enabled(!emissive::enabled());
+                                }
+                                settings::MenuFx::None => {}
+                                // Unreachable by construction — every other
+                                // `MenuFx` belongs to an id in
+                                // `VK_INERT_LIVE`, which `settings::self_test`
+                                // pins — but a new variant that slips past
+                                // the pin must be LOUD, not silent.
+                                _ => eprintln!(
+                                    "settings: '{id}' reached an arm the Vulkan window does not \
+                                     have — ignored (classify it in VK_INERT_LIVE)"
+                                ),
+                            }
+                            settings::save(&cfg);
+                            menu_rows_stale = true;
+                            menu_live_edit = true;
+                        }
+                    }
+                    hud::HudAction::TextEdit(id, v) => {
+                        if let Some(item) = settings::item_by_id(&id) {
+                            if matches!(
+                                settings::menu_text_edit(item, &v, &mut cfg),
+                                settings::MenuFx::Restart
+                            ) {
+                                eprintln!("settings: '{id}' saved — applies on next launch");
+                                settings::save(&cfg);
+                                menu_rows_stale = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if edges.quit {
+            quit.store(true, Relaxed);
+            break;
+        }
+        // ESC with no HUD (Slint init failed): the menu can't exist, so keep
+        // the historical quit semantics rather than a dead key.
+        if edges.esc && hud.is_none() {
+            quit.store(true, Relaxed);
+            break;
+        }
+        let menu_open = hud.as_ref().is_some_and(|h| h.menu_open());
+        ui.set_text_input(menu_open);
+
         // HIDDEN: NOTHING TO PRESENT INTO, SO NOTHING WORTH TRACING. The pump
         // reports it (`WinSize::hidden`, off SDL3's Minimized/Occluded and
         // Restored/Exposed events — the extent never says so on Linux, see that
@@ -29169,32 +29649,72 @@ fn window_frames(
             scene::apply_tod(&mut scene, snap.tod);
             prev_hour = snap.tod;
         }
-        // Foliage sway has no Vulkan arm — `vk::tracer` hard-codes
-        // `sway_armed: false` and the geometry uploads once, so nothing here
-        // ever reads a baked offset. The CLOCK is kept (at the capture arm's
-        // real-seconds rate) because that is the part a future arm needs to
-        // inherit; the BAKE is not, because `foliage::bake` is a rayon fan-out
-        // over every sway cell and its memo is keyed on the time it is handed —
-        // which advances every frame, so it would miss every frame and spend
-        // the whole scene's worth of work producing a value with no reader.
-        // Restore the call in the same commit that arms the Vulkan side.
-        let sway_time = cloud_time as f32;
-        let fs = CineFrame {
-            cam: snap.cam,
-            hour: Some(snap.tod),
-            clouds: clouds::Clouds::live(scene.diag, cloud_time as f32),
-            fireflies: fireflies::Fireflies::live(&scene, cloud_time as f32),
-            sway_time,
-        };
-        // `None` only exists inside `rebuild_at`, which returns on the way out
-        // of it — so by here it is always `Some`, and saying so beats threading
-        // an `Option` through the render call.
-        let c = cv.as_mut().expect("the tracer is Some outside a failed rebuild");
-        c.tg.refresh_sky(&scene);
-        if let Err(e) = c.render_frame(hg, &scene, &shot, &fs, rw, rh, q, opts) {
-            eprintln!("window: {e}");
-            code = 1;
-            break;
+
+        // ── The HUD (rung 4): F1, the frame's readouts, the staged dirty
+        // rects. SIZE FOLLOWS THE SWAPCHAIN BY COMPARISON, here rather than at
+        // each of `rebuild_at`'s exits and the stale arm — so no route into a
+        // resize can forget it (D3D12 calls `set_size` at two sites). An
+        // unchanged HUD stages nothing (zero raster, zero bytes); staging
+        // continues while hidden so re-showing needs no special case.
+        if let Some(hd) = hud.as_mut() {
+            if hd.size() != pres.hud_size() {
+                let (hw, hh) = pres.hud_size();
+                hd.set_size(hw, hh);
+            }
+            if edges.toggle_hud {
+                hd.set_visible(!hd.visible());
+                eprintln!("hud: {} (F1 toggles)", if hd.visible() { "ON" } else { "OFF" });
+            }
+            // "VK" is the label the Vulkan capture arm's HUD already wears
+            // (`cine_composite_hud`), so a still and the window agree;
+            // `last_ms` is the PREVIOUS frame's time, the sample the FPS graph
+            // wants; no frame generation and no aperture on this path, so 1.0
+            // and 0.0.
+            if let Some(hf) = hd.frame(&snap.cam, snap.tod, moved, sun_moved, "VK", last_ms as f32, 1.0, 0.0)
+            {
+                pres.hud_stage(hf);
+            }
+            pres.set_hud_visible(hd.visible() || hd.menu_open());
+        }
+
+        // ── Pause-menu HOLD: while the menu is open, skip the trace and
+        // re-present the upscaler's LAST output under the overlay — "pause"
+        // genuinely pauses (no history advances, no accumulation, the camera
+        // frozen by the flycam pause, `f` not advanced so a `--qa` driver can
+        // assert it) and the menu repaints at the display rate, which FIFO
+        // paces without a sleep. Falls through to a real frame when a live
+        // edit needs to show behind the menu, when the TOD moved (apply_tod +
+        // one frame), or when nothing was ever presented (the upscaler's
+        // output does not exist before the first `render_frame`).
+        let hold = menu_open && pres.frame_presented && !menu_live_edit && !sun_moved;
+        if !hold {
+            // Foliage sway has no Vulkan arm — `vk::tracer` hard-codes
+            // `sway_armed: false` and the geometry uploads once, so nothing here
+            // ever reads a baked offset. The CLOCK is kept (at the capture arm's
+            // real-seconds rate) because that is the part a future arm needs to
+            // inherit; the BAKE is not, because `foliage::bake` is a rayon fan-out
+            // over every sway cell and its memo is keyed on the time it is handed —
+            // which advances every frame, so it would miss every frame and spend
+            // the whole scene's worth of work producing a value with no reader.
+            // Restore the call in the same commit that arms the Vulkan side.
+            let sway_time = cloud_time as f32;
+            let fs = CineFrame {
+                cam: snap.cam,
+                hour: Some(snap.tod),
+                clouds: clouds::Clouds::live(scene.diag, cloud_time as f32),
+                fireflies: fireflies::Fireflies::live(&scene, cloud_time as f32),
+                sway_time,
+            };
+            // `None` only exists inside `rebuild_at`, which returns on the way out
+            // of it — so by here it is always `Some`, and saying so beats threading
+            // an `Option` through the render call.
+            let c = cv.as_mut().expect("the tracer is Some outside a failed rebuild");
+            c.tg.refresh_sky(&scene);
+            if let Err(e) = c.render_frame(hg, &scene, &shot, &fs, rw, rh, q, opts) {
+                eprintln!("window: {e}");
+                code = 1;
+                break;
+            }
         }
         // `inv_samples` is 1.0: the reconstruction arm's output is one finished
         // image, not a sum to be averaged (that divisor belongs to the
@@ -29318,8 +29838,10 @@ fn window_frames(
             }
         }
         last_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-        cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
-        f = f.wrapping_add(1);
+        if !hold {
+            cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            f = f.wrapping_add(1);
+        }
     }
     // The loop's LAST write to `last_ms` has no reader (the `pos` verb reads it
     // at the top of the next iteration, and there is no next iteration), which
@@ -31393,6 +31915,7 @@ fn cine_composite_hud(
                                 &live,
                                 group,
                                 &std::collections::HashMap::new(),
+                                &[],
                             ));
                         }
                     }
@@ -36839,12 +37362,17 @@ fn run_check(
 /// descriptor (settings::menu_items) rendered against the live session state
 /// + the persisted file. Control tags mirror settings::Control for the
 /// markup's row dispatch.
+///
+/// `inert` = the Live rows THIS window cannot act on (`settings::VK_INERT_LIVE`
+/// on Vulkan, empty on D3D12): badged "n/a" and dimmed rather than hidden, so
+/// the two windows show one menu.
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 fn build_menu_rows(
     cfg: &settings::Settings,
     live: &settings::LiveView,
     group: &str,
     cli_over: &std::collections::HashMap<String, String>,
+    inert: &[&str],
 ) -> Vec<hud::MenuRow> {
     // Saved values apply_to_opts warn-IGNORED — recomputed fresh from the
     // current file each rebuild (a silent re-validation, nothing printed), so
@@ -36882,6 +37410,7 @@ fn build_menu_rows(
                 value,
                 restart,
                 cli: sess.is_some(),
+                na: inert.contains(&i.id),
                 control: match i.control {
                     settings::Control::Toggle { .. } => "toggle",
                     settings::Control::Cycle { .. } => "cycle",
@@ -37345,7 +37874,10 @@ fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>, dn_fold: 
 /// is polled EVERY call (it is cheap, and it is what keeps the window from
 /// being ghosted by Windows); the raster + present are the expensive half and
 /// run at most every `LOAD_TICK_MS`.
-#[cfg(windows)]
+///
+/// The constant is shared with the Vulkan window's page (`window_frames`,
+/// B6b rung 4) — one cadence for one loading page on two windows.
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 const LOAD_TICK_MS: u128 = 33;
 
 #[cfg(windows)]
@@ -39443,7 +39975,7 @@ fn session(
             if hd.menu_open() && menu_rows_stale {
                 menu_rows_stale = false;
                 let group = hd.group().to_string();
-                hd.set_rows(build_menu_rows(cfg, &live, &group, cli_over));
+                hd.set_rows(build_menu_rows(cfg, &live, &group, cli_over, &[]));
             }
             for act in hd.take_actions() {
                 match act {
