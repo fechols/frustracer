@@ -251,8 +251,8 @@ const MAX_SAMPLES: u32 = 1024;
 const RENDER_BUDGET: Duration = Duration::from_millis(15);
 /// U cycles samples per pixel by doubling, wrapping at dlss::MAX_SPP (128):
 /// 1 -> 2 -> 4 -> ... -> 128 -> 1. Powers of two because the interesting axis
-/// is variance, which halves per doubling (error ~ 1/√N).
-#[cfg_attr(not(windows), allow(dead_code))]
+/// is variance, which halves per doubling (error ~ 1/√N). Both windows since
+/// B6c rung 2.
 fn next_spp(cur: u32) -> u32 {
     let n = cur.saturating_mul(2);
     if n > dlss::MAX_SPP {
@@ -28831,13 +28831,14 @@ fn run_cinematic_cpu(
 /// own slice — `P` and `--qa screenshot` say so); `--lock-res` (the trace
 /// extent follows the swapchain 1:1 here, where D3D12's re-entry re-derives a
 /// LOCKED render res); the toggle keys that answer to arms this window has not
-/// got (SPACE/F/R/T/O/B/G/X/K/N/J/U/V/I/C/Y/Z and 1-3 — one tracer, one
-/// upscaler, one denoiser, one quality; their settings rows are the "n/a"
-/// ones); and held-repeat on the gamepad's D-pad in the menu (SDL buttons do
-/// not auto-repeat — `pad.rs`'s repeat core is XInput-bound). The mid-compile
-/// repaint that used to close this list landed with B6c rung 1: the memo made
-/// rebuilds instant and `VkTracer::new`'s tick made the one remaining cold
-/// pass repaint per unit.
+/// got (SPACE/F/R/T/O/B/G/X/K/N/J/I/C/Y/Z — one tracer, one upscaler, one
+/// denoiser; their settings rows are the "n/a" ones; H is refused for D3D12's
+/// own upscaler-sub-mode reason, not for a missing arm — the quality keys
+/// U/V/1-3 went LIVE in B6c rung 2); and held-repeat on the gamepad's D-pad
+/// in the menu (SDL buttons do not auto-repeat — `pad.rs`'s repeat core is
+/// XInput-bound). The mid-compile repaint that used to close this list landed
+/// with B6c rung 1: the memo made rebuilds instant and `VkTracer::new`'s tick
+/// made the one remaining cold pass repaint per unit.
 ///
 /// THE SCENE IS THE WORLD, because `req` already says so: a bare invocation
 /// sets `world_wanted`, and nothing about this path changes it.
@@ -29491,7 +29492,12 @@ fn window_frames(
             return Err(e);
         }
     };
-    let q = cine_quality(&shot);
+    // `mut` since B6c rung 2: the 1/2/3 keys and the menu's preset row
+    // rebuild it live (the same two lines `cine_quality` runs, at the chosen
+    // preset). `preset_now` mirrors it for the LiveView, which is also what
+    // `menu_adjust`'s preset cycle reads.
+    let mut q = cine_quality(&shot);
+    let mut preset_now: u32 = 3;
 
     // The integrator. It owns the pose and the hour from here on — the render
     // loop only ever SNAPSHOTS, which is the one-snapshot-per-iteration rule
@@ -30019,28 +30025,38 @@ fn window_frames(
                             "enter" | "return" | "a" => edges.menu_activate = true,
                             "start" => edges.menu_toggle = true,
                             "back" | "b" => edges.menu_back = true,
+                            "u" => edges.cycle_spp = true,
+                            "v" => edges.toggle_height = true,
+                            "1" => edges.quality = Some(1),
+                            "2" => edges.quality = Some(2),
+                            "3" => edges.quality = Some(3),
                             _ => {}
                         }
                         match n.as_str() {
                             "esc" | "escape" | "f1" | "f11" | "up" | "down" | "left" | "right"
-                            | "enter" | "return" | "a" | "start" | "back" | "b" => {
+                            | "enter" | "return" | "a" | "start" | "back" | "b" | "u" | "v"
+                            | "1" | "2" | "3" => {
                                 qa::info_reply(&format!("key {n} queued"))
                             }
                             "p" => qa::err_reply(
                                 "the Vulkan window has no screenshot verb yet — it wants the \
                                  capture arm's resolve+PNG path, which is its own slice",
                             ),
+                            "h" => qa::err_reply(
+                                "hemi bounces are a still-frame feature the upscaler sub-mode \
+                                 refuses on D3D12 too — and this window is always that sub-mode",
+                            ),
                             "space" | "f" | "r" | "t" | "o" | "g" | "x" | "k" | "n" | "m" | "j"
-                            | "h" | "u" | "v" | "i" | "c" | "y" | "z" | "1" | "2" | "3" => {
+                            | "i" | "c" | "y" | "z" => {
                                 qa::err_reply(&format!(
                                     "key {n} answers to an arm the Vulkan window has not got (one \
-                                     tracer, one upscaler, one denoiser, one quality) — its \
-                                     settings row is the n/a one"
+                                     tracer, one upscaler, one denoiser) — its settings row is \
+                                     the n/a one"
                                 ))
                             }
                             _ => qa::err_reply(
-                                "unknown key (esc f1 f11 up down left right enter start back; p \
-                                 and the mode/toggle keys are refused by name)",
+                                "unknown key (esc f1 f11 up down left right enter start back u v \
+                                 1 2 3; p and the mode/toggle keys are refused by name)",
                             ),
                         }
                     }
@@ -30140,13 +30156,13 @@ fn window_frames(
                 dynamic: false,
                 overlay: false,
                 gpu_tone: true,
-                // `cine_quality` is `Quality::preset(3)` with the shot's GI
-                // folded in — the quality row reads 3 and is inert here.
-                preset: 3,
-                spp: 1,
+                // Live since B6c rung 2 — and `menu_adjust`'s preset/spp
+                // cycles read these, so they must be the real values.
+                preset: preset_now,
+                spp: cv.as_ref().map_or(1, |c| c.spp),
                 bounce: if shot.gi { 2 } else { 0 },
                 height_armed: bvh::height_armed(),
-                height_on: false,
+                height_on: bvh::height_on(),
                 dlss: false,
                 xess: false,
                 fsr: true,
@@ -30213,6 +30229,12 @@ fn window_frames(
                                 settings::MenuFx::ToggleHud => edges.toggle_hud = true,
                                 settings::MenuFx::SetTod(t) => fly.set_tod(t),
                                 settings::MenuFx::MoveEase(s) => fly.set_move_ease(s),
+                                // The quality rows (B6c rung 2) synthesize the
+                                // key's edge, D3D12's shape — ONE consumer
+                                // below serves the menu and the real key.
+                                settings::MenuFx::Quality(n) => edges.quality = Some(n),
+                                settings::MenuFx::CycleSpp => edges.cycle_spp = true,
+                                settings::MenuFx::ToggleHeight => edges.toggle_height = true,
                                 // Shading changes land through the per-frame
                                 // `Clouds::live` / `Fireflies::live` /
                                 // `FrameCb`'s `emissive::enabled()` reads; no
@@ -30313,6 +30335,55 @@ fn window_frames(
         if snap.tod != prev_hour {
             scene::apply_tod(&mut scene, snap.tod);
             prev_hour = snap.tod;
+        }
+
+        // ── The quality keys (B6c rung 2): 1/2/3, U, V — live, one consumer
+        // for the real key press and the menu row's synthesized edge alike.
+        // Each commit latches `CineVk::force_reset`, the discontinuity
+        // declaration both temporal consumers read; there is no `frame = 0`
+        // here because this window has no accumulator — `seq` free-runs and
+        // the temporal model owns the history. H stays refused for D3D12's
+        // own reason (the upscaler sub-mode is a temporal integrator; hemi
+        // tiers are a still-frame feature) — see `VK_INERT_LIVE`.
+        if let Some(p) = edges.quality {
+            preset_now = p;
+            // `cine_quality` at the chosen preset: the same two lines, so the
+            // shot's GI fold-in (the capture contract) survives a change.
+            q = Quality::preset(p);
+            if shot.gi {
+                q.fb = shade::FrustumBounce { ao: false, gi: true, depth: q.fb.depth };
+            }
+            if let Some(c) = cv.as_mut() {
+                c.force_reset = true;
+            }
+            eprintln!("quality preset {p}");
+        }
+        if edges.cycle_spp {
+            if let Some(c) = cv.as_mut() {
+                c.spp = next_spp(c.spp);
+                c.force_reset = true;
+                eprintln!("gpu: spp {}", c.spp);
+            }
+        }
+        if edges.toggle_height {
+            // The D3D12 `--gpu` arm's guards, verbatim in spirit: `armed` is
+            // the compile-time half (the relief march is in the kernels or it
+            // is not), `any_height` the scene's.
+            if !bvh::height_armed() {
+                eprintln!("gpu: heightfield not armed (restart with --heightfield for relief)");
+            } else if !scene.any_height {
+                eprintln!("gpu: no height data in this scene");
+            } else {
+                let on = !bvh::height_on();
+                bvh::set_height_on(on);
+                if let Some(c) = cv.as_mut() {
+                    c.force_reset = true;
+                }
+                eprintln!(
+                    "gpu: heightfield relief: {}",
+                    if on { "ON" } else { "OFF (normal-mapped)" }
+                );
+            }
         }
 
         // ── The HUD (rung 4): F1, the frame's readouts, the staged dirty
@@ -30687,6 +30758,19 @@ struct CineVk {
     /// NRD's `prev_mats` is built from, and what decides whether the terminal
     /// quadtree can be replayed. One per shot; see `cinematic::Temporal`.
     temporal: cinematic::Temporal,
+    /// Latched by the WINDOW on a live quality/spp/height commit (B6c rung 2)
+    /// and consumed by the next `render_frame`'s FIRST sub-frame: both
+    /// temporal consumers — FSR3's `Dispatch.reset` and NRD's
+    /// `common_settings` reset — see one discontinuity declaration, because
+    /// the noise statistics just changed under their histories. The capture
+    /// never sets it; `Temporal::step`'s own `reset` keeps owning the
+    /// shot-boundary case.
+    force_reset: bool,
+    /// Samples per sub-frame, the CB's `spp`. `opts.spp` at build — the CLI
+    /// contract the capture keeps — and cycled live by the window's U key
+    /// (D3D12's own U semantics under an upscaler: the kernels take it from
+    /// the CB, no rebuild).
+    spp: u32,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -30814,6 +30898,8 @@ impl CineVk {
             dn,
             seq: 0,
             temporal: cinematic::Temporal::default(),
+            force_reset: false,
+            spp: opts.spp,
         })
     }
 
@@ -30914,6 +31000,10 @@ impl CineVk {
         // which is also why this method takes no frame index at all.
         let warm = if self.seq == 0 { dlss::JITTER_PHASE.saturating_sub(samples) } else { 0 };
 
+        // The window's live-quality latch, consumed by the FIRST sub-frame
+        // only: one discontinuity declaration per commit. ORing it into every
+        // sub-frame would re-reset the histories a still shot is integrating.
+        let mut force_reset = std::mem::take(&mut self.force_reset);
         for _ in 0..warm + samples {
             let jit = dlss::jitter_for(self.seq);
             // What the PREVIOUS sub-frame was, which is a different question
@@ -30923,7 +31013,9 @@ impl CineVk {
             // Inside an output frame the pose really is unchanged, so `st`
             // reports prev == cur AND licenses a replay; at an output-frame
             // boundary it reports the frame before and refuses one.
-            let st = self.temporal.step(&basis, &fs.cam, jit);
+            let mut st = self.temporal.step(&basis, &fs.cam, jit);
+            st.reset |= force_reset;
+            force_reset = false;
             let replay = st.replay && opts.replay;
             let p = gfx::frame::FrameParams {
                 cam: basis,
@@ -30934,7 +31026,10 @@ impl CineVk {
                 prev_cam: Some(st.prev_basis),
                 q,
                 verify: false,
-                spp: opts.spp,
+                // `self.spp`, not `opts.spp`: the CLI value at build, cycled
+                // live by the window's U key. The capture never cycles it, so
+                // its CLI contract is unchanged.
+                spp: self.spp,
                 probe_sample: 0,
                 clouds: fs.clouds,
                 fireflies: fs.fireflies,

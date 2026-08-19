@@ -2184,29 +2184,32 @@ pub fn item_by_id(id: &str) -> Option<&'static MenuItem> {
     menu_items().iter().find(|i| i.id == id)
 }
 
-/// The Live-tier rows the VULKAN window cannot act on (B6b rung 4) — shown
-/// with the "n/a" badge rather than hidden, and refused at `Adjust` before
-/// `menu_adjust` can persist anything. ONE menu on both windows, the
-/// differences badged rather than disappeared (the `height_on` "unarmed"
-/// precedent). Each is here for a reason the window can name: `mode`,
-/// `hybrid`, `dynamic`, `overlay`, `gpu_tone` — one render arm and one
-/// present path; `preset`, `spp`, `bounce` — the interactive shot's quality
-/// is held at the pacing measurement's value; `height_on` — no relief arm;
-/// `dlss`/`xess`/`fsr`/`oidn`/`oidn_temporal`/`nppd` — FSR3 is the only
-/// upscaler and NRD the only denoiser there; `bloom` — no pyramid; the
-/// `autoexp*` family — the aperture controller is not ticked on that path.
+/// The Live-tier rows the VULKAN window cannot act on (B6b rung 4; three rows
+/// went live in B6c rung 2) — shown with the "n/a" badge rather than hidden,
+/// and refused at `Adjust` before `menu_adjust` can persist anything. ONE
+/// menu on both windows, the differences badged rather than disappeared (the
+/// `height_on` "unarmed" precedent). Each is here for a reason the window can
+/// name: `mode`, `hybrid`, `dynamic`, `overlay`, `gpu_tone` — one render arm
+/// and one present path; `bounce` — D3D12's own upscaler sub-mode refuses H
+/// ("still-frame feature": hemi tiers converge over parked accumulation,
+/// which the temporal integrator's jittered 1-frame model is not), and this
+/// window is ALWAYS that sub-mode; `dlss`/`xess`/`fsr`/`oidn`/
+/// `oidn_temporal`/`nppd` — FSR3 is the only upscaler and NRD the only
+/// denoiser there; `bloom` — no pyramid; the `autoexp*` family — the aperture
+/// controller is not ticked on that path.
+/// NO LONGER HERE (B6c rung 2): `preset`, `spp`, `height_on` — all three ride
+/// the shared `FrameCb`, so the window applies them live the way D3D12's
+/// `--gpu` arm does (`CineVk.force_reset` declares the discontinuity to FSR3
+/// and NRD).
 /// RESTART rows are never here: a restart row is a file edit, and the file
 /// applies on every platform through `apply_to_opts`.
 pub const VK_INERT_LIVE: &[&str] = &[
     "overlay",
     "gpu_tone",
     "mode",
-    "preset",
-    "spp",
     "bounce",
     "hybrid",
     "dynamic",
-    "height_on",
     "dlss",
     "xess",
     "fsr",
@@ -2240,15 +2243,27 @@ pub fn self_test() -> Result<(), String> {
         }
     }
     // And the rows it leaves live on Vulkan are exactly the ones that window
-    // wires (hud, tod, clouds, fireflies, fireflies_count, emissive_lights,
-    // move_ease) — pinned, so a new Live row lands on one list or the other
-    // rather than silently acting on a backend nobody checked it against.
+    // wires (hud; preset/spp/height_on since B6c rung 2; tod, clouds,
+    // fireflies, fireflies_count, emissive_lights, move_ease) — pinned, so a
+    // new Live row lands on one list or the other rather than silently acting
+    // on a backend nobody checked it against.
     let vk_live: Vec<&str> = menu_items()
         .iter()
         .filter(|i| i.tier == Tier::Live && !VK_INERT_LIVE.contains(&i.id))
         .map(|i| i.id)
         .collect();
-    let want = ["hud", "tod", "clouds", "fireflies", "fireflies_count", "emissive_lights", "move_ease"];
+    let want = [
+        "hud",
+        "preset",
+        "spp",
+        "height_on",
+        "tod",
+        "clouds",
+        "fireflies",
+        "fireflies_count",
+        "emissive_lights",
+        "move_ease",
+    ];
     if vk_live != want {
         return Err(format!(
             "the Live rows not in VK_INERT_LIVE are {vk_live:?}, expected {want:?} — a new Live row \
