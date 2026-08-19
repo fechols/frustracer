@@ -3002,6 +3002,62 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # key down, enter, right, right + the settings file / key f11 twice / resize / quit.
                                       # Verified: all of the above green; cargo test 31; --check PASSED with both goldens
                                       # byte-identical; --check-vk validation clean on RADV and llvmpipe.
+                                      #
+                                      # B6C RUNG 1 — THE SPIR-V MEMO + THE COMPILE TICK (2026-08-19; spirv::Memo +
+                                      # Spirv::memo_stats + FR_SPIRV_NOMEMO + VkTracer::new's per-unit tick + S2's
+                                      # determinism arm + the V5 / end-of-suite memo teeth). The slice rungs 3 and 4
+                                      # both recommended, landed as recommended: a memo keyed on what reaches DXC,
+                                      # not a VkTracer split.
+                                      # THE KEY IS THE FULL TUPLE (source, entry, target, debug), COMPARED not just
+                                      # hashed — a DefaultHasher collision that served the wrong kernel would be a
+                                      # wrong-resource read behind a valid module, the binding self_test's failure
+                                      # class through another door. `what` is diagnostic-only and excluded; `extra`
+                                      # calls go through compile_args, which NEVER memoizes ("-enable-16bit-types"
+                                      # is not in the key) — the bypass and the gates' fresh-compile handle are one
+                                      # mechanism. The map is a RefCell on the !Send Spirv, which outlives every
+                                      # rebuild (rebuild_at's survivors list), so there is no version to bump and no
+                                      # lever word; FR_SPIRV_NOMEMO kills it, loud once.
+                                      # THE TEETH, BOTH WAYS, because a memo's failure modes are both silent:
+                                      # (a) --check-spirv S2 grows a DETERMINISM arm — nothing in this tree had ever
+                                      # asserted DXC is bit-reproducible for a fixed (args, source), and every memo
+                                      # claim rests on it. One unit, recompiled fresh, byte-compared; the memo hit
+                                      # compared against both; hits==0 under an unarmed lever FAILS (anti-vacuity).
+                                      # Measured: reference[Nvidia]:cs_reference, 125682 words, byte-identical.
+                                      # (b) --check-vk: V5 re-requests one key where the sources are in hand
+                                      # (hit == fresh == first), and the SUITE asserts hits > 0 at the end — V6/V12/
+                                      # V13 rebuild tracers over V5's keys, so the exact-zero render gates score
+                                      # memo-SERVED modules (fidelity at device strength). Measured: 101 hits / 60
+                                      # misses on RADV, 89 / 60 on llvmpipe (V11/V13 SKIP there).
+                                      # (c) spirv::self_test grows the DXC-free half (hit fidelity, accounting,
+                                      # full-key discrimination — every tuple element must separate two keys) and
+                                      # joins the --check ROSTER as "spirv": it only ran under --check-spirv /
+                                      # --check-mtl before, i.e. one CI job instead of four.
+                                      # THE TICK is the rung's second half: VkTracer::new takes
+                                      # Option<&mut dyn FnMut(done, total)>, called per compiled unit; the window's
+                                      # bring-up repaints the loading page on it with the count in the detail line.
+                                      # Gates/capture/rebuild_at pass None. The rung-4 known-accept NARROWS: the
+                                      # marquee now stalls only within VkScene::new / VkTextures::new and within any
+                                      # one unit (~0.3 s cold, microseconds on a hit).
+                                      # MEASURED (Radeon 8060S / RADV, the window over --qa, resize 800x600 then
+                                      # 1024x768): rebuild split swapchain 2.1-3.0 ms | teardown 2.0-2.6 ms |
+                                      # tracer+upscaler+denoiser 718-833 ms | memo 24 hit(s) — against rung 3's
+                                      # 7.5-8.5 s. The DXC term is GONE; the remaining ~0.8 s is allocation, the
+                                      # FFX/NRD contexts and reflection. Render extent tracked the window through
+                                      # both commits (rebuilds 1 then 2 in `pos`), pump gap held ~1.06 ms.
+                                      # STILL NOT DONE, deliberately: no on-disk cache (the memo dies with the
+                                      # process — no CACHE_VERSION, no staleness class); no D3D12 DXIL twin
+                                      # (gpu/dxc.rs's FR_NOPRECISE strip_precise rewrites the source INSIDE
+                                      # compile_args, so its key must hash post-rewrite — a Windows campaign's
+                                      # slice); the marquee within VkScene::new / VkTextures::new.
+                                      # Touch spirv.rs's Memo/compile/memo_stats/self_test / VkTracer::new's tick /
+                                      # CineVk::build's tick / the bring-up tick closure / S2's determinism arm /
+                                      # V5's memo check / run_check_vk's end-of-suite assert / rebuild_at's split
+                                      # line -> run --check (LAST; "spirv" among the roster), cargo test,
+                                      # --check-spirv (the determinism arm must fire), --check-vk on RADV AND
+                                      # llvmpipe (the end-of-suite hit assert runs on both), FR_SPIRV_NOMEMO=1
+                                      # --check-spirv (loud + exempt), tools/win-cross-check.sh, and the window over
+                                      # --qa: resize twice, read the split line's "memo N hit(s)" and `pos`'s
+                                      # rebuilds/render fields.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

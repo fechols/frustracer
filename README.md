@@ -272,7 +272,10 @@ Four rungs of the B6b ladder have landed on it. The **camera is yours** (WASD/
 arrows + QE, mouse-drag look, the Ctrl/Shift slow chord, `,`/`.` scrubbing the
 clock, a gamepad) through the same 500 Hz integrator the Windows session flies;
 the **window resizes** (a drag, a compositor, or `--qa resize`) and the tracer
-rebuilds at the negotiated extent; and it has the **HUD** (F1), the **pause
+rebuilds at the negotiated extent in under a second — a compile memo returns
+the kernels' SPIR-V instead of re-running DXC for ~8 s, and the loading page
+now repaints through the one cold compile a boot still pays; and it has the
+**HUD** (F1), the **pause
 menu** (ESC, or a pad's Start) with its settings pages and writeback, **F11**
 fullscreen, and a **loading page** behind the world boot — the same Slint
 overlay the Windows window draws, composited by a `vk/hud.rs` peer of
