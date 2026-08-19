@@ -664,6 +664,28 @@ pub fn sw_rays_leaf() -> bool {
     sw_rays() && crate::bvh::CUT_SEED_RAYS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The browser corpus's define prelude (Stage F1 of the WASM/WebGPU port).
+/// PREPENDED by the web-subset assembler (`--check-wgsl` / `--bake-web` /
+/// the wasm session) to EVERY unit it collects — never pushed into
+/// `trace_sources`' own lists, which is what makes the off-state structural:
+/// a native session simply never calls this, and the assembled native
+/// sources are byte-identical by construction, not by a define that must be
+/// kept empty. Prepending at collection is also immune to the probe-reach
+/// trap by shape — there is no per-unit list a unit could be missing from.
+///
+/// Two defines: `WEB` (the arm F2's WEB_TEX and its successors key on), and
+/// `ABL_NO_WAVE_OPS` — ctr.hlsli's plain-atomic fallback (`FR_ABL=nowave`)
+/// promoted to the web default, because WGSL core has no subgroup ops. The
+/// `#ifndef` guard keeps a simultaneous `FR_ABL=nowave` run legal (identical
+/// redefinition is only a warning, but a warning in 16 units is noise that
+/// buries a real one). The TOOTH for this define reaching every unit is
+/// downstream and end-to-end: `wgsl::validate` grants no SUBGROUP
+/// capability, so a unit this prelude missed fails `--check-wgsl` W4 on its
+/// leaked subgroup ops rather than passing quietly.
+pub fn web_defs() -> &'static str {
+    "#define WEB 1\n#ifndef ABL_NO_WAVE_OPS\n#define ABL_NO_WAVE_OPS 1\n#endif"
+}
+
 
 pub const SMOKE_HLSL: &str = include_str!("../shaders/smoke.hlsl");
 /// Order-2 SH irradiance, standalone (no cbuffer of its own — the coefficients

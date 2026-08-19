@@ -18,7 +18,26 @@
 #define PI  3.14159265358979
 #define TAU 6.28318530717959
 #define FLT_MAX 3.402823466e38
+// WEB (the browser corpus): WGSL has no infinity — the folded OpConstant
+// +Inf cannot be spelled as a WGSL literal (cs_sky, measured 2026-08-18)
+// and OpIsInf has no WGSL target at all. FLT_MAX is the web sentinel and
+// ISINF its test: `>= FLT_MAX` is true for the sentinel AND for any
+// genuinely overflowed runtime value, so miss-detection keeps its meaning.
+// No `== INF`/`< INF` compare exists in the corpus (checked when this arm
+// landed), so the sentinel swap changes no other predicate. Native keeps
+// the real bit pattern and the intrinsic — the off-state is the #ifdef.
+#ifdef WEB
+#define INF FLT_MAX
+#define ISINF(x) ((x) >= FLT_MAX)
+// The exponent bit test (the shade.hlsli overflow-backstop idiom) — exactly
+// IEEE isfinite, spelled without the intrinsic naga cannot emit (OpIsNan
+// has no WGSL target; caught by the bistro heightfield arm).
+#define ISFINITE(x) ((asuint(x) & 0x7f800000u) != 0x7f800000u)
+#else
 #define INF (asfloat(0x7f800000u))
+#define ISINF(x) isinf(x)
+#define ISFINITE(x) isfinite(x)
+#endif
 
 #define KIND_LEAF    0u
 #define KIND_SKY     1u
@@ -1560,6 +1579,17 @@ RWStructuredBuffer<GBufCore> gbuf : register(u15);
 
 // Ext — 72 B/px, stored ONLY under FLAG_GBUF_EXT (a wired RR/FSR-RR feed, or
 // GPU-resident NPPD). Every field keeps its old name, type and precision.
+//
+// ABSENT under WEB (the browser corpus, 2026-08-18): no RR, no FSR-RR, no
+// NPPD exists in a browser session, so FLAG_GBUF_EXT can never be set there
+// — and the record is unWGSLable as-is anyway (vec4 members give the element
+// 16-alignment, so the tight 72-B stride is illegal in WGSL storage; padding
+// to 80 would buy layout legality for a buffer the session cannot ever
+// store). Compiling the declaration and both stores out drops a storage-
+// buffer binding from every trace entry — the browser's scarcest resource
+// (the W5 budget audit's subject). CONTRACT: the WebGPU session must never
+// set FLAG_GBUF_EXT (assert at its flag-build site when Stage C lands).
+#ifndef WEB
 struct GBufExt {
     float4 nr;    // normal.xyz, roughness
     float4 alb;   // diff_alb.xyz = albedo*(1-metallic)*(1-trans) — the
@@ -1575,6 +1605,7 @@ struct GBufExt {
                   // (ao|is.x, is.y|is.z). FLAG_FSR_SIG; else 0.
 };
 RWStructuredBuffer<GBufExt> gbuf_ext : register(u32);
+#endif // WEB
 
 // f32 -> f16 bits with round-to-nearest-even — NOT the f32tof16 intrinsic
 // (the legacy DXIL op truncates). The CPU twin is half::f16::from_f32;
@@ -1733,6 +1764,7 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     // Below here is guide/signal data that only an RR/FSR-RR feed or NPPD
     // reads. Skipping the store is the entire point of the split — it is
     // 72 of the old 88 B/px, measured at 0.34 ms on the world.
+#ifndef WEB // no ext consumers exist in a browser session — see the decl
     if ((flags & FLAG_GBUF_EXT) == 0u) return;
 
     GBufExt g;
@@ -1747,7 +1779,7 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     // bug). Multiply order matches PrimarySurface::diff_albedo bit-for-bit.
     g.alb = float4(ps.albedo * (1.0 - ps.metallic) * (1.0 - ps.trans), ps.ripple_amp);
     float3 spec_alb = lerp(float3(0.04, 0.04, 0.04), ps.albedo, ps.metallic);
-    g.spec = float4(spec_alb, isinf(ps.spec_t) ? CAM_FAR : ps.spec_t);
+    g.spec = float4(spec_alb, ISINF(ps.spec_t) ? CAM_FAR : ps.spec_t);
     g.sig = uint4(0u, 0u, 0u, 0u);
     g.sig2 = uint2(0u, 0u);
     // EMISSIVE DEMODULATION (FLAG_EMIS_DEMOD, gfx::frame's rationale): the
@@ -1783,12 +1815,13 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
         // gates. Append, never insert: every gate decodes lanes by index.
         float sig_w_hi = (flags & FLAG_REMOD_EXACT)
             ? ps.m_d
-            : (isinf(ps.shadow_t) ? CAM_FAR : ps.shadow_t);
+            : (ISINF(ps.shadow_t) ? CAM_FAR : ps.shadow_t);
         g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z),
                       pack_h2(ps.ao_t, sig_w_hi));
         g.sig2 = uint2(pack_h2(ps.ao, is.x), pack_h2(is.y, is.z));
     }
     gbuf_ext[pi] = g;
+#endif // WEB
 }
 
 // xess.rs::view_z_to_clip_depth: linear view-Z -> [0,1] reversed-Z clip
@@ -1822,6 +1855,7 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     c.core = float4(gbuf_mv(dir, fx, fy), CAM_FAR,
                     (flags & FLAG_FSR_SIG) ? CAM_FAR : 0.0);
     gbuf[pi] = c;
+#ifndef WEB // no ext consumers exist in a browser session — see the decl
     if ((flags & FLAG_GBUF_EXT) == 0u) return;
     // Sole-NRD sessions skip the 72 B ext store outright: the bridge's own
     // sky branches never read these bytes (stale is fine BY CONSTRUCTION —
@@ -1837,6 +1871,7 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     g.sig = uint4(0u, 0u, 0u, 0u);
     g.sig2 = uint2(0u, 0u);
     gbuf_ext[pi] = g;
+#endif // WEB
 }
 
 // sh.rs::Sh9::irradiance — cosine-weighted sky irradiance at `n`, DIVIDED BY PI
@@ -1891,7 +1926,19 @@ StructuredBuffer<uint>   mat_cutout : register(t3, space1);
 // uv_tri_mat pattern) — the relief march needs the triangle's vertices for
 // its tangent-frame/depth math inside the trace primitives, where the
 // space0 root SRVs aren't necessarily bound.
+// The web arm reads the same 12-B-packed wire as a scalar array — vec3
+// storage elements carry stride 16 in WGSL (shade.hlsli's positions note);
+// uv_pos is the one spelling every consumer uses.
+#ifdef WEB
+StructuredBuffer<float> uv_positions : register(t4, space1);
+float3 uv_pos(uint i) {
+    uint b = i * 3u;
+    return float3(uv_positions[b], uv_positions[b + 1u], uv_positions[b + 2u]);
+}
+#else
 StructuredBuffer<float3> uv_positions : register(t4, space1);
+float3 uv_pos(uint i) { return uv_positions[i]; }
+#endif
 // Per-material relief map: normal tex + 1 when the material carries a
 // heightfield (Material::height_amp > 0), else 0, plus the amp itself in
 // texel widths (bvh.rs::tri_height_depth's inputs, folded to one fetch —
@@ -1935,7 +1982,14 @@ uint tri_of(uint inst, uint prim) { return prim; }
 // maps — Texture::srgb), carrying the FULL CPU-generated mip chain (built in
 // texture.rs::build_mips, uploaded verbatim — CPU-trilinear parity: both
 // samplers read identical texels at identical ray-cone lods).
+// WEB_TEX (the browser corpus): WebGPU has no unbounded texture range and
+// naga refuses ShaderNonUniform — gfx::texweb's generated block replaces
+// this whole declaration (meta table at t10, texel buffer at t11, exact-
+// size Texture2DArray buckets from t12) and every consumer below carries a
+// WEB_TEX arm that answers bit-exactly through it.
+#ifndef WEB_TEX
 Texture2D<float4>        texs[]     : register(t10, space1);
+#endif
 // Static: trilinear, repeat wrap — texture.rs::sample_trilinear in hardware
 // (sRGB decode per texel via the SRGB SRV format, texel centers at i + 0.5;
 // every sample passes an explicit ray-cone lod to SampleLevel, and lod <= 0
@@ -1953,7 +2007,7 @@ SamplerState             samp_aniso : register(s1, space1);
 // consumer's min(w-1) clamp absorbs it, same as the CPU).
 float uv_wrap(float c) {
     float f = c - floor(c);
-    return isfinite(f) ? f : 0.0;
+    return ISFINITE(f) ? f : 0.0;
 }
 
 // scene.rs::tri_uv — barycentric UV interpolation at a hit.
@@ -1973,12 +2027,23 @@ bool alpha_cutout(uint tri, float u, float v) {
     uint cm = mat_cutout[uv_tri_mat[tri]];
     if (cm == 0u) return false;
     float2 uv = tri_uv(tri, u, v);
+#ifdef WEB_TEX
+    // Bit-exact: the RGBA8 word's top byte IS the alpha byte, and the UNORM
+    // n/255 representation makes `.a*255 < 127.5` ≡ `byte < 128`.
+    uint ti = cm - 1u;
+    uint2 wh = web_tex_dims(ti);
+    uint w = wh.x, h = wh.y;
+    uint x = min(uint(uv_wrap(uv.x) * float(w)), w - 1u);
+    uint y = min(uint(uv_wrap(uv.y) * float(h)), h - 1u);
+    return web_tex_a8(ti, x, y) < 128u;
+#else
     uint ti = NonUniformResourceIndex(cm - 1u);
     uint w, h;
     texs[ti].GetDimensions(w, h);
     uint x = min(uint(uv_wrap(uv.x) * float(w)), w - 1u);
     uint y = min(uint(uv_wrap(uv.y) * float(h)), h - 1u);
     return texs[ti].Load(int3(int(x), int(y), 0)).a * 255.0 < 127.5;
+#endif
 }
 
 #ifdef HEIGHTFIELD
@@ -2003,7 +2068,13 @@ bool alpha_cutout(uint tri, float u, float v) {
 // makes a 255-alpha region an exact 1.0 field (the flat-field identity).
 float height_bilinear(uint ti, float2 uv) {
     uint w, h;
+#ifdef WEB_TEX
+    uint2 wh = web_tex_dims(ti);
+    w = wh.x;
+    h = wh.y;
+#else
     texs[ti].GetDimensions(w, h);
+#endif
     float x = uv_wrap(uv.x) * float(w) - 0.5;
     float y = uv_wrap(uv.y) * float(h) - 0.5;
     float x0f = floor(x), y0f = floor(y);
@@ -2013,10 +2084,19 @@ float height_bilinear(uint ti, float2 uv) {
     int x1 = ((int(x0f) + 1) % iw + iw) % iw;
     int y0 = ((int(y0f) % ih) + ih) % ih;
     int y1 = ((int(y0f) + 1) % ih + ih) % ih;
+#ifdef WEB_TEX
+    // float(byte) — exactly the value the native arm recovers: UNORM n/255
+    // times 255 round-trips every byte exactly in f32.
+    float a00 = float(web_tex_a8(ti, uint(x0), uint(y0)));
+    float a10 = float(web_tex_a8(ti, uint(x1), uint(y0)));
+    float a01 = float(web_tex_a8(ti, uint(x0), uint(y1)));
+    float a11 = float(web_tex_a8(ti, uint(x1), uint(y1)));
+#else
     float a00 = texs[ti].Load(int3(x0, y0, 0)).a * 255.0;
     float a10 = texs[ti].Load(int3(x1, y0, 0)).a * 255.0;
     float a01 = texs[ti].Load(int3(x0, y1, 0)).a * 255.0;
     float a11 = texs[ti].Load(int3(x1, y1, 0)).a * 255.0;
+#endif
     float bot = a00 + fx * (a10 - a00);
     float top = a01 + fx * (a11 - a01);
     return (bot + fy * (top - bot)) / 255.0;
@@ -2032,9 +2112,9 @@ uint height_march(uint tri, float3 o, float3 dir, inout float t_io, inout float 
     uint i0 = uv_indices[tri * 3u];
     uint i1 = uv_indices[tri * 3u + 1u];
     uint i2 = uv_indices[tri * 3u + 2u];
-    float3 p0 = uv_positions[i0];
-    float3 e1 = uv_positions[i1] - p0;
-    float3 e2 = uv_positions[i2] - p0;
+    float3 p0 = uv_pos(i0);
+    float3 e1 = uv_pos(i1) - p0;
+    float3 e2 = uv_pos(i2) - p0;
     // tri_height_depth: amp (texel widths) × sqrt(world_area/(uv_area·w·h)).
     float2 d1 = uv_buf[i1] - uv_buf[i0];
     float2 d2 = uv_buf[i2] - uv_buf[i0];
@@ -2042,18 +2122,24 @@ uint height_march(uint tri, float3 o, float3 dir, inout float t_io, inout float 
     precise float wa = 0.5 * length(nn);
     precise float ua = 0.5 * abs(d1.x * d2.y - d1.y * d2.x);
     uint tw, th;
+#ifdef WEB_TEX
+    uint2 _wh = web_tex_dims(ti);
+    tw = _wh.x;
+    th = _wh.y;
+#else
     texs[ti].GetDimensions(tw, th);
+#endif
     float denom = ua * float(tw * th);
     if (!(denom > 1e-20) || !(wa > 0.0)) return 0u;
     float ts = sqrt(wa / denom);
-    if (!isfinite(ts)) return 0u;
+    if (!ISFINITE(ts)) return 0u;
     float depth = mh.amp * ts;
     if (!(depth > 0.0)) return 0u;
 
     float t_p = t_io, u = u_io, v = v_io;
     float n2 = dot(nn, nn);
     float dh = dot(dir, nn) / (sqrt(n2) * depth);
-    if (!isfinite(dh) || dh == 0.0) return 0u;
+    if (!ISFINITE(dh) || dh == 0.0) return 0u;
     // Barycentric rates along the ray (Cramer; the normal component of dir
     // cancels identically — (N×e2)·N ≡ 0).
     float bu = dot(cross(dir, e2), nn) / n2;

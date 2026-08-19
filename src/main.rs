@@ -180,6 +180,12 @@ mod reflect;
 #[cfg(any(unix, windows))]
 mod spirv;
 mod stats;
+// SPIR-V -> WGSL: the corpus's FOURTH code generator (the browser port —
+// DXIL, SPIR-V and spirv-cross's MSL being the first three), naga behind one
+// seam. UNCFG'D, unlike `spirv` above — naga is pure Rust with no loader, and
+// the wasm session runs this same module at page load, so the gate and the
+// page share one translator by construction.
+mod wgsl;
 mod prof;
 mod replay;
 mod temporal;
@@ -383,6 +389,7 @@ fn main() {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_wgsl,
         check_msl,
         check_mtl,
         check_vk,
@@ -1060,6 +1067,9 @@ fn main() {
         // carries it, so `--check-spirv san-miguel.obj` gates arms the
         // procedural scene cannot reach.
         || check_spirv
+        // Scene-keyed for the same reason — the web subset assembles through
+        // the same scene-conditional defines.
+        || check_wgsl
         // Scene-keyed for the line above's reason, and it is the SAME corpus:
         // both gates enumerate it through `corpus_units`.
         || check_msl
@@ -1405,6 +1415,12 @@ fn main() {
             );
             std::process::exit(2);
         }
+    }
+    if check_wgsl {
+        // Uncfg'd like the gate: W0 (the naga round-trip) runs on any target,
+        // wasm included; W1+ skip loudly where no DXC drop can load.
+        let code = run_check_wgsl(&scene);
+        std::process::exit(code);
     }
     if check_msl {
         #[cfg(target_os = "macos")]
@@ -14579,6 +14595,326 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
     }
     println!("CHECK-SPIRV {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// The BROWSER unit subset (the WASM/WebGPU port) — what `--check-wgsl` gates
+/// and `--bake-web` will ship. DELIBERATELY NOT `corpus_units`: the web corpus
+/// is a different claim — one vendor arm (no CAND_TMIN0: rt_sw.hlsli has no
+/// candidate loop for it to fix), no sway (suppressed under --sw-rays anyway),
+/// and a unit list that EXCLUDES by decision rather than by rot: feed (the
+/// native upscaler bridge), nrd_bridge/nppd (DLL denoisers), dxr-* (no
+/// DispatchRays in a browser), fsr-composite/quin (nothing to fuse),
+/// bc7enc (web textures arrive pre-encoded), smoke/waveprobe/waveviz (native
+/// instruments). Every exclusion names its reason so a unit that should join
+/// the web tier gets argued in, not forgotten out.
+///
+/// `gfx::shaders::web_defs()` is PREPENDED to every unit here — at collection,
+/// not inside `trace_sources` — which is what makes the native off-state
+/// structural (native assembly is untouched by construction) and the
+/// probe-reach question moot by shape: there is no per-unit define list a unit
+/// could be missing from. The end-to-end tooth for the defines DOING something
+/// is `wgsl::validate`'s empty capability set: a leaked subgroup op fails W4.
+#[cfg(any(unix, windows))]
+fn web_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, String> {
+    use gfx::shaders as sh;
+    use gfx::vocab::Vendor;
+
+    // The corpus premise, asserted rather than assumed: without --sw-rays the
+    // trace units declare a RaytracingAccelerationStructure, which WebGPU
+    // cannot express — a caller that forgot the lever must hear it here, not
+    // as 40 naga errors downstream.
+    if !sh::sw_rays() {
+        return Err("web_units assembled without --sw-rays armed — that corpus declares an \
+                    acceleration structure WebGPU cannot express"
+            .into());
+    }
+    let web = |src: String| format!("{}\n{}", sh::web_defs(), src);
+    let t = sh::trace_sources(&sh::TraceKeys { scene, vendor: Vendor::Nvidia, sway_armed: false });
+    let f = sh::frd_sources();
+    Ok(vec![
+        ("reference".into(), web(t.reference), Shape::Compute("cs_6_5")),
+        ("resolve".into(), web(t.resolve), Shape::Compute("cs_6_5")),
+        ("wavefront".into(), web(t.wavefront), Shape::Compute("cs_6_5")),
+        ("sky".into(), web(t.sky), Shape::Compute("cs_6_5")),
+        ("leaf".into(), web(t.leaf), Shape::Compute("cs_6_5")),
+        ("leaf_fb".into(), web(t.leaf_fb), Shape::Compute("cs_6_5")),
+        ("hemi_wave".into(), web(t.hemi_wave), Shape::Compute("cs_6_5")),
+        ("hemi_leaf".into(), web(t.hemi_leaf), Shape::Compute("cs_6_5")),
+        ("compose".into(), web(t.compose), Shape::Compute("cs_6_5")),
+        ("frd-temporal".into(), web(f.temporal), Shape::Compute("cs_6_5")),
+        ("frd-blur".into(), web(f.blur), Shape::Compute("cs_6_5")),
+        ("bloom".into(), web(sh::BLOOM_HLSL.to_string()), Shape::Compute("cs_6_0")),
+        ("autoexp".into(), web(sh::AUTOEXP_HLSL.to_string()), Shape::Compute("cs_6_0")),
+        ("tonemap".into(), web(sh::TONEMAP_HLSL.to_string()), Shape::Gfx),
+        ("blit".into(), web(sh::BLIT_HLSL.to_string()), Shape::Gfx),
+        ("hud".into(), web(sh::HUD_HLSL.to_string()), Shape::Gfx),
+    ])
+}
+
+/// `--check-wgsl`: the browser corpus through the browser's whole generator
+/// chain — the gate `src/spirv.rs`'s header and `src/reflect.rs` both
+/// forward-reference by name.
+///
+/// W0 pure naga round-trip + anti-vacuity (any OS, wasm included) | W1 DXC |
+/// W2 assemble the web subset + compile to SPIR-V (+ spirv-val when the tool
+/// is present — naga and the reference validator catch different things) |
+/// W3 naga spv-in | W4 validate at the WebGPU-core capability floor + WGSL
+/// out + RE-PARSE the emitted text (the round-trip: the text is what a
+/// browser's compiler eats, and naga's writer and reader are separate code).
+///
+/// Wx failures during bring-up are the PRODUCT, not noise: what naga refuses
+/// on this corpus is the work-list for the corpus fixes (the F2/WEB_TEX
+/// stage), exactly as `--check-msl`'s refusals were for the Metal port.
+fn run_check_wgsl(scene: &scene::Scene) -> i32 {
+    let mut ok = true;
+
+    // ---- W0: the pure half. No DXC, no GPU, no file on disk. ----
+    match wgsl::self_test() {
+        Ok(()) => println!("check-wgsl: W0 naga round-trip + anti-vacuity OK"),
+        Err(e) => {
+            eprintln!("check-wgsl: FAIL W0 {e}");
+            ok = false;
+        }
+    }
+
+    // wasm/other: W0 is the half this target can run (and the half it WILL
+    // run at page load); W1+ want a DXC drop and belong to native CI.
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = scene;
+        println!(
+            "check-wgsl: SKIP W1 (no dynamic loader for DXC on this target — W0 is the pure \
+             half; W1+ run on native CI)"
+        );
+        println!("CHECK-WGSL {}", if ok { "PASSED" } else { "FAILED" });
+        i32::from(!ok)
+    }
+    #[cfg(any(unix, windows))]
+    {
+        // The web corpus premise, armed here so a bare `--check-wgsl` is
+        // sufficient. Printed because it changes the assembly (the lever-line
+        // rule); a session flag never reaches this point armed differently —
+        // the gate exits the process.
+        if !gfx::shaders::sw_rays() {
+            println!(
+                "check-wgsl: arming --sw-rays (the web corpus is the software-ray corpus by \
+                 definition — WebGPU has no ray query)"
+            );
+            gfx::shaders::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // ---- W1: the compiler. A missing drop is a normal condition. ----
+        let dir = crate::spirv::default_dir();
+        let dxc = match crate::spirv::Spirv::load(&dir) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("check-wgsl: SKIP W1 ({e})");
+                return i32::from(!ok);
+            }
+        };
+        println!("check-wgsl: W1 {} loaded from {dir}", crate::spirv::LIB_NAME);
+
+        // ---- W2: assemble + compile the web subset. ----
+        let units = match web_units(scene) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("check-wgsl: FAIL W2 {e}");
+                println!("CHECK-WGSL FAILED");
+                return 1;
+            }
+        };
+        // spirv-val, same lookup as S3's: bundled drop first, PATH second,
+        // loud SKIP third. Independent of naga on purpose.
+        let val = {
+            let bundled = std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/SDKs/spirv-tools/bin/spirv-val"
+            ));
+            if bundled.is_file() {
+                Some(bundled)
+            } else if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+                Some(std::path::PathBuf::from("spirv-val"))
+            } else {
+                None
+            }
+        };
+        if val.is_none() {
+            println!(
+                "check-wgsl: SKIP W2 spirv-val (not found; run install-prerequisites.sh spirv) \
+                 — compilation still gates, and W3/W4 validate independently"
+            );
+        }
+        let tmp = std::env::temp_dir().join(format!("frustracer-wgsl-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let mut modules: Vec<(String, Vec<u32>)> = Vec::new();
+        let (mut failed, mut validated) = (0usize, 0usize);
+        let mut split_clones = 0usize;
+        for (name, src, shape) in &units {
+            let jobs = match corpus_jobs(name, src, shape) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W2 {e}");
+                    ok = false;
+                    failed += 1;
+                    continue;
+                }
+            };
+            for (entry, target) in jobs {
+                let what = if entry.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name}:{entry}")
+                };
+                // vulkan1.1 (SPIR-V 1.3), OVERRIDING spirv_args()'s vulkan1.3
+                // via the appended-extra seam (last flag wins in DXC): the two
+                // things that forced 1.3 — subgroup ops and RayQuery — are
+                // both absent from the web corpus by construction (nowave +
+                // sw-rays), and SPIR-V >= 1.4 lets DXC emit OpCopyLogical for
+                // struct copies, which naga's spv-in does not implement
+                // (measured 2026-08-18: 6 of the first run's 14 failures).
+                let words = match dxc.compile_args(
+                    src,
+                    &entry,
+                    &target,
+                    &what,
+                    false,
+                    &["-fspv-target-env=vulkan1.1"],
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("check-wgsl: FAIL W2 {e}");
+                        ok = false;
+                        failed += 1;
+                        continue;
+                    }
+                };
+                // The naga-normalization passes — BEFORE spirv-val, so the
+                // reference validator checks the artifact naga (and the
+                // page, via --bake-web) actually consumes. The new-id count
+                // rides the W2 line: a corpus-wide zero would mean the
+                // passes stopped reaching anything — the probe-reach alarm.
+                let pre = words[3];
+                let words = wgsl::normalize(&words);
+                split_clones += (words[3] - pre) as usize;
+                if let Some(val) = val.as_ref() {
+                    let stem = what.replace(['[', ']', ':', '+'], "_");
+                    let path = tmp.join(format!("{stem}.spv"));
+                    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    if std::fs::write(&path, &bytes).is_ok() {
+                        match std::process::Command::new(val).arg(&path).output() {
+                            Ok(o) if o.status.success() => validated += 1,
+                            Ok(o) => {
+                                eprintln!(
+                                    "check-wgsl: FAIL W2 {what}: spirv-val: {}",
+                                    String::from_utf8_lossy(&o.stderr).trim()
+                                );
+                                ok = false;
+                                failed += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("check-wgsl: FAIL W2 {what}: spirv-val: {e}");
+                                ok = false;
+                                failed += 1;
+                            }
+                        }
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                modules.push((what, words));
+            }
+        }
+        let _ = std::fs::remove_dir(&tmp);
+        // A corpus that assembled to nothing would report a clean sweep.
+        if modules.is_empty() {
+            eprintln!("check-wgsl: FAIL W2 the web subset assembled zero modules");
+            ok = false;
+        }
+        let bytes: usize = units.iter().map(|(_, s, _)| s.len()).sum();
+        println!(
+            "check-wgsl: W2 {} units ({bytes} B assembled) -> {} SPIR-V modules | {validated} \
+             spirv-val | normalize +{split_clones} ids | {failed} failed",
+            units.len(),
+            modules.len()
+        );
+
+        // ---- W3 + W4: the browser's generator, module by module. ----
+        // `FR_WGSL_DUMP=<dir>` — FR_SPIRV_DUMP's twin for THIS corpus (the
+        // WEB prelude changes the assembly, so check-spirv's dump is a
+        // different corpus). Writes <what>.spv always, <what>.types.txt once
+        // naga parsed (its validator names types by handle index — a bare
+        // "[17]" is unreadable without the listing), and <what>.wgsl once
+        // the writer produced text (even if the re-parse then failed — the
+        // text is the evidence).
+        let dump = std::env::var_os("FR_WGSL_DUMP").map(std::path::PathBuf::from);
+        if let Some(d) = dump.as_ref() {
+            match std::fs::create_dir_all(d) {
+                Ok(()) => {
+                    println!("check-wgsl: FR_WGSL_DUMP — writing modules to {}", d.display());
+                }
+                Err(e) => eprintln!("check-wgsl: FR_WGSL_DUMP={} unusable ({e})", d.display()),
+            }
+        }
+        let (mut parsed, mut tripped) = (0usize, 0usize);
+        for (what, words) in &modules {
+            let stem = what.replace(['[', ']', ':', '+'], "_");
+            if let Some(d) = dump.as_ref() {
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let _ = std::fs::write(d.join(format!("{stem}.spv")), &bytes);
+            }
+            let module = match wgsl::parse_spv(words) {
+                Ok(m) => {
+                    parsed += 1;
+                    m
+                }
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W3 {what}: {e}");
+                    ok = false;
+                    continue;
+                }
+            };
+            if let Some(d) = dump.as_ref() {
+                use std::fmt::Write as _;
+                let mut t = String::new();
+                for (h, ty) in module.types.iter() {
+                    let _ = writeln!(t, "{h:?}: name={:?} inner={:?}", ty.name, ty.inner);
+                }
+                let _ = std::fs::write(d.join(format!("{stem}.types.txt")), t);
+            }
+            let info = match wgsl::validate(&module) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W4 {what}: {e}");
+                    ok = false;
+                    continue;
+                }
+            };
+            let text = match wgsl::emit_wgsl(&module, &info) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W4 {what}: {e}");
+                    ok = false;
+                    continue;
+                }
+            };
+            if let Some(d) = dump.as_ref() {
+                let _ = std::fs::write(d.join(format!("{stem}.wgsl")), &text);
+            }
+            match wgsl::parse_wgsl(&text).and_then(|re| wgsl::validate(&re).map(|_| ())) {
+                Ok(()) => tripped += 1,
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W4 {what}: round-trip {e}");
+                    ok = false;
+                }
+            }
+        }
+        println!(
+            "check-wgsl: W3 {parsed}/{} parsed | W4 {tripped}/{} validated + WGSL round-trip",
+            modules.len(),
+            modules.len()
+        );
+        println!("CHECK-WGSL {}", if ok { "PASSED" } else { "FAILED" });
+        i32::from(!ok)
+    }
 }
 
 /// `--check-msl`: the Metal shader toolchain — the corpus's THIRD code

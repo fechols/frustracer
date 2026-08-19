@@ -847,6 +847,15 @@ pub struct Cli {
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
+    /// `--check-wgsl`: the browser corpus's gate (the WASM/WebGPU port) —
+    /// assemble the WEB unit subset under `web_defs()`, compile to SPIR-V
+    /// (the `--check-spirv` step, same DXC drop), then take it the one
+    /// generator further the browser needs: naga spv-in -> validate at the
+    /// WebGPU-core capability floor -> WGSL text -> re-parse the emitted
+    /// text. Stages W0.. ; W0 is pure (no DXC, any OS). The web corpus is
+    /// the `--sw-rays` corpus BY DEFINITION (WebGPU has no ray query), so
+    /// the gate arms that lever itself.
+    pub check_wgsl: bool,
     /// `--check-msl`: take that same corpus one generator further — SPIR-V ->
     /// MSL (spirv-cross) -> AIR -> `.metallib` (`xcrun metal`). The first rung
     /// of a Metal tracer, and macOS-only because the Apple tools are.
@@ -1168,6 +1177,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_fsr3 = false;
     let mut check_metalfx = false;
     let mut check_spirv = false;
+    let mut check_wgsl = false;
     let mut check_msl = false;
     let mut check_mtl = false;
     let mut check_vk = false;
@@ -1238,6 +1248,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--check-fsr3" => check_fsr3 = true,
             "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
+            "--check-wgsl" => check_wgsl = true,
             "--check-msl" => check_msl = true,
             "--check-mtl" => check_mtl = true,
             "--check-vk" => check_vk = true,
@@ -2613,6 +2624,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_wgsl,
         check_msl,
         check_mtl,
         check_vk,
@@ -2812,6 +2824,10 @@ pub fn usage() {
                 eprintln!("  --check-spirv headless (unix): assemble the shipping kernel corpus and compile every");
                 eprintln!("                unit to SPIR-V for the Vulkan backend, then spirv-val each module —");
                 eprintln!("                needs SDKs/dxc-linux (install-prerequisites.sh dxc); no GPU");
+                eprintln!("  --check-wgsl  headless: the BROWSER corpus (the web unit subset, --sw-rays + no wave");
+                eprintln!("                ops by construction) through the browser's whole generator chain —");
+                eprintln!("                SPIR-V (DXC) -> naga validate at the WebGPU-core floor -> WGSL text ->");
+                eprintln!("                re-parse. W0 is pure and runs anywhere; W1+ need a DXC drop; no GPU");
                 eprintln!("  --check-msl   headless (macOS): the same corpus one generator further — SPIR-V ->");
                 eprintln!("                MSL (spirv-cross) -> .metallib (xcrun metal). The first rung of a Metal");
                 eprintln!("                tracer: it compiles and nothing else, so what refuses IS the product.");

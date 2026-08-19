@@ -47,8 +47,10 @@ cbuffer FrdCb : register(b0) {
     float max_accum;
     float fast_frames;
     float clamp_sigma;
-    float cam_step;
+    // float3 leads the row (WGSL uniform 16-alignment — the browser
+    // lockstep; frd_temporal.hlsl carries the full note).
     float3 cam_fwd;
+    float cam_step;
     float proj;       // world→pixel: r_px = (r_world / z) · proj
     float r_max;      // --frd-blur-radius (default frd.rs R_MAX)
     float pass_scale; // 1.0 (blur) | 1.7 (post)

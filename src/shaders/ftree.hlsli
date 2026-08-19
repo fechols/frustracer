@@ -40,8 +40,20 @@
 // slots; `occ` bit s = slot occupied (the CPU-side bnode array is not
 // uploaded — GPU cuts never seed rays).
 struct FtNode {
-    float3 org;
-    float3 sca;
+    // org/sca ride as SIX scalars, not two float3s (the browser lockstep,
+    // 2026-08-18): tightly-packed float3 pairs are legal StructuredBuffer
+    // layout, but a vec3 at offset 12 is illegal WGSL STORAGE layout
+    // (vec3 aligns to 16 there — cs_level/cs_level_wide, measured). Six
+    // floats occupy bytes 0-23 identically, so the 112-B QFNode wire and
+    // ftree.rs's upload are UNTOUCHED — the Stage-0b flat-indirect-args
+    // treatment. ft_slot_box reassembles the vectors; nothing else reads
+    // these fields.
+    float org_x;
+    float org_y;
+    float org_z;
+    float sca_x;
+    float sca_y;
+    float sca_z;
     uint2 qmnx;
     uint2 qmny;
     uint2 qmnz;
@@ -66,10 +78,12 @@ uint ft_q8(uint2 row, uint s) {
 // false-sky class); the CPU side is a bare mul-then-add, so bit-parity
 // requires the same here.
 void ft_slot_box(FtNode nd, uint s, out float3 mn, out float3 mx) {
+    float3 org = float3(nd.org_x, nd.org_y, nd.org_z);
+    float3 sca = float3(nd.sca_x, nd.sca_y, nd.sca_z);
     float3 qn = float3(ft_q8(nd.qmnx, s), ft_q8(nd.qmny, s), ft_q8(nd.qmnz, s));
     float3 qx = float3(ft_q8(nd.qmxx, s), ft_q8(nd.qmxy, s), ft_q8(nd.qmxz, s));
-    precise float3 lo = nd.org + qn * nd.sca;
-    precise float3 hi = nd.org + qx * nd.sca;
+    precise float3 lo = org + qn * sca;
+    precise float3 hi = org + qx * sca;
     mn = lo;
     mx = hi;
 }

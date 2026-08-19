@@ -77,6 +77,18 @@ tracy-client = { version = "0.17.6", optional = true, default-features = false, 
 # LoadLibraryExW itself, so the DLL-free bar for every OTHER --check* is
 # untouched — the library only loads when a gate asks this module to compile.
 libloading = "0.8"
+# The corpus's FOURTH code generator: SPIR-V -> WGSL for the browser port
+# (src/wgsl.rs, gated by --check-wgsl). Pure Rust, no DLL, no loader — the
+# --check* DLL-free bar is untouched. A BASE dependency, not a cargo feature,
+# per the recorded rule that a gate's availability must not depend on build
+# flags (the MetalFX note below); it also compiles on wasm32, where the
+# browser session translates `--bake-web`'s shipped SPIR-V with this same
+# naga at page load — one translator, lockfile-pinned, both sides. VERSION
+# LOCKSTEP: when the WebGPU backend lands (wgpu, Stage C of the browser
+# plan), wgpu's own naga must resolve to THIS major, or the gate validates
+# with a different translator than the page runs.
+naga = { version = "30.0.0", features = ["spv-in", "wgsl-in", "wgsl-out"] }
+
 [features]
 tracy = ["dep:tracy-client"]
 
