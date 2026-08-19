@@ -1388,8 +1388,23 @@ fn main() {
         // `gpu/dxc.rs` on Windows is the point — a front-end divergence between
         // the tree's two code generators becomes a same-box comparison instead
         // of a cross-CI one.
-        let code = run_check_spirv(&scene);
-        std::process::exit(code);
+        #[cfg(any(unix, windows))]
+        {
+            let code = run_check_spirv(&scene);
+            std::process::exit(code);
+        }
+        // The failure-by-name the gate's cfg comment promises: wasm has no
+        // dynamic loader to hand DXC through, so the SPIR-V arm is native-only
+        // and says so. Exit 2 — an environment fact, not a corpus verdict
+        // (the browser corpus's own gate is `--check-wgsl`).
+        #[cfg(not(any(unix, windows)))]
+        {
+            eprintln!(
+                "check-spirv: this target cannot load DXC (no dynamic loader) — the corpus's \
+                 SPIR-V arm is native-only; the browser corpus is --check-wgsl's subject"
+            );
+            std::process::exit(2);
+        }
     }
     if check_msl {
         #[cfg(target_os = "macos")]
@@ -26371,6 +26386,11 @@ fn run_cinematic(
         #[cfg(all(unix, not(target_os = "macos")))]
         cinematic::ArmPick::Gpu => "vk",
         #[cfg(target_os = "macos")]
+        cinematic::ArmPick::Gpu => "cpu",
+        // wasm32: the macOS substitution, for the same reason — no GPU
+        // cinematic arm exists here (the browser session is not --cinematic;
+        // its WebGPU tracer presents to a canvas, not a capture pipeline).
+        #[cfg(target_arch = "wasm32")]
         cinematic::ArmPick::Gpu => "cpu",
     };
     // Beside the label rather than at the dispatch, so `--cinematic-dry-run`

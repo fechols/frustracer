@@ -749,21 +749,41 @@ fn remap_ffx_samplers(msl: &std::path::Path) -> Result<(), String> {
 }
 
 fn main() {
-    require_nrd();
     // Declared on every platform, not just where it can be set: Windows never
-    // builds this (it upscales through ffx-api v2.3.0), and an undeclared cfg
-    // is a warning wherever the attribute is written.
+    // builds ffx_fsr3_src (it upscales through ffx-api v2.3.0), and an
+    // undeclared cfg is a warning wherever the attribute is written. Hoisted
+    // ABOVE the wasm early-out and require_nrd for the same reason — a target
+    // that skips the whole build script body still compiles the source that
+    // writes these attributes. (dlss_ngx was declared once per host arm below;
+    // it lives here now so the wasm arm declares it too.)
     println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_src)");
     // The Metal arm of the same feature: set when at least one SPIR-V
     // permutation reached `.metallib`. (The ObjC++ `ffx_metal` backend joins
     // this condition when it exists; today the cfg gates only the transpiled
-    // shader table.) Declared everywhere for the same reason as the line above.
+    // shader table.)
     println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_metal)");
     // The Vulkan arm of the same feature: set when `ffx_vk.cpp` and
     // shim/ffx_fsr3_vk.cpp actually compiled, which needs the distro's
     // vulkan-headers and is Linux-only. Distinct from `ffx_fsr3_src` because
     // the neutral units build on macOS too — see the note at the cfg's site.
     println!("cargo:rustc-check-cfg=cfg(ffx_fsr3_vk)");
+    println!("cargo:rustc-check-cfg=cfg(dlss_ngx)");
+    // wasm32 (the browser port): nothing below applies — no C++ shims can be
+    // compiled for or linked into a wasm module, no DLL/so is ever loaded
+    // (NRD and every other SDK are native-only by construction), and the
+    // link-lib directives would name libraries that do not exist there. This
+    // is keyed on CARGO_CFG_TARGET_ARCH (the TARGET), not cfg!/#[cfg] (the
+    // HOST) — the trap build_ffx_fsr3's header documents. It must run before
+    // require_nrd(): that gate's submodule-presence panic is deliberately
+    // target-independent for native builds, and a wasm build from a bare
+    // checkout has to succeed (CI's check-wasm job runs without submodules).
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        // Pin the rerun set: with no rerun-if lines at all, cargo re-runs the
+        // script on ANY package file change.
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
+    require_nrd();
     #[cfg(windows)]
     {
         // FidelityFX FFI shim: the ffx-api structs (pNext chains,
@@ -793,7 +813,7 @@ fn main() {
         // driver's _nvngx.dll — no CRT conflict; the static _s variants are
         // /MT) and stages nvngx_dlssg.dll + nvngx_dlssd.dll next to the
         // binary (NGX resolves feature snippets from the exe directory).
-        println!("cargo:rustc-check-cfg=cfg(dlss_ngx)");
+        // (check-cfg for dlss_ngx is declared at the top of main.)
         println!("cargo:rerun-if-changed=shim/ngx_shared.cpp");
         println!("cargo:rerun-if-changed=shim/ngx_shared.h");
         println!("cargo:rerun-if-changed=shim/dlssg_shim.cpp");
@@ -871,7 +891,6 @@ fn main() {
     }
     #[cfg(not(windows))]
     {
-        println!("cargo:rustc-check-cfg=cfg(dlss_ngx)");
         build_ffx_fsr3();
 
         // `intel_tex_2` (the ispc BC7 encoder — the `--bc7-cpu` A/B arm) ships

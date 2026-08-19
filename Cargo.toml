@@ -23,6 +23,9 @@ rayon = "1.10"
 tobj = "4"
 # Benchmark scene OBJs are committed to git LFS as zstd-compressed text
 # (.obj.zst — OBJ is ASCII, ~5x); the loader decodes them transparently.
+# wasm32 note (the browser port): zstd-sys has a real wasm arm (its wasm-shim
+# stubs the libc surface), but building it needs a clang that can emit wasm32
+# objects on PATH (ubuntu runners have one; a Windows box needs LLVM installed).
 zstd = "0.13"
 image = "0.25"
 # glTF 2.0 loader (src/gltf_loader.rs). `import` resolves buffers (GLB bin
@@ -58,12 +61,6 @@ rustfft = "6"
 # f16 bit-pattern storage for the CPU G-buffer planes (dlss.rs ld16/st16) —
 # a base dependency, not windows-only: headless --check reads them too.
 half = "2"
-# BC7 block compression of OPAQUE scene textures at load (src/bc7.rs, --bc7).
-# Intel's ISPC texture compressor: an ordinary static crate dep — it ships
-# prebuilt ISPC binaries, so no ISPC toolchain and no runtime DLL, which is
-# what keeps every --check* DLL-free (unlike the SDKs/ LoadLibrary policy).
-# A base dependency, not windows-only: bc7::self_test runs under --check.
-intel_tex_2 = "0.5"
 # CPU profiler (Tracy). Off by default — without `--features tracy` this dep
 # is not even compiled and every prof:: hook is an inert no-op. The crate
 # version pairs 1:1 with a Tracy server (GUI) protocol version — see the
@@ -80,9 +77,30 @@ tracy-client = { version = "0.17.6", optional = true, default-features = false, 
 # LoadLibraryExW itself, so the DLL-free bar for every OTHER --check* is
 # untouched — the library only loads when a gate asks this module to compile.
 libloading = "0.8"
-
 [features]
 tracy = ["dep:tracy-client"]
+
+# The browser port (wasm32). `getrandom` is not used directly — it is
+# tobj → ahash's entropy source, and on wasm32-unknown-unknown it must be
+# TOLD to use the JS backend: this feature plus the `getrandom_backend`
+# --cfg in .cargo/config.toml (both halves required; either alone is a
+# compile error, which is getrandom's own anti-drift design).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# BC7 block compression of OPAQUE scene textures at load (src/bc7.rs, --bc7).
+# Intel's ISPC texture compressor: an ordinary static crate dep — it ships
+# prebuilt ISPC binaries, so no ISPC toolchain and no runtime DLL, which is
+# what keeps every --check* DLL-free (unlike the SDKs/ LoadLibrary policy).
+# Every NATIVE target, not windows-only: bc7::self_test's encode arm runs
+# under --check on all three OSes. Not a base dep since the browser port
+# (2026-08-18): the crate's build script panics outright on target_family
+# "wasm" and its payload is prebuilt x86/ARM ISPC objects no wasm link could
+# eat — web textures arrive pre-encoded from `--bake-web`, so the browser
+# never encodes. src/bc7.rs keeps the vocabulary (Bc7Mode/should_compress)
+# compiled everywhere and cfg's only the encoder internals off wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+intel_tex_2 = "0.5"
 
 # The interactive presentation stack (SDL3 window + D3D12 + Streamline) is
 # Windows-only; headless --check/--check-dlss build everywhere without it.

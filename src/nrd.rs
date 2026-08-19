@@ -748,6 +748,12 @@ impl Default for SigmaSettings {
 }
 
 // The measured MSVC-x64 ground truth (sizer against the pinned headers).
+// Pointer-width-gated because that is what the values ARE: `LibraryDesc`
+// and friends carry pointers, so every size/offset below is a 64-bit fact.
+// The only non-64-bit target this tree compiles for is wasm32 (the browser
+// port), where no NRD library can ever be loaded — the transcription still
+// compiles there, only the x64 ground truth stands down.
+#[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(std::mem::size_of::<AllocationCallbacks>() == 32);
     assert!(std::mem::size_of::<SpirvBindingOffsets>() == 16);
@@ -880,6 +886,29 @@ mod loader {
         pub(super) fn sym(lib: &Lib, name: &[u8]) -> Option<*mut std::ffi::c_void> {
             unsafe { GetProcAddress(*lib, PCSTR(name.as_ptr())) }
                 .map(|f| f as usize as *mut std::ffi::c_void)
+        }
+    }
+
+    // wasm32 (the browser port): there is no dynamic loading of any kind, so
+    // `open` IS the error message. This stub exists so `mod loader` and the
+    // `Nrd` machinery keep compiling with zero cascade — nothing on wasm ever
+    // calls them (`--nrd` sessions are native), and if something did, the
+    // failure names the platform instead of dying at link time.
+    #[cfg(target_arch = "wasm32")]
+    mod imp {
+        use std::path::Path;
+
+        pub(super) type Lib = ();
+
+        pub(super) fn open(path: &Path) -> Result<Lib, String> {
+            Err(format!(
+                "{}: wasm32 cannot load dynamic libraries (NRD is native-only)",
+                path.display()
+            ))
+        }
+
+        pub(super) fn sym(_lib: &Lib, _name: &[u8]) -> Option<*mut std::ffi::c_void> {
+            None
         }
     }
 

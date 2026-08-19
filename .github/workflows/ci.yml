@@ -378,6 +378,51 @@ jobs:
             check_gi.png
           if-no-files-found: warn
 
+  # THE WASM JOB — the browser port's compile guard (Stage A/B of the
+  # WASM+WebGPU plan). It proves two things and deliberately no more:
+  #
+  #   1. The whole crate + dependency graph TYPE-CHECKS for
+  #      wasm32-unknown-unknown. Everything platform-bound is either behind a
+  #      target cfg (gpu/vk/mtl/hud/input/oidn/pad, reflect/spirv) or compiles
+  #      to a std stub that fails loudly at runtime — the same guard shape
+  #      check-linux carries for `mod vk`: without this job, every wasm cfg in
+  #      the tree is outside CI's reach while being the port under active
+  #      development.
+  #   2. A BARE CHECKOUT SUFFICES — no submodules, no NRD, no SDKs. That is
+  #      build.rs's wasm early-out working as designed (it returns before
+  #      require_nrd's submodule panic), and this job checking out WITHOUT
+  #      submodules is the tooth that keeps it true: reordering the early-out
+  #      below require_nrd() fails here on every push.
+  #
+  # NO RUSTFLAGS ENV, unlike the x64 jobs, and it is load-bearing twice over:
+  # an env RUSTFLAGS replaces .cargo/config.toml's [target] tables wholesale,
+  # which would strip the `getrandom_backend="wasm_js"` --cfg the wasm build
+  # needs (tobj → ahash → getrandom refuses to guess an entropy source on
+  # wasm). And the proc-macro cache-poisoning fix the other jobs' RUSTFLAGS
+  # exists for does not apply here: with `--target` passed, host artifacts
+  # (proc macros, build scripts) receive no rustflags at all, so nothing
+  # ISA-specific lands in this job's cache.
+  #
+  # `clang` on the runner image carries the wasm32 backend, which is what
+  # zstd-sys's wasm-shim arm compiles with. cargo CHECK, not build: the wasm
+  # binary artifact is Stage D's subject (wasm-bindgen and a web shell); what
+  # this job guards is the cfg map.
+  check-wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Deliberately NO `submodules: true` — see point 2 above. lfs stays off
+      # like every other job.
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check (wasm32)
+        run: cargo check --target wasm32-unknown-unknown --profile quick
+
   # THE VULKAN JOB — the backend's own gates, which until now ran on exactly one
   # developer's box. check-linux proves the tree BUILDS with `mod vk` compiled;
   # this proves the backend WORKS: --check-spirv (the corpus through DXC and
