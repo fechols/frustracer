@@ -441,7 +441,11 @@ pub fn path() -> PathBuf {
 /// `self_test` can pin it.
 pub fn headless_args<I: IntoIterator<Item = S>, S: AsRef<str>>(args: I) -> bool {
     args.into_iter().any(|a| {
-        let a = a.as_ref();
+        // One fold covers every clause — the CLI parser is case-insensitive,
+        // and this scanner runs BEFORE it, so it must fold in lockstep or
+        // `--Check` would parse fine yet still load the settings file.
+        let a = a.as_ref().to_ascii_lowercase();
+        let a = a.as_str();
         a == "--no-settings"
             || a.starts_with("--check")
             || a.ends_with("-dump")
@@ -542,6 +546,9 @@ pub fn parse_chain(s: &str) -> Option<ChainChoice> {
     }
 }
 
+/// Deliberately exact-match (unlike the CLI, which folds case): the settings
+/// file is machine-written lowercase, and a hand-edit that gets the case wrong
+/// hits the same warn-ignore path as any other typo.
 pub fn parse_prefer(s: &str) -> Option<crate::gfx::vocab::Prefer> {
     use crate::gfx::vocab::Prefer;
     match s {
@@ -2468,6 +2475,12 @@ pub fn self_test() -> Result<(), String> {
         vec!["--frd-lab", "strafe"],
         vec!["--frd-lab-speed", "8"],
         vec!["--no-settings"],
+        // Mixed-case spellings — the scanner folds in lockstep with
+        // cli::parse_from (one exact-match, one prefix, one suffix clause).
+        vec!["--Check"],
+        vec!["--No-Settings"],
+        vec!["--DLSS-Dump"],
+        vec!["--Cinematic-Samples", "64"],
     ] {
         if !headless_args(probe.iter().copied()) {
             return Err(format!("headless_args missed {probe:?}"));
@@ -2518,7 +2531,7 @@ pub fn self_test() -> Result<(), String> {
     if parse_waveviz("2").is_some() {
         return Err("waveviz vocab accepted a bare number (the file speaks off/on/chs)".into());
     }
-    for c in ["grid", "som"] {
+    for c in ["grid", "som", "SOM", "Grid"] {
         crate::emissive::parse_cluster(c).ok_or_else(|| format!("el_cluster vocab '{c}' rejected"))?;
     }
     if crate::emissive::parse_cluster("bogus").is_some() {

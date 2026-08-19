@@ -25,6 +25,20 @@
 //! `main` prints them, so parsing inside a gate stays quiet. Hard errors still
 //! `exit(2)` where they happen — the gates only ever feed this valid input, and
 //! an invalid command line has nowhere useful to return to.
+//!
+//! # Case
+//!
+//! Flag names are ASCII-case-insensitive: `parse_from` folds each token before
+//! the match (`--Prefer-Intel` works), keeping the original for diagnostics and
+//! the positional scene path. Keyword VALUES fold at the one site that
+//! interprets them — inline in the arm for cli-only vocabularies, inside the
+//! shared validator (`autoexp::Mode::parse`, `xess::lock_scale`,
+//! `bc7::Quality::parse`, `emissive::parse_cluster`, `bvh::set_builder`,
+//! main's `--spin` match, `cinematic::canonical_preset`) for the rest. Paths,
+//! the `--cinematic` shot-list fallback, and `settings:<Group>` names stay
+//! verbatim. The two raw-argv scanners that run BEFORE this parser
+//! (`crash::disabled_by_args`, `settings::headless_args`) fold in lockstep,
+//! and `self_test` section 8 pins all of it.
 
 use crate::camera::Camera;
 use crate::{
@@ -448,9 +462,11 @@ pub struct Opts {
     /// Purely display-stage (a HUD string), so no gate, golden or benchmark
     /// can move; the pose it prints is the same `Camera` the tracer used.
     pub cam_readout: bool,
-    /// `--no-rr-emis-demod` clears (`gfx::frame::set_rr_emis_demod`); the
-    /// default is ON. Kills the DLSS-RR emissive demodulation and restores the
-    /// pre-fix feed, which is the A/B arm the artifact was measured with — see
+    /// `--rr-emis-demod` arms (`gfx::frame::set_rr_emis_demod`); the default
+    /// is OFF (2026-08-18: emission rides DLSS-RR's temporal integration like
+    /// every other term — a post-RR re-add shimmers structurally, and the
+    /// near-emitter whole-frame lift is the default's known-accept). The
+    /// armed arm is the A/B lever that MEASURED that lift — see
     /// `gfx::frame::FLAG_EMIS_DEMOD`. Bit-identical when off (the CB bit
     /// clears and both shader halves branch around themselves), and inert on
     /// every arm that is not DLSS-RR.
@@ -831,6 +847,15 @@ pub struct Cli {
     /// `--check-spirv`: assemble the shipping corpus and compile every unit to
     /// SPIR-V. unix-only today, like the backend it gates.
     pub check_spirv: bool,
+    /// `--check-wgsl`: the browser corpus's gate (the WASM/WebGPU port) —
+    /// assemble the WEB unit subset under `web_defs()`, compile to SPIR-V
+    /// (the `--check-spirv` step, same DXC drop), then take it the one
+    /// generator further the browser needs: naga spv-in -> validate at the
+    /// WebGPU-core capability floor -> WGSL text -> re-parse the emitted
+    /// text. Stages W0.. ; W0 is pure (no DXC, any OS). The web corpus is
+    /// the `--sw-rays` corpus BY DEFINITION (WebGPU has no ray query), so
+    /// the gate arms that lever itself.
+    pub check_wgsl: bool,
     /// `--check-msl`: take that same corpus one generator further — SPIR-V ->
     /// MSL (spirv-cross) -> AIR -> `.metallib` (`xcrun metal`). The first rung
     /// of a Metal tracer, and macOS-only because the Apple tools are.
@@ -1045,7 +1070,7 @@ pub fn defaults() -> Opts {
         }),
         gpu_timing: false,
         cam_readout: false,
-        rr_emis_demod: true,
+        rr_emis_demod: false,
         vsync: true,
         // The 10-bit swapchain is the default: see Opts::hdr (the probe picks
         // PQ vs gamma). The 8-bit path survives as --no-hdr and as the FG
@@ -1152,6 +1177,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_fsr3 = false;
     let mut check_metalfx = false;
     let mut check_spirv = false;
+    let mut check_wgsl = false;
     let mut check_msl = false;
     let mut check_mtl = false;
     let mut check_vk = false;
@@ -1183,7 +1209,13 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     // --cinematic [preset]) without swallowing the next flag.
     let mut args = args.peekable();
     while let Some(a) = args.next() {
-        match a.as_str() {
+        // Flag matching is ASCII-case-insensitive (--Prefer-Intel works); `a`
+        // stays untouched for diagnostics and the positional scene path. Arms
+        // that re-dispatch on the flag inside the arm must compare `key`, not
+        // `a` — comparing `a` there silently routes mixed-case input to the
+        // arm's catch-all field.
+        let key = a.to_ascii_lowercase();
+        match key.as_str() {
 
             "--check" => check = true,
             "--check-dlss" => check_dlss = true,
@@ -1216,6 +1248,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--check-fsr3" => check_fsr3 = true,
             "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
+            "--check-wgsl" => check_wgsl = true,
             "--check-msl" => check_msl = true,
             "--check-mtl" => check_mtl = true,
             "--check-vk" => check_vk = true,
@@ -1242,7 +1275,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     eprintln!("{a} needs a non-negative integer argument");
                     std::process::exit(2);
                 });
-                if a == "--nrd-max-stabilized-frames" {
+                if key == "--nrd-max-stabilized-frames" {
                     opts.nrd_tune.max_stabilized_frames = Some(v);
                 } else {
                     opts.nrd_tune.max_accum_frames = Some(v);
@@ -1305,7 +1338,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     eprintln!("{a} needs a non-negative integer argument");
                     std::process::exit(2);
                 });
-                match a.as_str() {
+                match key.as_str() {
                     "--frd-max-accum-frames" => {
                         // The meta plane stores n/63 (frd::META_N_MAX), so a
                         // larger cap truncates at the wire regardless of the
@@ -1345,7 +1378,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         eprintln!("{a} needs a non-negative float argument");
                         std::process::exit(2);
                     });
-                if a == "--frd-blur-radius" {
+                if key == "--frd-blur-radius" {
                     opts.frd_tune.blur_radius = Some(v);
                 } else {
                     opts.frd_tune.clamp_sigma = Some(v);
@@ -1369,7 +1402,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 })
             }
             "--nppd-device" => {
-                opts.nppd_device = match args.next().as_deref() {
+                // Folding the whole token is safe: the vocabulary and the
+                // dml: prefix are ASCII, the suffix is digits.
+                opts.nppd_device = match args.next().map(|s| s.to_ascii_lowercase()).as_deref() {
                     Some("auto") => None,
                     Some("cpu") => Some(-1),
                     Some(s) if s == "dml" => Some(0),
@@ -1680,7 +1715,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--no-bloom" => opts.bloom = false,
             "--bloom-kernel" => {
                 let v = args.next().unwrap_or_default();
-                opts.bloom_kernel = match v.as_str() {
+                opts.bloom_kernel = match v.to_ascii_lowercase().as_str() {
                     "box" => bloom::DownKernel::Box,
                     "wide" => bloom::DownKernel::Wide13,
                     _ => {
@@ -1885,7 +1920,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 // closest-hit variant. Consumed only on an exact match, so a
                 // following scene path is safe (the --blas-split idiom).
                 // Mirrored in settings.rs (advanced.waveviz — off/on/chs).
-                opts.waveviz = if args.peek().is_some_and(|v| v == "chs") {
+                opts.waveviz = if args.peek().is_some_and(|v| v.eq_ignore_ascii_case("chs")) {
                     args.next();
                     2
                 } else {
@@ -1976,7 +2011,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 if opts.dual_gpu.is_none() {
                     opts.dual_gpu = Some(2);
                 }
-                opts.dual_gpu_arm = Some(match v.as_str() {
+                opts.dual_gpu_arm = Some(match v.to_ascii_lowercase().as_str() {
                     "wave" | "wavefront" | "gpu" => crate::gfx::vocab::Arm::Wave,
                     "dxr" => crate::gfx::vocab::Arm::Dxr,
                     _ => {
@@ -2089,10 +2124,11 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     |v: &str| v.contains('.') || v.contains('/') || v.contains('\\');
                 let sel = match args.peek().map(String::as_str) {
                     Some(v) if !v.starts_with("--") && !looks_path(v) => {
-                        let v = args.next().unwrap();
+                        let raw = args.next().unwrap();
+                        let v = raw.to_ascii_lowercase();
                         if !matches!(v.as_str(), "strafe" | "dolly" | "orbit" | "tod") {
                             eprintln!(
-                                "--frd-lab kind must be strafe | dolly | orbit | tod (got '{v}')"
+                                "--frd-lab kind must be strafe | dolly | orbit | tod (got '{raw}')"
                             );
                             std::process::exit(2);
                         }
@@ -2111,9 +2147,10 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     |v: &str| v.contains('.') || v.contains('/') || v.contains('\\');
                 let sel = match args.peek().map(String::as_str) {
                     Some(v) if !v.starts_with("--") && !looks_path(v) => {
-                        let v = args.next().unwrap();
+                        let raw = args.next().unwrap();
+                        let v = raw.to_ascii_lowercase();
                         if !matches!(v.as_str(), "wobble") {
-                            eprintln!("--bloom-lab kind must be wobble (got '{v}')");
+                            eprintln!("--bloom-lab kind must be wobble (got '{raw}')");
                             std::process::exit(2);
                         }
                         Some(v)
@@ -2241,12 +2278,16 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // off | hud | menu | settings:<Group>
             "--cinematic-hud" => {
                 let spec = args.next().unwrap_or_else(|| "hud".to_string());
-                cine.hud = match spec.as_str() {
+                // Keywords fold; the <Group> tail is sliced from the ORIGINAL
+                // spec (settings::GROUPS names are capitalized). The ASCII
+                // fold is length-preserving, so the byte offsets line up.
+                let sl = spec.to_ascii_lowercase();
+                cine.hud = match sl.as_str() {
                     "off" => None,
                     "hud" => Some(None),
                     "menu" => Some(Some(String::new())),
                     s if s.starts_with("settings:") => {
-                        Some(Some(s["settings:".len()..].to_string()))
+                        Some(Some(spec["settings:".len()..].to_string()))
                     }
                     "settings" => Some(Some(settings::GROUPS[0].to_string())),
                     other => {
@@ -2352,7 +2393,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--oidn-device" => {
                 // Names map to oidn.h OIDNDeviceType values.
-                opts.oidn_device = match args.next().as_deref() {
+                opts.oidn_device = match args.next().map(|s| s.to_ascii_lowercase()).as_deref() {
                     Some("default") => 0,
                     Some("cpu") => 1,
                     Some("sycl") => 2,
@@ -2365,7 +2406,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 }
             }
             "--oidn-quality" => {
-                opts.oidn_quality = match args.next().as_deref() {
+                opts.oidn_quality = match args.next().map(|s| s.to_ascii_lowercase()).as_deref() {
                     Some("fast") => OIDN_QUALITY_FAST,
                     Some("balanced") => OIDN_QUALITY_BALANCED,
                     Some("high") => OIDN_QUALITY_HIGH,
@@ -2378,7 +2419,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--lock-res" => {
                 // One flag, one scale, every arm — the per-mode defaults
                 // (CPU quality, GPU native) are gone.
-                opts.lock_scale = match args.next().as_deref() {
+                // "dynamic" is the one word xess::lock_scale does not own, so
+                // it folds here; the rest fold inside the shared validator.
+                opts.lock_scale = match args.next().map(|s| s.to_ascii_lowercase()).as_deref() {
                     Some("dynamic") => None,
                     Some(s) => match xess::lock_scale(s) {
                         Some(r) => Some(r),
@@ -2411,7 +2454,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         std::process::exit(2);
                     });
                 let t = &mut opts.fsr_tune;
-                match a.as_str() {
+                match key.as_str() {
                     "--fsr-max-radiance" => t.max_radiance = Some(v),
                     "--fsr-stability-bias" => t.stability_bias = Some(v),
                     "--fsr-radiance-clip-k" => t.radiance_clip_k = Some(v),
@@ -2516,7 +2559,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--tile" => {
                 let spec = args.next().unwrap_or_default();
-                let (x, z) = match spec.split_once('x') {
+                let (x, z) = match spec.split_once(['x', 'X']) {
                     Some((a, b)) => (a.trim().parse().ok(), b.trim().parse().ok()),
                     None => {
                         let n: Option<u32> = spec.trim().parse().ok();
@@ -2557,7 +2600,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // panic there ("failed to load OBJ '--preferIntel'"), which reads
             // as a renderer crash rather than a typo. Scene paths never start
             // with `--`, so this arm costs nothing legitimate.
-            a if a.starts_with("--") => {
+            k if k.starts_with("--") => {
                 eprintln!("unknown flag '{a}' — run --help for the flag list");
                 std::process::exit(2);
             }
@@ -2581,6 +2624,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_fsr3,
         check_metalfx,
         check_spirv,
+        check_wgsl,
         check_msl,
         check_mtl,
         check_vk,
@@ -2614,6 +2658,8 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
 /// The `--help` text, printed by `main` when `Cli::helped` is set.
 pub fn usage() {
                 eprintln!("usage: frustracer [model.obj|.gltf|.glb] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
+                eprintln!("  flag names and keyword values are case-insensitive; paths, scene files and");
+                eprintln!("  settings-group names are taken verbatim");
                 eprintln!("  --world       boot the curated multi-scene world (the flagless interactive default;");
                 eprintln!("                exclusive with a scene arg, --stress, --tile, --spin, and --check*)");
                 eprintln!("  --no-world    flagless boot uses the procedural default scene instead");
@@ -2647,8 +2693,9 @@ pub fn usage() {
                 eprintln!("                against the closed form 2^(i+1)-1 px");
                 eprintln!("  --qa [port]   live AI QA control socket on 127.0.0.1 (default 4599):");
                 eprintln!("                line-in/JSON-line-out verbs driving the interactive session —");
-                eprintln!("                pos | tp | look | tod | drive | key | screenshot | sync | quit.");
-                eprintln!("                Drive it with the `frqa` client (or raw TCP)");
+                eprintln!("                pos | tp | look | tod | drive | key | screenshot | resize | sync | quit.");
+                eprintln!("                Drive it with the `frqa` client (or raw TCP); not every verb reaches");
+                eprintln!("                every backend, and a session names the rung that owns a missing one");
                 eprintln!("  --waveviz [chs]  wave-footprint overlay: every pixel wears its wave's hash");
                 eprintln!("                color (I toggles live in GPU arms, every upscaler included;");
                 eprintln!("                --spin runs dump waveviz-<arm>.png + compactness stats;");
@@ -2777,6 +2824,10 @@ pub fn usage() {
                 eprintln!("  --check-spirv headless (unix): assemble the shipping kernel corpus and compile every");
                 eprintln!("                unit to SPIR-V for the Vulkan backend, then spirv-val each module —");
                 eprintln!("                needs SDKs/dxc-linux (install-prerequisites.sh dxc); no GPU");
+                eprintln!("  --check-wgsl  headless: the BROWSER corpus (the web unit subset, --sw-rays + no wave");
+                eprintln!("                ops by construction) through the browser's whole generator chain —");
+                eprintln!("                SPIR-V (DXC) -> naga validate at the WebGPU-core floor -> WGSL text ->");
+                eprintln!("                re-parse. W0 is pure and runs anywhere; W1+ need a DXC drop; no GPU");
                 eprintln!("  --check-msl   headless (macOS): the same corpus one generator further — SPIR-V ->");
                 eprintln!("                MSL (spirv-cross) -> .metallib (xcrun metal). The first rung of a Metal");
                 eprintln!("                tracer: it compiles and nothing else, so what refuses IS the product.");
@@ -3091,9 +3142,11 @@ pub fn usage() {
                 eprintln!("                      wasn't already; an adapter without RT tier 1.0 still degrades to");
                 eprintln!("                      the wavefront, loudly)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + GPU-based validation");
-                eprintln!("  --no-rr-emis-demod  stop demodulating emissive out of the DLSS-RR");
-                eprintln!("                colour input (the pre-fix feed: an on-screen emitter then");
-                eprintln!("                lifts the WHOLE frame ~0.5 stops). The A/B arm, not a tuning knob");
+                eprintln!("  --rr-emis-demod  demodulate emissive out of the DLSS-RR colour input and");
+                eprintln!("                re-add it post-RR (default OFF: emission rides RR's temporal");
+                eprintln!("                integration; armed, emitters bypass it and shimmer, but an");
+                eprintln!("                on-screen emitter no longer lifts the WHOLE frame ~0.5 stops).");
+                eprintln!("                The A/B arm that measured that lift, not a tuning knob");
                 eprintln!("  --cam-readout  draw the live camera pose (position, quaternion, a paste-ready");
                 eprintln!("                --cam argument, TOD and aperture) into the HUD's bottom-left —");
                 eprintln!("                a screenshot then carries everything needed to reproduce the pose");
@@ -3430,6 +3483,9 @@ pub fn self_test() -> Result<(), String> {
         (vec!["--autoexp-mode", "tonemap"], crate::autoexp::Mode::Tonemap),
         (vec!["--autoexp-mode", "lights", "--autoexp-mode", "tonemap"], crate::autoexp::Mode::Tonemap),
         (vec!["--autoexp-mode", "tonemap", "--autoexp-mode", "lights"], crate::autoexp::Mode::Lights),
+        // Case-insensitive in both halves: the flag key folds in parse_from,
+        // the value folds in autoexp::Mode::parse.
+        (vec!["--Autoexp-Mode", "Lights"], crate::autoexp::Mode::Lights),
     ] {
         let got = parse_argv(&argv).opts.autoexp_mode;
         if got != want {
@@ -3936,6 +3992,91 @@ pub fn self_test() -> Result<(), String> {
     }
     if lever_snapshot() != before {
         return Err("the --fireflies note path touched a process global".into());
+    }
+
+    // ---- 8. case-insensitive keys and vocab values ------------------------
+    // parse_from folds every flag token; vocabulary values fold at the site
+    // that interprets them. Paths and free-form values stay verbatim. The
+    // whole section sits inside its own purity pair — folding allocates, it
+    // must not write.
+    let before = lever_snapshot();
+    // The motivating typo (the unknown-flag arm's comment cites it).
+    if parse_argv(&["--Prefer-Intel"]).opts.prefer != Some(Prefer::Intel) {
+        return Err("--Prefer-Intel must fold to --prefer-intel".into());
+    }
+    if parse_argv(&["--ANISO", "8"]).opts.aniso != 8 {
+        return Err("--ANISO must fold to --aniso".into());
+    }
+    // A value vocabulary with teeth: the default kernel is Wide13, so a
+    // failed fold could not pass by accident.
+    if parse_argv(&["--Bloom-Kernel", "Box"]).opts.bloom_kernel != bloom::DownKernel::Box {
+        return Err("--Bloom-Kernel Box must select the box kernel".into());
+    }
+    // The inner-redispatch arms, BOTH directions each: a fold applied to the
+    // outer match but not the inner comparison routes mixed-case input to the
+    // arm's catch-all field — the field must move, and its sibling must NOT.
+    let n = parse_argv(&["--NRD-Max-Stabilized-Frames", "4"]);
+    if n.opts.nrd_tune.max_stabilized_frames != Some(4)
+        || n.opts.nrd_tune.max_accum_frames.is_some()
+    {
+        return Err("--NRD-Max-Stabilized-Frames must set stabilized, not accum".into());
+    }
+    let n = parse_argv(&["--NRD-Max-Accum-Frames", "5"]);
+    if n.opts.nrd_tune.max_accum_frames != Some(5)
+        || n.opts.nrd_tune.max_stabilized_frames.is_some()
+    {
+        return Err("--NRD-Max-Accum-Frames must set accum, not stabilized".into());
+    }
+    let f = parse_argv(&["--FRD-Blur-Radius", "3"]);
+    if f.opts.frd_tune.blur_radius != Some(3.0) || f.opts.frd_tune.clamp_sigma.is_some() {
+        return Err("--FRD-Blur-Radius must set blur_radius, not clamp_sigma".into());
+    }
+    let f = parse_argv(&["--FRD-Clamp-Sigma", "2"]);
+    if f.opts.frd_tune.clamp_sigma != Some(2.0) || f.opts.frd_tune.blur_radius.is_some() {
+        return Err("--FRD-Clamp-Sigma must set clamp_sigma, not blur_radius".into());
+    }
+    // For the fsr sextet, pin a named arm against the `_` catch-all field —
+    // the catch-all is exactly where a missed inner fold would land.
+    let f = parse_argv(&["--FSR-Normal-Strength", "0.5"]);
+    if f.opts.fsr_tune.normal_strength != Some(0.5) || f.opts.fsr_tune.kernel_relaxation.is_some()
+    {
+        return Err("--FSR-Normal-Strength must set normal_strength, not the catch-all".into());
+    }
+    // Verbatim negatives: paths and free-form values keep the user's case.
+    if parse_argv(&["Model.OBJ"]).obj.as_deref() != Some("Model.OBJ") {
+        return Err("the positional scene path must keep its case".into());
+    }
+    if parse_argv(&["--NRD-Path", "C:/SDKs/NRD"]).opts.nrd_path != "C:/SDKs/NRD" {
+        return Err("--nrd-path's value must stay verbatim".into());
+    }
+    if parse_argv(&["--cinematic", "MyShots.json"]).cinematic.as_deref() != Some("MyShots.json") {
+        return Err("--cinematic's shot-list path must stay verbatim".into());
+    }
+    // --cinematic-hud: the keyword folds, the settings-group tail does not.
+    let h = parse_argv(&["--cinematic-hud", "SETTINGS:Display"]);
+    if h.cine.hud != Some(Some("Display".to_string())) {
+        return Err("--cinematic-hud SETTINGS:<Group> must fold the keyword only".into());
+    }
+    // Mixed-case spellings of the remaining shapes: the tile separator, the
+    // short help flag, an optional-value peek, a delegated validator each for
+    // xess::lock_scale and bc7::Quality::parse.
+    if parse_argv(&["--Tile", "4X2"]).tile != Some((4, 2)) {
+        return Err("--Tile 4X2 must parse as a 4x2 grid".into());
+    }
+    if !parse_argv(&["-H"]).helped {
+        return Err("-H must fold to -h".into());
+    }
+    if parse_argv(&["--WaveViz", "CHS"]).opts.waveviz != 2 {
+        return Err("--WaveViz CHS must take the closest-hit mode".into());
+    }
+    if parse_argv(&["--Lock-Res", "Native"]).opts.lock_scale != Some(1.0) {
+        return Err("--Lock-Res Native must fold to the native ratio".into());
+    }
+    if parse_argv(&["--BC7-Quality", "SLOW"]).opts.bc7.quality() != Some(bc7::Quality::Slow) {
+        return Err("--BC7-Quality SLOW must fold to the slow profile".into());
+    }
+    if lever_snapshot() != before {
+        return Err("the case-folding paths touched a process global".into());
     }
 
     Ok(())

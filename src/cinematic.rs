@@ -2034,6 +2034,14 @@ pub fn self_test() -> Result<(), String> {
     if is_preset("shots/mine.json") {
         return Err("a path must not resolve as a preset".into());
     }
+    // The lookup folds case and returns the CANONICAL spelling — the one
+    // resolve_shots matches — while a path stays a path under any casing.
+    if canonical_preset("HERO") != Some("hero") || !is_preset("Hero") {
+        return Err("a mixed-case preset name must fold to its canonical spelling".into());
+    }
+    if canonical_preset("hero.json").is_some() {
+        return Err("a path must not fold into a preset".into());
+    }
 
     // ffmpeg command construction: the pattern, the frame rate and the
     // loop flag are what make the encode reproducible from the manifest alone.
@@ -2208,5 +2216,14 @@ pub fn self_test() -> Result<(), String> {
 
 /// Is `arg` one of the built-in presets? Anything else is a shot-list path.
 pub fn is_preset(arg: &str) -> bool {
-    PRESETS.contains(&arg)
+    canonical_preset(arg).is_some()
+}
+
+/// Case-insensitive preset lookup returning the canonical (lowercase)
+/// spelling — `resolve_shots` matches that spelling exactly, so callers must
+/// pass the canonical name onward, never the user's. A non-preset arg (a
+/// shot-list path) returns None and stays verbatim; no path can collide with
+/// a preset under an ASCII fold because presets contain no `.` or `/`.
+pub fn canonical_preset(arg: &str) -> Option<&'static str> {
+    PRESETS.iter().find(|p| p.eq_ignore_ascii_case(arg)).copied()
 }

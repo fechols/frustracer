@@ -16,7 +16,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: frqa [-p port] <verb ...>\n  verbs: pos | tp x y z [yaw pitch] | look yaw \
          pitch | tod H | drive x y z ticks | drive stop | key <name> | screenshot <path.png> \
-         | sync N | quit   (see `frustracer --qa`)"
+         | resize W H | sync N | quit   (see `frustracer --qa`)\n  not every verb reaches \
+         every backend — the session answers with the rung that owns a missing one"
     );
     std::process::exit(2);
 }

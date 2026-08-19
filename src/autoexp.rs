@@ -301,9 +301,10 @@ pub enum Mode {
 
 impl Mode {
     /// The CLI/settings vocabulary — one parser, so `cli.rs` and a settings
-    /// file cannot disagree about what the words mean.
+    /// file cannot disagree about what the words mean. ASCII-case-insensitive;
+    /// the fold lives HERE, nowhere else.
     pub fn parse(s: &str) -> Option<Mode> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "tonemap" => Some(Mode::Tonemap),
             "lights" => Some(Mode::Lights),
             _ => None,

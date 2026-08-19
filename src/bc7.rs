@@ -61,6 +61,14 @@
 //! which only ever reads the untouched RGBA8 masks.
 
 use crate::texture::Texture;
+// The encoder itself is native-only (the browser port): intel_tex_2 ships
+// prebuilt x86/ARM ISPC objects and its build script panics on wasm targets.
+// Everything BELOW the encode functions — Bc7Mode, Quality, should_compress,
+// blocks/encoded_len — is vocabulary other modules embed (cli.rs carries a
+// Bc7Mode; gfx::scene documents the should_compress agreement) and stays
+// compiled on every target, wasm included. Web textures arrive pre-encoded
+// from `--bake-web`; the browser never encodes.
+#[cfg(not(target_arch = "wasm32"))]
 use intel_tex_2::{RgbaSurface, bc7};
 
 /// BC7's fixed tile: 4×4 texels in 16 bytes (8 bpp).
@@ -125,8 +133,9 @@ impl Bc7Mode {
 }
 
 impl Quality {
+    /// ASCII-case-insensitive; the CLI/settings vocabulary folds HERE.
     pub fn parse(s: &str) -> Option<Quality> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "ultrafast" => Some(Quality::UltraFast),
             "fast" => Some(Quality::Fast),
             "basic" => Some(Quality::Basic),
@@ -166,6 +175,7 @@ impl Quality {
 
     /// The `opaque_*` presets only — see the module note: they are what keeps
     /// the alpha-mode search out of the encoder.
+    #[cfg(not(target_arch = "wasm32"))]
     fn settings(self) -> bc7::EncodeSettings {
         match self {
             Quality::UltraFast => bc7::opaque_ultra_fast_settings(),
@@ -223,6 +233,7 @@ pub fn should_compress(t: &Texture) -> bool {
 /// Caller must have checked `should_compress` (which also guarantees the
 /// 4-aligned dims the ISPC kernel assumes — its `calc_output_size` is
 /// `ceil(w·h / 16) · 16`, which under-counts blocks on unaligned dims).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn encode_opaque(t: &Texture, q: Quality) -> Vec<u8> {
     debug_assert!(should_compress(t), "bc7: encode_opaque needs should_compress");
     bc7::compress_blocks(
@@ -238,6 +249,7 @@ pub fn encode_opaque(t: &Texture, q: Quality) -> Vec<u8> {
 /// texels are never sampled: the hardware clamps the filter footprint to
 /// the level's logical dims. `should_compress` still gates on the BASE dims
 /// only, unchanged.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn encode_level(w: u32, h: u32, texels: &[[u8; 4]], q: Quality) -> Vec<u8> {
     if w % BLOCK == 0 && h % BLOCK == 0 {
         return bc7::compress_blocks(
@@ -328,25 +340,33 @@ pub fn self_test() -> Result<(), String> {
     // Encode: exact output length, and determinism — the encode is re-run on
     // every load AND re-run by the fidelity gate as its oracle, so a
     // nondeterministic encode would make both irreproducible.
-    let a = encode_opaque(&opaque, Quality::Fast);
-    if a.len() != encoded_len(8, 8) {
-        return Err(format!("bc7: 8x8 encoded to {} B, want {}", a.len(), encoded_len(8, 8)));
-    }
-    if a != encode_opaque(&opaque, Quality::Fast) {
-        return Err("bc7: encode is not deterministic".into());
-    }
-    if a.iter().all(|&b| b == 0) {
-        return Err("bc7: 8x8 encoded to all zeros (kernel did not run?)".into());
-    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let a = encode_opaque(&opaque, Quality::Fast);
+        if a.len() != encoded_len(8, 8) {
+            return Err(format!("bc7: 8x8 encoded to {} B, want {}", a.len(), encoded_len(8, 8)));
+        }
+        if a != encode_opaque(&opaque, Quality::Fast) {
+            return Err("bc7: encode is not deterministic".into());
+        }
+        if a.iter().all(|&b| b == 0) {
+            return Err("bc7: 8x8 encoded to all zeros (kernel did not run?)".into());
+        }
 
-    // A constant block is BC7's easy case: every 4x4 tile of a flat texture
-    // must encode to the SAME 16 bytes. Catches a stride/pitch mix-up (which
-    // would make tiles differ) without needing a decoder.
-    let flat = tex(16, 16, &|_, _| [200, 30, 30, 255], true, false);
-    let enc = encode_opaque(&flat, Quality::Fast);
-    if enc.chunks_exact(BLOCK_BYTES).any(|b| b != &enc[..BLOCK_BYTES]) {
-        return Err("bc7: flat texture did not encode to identical blocks (stride bug?)".into());
+        // A constant block is BC7's easy case: every 4x4 tile of a flat texture
+        // must encode to the SAME 16 bytes. Catches a stride/pitch mix-up (which
+        // would make tiles differ) without needing a decoder.
+        let flat = tex(16, 16, &|_, _| [200, 30, 30, 255], true, false);
+        let enc = encode_opaque(&flat, Quality::Fast);
+        if enc.chunks_exact(BLOCK_BYTES).any(|b| b != &enc[..BLOCK_BYTES]) {
+            return Err("bc7: flat texture did not encode to identical blocks (stride bug?)".into());
+        }
     }
+    // wasm32: no encoder exists on this target (see the module note) — the
+    // vocabulary tests above and the Bc7Mode algebra below still run, so the
+    // SKIP is scoped to the encode arm and says so rather than passing silently.
+    #[cfg(target_arch = "wasm32")]
+    println!("bc7: SKIP encode arm (no encoder on wasm32 — web textures arrive pre-encoded)");
 
     // Bc7Mode: the flag algebra the CLI arms rely on. --bc7 arms the GPU
     // default but never switches an explicit CPU arm; --bc7-quality keys the

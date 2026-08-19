@@ -334,7 +334,7 @@ fn smoke_pass(
 
     let push = vkd.buffer(16, ub, true)?;
     let counters = vkd.buffer(8, sb | src | dst, false)?;
-    let args = vkd.buffer(12, sb | ind | src, false)?;
+    let args = vkd.buffer(crate::gfx::shaders::ARG_STRIDE, sb | ind | src, false)?;
     let outbuf = vkd.buffer(words * 4, sb | src | dst, false)?;
 
     let free = |vkd: &Vk| {
@@ -448,7 +448,7 @@ fn smoke_pass(
         let ob = hg.read_buffer(&outbuf, words as usize * 4)?;
         let out: Vec<u32> =
             ob.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        let ab = hg.read_buffer(&args, 12)?;
+        let ab = hg.read_buffer(&args, crate::gfx::shaders::ARG_STRIDE as usize)?;
         let a: Vec<u32> =
             ab.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         let cb = hg.read_buffer(&counters, 8)?;

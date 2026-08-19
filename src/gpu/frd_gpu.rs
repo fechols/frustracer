@@ -622,10 +622,13 @@ impl FrdGpu {
                 .to_bits(),
                 (t.fast_frames.map_or(crate::frd::FAST_FRAMES, |v| v as f32)).to_bits(),
                 (t.clamp_sigma.unwrap_or(crate::frd::CLAMP_SIGMA)).to_bits(),
-                f.cam_step.to_bits(),
+                // cam_fwd leads its row (dwords 8-10), cam_step takes the
+                // tail dword (11) — the WGSL-uniform alignment lockstep with
+                // both FrdCb declarations (frd_temporal.hlsl has the note).
                 f.cam_fwd[0].to_bits(),
                 f.cam_fwd[1].to_bits(),
                 f.cam_fwd[2].to_bits(),
+                f.cam_step.to_bits(),
                 f.proj.to_bits(),
                 (t.blur_radius.unwrap_or(crate::frd::R_MAX)).to_bits(),
                 pass_scale.to_bits(),

@@ -91,8 +91,9 @@ of NVIDIA's NRD entry names.
 | `--check` | nothing (DLL-free) | the CPU suite + every module `self_test`; writes the goldens |
 | `--check-gpu` | real GPU + DXC | the wavefront tracer — **not in CI** |
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
-| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V19 |
-| `--check-spirv` | unix + DXC/spirv-val | the whole shader corpus → SPIR-V |
+| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V20 |
+| `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
+| `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip (W0 is DXC-free) |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
 | `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |
@@ -105,8 +106,9 @@ Each takes an optional scene and composes with `--stress N`. Exit **2** = enviro
 
 **CI** (`.github/workflows/ci.yml`, 5 jobs, all `--profile quick`): Windows/Linux/macOS run
 `--check`, `--check-dlss`, `--check-xess`, `--check-fsr`, `--check-nrd`; a Vulkan job runs
-`--check-spirv` + `--check-vk` with anti-vacuity greps; a Metal job runs the four Metal
-gates. No clippy or fmt job.
+`--check-spirv` + `--check-wgsl` + `--check-vk` with anti-vacuity greps; a Metal job runs
+the four Metal gates; a wasm job holds `cargo check --target wasm32-unknown-unknown` green
+from a bare checkout. No clippy or fmt job.
 
 **The "touch X → run Y" convention.** ~35 such run-lists live in module headers and the
 archive — find the one for what you touched and follow it. The floor is `--check` +
@@ -246,7 +248,8 @@ without a human feel-test.
 ## Flag index
 
 An **index, not documentation** — one line per family, pointing into the archive. 220 flags;
-`--help` and `src/cli.rs` are authoritative. Most `--x` features have a `--no-x` twin that
+`--help` and `src/cli.rs` are authoritative. Flag names and keyword values are ASCII-case-
+insensitive; paths, scene files and `settings:<Group>` names are taken verbatim. Most `--x` features have a `--no-x` twin that
 spells the opposite; A/B levers are generally bit-identical when off.
 
 **Scene & camera** — `<path>.obj|.gltf|.glb` (positional) · `--world` / `--no-world` ·
@@ -262,8 +265,9 @@ spells the opposite; A/B levers are generally bit-identical when off.
 `--no-adaptive`
 
 **Denoisers** (one slot) — `--nrd` (default) + the `--nrd-*` tuning family + `--nrd-perf` ·
-`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*` · `--no-rr-emis-demod`
-(the DLSS-RR emissive-demodulation A/B arm)
+`--frd` + `--frd-*` · `--oidn` + `--oidn-*` · `--nppd` + `--nppd-*` · `--rr-emis-demod`
+(the DLSS-RR emissive-demodulation A/B arm, default OFF — emission rides RR's temporal
+integration; armed, an on-screen emitter no longer lifts the frame but emitters shimmer)
 
 **Lighting & sky** — `--rtgi-bounces 0..2` / `--rtgi` / `--no-rtgi` · `--emissive-lights [N]`
 `--el-cluster grid|som` · `--fireflies N` · `--no-clouds` `--cloud-shadow N` `--sky-lod K` ·
@@ -287,7 +291,7 @@ lights|tonemap` `--exposure-bias EV` `--autoexp-spike-guard` / `-strength`
 `--no-vsync` · `--move-ease S` / `--no-move-ease` · `--no-audio` · `--no-settings` ·
 `--prefer-nvidia|amd|intel`
 
-**Headless modes** — the 14 `--check*` gates · `--spin still|path` + `--spin-frames|-warmup|
+**Headless modes** — the 15 `--check*` gates · `--spin still|path` + `--spin-frames|-warmup|
 -hybrid|-plain` · `--cinematic <preset>` + the `--cinematic-*` family (res/fps/frames/samples/
 island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `--frd-lab-*` ·
 `--bloom-lab [wobble]` (glare shift-variance probe; scene-free, GPU-free) · `--qa [port]`

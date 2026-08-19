@@ -22,13 +22,15 @@
 //! BVH build. Its key covers every curated entry's identity, PRESENCE, and
 //! dependency stats (`build_world_key` — source + mtl for OBJ, source +
 //! external buffers/images for glTF via `gltf_loader::dependency_files`),
-//! plus the ring constants; glTF textures ride the cache as INLINE texels
-//! (their synthetic sources have no file to re-decode from).
+//! plus the ring constants; every texture rides the cache as INLINE
+//! post-conversion texels in one zstd frame (WORLD_VERSION 4 — the warm
+//! boot was texture-bound), path-sourced ones stat-gated per record.
 //!
 //! Deliberately NOT here: instancing (the whole correctness architecture
 //! assumes one flat BVH) and per-region skies (the one-sky invariant).
-//! Follow-ons: per-island firefly scale, cross-part texture dedup,
-//! zstd-compressing the sidecar payload.
+//! Follow-ons: per-island firefly scale, cross-part texture dedup. (The
+//! geometry/BVH PODs deliberately stay raw: they read in ~0.6 s and
+//! compress poorly.)
 
 use crate::scene::{self, MatKind, Material, Scene, NO_TEX};
 use glam::{Vec2, Vec3A};
@@ -1014,10 +1016,12 @@ pub fn self_test() -> Result<(), String> {
         let dep_path = dir.join("worldtest.dep");
         std::fs::write(&dep_path, b"dep-v1").map_err(|e| format!("worldtest dep write: {e}"))?;
 
-        // Two parts; part B's textures exercise BOTH flavors: tex 0 INLINE
-        // (2×2 "gltf:" synthetic source — mips must round-trip via rebuild),
-        // tex 1 PATH (the real PNG, re-decoded at load). Part A's 1×1
-        // empty-source texture rides inline too.
+        // Two parts; part B's textures exercise BOTH record shapes: tex 0
+        // stat-less (2×2 "gltf:" synthetic source — mips must round-trip via
+        // rebuild), tex 1 stat-gated (the real PNG: its (size, mtime) pair
+        // rides the record, and the stat-drift gate below edits the file).
+        // Part A's 1×1 empty-source texture rides stat-less too. All texels
+        // travel as zstd frames (v4).
         let pa = test_part(1, 0, 0);
         let mut pb = test_part(2, 1, 0);
         pb.textures[0] = crate::texture::Texture::from_cached(
@@ -1088,6 +1092,19 @@ pub fn self_test() -> Result<(), String> {
         scene_cache::store_world(&cache, &key, &world_sc, &bvh, &meta);
         if !cache.exists() {
             return err("world cache: store did not write".into());
+        }
+
+        // Regenerated-store byte identity: the sidecar's bytes must be a
+        // pure function of (key, scene, bvh, meta). Multithreaded zstd, a
+        // floating TEXEL_ZSTD_LEVEL, or an unordered compress-collect each
+        // break exactly this — the self-test form of the "regenerated
+        // world.fcache BYTE-IDENTICAL" determinism doctrine.
+        let cache2 = dir.join("world2.fcache");
+        scene_cache::store_world(&cache2, &key, &world_sc, &bvh, &meta);
+        let b_a = std::fs::read(&cache).map_err(|e| e.to_string())?;
+        let b_b = std::fs::read(&cache2).map_err(|e| e.to_string())?;
+        if b_a != b_b {
+            return err("world cache: regenerated store not byte-identical".into());
         }
 
         // Round-trip hit: everything faithful.
@@ -1225,6 +1242,84 @@ pub fn self_test() -> Result<(), String> {
             if scene_cache::try_load_world(&patched, &key).is_some() {
                 return err(format!("world cache: served a truncation at {cut}"));
             }
+        }
+
+        // zstd frame corruption = a silent miss, never a 1×1 fallback (the
+        // Path arm's fallback covers a vanished EXTERNAL file; a bad inline
+        // frame means the sidecar itself is rot). Locate the "gltf:" test
+        // texture's frame from its unique source string — record layout:
+        // source, 5 flags, no stat (stat-less source), w, h, comp_len, frame
+        // — then PROVE the probe reached a frame (the FR_ABL lesson) by
+        // checking the zstd magic at the computed offset before patching.
+        // Three corruptions: the magic, the frame DESCRIPTOR (reserved bits
+        // = guaranteed decode error), and a PAYLOAD byte. The payload flip
+        // is the tooth that pins the store side's ChecksumFlag: without the
+        // xxhash64 content checksum, a byte flip inside a RAW block (these
+        // tiny test texels store raw) "decompresses" clean to wrong texels
+        // and this gate serves a hit.
+        let gltf_src = b"gltf:image:0:srgb";
+        let src_pos = bytes
+            .windows(gltf_src.len())
+            .position(|w| w == gltf_src)
+            .ok_or_else(|| "world cache: gltf test source not found in sidecar bytes".to_string())?;
+        let frame_pos = src_pos + gltf_src.len() + 5 + 4 + 4 + 4;
+        if bytes.get(frame_pos..frame_pos + 4) != Some(&[0x28, 0xB5, 0x2F, 0xFD][..]) {
+            return err("world cache: no zstd magic at the computed frame offset — the corruption probe reaches nothing".into());
+        }
+        let mut b2 = bytes.clone();
+        b2[frame_pos + 4] = 0xFF; // frame descriptor: reserved bit set
+        std::fs::write(&patched, &b2).map_err(|e| e.to_string())?;
+        if scene_cache::try_load_world(&patched, &key).is_some() {
+            return err("world cache: served despite a corrupt zstd frame header".into());
+        }
+        let mut b2 = bytes.clone();
+        b2[frame_pos] ^= 0xFF; // the magic itself
+        std::fs::write(&patched, &b2).map_err(|e| e.to_string())?;
+        if scene_cache::try_load_world(&patched, &key).is_some() {
+            return err("world cache: served despite a destroyed zstd magic".into());
+        }
+        let mut b2 = bytes.clone();
+        b2[frame_pos + 10] ^= 0xFF; // block payload — only the checksum catches this
+        std::fs::write(&patched, &b2).map_err(|e| e.to_string())?;
+        if scene_cache::try_load_world(&patched, &key).is_some() {
+            return err("world cache: served despite a flipped frame payload byte".into());
+        }
+
+        // Texture stat drift = miss. The PNG is NOT a key dep, so the key
+        // blob still matches — a hit here would prove the per-record
+        // (size, mtime) pair was dropped from the unified v4 record. The
+        // new content need not decode: the stat gate fires before any
+        // decompress. REVERSIBLE (unlike the dep mutation below): bytes and
+        // mtime are captured here and restored after, so the dep gate still
+        // operates on a hit-capable cache.
+        let png_orig = std::fs::read(&png_path).map_err(|e| e.to_string())?;
+        let png_mtime = std::fs::metadata(&png_path)
+            .and_then(|m| m.modified())
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&png_path, b"edited-texture-bytes-longer-than-before")
+            .map_err(|e| e.to_string())?;
+        if scene_cache::try_load_world(&cache, &key).is_some() {
+            return err("world cache: served despite a texture stat change".into());
+        }
+
+        // Restore the PNG (bytes + mtime) and PROVE the cache hits again.
+        // Without this, the stat miss above shadows the dep gate below: the
+        // key-blob compare runs BEFORE the texture loop, so against a
+        // stat-stale cache the dep gate reports "miss" even with the key
+        // compare deleted — a gate that cannot fire. The hit is the
+        // probe-reach proof (the FR_ABL lesson) that the NEXT miss is
+        // attributable to the key.
+        std::fs::write(&png_path, &png_orig).map_err(|e| e.to_string())?;
+        std::fs::File::options()
+            .write(true)
+            .open(&png_path)
+            .and_then(|f| f.set_modified(png_mtime))
+            .map_err(|e| e.to_string())?;
+        if scene_cache::try_load_world(&cache, &key).is_none() {
+            return err(
+                "world cache: PNG restore did not re-arm the cache — the dep gate is vacuous"
+                    .into(),
+            );
         }
 
         // Dep-file mutation LAST (it can't be un-mutated — mtime moves): the

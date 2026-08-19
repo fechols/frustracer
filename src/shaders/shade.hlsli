@@ -77,8 +77,30 @@ float3 abl_tq_pass_t(float t1, out float first_t) {
 #endif
 
 // t0 (bvh nodes) and t1 (tri_idx) belong to the frustum kernels.
+//
+// WEB (the browser corpus, 2026-08-18): a vec3-element storage array has
+// stride 16 in WGSL, and this wire is tightly-packed 12 — retyping the
+// upload would touch every backend, so the web arm reads the SAME bytes as
+// a scalar array (stride 4, always legal) and pos_at/nrm_at reassemble.
+// Native keeps the float3 declaration and its SRV stride untouched; both
+// arms go through the accessors, so every consumer spells one thing.
+#ifdef WEB
+StructuredBuffer<float> positions : register(t2);
+StructuredBuffer<float> normals   : register(t3);
+float3 pos_at(uint i) {
+    uint b = i * 3u;
+    return float3(positions[b], positions[b + 1u], positions[b + 2u]);
+}
+float3 nrm_at(uint i) {
+    uint b = i * 3u;
+    return float3(normals[b], normals[b + 1u], normals[b + 2u]);
+}
+#else
 StructuredBuffer<float3> positions : register(t2);
 StructuredBuffer<float3> normals   : register(t3);
+float3 pos_at(uint i) { return positions[i]; }
+float3 nrm_at(uint i) { return normals[i]; }
+#endif
 StructuredBuffer<uint>   indices   : register(t4); // flat, 3 per tri (also the BLAS index buffer)
 StructuredBuffer<uint>   tri_mat   : register(t5);
 
@@ -92,7 +114,15 @@ StructuredBuffer<uint>   tri_mat   : register(t5);
 // Mirrors trace.rs::GpuMat field-for-field (108 B) — a stride skew reads
 // garbage; the two must move in the same commit.
 struct Mat {
-    float3 albedo;
+    // The three float3s ride as scalars (the ft_nodes flatten, browser
+    // lockstep 2026-08-18): the members happen to land 16-aligned, but the
+    // 108-B ARRAY STRIDE is illegal WGSL storage layout once any member
+    // aligns to 16 — scalars make the element 4-aligned and the tight wire
+    // legal. Bytes 0-107 are IDENTICAL, so scene upload and the DXR arm are
+    // untouched; mat_albedo/mat_emissive/mat_trans_tint reassemble.
+    float albedo_x;
+    float albedo_y;
+    float albedo_z;
     float roughness;
     float metallic;
     float anisotropy;
@@ -102,13 +132,17 @@ struct Mat {
     float translucency;
     float transmission;
     uint tex; // Scene::textures index (MAT_TEXTURED: the space1 texs[] slot)
-    float3 emissive;   // Ke; added at every lap, outside the kd*(1-transmission) factor
+    float emissive_x;  // Ke; added at every lap, outside the kd*(1-transmission) factor
+    float emissive_y;
+    float emissive_z;
     uint normal_tex;   // tangent-space normal map (TEX_NONE = none; UNORM SRV)
     uint rough_tex;    // roughness map, samples .g (glTF channel convention)
     uint metal_tex;    // metallic map, samples .b
     uint emissive_tex; // emissive map (sRGB SRV)
     float normal_scale;
-    float3 trans_tint; // transmission/absorption tint; sentinel .x < 0 = "use albedo"
+    float trans_tint_x; // transmission/absorption tint; sentinel .x < 0 = "use albedo"
+    float trans_tint_y;
+    float trans_tint_z;
     float ior;         // Snell/Fresnel IOR (default 1.5; water 1.33)
     float ripple_amp;  // water ripple slope amplitude (0 = none)
     // Per-material world-space detail texel scale (Scene::detail_scales —
@@ -119,11 +153,14 @@ struct Mat {
     uint normal_var_tex;
 };
 StructuredBuffer<Mat> materials : register(t6);
+float3 mat_albedo(Mat m) { return float3(m.albedo_x, m.albedo_y, m.albedo_z); }
+float3 mat_emissive(Mat m) { return float3(m.emissive_x, m.emissive_y, m.emissive_z); }
+float3 mat_trans_tint(Mat m) { return float3(m.trans_tint_x, m.trans_tint_y, m.trans_tint_z); }
 
 // Material::trans_tint_or — the ONE tint source (per-interface glass tint,
 // Beer–Lambert, shadow tint): trans_tint when set, else albedo verbatim.
 float3 trans_tint_or(Mat m, float3 albedo) {
-    return m.trans_tint.x >= 0.0 ? m.trans_tint : albedo;
+    return m.trans_tint_x >= 0.0 ? mat_trans_tint(m) : albedo;
 }
 
 // shade.rs's glassware constants: the interface budget for the refraction
@@ -503,10 +540,10 @@ float3 detail_bump(float3 base, float3 n, float3 g) {
 void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n) {
     uint3 idx = uint3(indices[hit.tri * 3u], indices[hit.tri * 3u + 1u], indices[hit.tri * 3u + 2u]);
     float w = 1.0 - hit.u - hit.v;
-    n = normalize_or_zero(normals[idx.x] * w + normals[idx.y] * hit.u + normals[idx.z] * hit.v);
+    n = normalize_or_zero(nrm_at(idx.x) * w + nrm_at(idx.y) * hit.u + nrm_at(idx.z) * hit.v);
     if (all(n == float3(0.0, 0.0, 0.0))) {
-        float3 e1 = positions[idx.y] - positions[idx.x];
-        float3 e2 = positions[idx.z] - positions[idx.x];
+        float3 e1 = pos_at(idx.y) - pos_at(idx.x);
+        float3 e2 = pos_at(idx.z) - pos_at(idx.x);
         n = normalize_or_zero(cross(e1, e2));
     }
     if (dot(n, rd) > 0.0) {
@@ -515,8 +552,8 @@ void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n
         // the old unconditional flip when they fire: nf·n <= 0 (winding
         // disagrees with the authored normals — also the degenerate face's
         // exact 0.0, and NaN) and !(nf·d < 0) (the face really is backfacing).
-        float3 e1 = positions[idx.y] - positions[idx.x];
-        float3 e2 = positions[idx.z] - positions[idx.x];
+        float3 e1 = pos_at(idx.y) - pos_at(idx.x);
+        float3 e2 = pos_at(idx.z) - pos_at(idx.x);
         float3 nf = cross(e1, e2);
         if (dot(nf, n) <= 0.0 || !(dot(nf, rd) < 0.0)) n = -n;
     }
@@ -533,9 +570,9 @@ void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n
 // ZERO rng draws — the same-seed gates rely on that.
 float tex_lod_base(uint tri, float n_dot_d, float cone_w) {
     uint3 idx = uint3(indices[tri * 3u], indices[tri * 3u + 1u], indices[tri * 3u + 2u]);
-    float3 p0 = positions[idx.x];
-    float3 e1 = positions[idx.y] - p0;
-    float3 e2 = positions[idx.z] - p0;
+    float3 p0 = pos_at(idx.x);
+    float3 e1 = pos_at(idx.y) - p0;
+    float3 e2 = pos_at(idx.z) - p0;
     float wa = length(cross(e1, e2)); // 2x area — the 1/2 cancels in the ratio
     float2 t0 = uv_buf[idx.x];
     float2 d1 = uv_buf[idx.y] - t0;
@@ -548,7 +585,13 @@ float tex_lod_base(uint tri, float n_dot_d, float cone_w) {
 // Texture::lod_dims mirror: complete the base term for one map's dims.
 float tex_lod(uint ti, float lod_base) {
     uint tw, th;
+#ifdef WEB_TEX
+    uint2 wh = web_tex_dims(ti);
+    tw = wh.x;
+    th = wh.y;
+#else
     texs[NonUniformResourceIndex(ti)].GetDimensions(tw, th);
+#endif
     return lod_base + 0.5 * log2(float(tw * th));
 }
 
@@ -562,9 +605,9 @@ float tex_lod(uint ti, float lod_base) {
 // texture footprint (tri_grads_from) — same as on the CPU. Degenerate => false.
 bool tri_uv_basis(uint tri, out float3 tu, out float3 tv) {
     uint3 idx = uint3(indices[tri * 3u], indices[tri * 3u + 1u], indices[tri * 3u + 2u]);
-    float3 p0 = positions[idx.x];
-    float3 e1 = positions[idx.y] - p0;
-    float3 e2 = positions[idx.z] - p0;
+    float3 p0 = pos_at(idx.x);
+    float3 e1 = pos_at(idx.y) - p0;
+    float3 e2 = pos_at(idx.z) - p0;
     float2 t0 = uv_buf[idx.x];
     float2 d1 = uv_buf[idx.y] - t0;
     float2 d2 = uv_buf[idx.z] - t0;
@@ -584,7 +627,7 @@ bool tri_uv_basis(uint tri, out float3 tu, out float3 tv) {
 // the eps-offset p.
 float3 tri_rest_point(uint tri, float u, float v) {
     uint3 idx = uint3(indices[tri * 3u], indices[tri * 3u + 1u], indices[tri * 3u + 2u]);
-    return positions[idx.x] * (1.0 - u - v) + positions[idx.y] * u + positions[idx.z] * v;
+    return pos_at(idx.x) * (1.0 - u - v) + pos_at(idx.y) * u + pos_at(idx.z) * v;
 }
 
 // shade.rs::tri_grads_from mirror (change both together): the ray cone's
@@ -663,10 +706,17 @@ struct TexFilt {
 // TexFilter::sample). SampleGrad is what makes samp_aniso mean anything —
 // SampleLevel gives the TMU no gradients to be anisotropic about.
 float3 tex_sample(uint ti, float2 uv, TexFilt f) {
+#ifdef WEB_TEX
+    if (f.aniso) {
+        return web_tex_grad(samp_aniso, ti, uv, f.gu, f.gv).rgb;
+    }
+    return web_tex_level(samp_lin, ti, uv, tex_lod(ti, f.lod_base)).rgb;
+#else
     if (f.aniso) {
         return texs[NonUniformResourceIndex(ti)].SampleGrad(samp_aniso, uv, f.gu, f.gv).rgb;
     }
     return texs[NonUniformResourceIndex(ti)].SampleLevel(samp_lin, uv, tex_lod(ti, f.lod_base)).rgb;
+#endif
 }
 
 // The per-lap filter for a hit: the elliptical footprint when the session and
@@ -820,7 +870,7 @@ void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
 #define SHADE_MAT_REFL(m) ((m).metallic > 0.04 || (m).roughness < 0.45)
 #endif
 #ifndef SHADE_MAT_EMISSIVE
-#define SHADE_MAT_EMISSIVE(m) (any((m).emissive != 0.0) || SHADE_MAT_EMISTEX(m))
+#define SHADE_MAT_EMISSIVE(m) (any(mat_emissive(m) != 0.0) || SHADE_MAT_EMISTEX(m))
 #endif
 
 // Whitted shading of a committed primary hit, reflection bounce included.
@@ -959,7 +1009,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Spec-AA: the detail field's discarded-octave slope variance
         // (0.0 = nothing to transfer), folded into rough_eff below.
         float s2_detail = 0.0;
-        float3 albedo = mat.albedo;
+        float3 albedo = mat_albedo(mat);
         if (SHADE_MAT_MARBLE(mat)) {
             albedo = marble(ro + rd * hit.t, mat.scale);
         } else if (SHADE_MAT_TEXKIND(mat)) {
@@ -990,7 +1040,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float lb = filt.aniso ? detail_aniso_base(filt.gu, filt.gv)
                                       : filt.lod_base;
                 uint tw, th;
+#ifdef WEB_TEX
+                uint2 wh = web_tex_dims(mat.tex);
+                tw = wh.x;
+                th = wh.y;
+#else
                 texs[NonUniformResourceIndex(mat.tex)].GetDimensions(tw, th);
+#endif
                 dlod = lb + 0.5 * log2(float(tw * th)); // Texture::lod_dims
             } else {
                 // Untextured: the same window measured directly in the
@@ -1619,7 +1675,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // bounce suppresses under a live flag (NEE delivers), and an unarmed
         // frame's clear flag keeps the RTGI bounce as the only delivery.
         if (SHADE_MAT_EMISSIVE(mat) && (cam_lights || (flags & FLAG_EMISSIVE) == 0u)) {
-            float3 emis = mat.emissive;
+            float3 emis = mat_emissive(mat);
             if (SHADE_MAT_EMISTEX(mat)) {
                 emis *= tex_sample(mat.emissive_tex, map_uv, filt);
             }
@@ -1695,7 +1751,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // suites absorb the reassociation vs the flattened fold).
                 float rec_t;
                 float3 rcol = trace_shade(p, rdir, rng, depth + 1u, cone_w, rec_t);
-                if (!isinf(rec_t)) {
+                if (!ISINF(rec_t)) {
                     prim.spec_t = rec_t; // depth 0 == the captured surface
                     float3 rc = rtput * rcol;
                     total += rc;
@@ -1769,11 +1825,11 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                               indices[hit.tri * 3u + 2u]);
             float w = 1.0 - hit.u - hit.v;
             float3 n_raw =
-                normalize_or_zero(normals[idx.x] * w + normals[idx.y] * hit.u +
-                                  normals[idx.z] * hit.v);
+                normalize_or_zero(nrm_at(idx.x) * w + nrm_at(idx.y) * hit.u +
+                                  nrm_at(idx.z) * hit.v);
             if (all(n_raw == float3(0.0, 0.0, 0.0))) {
-                float3 e1 = positions[idx.y] - positions[idx.x];
-                float3 e2 = positions[idx.z] - positions[idx.x];
+                float3 e1 = pos_at(idx.y) - pos_at(idx.x);
+                float3 e2 = pos_at(idx.z) - pos_at(idx.x);
                 n_raw = normalize_or_zero(cross(e1, e2));
             }
             bool entering = dot(n_raw, n) >= 0.0; // the viewer-flip didn't fire
@@ -1812,7 +1868,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // miss_rec's.
                 float trec_t;
                 float3 tcol = trace_shade(torig, tdir, rng, depth + 1u, cone_w, trec_t);
-                if (!isinf(trec_t)) {
+                if (!ISINF(trec_t)) {
                     if ((entering || is_tir) && (flags & FLAG_DEPTH_TINT)) {
                         t_tput *= pow(max(trans_tint_or(mat, albedo), 1e-6),
                                       trec_t / (TRANS_DEPTH_K * SCENE_DIAG));

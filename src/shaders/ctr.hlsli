@@ -61,7 +61,54 @@
 #define HAVE_COUNTERS 1
 
 RWStructuredBuffer<uint>  counters : register(u3);
-RWStructuredBuffer<uint3> args     : register(u4);
+
+// --- the indirect-args buffer is FLAT, and the reason is portability --------
+//
+// This was `RWStructuredBuffer<uint3>` and read `args[slot] = uint3(x,y,z)`,
+// which is the natural spelling and works because HLSL gives a structured
+// buffer of `uint3` a 12-byte stride — exactly the (x, y, z) record D3D12's
+// ExecuteIndirect and Vulkan's vkCmdDispatchIndirect both consume.
+//
+// WGSL DOES NOT AGREE. There, `vec3<u32>` carries a 16-byte ALIGNMENT, so
+// `array<vec3<u32>>` gets a 16-byte stride and the fourth word is padding —
+// an `array<u32>` is the only spelling that lays 12-byte records end to end,
+// and WebGPU's dispatchWorkgroupsIndirect reads the same 12 bytes D3D12 does.
+// A `uint3` here would therefore have to become something else on the way to
+// the browser, at a site where getting the stride wrong is a wrong dispatch
+// GEOMETRY rather than a compile error. So the corpus says it the portable
+// way on every backend instead, and the divergence never exists.
+//
+// NOTHING ON THE CPU MOVED, and that is the check on this change. `args` is
+// bound as a ROOT UAV by GPU virtual address (trace.rs's
+// SetComputeRootUnorderedAccessView(RP_UAV0 + UAV_ARGS)) and as an untyped
+// storage buffer on Vulkan, so there is no view descriptor carrying a
+// StructureByteStride that could disagree with the shader. The command
+// signature is still ByteStride: 12, every offset is still `slot * 12`, and
+// the buffer is still 16 * 12 bytes. Same bytes, same addresses, one less
+// thing the WGSL port has to translate.
+RWStructuredBuffer<uint>  args     : register(u4);
+
+// One 12-byte DispatchIndirect record at `slot`. Callers keep passing a uint3
+// so the three prep kernels read as they did; only the addressing changed.
+//
+// THE STRIDE HAS TEETH, AND NOT WHERE YOU WOULD LOOK FOR THEM. Compiling this
+// with `slot * 4u` — precisely the mistake a 16-byte-strided `vec3<u32>` would
+// bake in — fails --check-gpu with 56 FAILs and exit 1. But BOTH dispatch
+// plumbing gates, the two whose whole job is to write an indirect record, read
+// it back and compare, STILL PASS: D3D12's M1 and Vulkan's V3 both drive
+// smoke.hlsl, which pastes nothing (so it never compiles this function at all)
+// and writes slot 0 only, where 0*3 == 0*4. Do not read either as cover for a
+// change here.
+//
+// What DOES catch it: --check-gpu, which CI does not run, and --check-vk's
+// V7/V8 — the real wavefront ladder, multi-slot, which CI does run on
+// llvmpipe. Plus shaders.rs's args_stride gate, which pins the word index
+// below against ARG_STRIDE under plain `cargo test` on every CI job.
+void args_write(uint slot, uint3 g) {
+    args[slot * 3u + 0u] = g.x;
+    args[slot * 3u + 1u] = g.y;
+    args[slot * 3u + 2u] = g.z;
+}
 
 // Per-dispatch push constants (b1); meanings are per-kernel.
 cbuffer Push : register(b1) { uint push0; uint push1; uint push2; uint push3; }

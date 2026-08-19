@@ -132,6 +132,23 @@ const _: () = assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL == CTR_W_REFERENCE + 
 /// value (xy0 | xy1 | t_start | depth | TraversalFrontier::opaque.xy).
 pub const LEAF_REC_BYTES: u64 = 24;
 
+/// One DispatchIndirect record: the (x, y, z) thread-group counts D3D12's
+/// ExecuteIndirect and Vulkan's vkCmdDispatchIndirect both consume. Every
+/// `args` allocation, command-signature ByteStride and dispatch byte-offset on
+/// both backends reads it from here.
+///
+/// It is duplicated into the HLSL, and that is new. `args` used to be a
+/// `RWStructuredBuffer<uint3>`, which carried the stride IN THE TYPE — HLSL
+/// strides a structured buffer of uint3 at 12, so shader and CPU could not
+/// disagree. The buffer went flat for the WGSL port (`vec3<u32>` aligns to 16
+/// there, so `array<vec3<u32>>` strides at 16 with a padding word and would not
+/// be the same record), which bought one spelling on every backend and cost
+/// exactly this: ctr.hlsli's `args_write` now states the stride itself, in
+/// words. So it gets a name here and a gate below that derives the HLSL text
+/// from it. A disagreement is a wrong dispatch GEOMETRY, not a compile error.
+pub const ARG_STRIDE: u64 = 12;
+const _: () = assert!(ARG_STRIDE % 4 == 0); // the shader indexes it in words
+
 /// continuation.hlsli's software-provider wire values. The ray call site
 /// treats both words as opaque; these mirrors exist only so --check-gpu can
 /// reject a malformed producer record before trusting the consumer.
@@ -645,6 +662,28 @@ pub fn sw_rays() -> bool {
 /// the ft_bnode upload, its ladder t1 binding, and the cut-pool headroom.
 pub fn sw_rays_leaf() -> bool {
     sw_rays() && crate::bvh::CUT_SEED_RAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The browser corpus's define prelude (Stage F1 of the WASM/WebGPU port).
+/// PREPENDED by the web-subset assembler (`--check-wgsl` / `--bake-web` /
+/// the wasm session) to EVERY unit it collects — never pushed into
+/// `trace_sources`' own lists, which is what makes the off-state structural:
+/// a native session simply never calls this, and the assembled native
+/// sources are byte-identical by construction, not by a define that must be
+/// kept empty. Prepending at collection is also immune to the probe-reach
+/// trap by shape — there is no per-unit list a unit could be missing from.
+///
+/// Two defines: `WEB` (the arm F2's WEB_TEX and its successors key on), and
+/// `ABL_NO_WAVE_OPS` — ctr.hlsli's plain-atomic fallback (`FR_ABL=nowave`)
+/// promoted to the web default, because WGSL core has no subgroup ops. The
+/// `#ifndef` guard keeps a simultaneous `FR_ABL=nowave` run legal (identical
+/// redefinition is only a warning, but a warning in 16 units is noise that
+/// buries a real one). The TOOTH for this define reaching every unit is
+/// downstream and end-to-end: `wgsl::validate` grants no SUBGROUP
+/// capability, so a unit this prelude missed fails `--check-wgsl` W4 on its
+/// leaked subgroup ops rather than passing quietly.
+pub fn web_defs() -> &'static str {
+    "#define WEB 1\n#ifndef ABL_NO_WAVE_OPS\n#define ABL_NO_WAVE_OPS 1\n#endif"
 }
 
 
@@ -2346,6 +2385,49 @@ pub fn workgraph_src(wavefront: &str, wide: u32, deep: u32) -> String {
 // gate can reach (`--check-gpu`/`--check-dxr` need a real adapter). They are
 // deliberately narrow: each asserts an ordering or a monotonicity statement,
 // never formatting.
+
+#[cfg(test)]
+mod indirect_args_stride_tests {
+    use super::{ARG_STRIDE, CTR_HLSLI, SMOKE_HLSL};
+
+    /// The indirect-args record is stated twice in two languages — byte offsets
+    /// on both CPU backends, a word index in `args_write` — so pin them
+    /// together. DERIVED from ARG_STRIDE rather than written out, which is what
+    /// makes it fail from either side: move the Rust const alone and the HLSL
+    /// stops containing the new index; move the HLSL alone and it stops
+    /// matching the const.
+    ///
+    /// This exists because the tooth it stands in for is expensive to reach. A
+    /// wrong multiplier is a wrong dispatch GEOMETRY, not a compile error, and
+    /// the gates that catch it are `--check-gpu` (which CI does not run) and
+    /// `--check-vk`'s V7/V8 (a full scene render, which it does). The M1 and V3
+    /// dispatch-plumbing gates — the two whose whole job is to write an
+    /// indirect record, read it back and compare — CANNOT: they drive
+    /// smoke.hlsl, which pastes nothing and so never compiles `args_write`,
+    /// and which writes slot 0 only, where 0*3 == 0*4.
+    #[test]
+    fn args_stride_agrees_across_the_language_boundary() {
+        let words = ARG_STRIDE / 4;
+        for (i, ch) in ['x', 'y', 'z'].iter().enumerate() {
+            let want = format!("args[slot * {words}u + {i}u] = g.{ch};");
+            assert!(
+                CTR_HLSLI.contains(&want),
+                "ctr.hlsli's args_write has no `{want}` — its word index and \
+                 ARG_STRIDE ({ARG_STRIDE} B) have diverged"
+            );
+        }
+        // Flat on BOTH declaring units. smoke.hlsl carries its own declaration
+        // because it pastes nothing; a uint3 left there would be the one
+        // compile unit still asserting the stride-by-type the port removed.
+        for (name, src) in [("ctr.hlsli", CTR_HLSLI), ("smoke.hlsl", SMOKE_HLSL)] {
+            assert!(
+                src.contains("RWStructuredBuffer<uint>  args"),
+                "{name}: `args` is not a flat uint buffer — a uint3 strides at \
+                 16 in WGSL and would not be a DispatchIndirect record there"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod width_ballast_shader_source_tests {

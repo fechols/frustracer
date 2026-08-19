@@ -67,19 +67,44 @@
 //!
 //! # Measured
 //!
-//! The whole shipping corpus — **47 units → 78 modules**, assembled by
+//! The whole shipping corpus — **47 units → 80 modules**, assembled by
 //! `gfx::shaders` exactly as a session assembles them, including all four
 //! `--dxr-inline` libraries with their RayQuery/any-hit machinery, the
 //! wavefront ladder, FRD's three kernels and the FSR composite — compiles
 //! under this flag set and passes `spirv-val`, with zero edits to any
 //! `.hlsl`. `--check-spirv` is that measurement, wired as a gate. The
-//! `--sw-rays` arm reads 37 → 66, which is also the anti-vacuity proof that
-//! the lever reaches the assembly (7 965 832 B vs 5 461 519 B).
+//! `--sw-rays` arm reads 37 → 68, which is also the anti-vacuity proof that
+//! the lever reaches the assembly (8 213 479 B vs 5 634 944 B).
 //!
 //! Treat those as a SNAPSHOT: the counts move with the corpus, and the header
 //! said "40 units, 84 entry points" for long enough that two other places in
 //! the tree disagreed with it and with each other. The gate prints the live
 //! numbers; this paragraph is orientation, not a pin.
+//!
+//! The snapshot above replaced "47 → 78 / 37 → 66" on 2026-08-14, and the
+//! delta is worth reading once because it is the shape these numbers move in:
+//! ONE entry point was added (`cs_rr_emis_readd`, in `feed.hlsl`) and the count
+//! rose by TWO, because `feed.hlsl` is assembled as two units — `feed[Nvidia]`
+//! and `dxr-feed[0]` — while the UNIT counts, 47 and 37, did not move at all.
+//! A module count is entries × the arms that paste them, so it is not a
+//! triangulation of anything on its own; read it beside the unit count.
+//!
+//! # The count is now cross-checkable, which it was not before
+//!
+//! Until this module grew its Windows arm, exactly one platform ever ran the
+//! gate, so "the corpus is one corpus everywhere" was an unfalsifiable claim.
+//! It is now a comparison: the assembly path is free of `#[cfg]` (nothing in
+//! `gfx::shaders` outside its `#[cfg(test)]` blocks) and the vendor arms are
+//! ENUMERATED rather than detected (`corpus_units` walks `[Nvidia, Amd]`), so
+//! the same numbers must print on every platform — and if they ever do not,
+//! that is the front-end divergence this module's ONE PIN exists to prevent,
+//! finally visible to something.
+//!
+//! VISIBLE, not yet ASSERTED: no gate compares the two platforms' counts, so
+//! this is a thing a reader can check across two CI logs and not a thing that
+//! fails. Wiring the count into a cross-platform pin needs a golden the two
+//! jobs share, which is the same shape `--check-wgsl`'s W7 will need for the
+//! browser corpus. Do not read the paragraph above as a guard that exists.
 //!
 //! # Two consumers, not one
 //!
@@ -96,16 +121,32 @@
 //! spirv-cross renumber per namespace; see its header for the measurement.
 //! These constants remain a VULKAN choice, and are free to stay one.
 //!
-//! # The one platform fact that makes this module unix-only
+//! # The one platform fact, and the two arms it needs
 //!
 //! DXC's `WinAdapter.h` typedefs `LPCWSTR` as `const wchar_t*`, and `wchar_t`
-//! is **4 bytes** here against Windows' 2 — so the argument array is UTF-32,
-//! not UTF-16. That is the entire difference. Vulkan-on-Windows needs
-//! `wide()` to emit `u16`, the library name flipped to `dxcompiler.dll`, and
-//! the `cfg(unix)` on the module and the `libloading` dependency lifted;
-//! everything else here — the vtables, the CLSIDs, the flags, the binding
-//! scheme — is already platform-neutral. `STDMETHODCALLTYPE` expands to
-//! nothing on this platform, so the methods are plain `extern "C"`.
+//! is **4 bytes** off Windows against Windows' 2 — so the argument array is
+//! UTF-32 there and UTF-16 here. That is the entire difference, and it is the
+//! only reason this module was `cfg(unix)` until now: `WChar`, `wide()`,
+//! `LIB_NAME` and `default_dir()` each carry a two-line arm and nothing else
+//! does. The vtables, the CLSIDs, the flags and the binding scheme were always
+//! platform-neutral.
+//!
+//! Two corollaries worth stating, because both would be silent if wrong:
+//!
+//! * **The calling convention is already right.** `STDMETHODCALLTYPE` expands
+//!   to nothing off Windows, and on **x86_64** Windows `__stdcall` IS the one
+//!   and only convention — so `extern "C"` is correct on both arms. It would
+//!   not be on 32-bit Windows, which this tree does not target and whose DXC
+//!   drop we do not fetch.
+//! * **No `dxil.dll`.** `gpu/dxc.rs` loads the validator/signer because
+//!   unsigned DXIL is rejected by the runtime. SPIR-V has no such step, so the
+//!   Windows arm here loads exactly one library, and a tree with
+//!   `dxcompiler.dll` but no `dxil.dll` still gates.
+//!
+//! `--check-spirv` therefore runs on Windows, which matters beyond Vulkan:
+//! it is a corpus gate, so it belongs on the platform the corpus's OTHER code
+//! generator (`gpu/dxc.rs`) lives on, where a divergence between the two is a
+//! same-box comparison rather than a cross-CI one.
 
 use std::ffi::c_void;
 
@@ -304,11 +345,26 @@ struct IBlobVtbl {
     get_buffer_size: unsafe extern "C" fn(*mut c_void) -> usize,
 }
 
-/// `wchar_t` on this platform. See the header — this is the one difference
-/// from the Windows arm.
+/// `wchar_t` as DXC sees it. See the header — this, `LIB_NAME` and
+/// `default_dir` are the whole platform delta.
 #[allow(non_camel_case_types)]
+#[cfg(windows)]
+type WChar = u16;
+#[allow(non_camel_case_types)]
+#[cfg(not(windows))]
 type WChar = u32;
 
+/// The two arms are two DIFFERENT ENCODINGS, not one cast at two widths.
+/// `c as u16` would silently truncate anything past the BMP into a wrong
+/// character rather than the surrogate pair Windows expects; every argument we
+/// pass today is ASCII, so the bug would sit unfired until the first non-ASCII
+/// path reached it. Spell each encoding correctly instead.
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<WChar> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(not(windows))]
 fn wide(s: &str) -> Vec<WChar> {
     s.chars().map(|c| c as WChar).chain(std::iter::once(0)).collect()
 }
@@ -361,9 +417,12 @@ pub struct Spirv {
 
 /// The host-native DXC library's filename, which is a fact about the TARGET
 /// and not about the host: a Linux drop is `libdxcompiler.so`, a macOS build
-/// `libdxcompiler.dylib`. One const, read by both the path join and the advice
-/// text, so a message can never name a file the loader did not try.
-pub const LIB_NAME: &str = if cfg!(target_os = "macos") {
+/// `libdxcompiler.dylib`, a Windows one `dxcompiler.dll`. One const, read by
+/// both the path join and the advice text, so a message can never name a file
+/// the loader did not try.
+pub const LIB_NAME: &str = if cfg!(windows) {
+    "dxcompiler.dll"
+} else if cfg!(target_os = "macos") {
     "libdxcompiler.dylib"
 } else {
     "libdxcompiler.so"
@@ -372,12 +431,13 @@ pub const LIB_NAME: &str = if cfg!(target_os = "macos") {
 /// Where the host-native drop lives, overridable with
 /// `FRUSTRACER_DXC_SPIRV_PATH`.
 ///
-/// Deliberately NOT `--dxc-path`/`FRUSTRACER_DXC_PATH`, which names the
-/// WINDOWS drop (`dxcompiler.dll` + `dxil.dll`). The installer fetches both
-/// from one release tag precisely so the two compilers cannot drift, but they
-/// are two artifacts in two directories and one path variable cannot name
-/// both — pointing the D3D12 lever at a `.so` would be the kind of quiet
-/// mis-wiring that surfaces as "SPIR-V is unavailable" on a tree that has it.
+/// Off Windows this is deliberately NOT `--dxc-path`/`FRUSTRACER_DXC_PATH`,
+/// which names the WINDOWS drop (`dxcompiler.dll` + `dxil.dll`). The installer
+/// fetches both from one release tag precisely so the two compilers cannot
+/// drift, but they are two artifacts in two directories and one path variable
+/// cannot name both — pointing the D3D12 lever at a `.so` would be the kind of
+/// quiet mis-wiring that surfaces as "SPIR-V is unavailable" on a tree that has
+/// it.
 ///
 /// TWO DIRECTORIES, ONE PIN, because the two arms are ACQUIRED differently and
 /// the pin is what makes that safe. Linux has an upstream tarball at `DXC_TAG`;
@@ -387,11 +447,42 @@ pub const LIB_NAME: &str = if cfg!(target_os = "macos") {
 /// would not be from the tag, and the invariant this module's header states —
 /// the two backends compile identical concatenated source, so a front-end
 /// difference is invisible to every gate — is exactly what that would break.
+///
+/// ON WINDOWS THAT WHOLE ARGUMENT COLLAPSES, and the code has to say so rather
+/// than inherit a caution that no longer applies: there is ONE drop, and the
+/// `dxcompiler.dll` that emits DXIL for `gpu/dxc.rs` is the same file that
+/// emits SPIR-V here. Two directories was never the point — ONE PIN was, and
+/// on this platform the pin is trivially held because it is one artifact. So
+/// the `FRUSTRACER_DXC_PATH` ENV VAR is honoured as the second-choice source:
+/// pointing the D3D12 lever at a Windows DXC drop and having SPIR-V not find it
+/// would be the mis-wiring, in the opposite direction.
+///
+/// HALF a lever, and deliberately so for now: `--dxc-path` is a FLAG, and
+/// `cli.rs` only reads the env var to seed its DEFAULT — the flag never writes
+/// the env var back, so a session started with `--dxc-path D:\dxc` still finds
+/// SPIR-V at the built-in path. `default_dir()` takes no `Opts` (its three
+/// gate call sites have none to give it), so closing that needs the dir
+/// threaded from `run_check_spirv`'s caller rather than a wider `var()` here.
+/// The advice text in `load` says which of the two actually works; do not
+/// widen this doc to promise the flag until the plumbing exists.
+///
+/// `FRUSTRACER_DXC_SPIRV_PATH` still wins where set, so the escape hatch for
+/// "compile SPIR-V with a different DXC than the one signing my DXIL" survives
+/// on every platform — which is what a front-end-divergence bisect would need.
 pub fn default_dir() -> String {
-    std::env::var("FRUSTRACER_DXC_SPIRV_PATH").unwrap_or_else(|_| {
+    if let Ok(d) = std::env::var("FRUSTRACER_DXC_SPIRV_PATH") {
+        return d;
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("FRUSTRACER_DXC_PATH")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string())
+    }
+    #[cfg(not(windows))]
+    {
         let sub = if cfg!(target_os = "macos") { "dxc-macos" } else { "dxc-linux" };
         format!("{}/SDKs/{sub}/lib", env!("CARGO_MANIFEST_DIR"))
-    })
+    }
 }
 
 impl Spirv {
@@ -400,7 +491,17 @@ impl Spirv {
     /// the same way the DXIL loader's does.
     pub fn load(dir: &str) -> Result<Self> {
         let path = std::path::Path::new(dir).join(LIB_NAME);
-        let advice = if cfg!(target_os = "macos") {
+        let advice = if cfg!(windows) {
+            format!(
+                "The corpus's SPIR-V arm needs the SAME {LIB_NAME} the DXIL arm already\n\
+                 uses — one file, one drop, no second download. Run\n\
+                 install-prerequisites.bat dxc, or point FRUSTRACER_DXC_SPIRV_PATH\n\
+                 (or the FRUSTRACER_DXC_PATH env var, which this falls back to — the\n\
+                 --dxc-path FLAG does NOT reach here) at a directory holding it.\n\
+                 dxil.dll is NOT needed here: it signs DXIL, and SPIR-V has no\n\
+                 signing step."
+            )
+        } else if cfg!(target_os = "macos") {
             format!(
                 "The Vulkan backend needs the DirectX Shader Compiler, and upstream\n\
                  publishes no macOS build at the pinned tag — so it is built from\n\

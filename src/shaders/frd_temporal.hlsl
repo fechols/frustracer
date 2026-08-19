@@ -71,8 +71,15 @@ cbuffer FrdCb : register(b0) {
     float max_accum;   // tuning (frd.rs constants unless --frd-* moved them)
     float fast_frames;
     float clamp_sigma;
-    float cam_step;    // |O_cur − O_prev| world units (specular parallax)
+    // cam_fwd BEFORE cam_step (the browser lockstep, 2026-08-18): a float3
+    // at dword 9 packs at offset 36 — legal cbuffer layout, illegal WGSL
+    // uniform layout (vec3 wants 16-alignment). Leading with the float3
+    // lands it on the row start (offset 32) and the scalar takes the row's
+    // tail dword; every lane from proj (12) on is UNMOVED, so the shared
+    // dword-16 light_par contract and the dword-20 matrix hold. Mirrored by
+    // frd_blur.hlsl and frd_gpu's cb() — the three move in lockstep.
     float3 cam_fwd;    // world-space camera forward (the n·v proxy)
+    float cam_step;    // |O_cur − O_prev| world units (specular parallax)
     // The blur passes' lanes, declared here only so light_par lands at the
     // shared dword-16 offset (root constants map by declaration order).
     float proj;

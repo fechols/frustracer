@@ -193,8 +193,9 @@ struct Wave {
     qleaf: Buffer,
     qsky: Buffer,
     cut_pool: Buffer,
-    /// 16 slots of `VkDispatchIndirectCommand` — same 12-byte layout D3D12's
-    /// dispatch command signature consumes, written by `cs_prep`/`cs_prep_mul`.
+    /// 16 slots of `VkDispatchIndirectCommand` — same `gs::ARG_STRIDE` layout
+    /// D3D12's dispatch command signature consumes, written by
+    /// `cs_prep`/`cs_prep_mul`.
     args: Buffer,
     /// t0 space0: the 8-wide frustum tree in its QUANTIZED wire format
     /// (`ftree::QFNode`), or the binary BVH under `--no-ftree`. The tracer's
@@ -745,7 +746,11 @@ impl VkTracer {
                 qleaf: vkd.buffer(cap_leaf * gs::LEAF_REC_BYTES, sb, false)?,
                 qsky: vkd.buffer(cap_leaf * 16, sb, false)?,
                 cut_pool: vkd.buffer(cap_cut * 256, sb, false)?,
-                args: vkd.buffer(16 * 12, sb | vk::BufferUsageFlags::INDIRECT_BUFFER, false)?,
+                args: vkd.buffer(
+                    16 * gs::ARG_STRIDE,
+                    sb | vk::BufferUsageFlags::INDIRECT_BUFFER,
+                    false,
+                )?,
                 tree,
                 ft_bnode,
                 pipes: wpipes,
@@ -2154,7 +2159,7 @@ impl VkTracer {
     ) {
         unsafe {
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
-            d.cmd_dispatch_indirect(cmd, args.buf, u64::from(slot) * 12);
+            d.cmd_dispatch_indirect(cmd, args.buf, u64::from(slot) * gs::ARG_STRIDE);
         }
     }
 

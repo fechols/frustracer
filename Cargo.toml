@@ -23,6 +23,9 @@ rayon = "1.10"
 tobj = "4"
 # Benchmark scene OBJs are committed to git LFS as zstd-compressed text
 # (.obj.zst — OBJ is ASCII, ~5x); the loader decodes them transparently.
+# wasm32 note (the browser port): zstd-sys has a real wasm arm (its wasm-shim
+# stubs the libc surface), but building it needs a clang that can emit wasm32
+# objects on PATH (ubuntu runners have one; a Windows box needs LLVM installed).
 zstd = "0.13"
 image = "0.25"
 # glTF 2.0 loader (src/gltf_loader.rs). `import` resolves buffers (GLB bin
@@ -58,20 +61,58 @@ rustfft = "6"
 # f16 bit-pattern storage for the CPU G-buffer planes (dlss.rs ld16/st16) —
 # a base dependency, not windows-only: headless --check reads them too.
 half = "2"
-# BC7 block compression of OPAQUE scene textures at load (src/bc7.rs, --bc7).
-# Intel's ISPC texture compressor: an ordinary static crate dep — it ships
-# prebuilt ISPC binaries, so no ISPC toolchain and no runtime DLL, which is
-# what keeps every --check* DLL-free (unlike the SDKs/ LoadLibrary policy).
-# A base dependency, not windows-only: bc7::self_test runs under --check.
-intel_tex_2 = "0.5"
 # CPU profiler (Tracy). Off by default — without `--features tracy` this dep
 # is not even compiled and every prof:: hook is an inert no-op. The crate
 # version pairs 1:1 with a Tracy server (GUI) protocol version — see the
 # Profiling section in CLAUDE.md before bumping either side.
 tracy-client = { version = "0.17.6", optional = true, default-features = false, features = ["enable", "broadcast"] }
+# The corpus's SPIR-V arm (src/spirv.rs). `libloading` is the cross-platform
+# spelling of the footprint policy every SDK in this tree already follows —
+# dlopen + dlsym at run time, nothing linked, nothing in the import table — and
+# it is the exact twin of gpu/dxc.rs's LoadLibraryExW + GetProcAddress.
+#
+# A BASE DEPENDENCY, NOT `cfg(unix)`, since --check-spirv runs on Windows: the
+# only thing that ever made src/spirv.rs unix-only was DXC's `wchar_t` width,
+# and both arms of that now exist. On Windows the crate resolves to
+# LoadLibraryExW itself, so the DLL-free bar for every OTHER --check* is
+# untouched — the library only loads when a gate asks this module to compile.
+libloading = "0.8"
+# The corpus's FOURTH code generator: SPIR-V -> WGSL for the browser port
+# (src/wgsl.rs, gated by --check-wgsl). Pure Rust, no DLL, no loader — the
+# --check* DLL-free bar is untouched. A BASE dependency, not a cargo feature,
+# per the recorded rule that a gate's availability must not depend on build
+# flags (the MetalFX note below); it also compiles on wasm32, where the
+# browser session translates `--bake-web`'s shipped SPIR-V with this same
+# naga at page load — one translator, lockfile-pinned, both sides. VERSION
+# LOCKSTEP: when the WebGPU backend lands (wgpu, Stage C of the browser
+# plan), wgpu's own naga must resolve to THIS major, or the gate validates
+# with a different translator than the page runs.
+naga = { version = "30.0.0", features = ["spv-in", "wgsl-in", "wgsl-out"] }
 
 [features]
 tracy = ["dep:tracy-client"]
+
+# The browser port (wasm32). `getrandom` is not used directly — it is
+# tobj → ahash's entropy source, and on wasm32-unknown-unknown it must be
+# TOLD to use the JS backend: this feature plus the `getrandom_backend`
+# --cfg in .cargo/config.toml (both halves required; either alone is a
+# compile error, which is getrandom's own anti-drift design).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# BC7 block compression of OPAQUE scene textures at load (src/bc7.rs, --bc7).
+# Intel's ISPC texture compressor: an ordinary static crate dep — it ships
+# prebuilt ISPC binaries, so no ISPC toolchain and no runtime DLL, which is
+# what keeps every --check* DLL-free (unlike the SDKs/ LoadLibrary policy).
+# Every NATIVE target, not windows-only: bc7::self_test's encode arm runs
+# under --check on all three OSes. Not a base dep since the browser port
+# (2026-08-18): the crate's build script panics outright on target_family
+# "wasm" and its payload is prebuilt x86/ARM ISPC objects no wasm link could
+# eat — web textures arrive pre-encoded from `--bake-web`, so the browser
+# never encodes. src/bc7.rs keeps the vocabulary (Bc7Mode/should_compress)
+# compiled everywhere and cfg's only the encoder internals off wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+intel_tex_2 = "0.5"
 
 # The interactive presentation stack (SDL3 window + D3D12 + Streamline) is
 # Windows-only; headless --check/--check-dlss build everywhere without it.
@@ -147,17 +188,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_XboxController",
 ] }
 
-# The Vulkan backend's shader toolchain (src/vk/spirv.rs). `libloading` is the
-# cross-platform spelling of the footprint policy every SDK in this tree
-# already follows — dlopen + dlsym at run time, nothing linked, nothing in the
-# import table — and it is the exact Linux twin of gpu/dxc.rs's
-# LoadLibraryExW + GetProcAddress. It costs no new download: it is already in
-# Cargo.lock via sdl3's Linux graph (dlib/glutin/clang-sys).
-#
-# unix-only because the module is, and the module is only because of ONE
-# platform fact: DXC's WinAdapter typedefs LPCWSTR as `const wchar_t*`, which
-# is 4 bytes here and 2 on Windows. Vulkan-on-Windows needs that cfg and the
-# library name flipped, nothing else — see the header in vk/spirv.rs.
+# `libloading` USED TO LIVE HERE and no longer does — it is a base dependency
+# now (see the [dependencies] block), because src/spirv.rs stopped being
+# unix-only. Nothing was added to the Windows build that it does not use: the
+# module it serves compiles there.
 #
 # `ash` is the raw Vulkan API — a generated binding, not a framework: no
 # allocator, no render graph, no policy of its own, which is what makes it the
@@ -165,11 +199,10 @@ windows = { version = "0.62", features = [
 # `loaded` feature is the same footprint policy again (it dlopens
 # libvulkan.so.1 through `libloading` and resolves every entry point by
 # symbol), so a box with no Vulkan loader gets a clean error instead of a
-# failed exec. unix-only for now for the same reason the module is: nothing
-# here forbids Vulkan on Windows, but the Windows build must not gain a
-# dependency it does not yet use.
+# failed exec. unix-only for now because `src/vk/` is: nothing here forbids
+# Vulkan on Windows — the shader half of that already moved — but the Windows
+# build must not gain a dependency it does not yet use.
 [target.'cfg(unix)'.dependencies]
-libloading = "0.8"
 ash = "0.38"
 
 # The Linux window (src/vk/present.rs, B6b rung 1). The SAME crate the Windows

@@ -1,5 +1,5 @@
 //! The window, its event pump, and the frame loop's presentation half —
-//! B6b rungs 1 (the window) and 2 (the input).
+//! B6b rungs 1 (the window), 2 (the input) and 3 (the resize).
 //!
 //! WHAT RUNG 1 ADDED TO THE HEADLESS PRESENT PATH. `swapchain.rs` acquires,
 //! renders, presents and lets the engine recycle, all over
@@ -30,13 +30,28 @@
 //! alive as arm B). That interval bounds how short a key tap can be before its
 //! down and its up land in one drain and the press is lost outright.
 //!
+//! RUNG 3 MAKES THE WINDOW RESIZE, and the shape is D3D12's rather than a new
+//! one. The Windows session debounces `SizeChanged` for 250 ms and then EXITS
+//! and re-enters `session()` at the new size (`SessionEnd::Resize`), rebuilding
+//! the tracer through `init_trace` — i.e. it pays the full shader compile on
+//! every commit and keeps only the device, the queue and the display PSOs
+//! (`gpu/mod.rs`'s `resize_output`). So there is no incremental resize to port
+//! and none is invented here: `WinSize` carries the extent across the same
+//! thread boundary the input crosses, the render thread debounces it against
+//! the same constant, and the commit rebuilds. `Presenter::resize` is the
+//! presentation half; `Swapchain::rebuild` is what makes it possible without
+//! taking the window's surface with it.
+//!
 //! WHAT `pump` STILL DOES NOT DO is `input.rs`'s job: the three-tier `Edges`
 //! drain (SPACE, F, H, P, F1 …) answers a pause menu this backend has no peer
 //! of yet. Continuous STATE for a 500 Hz integrator and per-FRAME EDGES for a
 //! session are two mechanisms on Windows too (`GetAsyncKeyState` beside
 //! `input.rs`), so keeping them apart here is that shape, not a fork of it.
+//! F11 belongs to that same drain, which is why a resize works here and
+//! fullscreen does not.
 
 use ash::vk;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use crate::vk::device::Vk;
@@ -44,6 +59,86 @@ use crate::vk::display::{self, Passes};
 use crate::vk::headless::VkHeadless;
 use crate::vk::spirv::Spirv;
 use crate::vk::swapchain::{self, Swapchain};
+
+/// The window's extent, crossing the same thread boundary the input does —
+/// B6b rung 3.
+///
+/// A SEPARATE CELL RATHER THAN A `flycam::Mirror` FIELD, and the reason is the
+/// same one that keeps `input.rs`'s `Edges` out of the mirror: a window extent
+/// is not a camera input. Rung 2's mirror carries a "WHO WRITES WHAT" block
+/// that is worth keeping true, and the integrator has no business reading a
+/// swapchain size.
+///
+/// TWO CELLS, TWO DIRECTIONS. `cur` is the pump telling the renderer what the
+/// window became; `want` is the renderer asking the pump to resize it (the
+/// `--qa resize` verb, which cannot call SDL itself — `set_size` belongs to the
+/// thread that made the window, exactly like `SDL_PumpEvents`). Packing each as
+/// `w << 32 | h` in one `AtomicU64` is what makes a read ATOMIC IN THE PAIR: two
+/// `AtomicU32`s could be read across a write and hand back one frame's width
+/// with the next frame's height, which is a swapchain built at a size the window
+/// never had.
+///
+/// AND ONE BIT, `hidden`, because on this platform the extent never says
+/// "minimized". SDL3's Wayland backend substitutes the cached size for a 0x0
+/// configure and `SDL_EVENT_WINDOW_MINIMIZED` does not touch the window's
+/// w/h at all, so a loop that waited for a 0 dimension (D3D12's model — Windows
+/// really does report 0x0 on minimize) would trace full frames into a hidden
+/// swapchain for as long as the compositor's FIFO fallback keeps releasing
+/// images, which is indefinitely. The visibility events are what SDL3 offers
+/// instead — `Minimized`/`Occluded` (Wayland maps xdg-toplevel's `suspended`
+/// state to the latter) and `Restored`/`Exposed`/`Shown` — so the pump carries
+/// that bit across the same boundary and the renderer idles on it.
+#[derive(Default)]
+pub struct WinSize {
+    cur: AtomicU64,
+    /// 0 means nothing pending — a legitimate size is never 0x0, and a request
+    /// for one would be refused by the debounce anyway.
+    want: AtomicU64,
+    /// The pump's report that the compositor is not showing this window.
+    hidden: AtomicBool,
+}
+
+impl WinSize {
+    fn pack(w: u32, h: u32) -> u64 {
+        (w as u64) << 32 | h as u64
+    }
+    fn unpack(v: u64) -> (u32, u32) {
+        ((v >> 32) as u32, v as u32)
+    }
+    /// The pump's write.
+    pub fn set(&self, w: u32, h: u32) {
+        self.cur.store(Self::pack(w, h), Relaxed);
+    }
+    /// The render thread's read. `(0, 0)` before the first event, which the
+    /// debounce reads as "no size yet" rather than as a minimize.
+    pub fn get(&self) -> (u32, u32) {
+        Self::unpack(self.cur.load(Relaxed))
+    }
+    /// Ask the pump to resize the window. LOGICAL size, because that is what
+    /// `SDL_SetWindowSize` takes; on a fractional-scale output the swapchain
+    /// that comes back is the PHYSICAL extent and will not match. That is why
+    /// `pos` reports the negotiated extent rather than echoing the request —
+    /// a driver reads what it got instead of assuming what it asked for.
+    pub fn request(&self, w: u32, h: u32) {
+        self.want.store(Self::pack(w, h), Relaxed);
+    }
+    /// The pump's take — clears the request so one ask resizes once.
+    fn take_request(&self) -> Option<(u32, u32)> {
+        match self.want.swap(0, Relaxed) {
+            0 => None,
+            v => Some(Self::unpack(v)),
+        }
+    }
+    /// The pump's write: is the window currently not being shown?
+    pub fn set_hidden(&self, h: bool) {
+        self.hidden.store(h, Relaxed);
+    }
+    /// The render thread's read of the same. `false` until the pump says
+    /// otherwise, so a compositor that never sends the events costs nothing.
+    pub fn hidden(&self) -> bool {
+        self.hidden.load(Relaxed)
+    }
+}
 
 /// The SDL side: context, window, and the event pump.
 ///
@@ -81,25 +176,34 @@ impl Win {
     /// which every call below depends on — without it
     /// `SDL_Vulkan_GetInstanceExtensions` has nothing to report.
     ///
-    /// DELIBERATELY NOT `.resizable()`. Rung 1 has no resize path — the
-    /// swapchain, the tracer and the display pipelines are all built once at
-    /// one extent — so advertising the capability invites a resize whose only
-    /// possible outcomes are bad: a driver that reports SUBOPTIMAL keeps
-    /// presenting the OLD extent and lets the compositor scale it (MEASURED on
-    /// RADV: 1280x720 stretched into a 320x240 window, still ~105 fps, a wrong
-    /// image that still looks like a picture — the very failure the FFX-extent
-    /// check in `run_window_vk` refuses), and a driver that reports
-    /// OUT_OF_DATE stops the session. Not asking for it is the honest shape
-    /// until rung 2 can rebuild.
+    /// `.resizable()` SINCE RUNG 3, and the measurement that kept it off until
+    /// now is the reason the rebuild is driven the way it is. Rungs 1 and 2
+    /// built the swapchain, the tracer and the display pipelines once at one
+    /// extent, so the capability could only invite a resize with two bad
+    /// outcomes: a driver reporting SUBOPTIMAL keeps presenting the OLD extent
+    /// and lets the compositor scale it (MEASURED on RADV: 1280x720 stretched
+    /// into a 320x240 window, still ~105 fps — a wrong image that still looks
+    /// like a picture, the very failure the FFX-extent check in `window_frames`
+    /// refuses), and a driver reporting OUT_OF_DATE ended the session.
     ///
-    /// It is not a GUARANTEE — a tiling compositor resizes whatever it likes —
-    /// which is why `Lost::Stale` exists underneath as well.
+    /// That measurement is why SUBOPTIMAL is STILL ignored (`swapchain::Lost`)
+    /// and the rebuild is driven by `Resized`/`PixelSizeChanged` instead: on
+    /// this ICD the present path would never report a resize at all, so a
+    /// backend that waited for `Lost::Stale` would advertise resizing and then
+    /// silently stretch. `Stale` remains a second, independent route in —
+    /// unavoidable, since a mode change or a monitor move arrives with no size
+    /// event — and both funnel into one rebuild.
+    ///
+    /// The hint was never a guarantee either way: a tiling compositor resizes
+    /// whatever it likes, which is what made the pre-rung-3 window die on its
+    /// first frame there.
     pub fn open(w: u32, h: u32, title: &str) -> Result<Win, String> {
         let sdl = sdl3::init().map_err(|e| format!("SDL_Init: {e}"))?;
         let video = sdl.video().map_err(|e| format!("SDL video subsystem: {e}"))?;
         let window = video
             .window(title, w, h)
             .position_centered()
+            .resizable()
             .vulkan()
             .build()
             .map_err(|e| format!("SDL_CreateWindow: {e}"))?;
@@ -163,7 +267,16 @@ impl Win {
     /// continuous STATE for a 500 Hz integrator. Windows keeps the same two
     /// mechanisms apart for the same reason (`input.rs` beside
     /// `GetAsyncKeyState`), so this is that shape rather than a fork of it.
-    pub fn pump(&mut self, m: &crate::flycam::Mirror) -> bool {
+    ///
+    /// RUNG 3 ADDS THE EXTENT, in both directions: size events arm `sz.cur`,
+    /// and a `sz.want` left by the `--qa resize` verb is applied HERE because
+    /// `SDL_SetWindowSize` belongs to the thread that made the window, exactly
+    /// like `SDL_PumpEvents`. Applying it produces a real size event (this
+    /// pass on Wayland, which queues it synchronously; a pass or two later on
+    /// X11, which round-trips), so the verb drives the ordinary path rather
+    /// than a private one — a resize that bypassed SDL would prove the rebuild
+    /// works and nothing about the events or the debounce.
+    pub fn pump(&mut self, m: &crate::flycam::Mirror, sz: &WinSize) -> bool {
         use sdl3::event::{Event, WindowEvent};
         use sdl3::gamepad::Axis;
         use sdl3::keyboard::Keycode;
@@ -175,6 +288,44 @@ impl Win {
         // loop and drop it.
         let mut evs = std::mem::take(&mut self.evs);
         evs.clear();
+        // BEFORE the drain. On Wayland SDL queues the resulting size event
+        // synchronously, so this pass's drain picks it up; on X11 the request
+        // round-trips through the server and the event lands a pass or two
+        // later. Either way it flows through the ordinary path below.
+        //
+        // NOTHING HERE CAN REPORT A REFUSAL, and saying so beats a branch that
+        // pretends to: sdl3 0.18's `Window::set_size` validates the integers
+        // and discards `SDL_SetWindowSize`'s own result, and SDL's Wayland and
+        // X11 backends silently no-op the call on a maximized or fullscreen
+        // window rather than failing it. A compositor that will not honour a
+        // client size (a tiled window) simply sends no event. So the only
+        // honest readout is the one the verb's reply already points at: `pos`,
+        // where the extent either moved or did not.
+        //
+        // CLAMPED TO THE DISPLAY the window is on, which is what bounds the
+        // verb: `MAX_WIN` in the verb table equals RADV's `maxImageExtent`,
+        // so it bounds nothing between the socket and `vkCreateSwapchainKHR`,
+        // and a floating compositor honours a 16384x16384 client size — which
+        // is a 1 GiB-per-image swapchain and a 268 Mpx tracer, i.e. an OOM
+        // reached from a "bounded" verb. A user dragging a corner cannot exceed
+        // the display; neither should a socket. Best-effort: if SDL cannot
+        // name the display, the request goes through as asked.
+        if let Some((rw, rh)) = sz.take_request() {
+            let (rw, rh) = match self.window.get_display().and_then(|d| d.get_bounds()) {
+                Ok(b) if b.width() > 0 && b.height() > 0 => {
+                    let (cw, ch) = (rw.min(b.width()), rh.min(b.height()));
+                    if (cw, ch) != (rw, rh) {
+                        eprintln!(
+                            "vk: resize {rw}x{rh} clamped to the display's {cw}x{ch} — a window \
+                             cannot be sized past the output it is on"
+                        );
+                    }
+                    (cw, ch)
+                }
+                _ => (rw, rh),
+            };
+            let _ = self.window.set_size(rw, rh);
+        }
         evs.extend(self.pump.poll_iter());
         m.pumped();
         let mut quit = false;
@@ -213,6 +364,40 @@ impl Win {
 
                 Event::Window { win_event: WindowEvent::FocusGained, .. } => m.set_focused(true),
                 Event::Window { win_event: WindowEvent::FocusLost, .. } => m.set_focused(false),
+
+                // BOTH HALVES OF SDL3'S SPLIT, and the payload of neither is
+                // used. SDL3 divided SDL2's one SizeChanged into `Resized`
+                // (logical) and `PixelSizeChanged` (physical) — `input.rs`
+                // arms on either for the same reason — but a swapchain is
+                // built against PIXELS, so the event is treated as a
+                // notification and `size_in_pixels` is asked for the number.
+                // Taking `Resized`'s logical payload would build the chain at
+                // a quarter resolution on a 2x output, which is the same
+                // mistake `Win::size`'s own doc warns about.
+                Event::Window {
+                    win_event: WindowEvent::Resized(..) | WindowEvent::PixelSizeChanged(..),
+                    ..
+                } => {
+                    let (pw, ph) = self.window.size_in_pixels();
+                    sz.set(pw, ph);
+                }
+
+                // VISIBILITY, for the renderer to idle on — see `WinSize`. Both
+                // pairs, because the platforms split them: X11 and Windows
+                // send Minimized/Restored, Wayland has no minimized state a
+                // client can see and sends Occluded/Exposed off xdg-toplevel's
+                // `suspended` instead. `Hidden`/`Shown` are the same fact
+                // arriving via `SDL_HideWindow`.
+                Event::Window {
+                    win_event:
+                        WindowEvent::Minimized | WindowEvent::Occluded | WindowEvent::Hidden,
+                    ..
+                } => sz.set_hidden(true),
+                Event::Window {
+                    win_event:
+                        WindowEvent::Restored | WindowEvent::Exposed | WindowEvent::Shown,
+                    ..
+                } => sz.set_hidden(false),
 
                 // A gamepad must be OPENED before SDL delivers its axes, and
                 // the handle has to be held for as long as we want them — so
@@ -416,8 +601,55 @@ impl Presenter {
         -> Result<Presenter, String>
     {
         let sc = Swapchain::from_surface(hg, surface, w, h)?;
-        let passes = Passes::new(hg, sp, sc.fmt)?;
+        // A refusal here frees the chain it would have served: `from_surface`
+        // took the surface over, so leaving `sc` behind would strand a
+        // swapchain AND the window's surface at instance teardown.
+        let passes = match Passes::new(hg, sp, sc.fmt) {
+            Ok(p) => p,
+            Err(e) => {
+                sc.destroy(&hg.vk);
+                return Err(e);
+            }
+        };
         Ok(Presenter { sc, passes, pacing: Pacing::new(2.0) })
+    }
+
+    /// Rebuild the swapchain at a new extent — the presentation half of a live
+    /// resize (B6b rung 3).
+    ///
+    /// `&mut self` RATHER THAN A FRESH `Presenter`, and `Pacing` is the reason:
+    /// replacing the struct would reset the interval statistics at every
+    /// resize, and the measurement this rung owes is precisely "does the
+    /// cadence come back to what it was" — which cannot be asked of an
+    /// instrument that restarts with the thing it is measuring.
+    ///
+    /// `Passes` SURVIVES unless the negotiated FORMAT moved, which is a
+    /// property of the type rather than an optimisation: `record_to` sets the
+    /// viewport and scissor as dynamic state per frame, so the pipelines carry
+    /// no extent at all, and `Passes::new` is keyed on the format alone. A drag
+    /// cannot change the format; a monitor move can, so the check stays. Built
+    /// before the old one is destroyed, the same order `Swapchain::rebuild`
+    /// uses and for the same reason.
+    ///
+    /// THE CALLER MUST RE-`bind_source` afterwards. Not done here because this
+    /// module does not know what it is presenting — the source image belongs to
+    /// FFX, is recreated at the new extent by the caller's own rebuild, and
+    /// binding a view that outlived its image is exactly the failure this
+    /// separation prevents from being silent.
+    pub fn resize(&mut self, hg: &VkHeadless, sp: &Spirv, w: u32, h: u32) -> Result<(), String> {
+        let was = self.sc.fmt;
+        self.sc.rebuild(hg, w, h)?;
+        if self.sc.fmt != was {
+            let fresh = Passes::new(hg, sp, self.sc.fmt)?;
+            self.passes.destroy(&hg.vk);
+            self.passes = fresh;
+            eprintln!(
+                "vk: the surface renegotiated its format across the resize ({was:?} -> {:?}) — \
+                 display pipelines rebuilt",
+                self.sc.fmt
+            );
+        }
+        Ok(())
     }
 
     /// Point the display stage at the image it should tonemap.

@@ -151,8 +151,9 @@ static CLUSTER_MODE: AtomicU32 = AtomicU32::new(0);
 /// by `set_cluster_mode`, `settings::apply_to_opts`'s warn-ignore validation,
 /// and `settings::self_test`'s vocabulary pin (which must stay side-effect-
 /// free and so cannot call the storing flavor).
+/// ASCII-case-insensitive; the vocabulary folds HERE, nowhere else.
 pub fn parse_cluster(name: &str) -> Option<ClusterMode> {
-    match name {
+    match name.to_ascii_lowercase().as_str() {
         "grid" => Some(ClusterMode::Grid),
         "som" => Some(ClusterMode::Som),
         _ => None,

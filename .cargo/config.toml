@@ -5,8 +5,22 @@
 # build-machine-specific. If you ever need to distribute a binary, build it with
 # RUSTFLAGS="-C target-cpu=x86-64-v3" (env overrides this file).
 # (The C++ shims are compiled by cc/build.rs and are unaffected.)
-[build]
+#
+# Scoped off wasm32 (the browser port): `[build]` applies to EVERY target, and
+# `-C target-cpu=native` handed to a wasm32 compile is at best a no-op and at
+# worst an error — wasm has no host CPU to be native to. The cfg table below
+# is the same flags for every native triple (env RUSTFLAGS still overrides).
+[target.'cfg(not(target_arch = "wasm32"))']
 rustflags = ["-C", "target-cpu=native"]
+
+# The browser port's one transitive rng: tobj → ahash → getrandom, which on
+# wasm32-unknown-unknown refuses to guess an entropy source and demands this
+# cfg (plus the crate's `wasm_js` feature, enabled in Cargo.toml's wasm table)
+# to bind the JS one. CAUTION for CI: an env RUSTFLAGS replaces this table
+# wholesale, so the check-wasm job must either leave RUSTFLAGS unset or carry
+# this --cfg itself.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']
 
 # Link with LLD (rust-lld), the COFF/link.exe-compatible driver bundled with the
 # rustup toolchain — no install, no PATH edit, no new prerequisite. This is the

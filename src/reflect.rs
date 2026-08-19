@@ -34,10 +34,28 @@
 //! is a linear walk of the instruction stream; every unknown opcode is
 //! skipped by its own word count, which is what keeps it total over SPIR-V
 //! versions it has never seen.
+//!
+//! # Why this is `crate::reflect` and not `vk::reflect`
+//!
+//! Verbatim the argument `crate::spirv`'s header makes about itself, and the
+//! same fix: it names no `ash` type and never did. What it reads is SPIR-V,
+//! which this tree now has THREE consumers for — Vulkan binds against it,
+//! `mtl::bind` cross-checks spirv-cross's Metal argument numbering against it,
+//! and `--check-spirv`'s S0 runs its `self_test` with no device and no backend
+//! at all. That last one is what forced the move: S0 is a pure gate, and once
+//! `crate::spirv` compiled on Windows, leaving the reflector under `vk/` would
+//! have made a GPU-free corpus gate depend on a backend that platform does not
+//! build. `vk::reflect` re-exports it, so no call site moved.
+//!
+//! It is also the derivation source for a WebGPU bind-group layout, which is
+//! the same shape a third time: `(set, binding)` read back out of the module
+//! rather than transcribed. `vk/layout.rs` remains the ONE place `DescKind`
+//! meets a Vulkan type; keep it that way, and keep this module free of every
+//! backend's vocabulary.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::vk::spirv::{self, Reg};
+use crate::spirv::{self, Reg};
 
 // ---------------------------------------------------------------------------
 // The SPIR-V words this module knows. Values from the SPIR-V 1.6 spec; the
@@ -256,6 +274,17 @@ impl Map {
     }
 
     /// One line per slot, in binding order.
+    ///
+    /// The MIRROR IMAGE of `main.rs`'s `#[cfg_attr(not(windows), ...)]` pair,
+    /// and annotated rather than deleted for the same reason they are: both
+    /// callers are inside `--check-vk` (`run_check_vk_layout` and the pipeline
+    /// dump), so on Windows this is unused today and `dead_code` is right to
+    /// say so. It is the human-readable half of the reflection — the
+    /// thing a layout gate prints when it fails — and a `--check-wgsl` bind-
+    /// group report wants exactly it. Keep the warning silenced NARROWLY, per
+    /// target rather than per module, so a genuinely orphaned method still
+    /// surfaces.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn lines(&self) -> Vec<String> {
         self.entries
             .iter()

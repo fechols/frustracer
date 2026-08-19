@@ -101,9 +101,9 @@ float sw_slab_t(float3 mn, float3 mx, float3 o, float3 inv_d, float tmin, float 
 // (and hemi_wave never pastes it at all).
 bool sw_moller(uint tri, float3 o, float3 d, out float t, out float u, out float v) {
     t = 0.0; u = 0.0; v = 0.0;
-    float3 v0 = uv_positions[uv_indices[tri * 3u]];
-    float3 e1 = uv_positions[uv_indices[tri * 3u + 1u]] - v0;
-    float3 e2 = uv_positions[uv_indices[tri * 3u + 2u]] - v0;
+    float3 v0 = uv_pos(uv_indices[tri * 3u]);
+    float3 e1 = uv_pos(uv_indices[tri * 3u + 1u]) - v0;
+    float3 e2 = uv_pos(uv_indices[tri * 3u + 2u]) - v0;
     float3 p = cross(d, e2);
     float det = dot(e1, p);
     if (abs(det) < 1e-10) return false;
