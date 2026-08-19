@@ -18856,6 +18856,7 @@ fn run_check_vk_render(
         gw as u32,
         gh as u32,
         vk::tracer::TracerOpts::default(),
+        None,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -19492,6 +19493,7 @@ fn run_check_vk_gbuf(
         pw as u32,
         ph as u32,
         vk::tracer::TracerOpts { gbuf_full: true, ..Default::default() },
+        None,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -19734,6 +19736,7 @@ fn run_check_vk_feed(
         // asserted once — and it saves a whole DXC pass. V14 turns the bit off
         // and on itself for the arm that gates it properly.
         vk::tracer::TracerOpts { gbuf_full: true, feed: true, nrd: true },
+        None,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -28809,10 +28812,13 @@ fn run_cinematic_cpu(
 /// scene, vendor and sway with NO resolution term, recommended a memo keyed
 /// on (source, entry) over splitting `VkTracer` into sized and unsized
 /// halves. B6c rung 1 is that memo (`spirv::Memo` — see its doc for the key
-/// and the kill lever), so every rebuild after the first re-costs as
-/// allocation + reflection, the split line reports the hits, and `--check-vk`
-/// asserts suite-wide that the memo actually fires (its own zero-hit run
-/// would otherwise read exactly like a pass).
+/// and the kill lever): MEASURED on the same box, a resize commit is now
+/// swapchain 2.1-3.0 ms | teardown 2.0-2.6 ms | tracer+upscaler+denoiser
+/// 718-833 ms with all 24 units memo hits — the remaining ~0.8 s is
+/// allocation, the FFX/NRD contexts and reflection, not DXC. The split line
+/// reports the hits, and `--check-vk` asserts suite-wide that the memo
+/// actually fires (its own zero-hit run would otherwise read exactly like a
+/// pass).
 ///
 /// THE PUMP DOES NOT NOTICE, which is rung 2's design being tested rather than
 /// trusted: through every one of those multi-second blocks the pump gap stayed
@@ -28827,10 +28833,11 @@ fn run_cinematic_cpu(
 /// LOCKED render res); the toggle keys that answer to arms this window has not
 /// got (SPACE/F/R/T/O/B/G/X/K/N/J/U/V/I/C/Y/Z and 1-3 — one tracer, one
 /// upscaler, one denoiser, one quality; their settings rows are the "n/a"
-/// ones); held-repeat on the gamepad's D-pad in the menu (SDL buttons do not
-/// auto-repeat — `pad.rs`'s repeat core is XInput-bound); and a repaint of the
-/// loading page THROUGH the ~8-20 s DXC compile (no tick hook inside
-/// `VkTracer::new`; the SPIR-V memo rung 3 recommended shrinks that window).
+/// ones); and held-repeat on the gamepad's D-pad in the menu (SDL buttons do
+/// not auto-repeat — `pad.rs`'s repeat core is XInput-bound). The mid-compile
+/// repaint that used to close this list landed with B6c rung 1: the memo made
+/// rebuilds instant and `VkTracer::new`'s tick made the one remaining cold
+/// pass repaint per unit.
 ///
 /// THE SCENE IS THE WORLD, because `req` already says so: a bare invocation
 /// sets `world_wanted`, and nothing about this path changes it.
@@ -29142,7 +29149,7 @@ fn rebuild_at(
     // dependence, say — would announce itself here as a return to seconds.
     let (h0, _) = sp.memo_stats();
     let t_up = std::time::Instant::now();
-    *cv = Some(CineVk::build(hg, sp, scene, vs, vt, bvh, gw, gh, true, want_dn, opts)?);
+    *cv = Some(CineVk::build(hg, sp, scene, vs, vt, bvh, gw, gh, true, want_dn, opts, None)?);
     let ms_up = t_up.elapsed().as_secs_f64() * 1000.0;
     let (h1, _) = sp.memo_stats();
 
@@ -29373,11 +29380,13 @@ fn window_frames(
     };
 
     // The rest of the boot's blocking work, each step behind ONE forced
-    // repaint of the page (the `load_step!` shape): the uploads are seconds
-    // and the DXC compile is ~8-20 s, and a terminal is not where the user is
-    // looking any more. KNOWN-ACCEPT: the marquee STALLS through each step —
-    // there is no tick hook inside `VkScene::new` / `VkTracer::new` — so the
-    // page is live between them and frozen within.
+    // repaint of the page (the `load_step!` shape): the uploads are seconds,
+    // and a terminal is not where the user is looking any more. The DXC
+    // compile — the ~8-20 s step the old known-accept was really about — now
+    // repaints PER COMPILED UNIT through the tick below (B6c rung 1).
+    // KNOWN-ACCEPT, narrowed: the marquee still stalls within `VkScene::new`
+    // and `VkTextures::new` (each a few seconds, no hook inside), and within
+    // any ONE compile unit (~0.3 s cold, microseconds on a memo hit).
     let mut step = |detail: &str, hud: &mut Option<hud::Hud>, pres: &mut vk::present::Presenter, pump: &mut Option<&mut vk::present::Win>| {
         progress::stage(0, 0, "");
         progress::phase(progress::Phase::GpuUpload, detail, 0);
@@ -29409,12 +29418,37 @@ fn window_frames(
     };
     let want_dn = opts.nrd;
     step("compiling shaders", &mut hud, pres, &mut pump);
+    // `step` ends HERE rather than after the bind below: the compile tick
+    // needs `page` next, and two live closures over one `page` would be two
+    // mutable borrows.
+    drop(step);
+    // THE COMPILE TICK (B6c rung 1). The known-accept above used to end at
+    // `VkTracer::new` — the marquee froze for the whole ~8-20 s DXC pass. The
+    // tracer now reports each compiled unit, the detail line carries the
+    // count, and `page`'s own LOAD_TICK_MS throttle keeps the present rate
+    // sane (a memo-hit rebuild ticks all units in microseconds and the page
+    // simply skips them).
+    let mut tick = |done: usize, total: usize| {
+        progress::phase(
+            progress::Phase::GpuUpload,
+            &format!("compiling shaders ({done}/{total})"),
+            0,
+        );
+        if let Err(e) = page(&mut hud, pres, &mut pump, false) {
+            eprintln!("window: loading page: {e}");
+        }
+    };
     // AN `Option` SINCE RUNG 3, and only because `CineVk::destroy` takes `self`
     // by value: a rebuild has to move the old one out before the new one is
     // built. `None` is reachable for the width of `rebuild_at`'s body and
     // nowhere else — every path that leaves it empty returns immediately.
-    let mut cv = match CineVk::build(hg, sp, &scene, &vs, &vt, &bvh, rw, rh, true, want_dn, opts)
-    {
+    // (Bound BEFORE the match: `tick` holds `pres` until it drops, and the
+    // refusal arm needs `pres` for the teardown.)
+    let cv_built =
+        CineVk::build(hg, sp, &scene, &vs, &vt, &bvh, rw, rh, true, want_dn, opts, Some(&mut tick));
+    drop(tick);
+    drop(page);
+    let mut cv = match cv_built {
         Ok(c) => Some(c),
         Err(e) => {
             window_teardown(hg, None, pres, Some(&vt), Some(&vs));
@@ -29427,8 +29461,6 @@ fn window_frames(
     }
     // Init is done: the page comes down (the session's first `hd.frame`
     // uploads the reveal as a forced full-window rect) and the sink idles.
-    drop(step);
-    drop(page);
     if let Some(hd) = hud.as_mut() {
         hd.set_loading(false);
     }
@@ -30588,7 +30620,7 @@ fn run_cinematic_vk(
             }
             built = Some((
                 key,
-                CineVk::build(&hg, &sp, scene, &vs, &vt, bvh, rw, rh, recon, want_dn, opts)?,
+                CineVk::build(&hg, &sp, scene, &vs, &vt, bvh, rw, rh, recon, want_dn, opts, None)?,
             ));
         }
         let cv = &mut built.as_mut().unwrap().1;
@@ -30672,6 +30704,11 @@ impl CineVk {
         recon: bool,
         want_dn: bool,
         opts: &Opts,
+        // Threaded to `VkTracer::new`'s per-unit compile hook — the window's
+        // bring-up repaints the loading page on it; the capture arm and
+        // `rebuild_at` pass `None` (a rebuild's compiles are memo hits, so
+        // there is nothing to watch).
+        tick: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<CineVk, String> {
         // THE UPSCALER FIRST, THE TRACER SECOND, and the order is the cost of a
         // refusal: `Fsr3::new` is milliseconds and needs only the device and
@@ -30727,6 +30764,7 @@ impl CineVk {
                 feed: recon,
                 nrd: recon && want_dn,
             },
+            tick,
         ) {
             Ok(t) => t,
             Err(e) => {
