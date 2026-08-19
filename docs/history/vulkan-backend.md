@@ -3101,6 +3101,41 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # key v (the unarmed refusal, by name), key h (the still-frame refusal),
                                       # key x (the inert refusal).
                                       # Verified: all of the above green, goldens byte-identical.
+                                      #
+                                      # B6C RUNG 3 — THE SCREENSHOT VERB (2026-08-19; edges.screenshot consumed +
+                                      # render::resolve_hdr_plain + the qa Shot pending + save_png). P and
+                                      # `--qa screenshot <path>`, built from parts that all existed: Fsr3's
+                                      # persistent readback (linear f32 RGB at output res), the CPU tonemap, and
+                                      # save_png — the "capture arm's resolve+PNG path" the refusals had promised
+                                      # by name since rung 2.
+                                      # THE ONE NEW FUNCTION IS A SUBTRACTION: resolve_hdr_plain is resolve_hdr
+                                      # WITHOUT the glare pass, because this window presents with the glare tap
+                                      # structurally dead (no vk bloom pyramid yet) and a screenshot records what
+                                      # the swapchain SHOWED — adding CPU glare the screen never drew would make
+                                      # the instrument lie. The site is annotated to move to resolve_hdr when the
+                                      # pyramid lands.
+                                      # WINDOWS P CONTRACT, KEPT WHOLE: SDR 8-bit; no HUD baked (--cinematic is
+                                      # the arm that composites one); screenshot_{n}.png in the CWD, the counter
+                                      # bumped only for auto-named shots; --qa paths verbatim, spaces rejoined.
+                                      # The vk qa side grows a SINGLE-SLOT Shot pending (at most one outstanding,
+                                      # the Windows rule) with the 30 s backstop — a hidden window's loop
+                                      # `continue`s before the consumer, so a pending must be able to time out —
+                                      # resolved on the save with the written name; a failed capture answers
+                                      # ok:false, never an info line a driver parses as success.
+                                      # MEASURED: a shot is one fence-wait, ~50 ms — the cost the presenter
+                                      # already pays every frame, so one frame's hitch. Two parked shots differ at
+                                      # mean |d| 0.197 LSB with local peaks at cloud/firefly edges: THE WORLD
+                                      # animates even under a parked camera (cloud_time advances per frame), so
+                                      # byte-equality was never this instrument's contract — on either backend.
+                                      # A shot under the menu HOLD reads the held FSR3 output, which is also what
+                                      # the swapchain is showing — consistent, not stale.
+                                      # Touch the screenshot consumer / resolve_hdr_plain / the qa screenshot verb
+                                      # + key p + banner strings / qa_shot_pend -> run --check (LAST), cargo test,
+                                      # --check-vk on RADV AND llvmpipe, tools/win-cross-check.sh, and the window
+                                      # over --qa in BOTH pump arms: parked tp + screenshot twice (files exist,
+                                      # scene-sized, near-identical), bare `screenshot` refused by name, key p
+                                      # names screenshot_0.png, a shot under the menu hold.
+                                      # Verified: all of the above green.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

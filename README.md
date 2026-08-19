@@ -287,8 +287,10 @@ flycam integrates. The present cadence is reported (mean/p50/p99 — p99 because
 a mean is exactly the statistic that cannot see a hitch). The quality levers
 are live: **1/2/3** picks the preset, **U** cycles samples per pixel and **V**
 toggles relief where a heightfield is armed — each declaring its own
-discontinuity to the FSR3/NRD histories. What it does not yet do: audio, a
-screenshot key, `--lock-res`, hemisphere bounces (**H** — a still-frame
+discontinuity to the FSR3/NRD histories. **P** (or `--qa screenshot <path>`)
+saves what the swapchain shows — the capture arm's readback through the CPU
+tonemap, ~50 ms. What it does not yet do: audio,
+`--lock-res`, hemisphere bounces (**H** — a still-frame
 feature the upscaler sub-mode refuses on Windows too), and the settings rows
 that answer to arms this backend has not got (one tracer, one upscaler, one
 denoiser — those rows wear an "n/a" badge rather than disappearing).
