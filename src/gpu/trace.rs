@@ -2728,9 +2728,12 @@ impl SceneGpu {
     /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
     /// `base..`: 10 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
     /// positions, mat_height, mat_shadow, blas_tri, chunk_base, sway_dmv —
-    /// t0..t9 space1) then one Texture2D SRV per scene texture (t10..
-    /// space1). The heap must be sized `base + TEX_TABLE_BUFS +
-    /// textures.len()`.
+    /// t0..t9 space1) then one Texture2D SRV per scene texture (t0..
+    /// space2 — a FRESH space, so the register restarts at 0 and is no
+    /// longer `TEX_TABLE_BUFS`; only the HEAP offset below still is.
+    /// `TEX_TABLE_BUFS`'s doc calls that split "one meaning, not two" —
+    /// this comment is the other file it had to hold in). The heap must
+    /// be sized `base + TEX_TABLE_BUFS + textures.len()`.
     pub fn write_scene_descriptors(
         &self,
         device: &ID3D12Device,
@@ -4704,7 +4707,7 @@ impl TraceGpu {
                 _ => s.tlas.GetGPUVirtualAddress(),
             };
             list.SetComputeRootShaderResourceView(RP_SRV0 + SRV_TLAS, tlas_va);
-            // The scene-texture table (t0..t3 + texs[] in space1). The heap
+            // The scene-texture table (t0..t3 in space1 + texs[] in space2). The heap
             // must be set before the table; resolve/feed re-setting the same
             // heap later is redundant-but-legal.
             list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);

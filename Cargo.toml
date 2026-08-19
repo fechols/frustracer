@@ -290,9 +290,24 @@ sdl3 = { version = "0.18", features = ["build-from-source-static", "ash"] }
 # method does not exist. It pulls nothing new: `MTLSamplerDescriptor` needs only
 # NSObject/NSString, both already in the graph.
 #
-# `MTLHeap`, `MTLIndirectCommandBuffer` (which is GPU-encoded command LISTS, a
-# different thing from indirect dispatch — do not add it on the name) and every
-# MTL4* stay out.
+# `MTLHeap` and `MTLIndirectCommandBuffer` (which is GPU-encoded command LISTS,
+# a different thing from indirect dispatch — do not add it on the name) stay
+# out.
+#
+# THIS USED TO SAY "and every MTL4* stay out", AND IT WAS FALSE THE DAY IT WAS
+# WRITTEN — refuted by this same file, in the `objc2-metal-fx` block below.
+# The dates are the whole lesson: B3 (`d88fd05`) added `objc2-metal-fx`, which
+# additively enables `objc2-metal/MTL4Compiler` for the entire graph, AND wrote
+# the note below admitting it. C2 (`756441a`) then wrote "every MTL4* stay out"
+# HERE, one screen above that note and well after it (`git log
+# d88fd05..756441a` is 38 commits long). Nobody lied and nothing regressed; a
+# stay-out list states an INTENTION, an invisible widening does not ask its
+# permission, and the two statements never had to meet.
+#
+# Corrected rather than deleted, because the wrong one is the one a reader
+# reaches first. What is true is the narrower claim: `grep -rn MTL4 src/ shim/`
+# is EMPTY, so no MTL4 API is called anywhere in our own code — `MTL4Compiler`
+# is in the build without a caller.
 #
 # NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
 # are pulled in and compile there); this is additive and touches neither.

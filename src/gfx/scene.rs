@@ -91,7 +91,7 @@ pub struct GpuMat {
     sheen: f32,
     translucency: f32,
     transmission: f32,
-    /// `Scene::textures` index for MAT_TEXTURED (the space1 `texs[]` slot).
+    /// `Scene::textures` index for MAT_TEXTURED (the space2 `texs[]` slot).
     tex: u32,
     emissive: [f32; 3],
     normal_tex: u32, // NO_TEX sentinel = HLSL TEX_NONE

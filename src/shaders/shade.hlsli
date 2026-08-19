@@ -131,7 +131,7 @@ struct Mat {
     float sheen;
     float translucency;
     float transmission;
-    uint tex; // Scene::textures index (MAT_TEXTURED: the space1 texs[] slot)
+    uint tex; // Scene::textures index (MAT_TEXTURED: the space2 texs[] slot)
     float emissive_x;  // Ke; added at every lap, outside the kd*(1-transmission) factor
     float emissive_y;
     float emissive_z;
