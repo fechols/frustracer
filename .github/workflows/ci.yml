@@ -651,18 +651,32 @@ jobs:
           done
           grep -q "WEB_TEX-off" wgsl.log \
             || { echo "::error::--check-wgsl's planted WEB_TEX-off arm left no trace — W6's tooth did not run"; exit 1; }
-          # The WebGPU host (Stage C1): a wgpu device EXECUTING what that
+          # The WebGPU host (Stages C1/C2): a wgpu device EXECUTING what that
           # chain emits — over the same lavapipe this job already installs
           # (wgpu's Vulkan backend finds the ICD the way ash does), with the
           # same DXC drop feeding J2. Positive assertions per the doctrine
           # below; the J-loop's trailing space is load-bearing (J1 must not
           # match a future J18).
+          #
+          # J6 is the browser's TRACER against the CPU reference; J7 is the
+          # WAVEFRONT QUADTREE against that reference, with the soundness
+          # counters at exactly 0. Both run on llvmpipe here, so the gate
+          # drops to a small frame on a software adapter deliberately (it says
+          # so on the line) — the verdicts are the same, the numbers are not
+          # for quoting.
           cargo run --profile quick -- --check-wgpu 2>&1 | tee wgpu.log
           grep -q "CHECK-WGPU PASSED" wgpu.log \
             || { echo "::error::--check-wgpu failed (or printed no summary)"; exit 1; }
-          for s in J0 J1 J2 J3; do
+          for s in J0 J1 J2 J3 J6 J7; do
             grep -q "check-wgpu: $s " wgpu.log \
               || { echo "::error::--check-wgpu printed no $s line at all — that stage did not run and did not say so"; exit 1; }
+          done
+          # Their own anti-vacuity: every verdict line must be there. A tracer
+          # that built and never rendered would still print the upload line,
+          # and "PASSED" would then mean nothing.
+          for v in "J6 primary visibility" "J6 radiance A/B" "J7 coverage" "J7 soundness" "J7 wavefront vs reference image"; do
+            grep -q "check-wgpu: $v" wgpu.log \
+              || { echo "::error::--check-wgpu printed no '$v' verdict — that comparison did not run"; exit 1; }
           done
           cargo run --profile quick -- --check-vk 2>&1 | tee vk.log
           grep -q "CHECK-VK PASSED" vk.log \

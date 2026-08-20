@@ -26,3 +26,6 @@
 
 pub mod device;
 pub mod headless;
+pub mod layout;
+pub mod scene;
+pub mod tracer;

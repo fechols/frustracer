@@ -686,6 +686,73 @@ pub fn web_defs() -> &'static str {
     "#define WEB 1\n#ifndef ABL_NO_WAVE_OPS\n#define ABL_NO_WAVE_OPS 1\n#endif"
 }
 
+/// The browser corpus's MISS MARKER.
+///
+/// WGSL has no infinity — the folded `OpConstant +Inf` cannot be spelled as
+/// a WGSL literal and `OpIsInf` has no WGSL target at all — so the `WEB` arm
+/// of `trace_common.hlsli` defines `INF` as `FLT_MAX` and `ISINF(x)` as
+/// `x >= FLT_MAX` (its own comment carries the argument). That is invisible
+/// inside the corpus, where every test goes through the macro.
+///
+/// It is NOT invisible to a HOST reading `tbuf` back: a browser-corpus miss
+/// is a FINITE float, so `t.is_finite()` — the classifier every native gate
+/// and every native readback uses — reports a sky pixel as a hit. Measured
+/// the first time `--check-wgpu` J6 scored visibility: 5545 of 19200 pixels
+/// read as "class mismatch" and the frame read as "all geometry", against a
+/// max relative `t` error of 2e-6 on the pixels it did classify — i.e. the
+/// render was already right and only the READING was wrong.
+///
+/// So the predicate lives here, once, for every host-side consumer: this
+/// gate, and Stage D's overlay when it reads the same buffer.
+pub const WEB_INF: f32 = f32::MAX;
+
+/// Did this `t` miss? The host-side twin of the corpus's `ISINF`.
+///
+/// A non-finite `t` counts too: on a native readback that IS the miss
+/// marker, and a NaN is a defect either way (the native gates classify it
+/// as sky for the same reason — a value that is not a distance).
+pub fn web_miss(t: f32) -> bool {
+    !t.is_finite() || t >= WEB_INF
+}
+
+/// The browser corpus's `TraceKeys`.
+///
+/// TWO CONSUMERS AND ONE STATEMENT: `--check-wgsl`'s `web_units` (which
+/// validates the corpus and pins it in `goldens/web_corpus.txt`) and
+/// `webgpu::tracer` (which COMPILES AND RUNS it). A tracer that keyed its own
+/// sources would be a second corpus wearing the first one's audit — the
+/// golden would pin text nothing executes, and the executed text would be
+/// pinned by nothing.
+///
+/// `vendor: Nvidia` is a CHOICE the browser has to make and cannot make
+/// well: `cand_defs` arms an AMD candidate-loop TMin workaround, and a page
+/// does not learn its GPU's vendor until after the shaders are baked. One
+/// vendor for the whole web corpus is therefore the shape, and Nvidia is the
+/// arm without the workaround — i.e. the plain source, the same one every
+/// non-AMD native session compiles.
+///
+/// `sway_armed: false` is not a choice at all: `--foliage-sway` is
+/// structurally suppressed under `--sw-rays`, which the browser corpus
+/// requires, so the web world is sway-less by construction.
+pub fn web_keys(scene: &crate::scene::Scene) -> TraceKeys<'_> {
+    TraceKeys { scene, vendor: crate::gfx::vocab::Vendor::Nvidia, sway_armed: false }
+}
+
+/// A browser unit: the define prelude, then the source.
+pub fn web_unit(src: &str) -> String {
+    format!("{}\n{src}", web_defs())
+}
+
+/// A browser TRACE unit: the define prelude, the generated WEB_TEX block,
+/// then the source.
+///
+/// The block is pasted BETWEEN the prelude and the unit so its helpers are
+/// declared before `trace_common` and `shade` consume them. Non-trace units
+/// never touch textures and take [`web_unit`] instead.
+pub fn web_trace_unit(texweb: &str, src: &str) -> String {
+    format!("{}\n{texweb}\n{src}", web_defs())
+}
+
 
 pub const SMOKE_HLSL: &str = include_str!("../shaders/smoke.hlsl");
 /// Order-2 SH irradiance, standalone (no cbuffer of its own — the coefficients
@@ -2440,6 +2507,42 @@ mod indirect_args_stride_tests {
                  16 in WGSL and would not be a DispatchIndirect record there"
             );
         }
+    }
+
+    /// `WEB_INF` is the host's copy of the browser corpus's miss marker, and
+    /// a host that disagrees with the shader about what a miss LOOKS LIKE
+    /// reads sky as geometry — measured, at 5545 of 19200 pixels, the first
+    /// time `--check-wgpu` J6 scored visibility.
+    ///
+    /// Three claims, because the constant is only useful if all three hold:
+    /// the HLSL still spells `FLT_MAX` as that literal, the literal is
+    /// exactly `f32::MAX` (so the Rust constant is the same number and not
+    /// merely a close one), and the `WEB` arm still routes `INF` to it. No
+    /// GPU and no DXC reach any of this — the whole point of the shader
+    /// source tests.
+    #[test]
+    fn web_inf_is_the_corpus_miss_marker() {
+        use super::{TRACE_COMMON_HLSLI as TC, WEB_INF, web_miss};
+        assert!(
+            TC.contains("#define FLT_MAX 3.402823466e38"),
+            "trace_common.hlsli no longer spells FLT_MAX as 3.402823466e38 — \
+             gfx::shaders::WEB_INF is a copy of that literal"
+        );
+        assert_eq!(
+            "3.402823466e38".parse::<f32>().unwrap(),
+            WEB_INF,
+            "the HLSL literal and WEB_INF are different floats"
+        );
+        assert!(
+            TC.contains("#define INF FLT_MAX"),
+            "the WEB arm no longer routes INF to FLT_MAX — the host-side \
+             miss test (web_miss) is keyed on that"
+        );
+        // The predicate, both ways. The native marker is a miss too (a host
+        // reading a native tbuf uses the same function), and the largest
+        // real distance below the sentinel is a HIT.
+        assert!(web_miss(WEB_INF) && web_miss(f32::INFINITY) && web_miss(f32::NAN));
+        assert!(!web_miss(1e30) && !web_miss(0.0) && !web_miss(f32::MAX / 2.0));
     }
 }
 

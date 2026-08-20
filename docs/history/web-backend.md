@@ -439,3 +439,388 @@ golden written then matched) + bistro (buckets live, W7 SKIP),
 Next: Stage C2 — the wgpu tracer recorder over per-entry layouts (the W
 track is closed; W5's profile data is the exact per-entry binding
 information C2's `webgpu/layout.rs` consumes).
+
+## Stage C2a (2026-08-20): the browser's TRACER renders — `--check-wgpu` J6
+
+C1 proved a wgpu device executes the translator's output on the SMOKE
+kernel. This is the tracer: the browser's own corpus, compiled through the
+browser's own chain, bound through layouts DERIVED from the modules wgpu
+compiles, rendering the reference kernel — and scored against the CPU
+reference by `--check-vk` V6's two verdicts, to the line.
+
+Scope is deliberately the reference kernel + resolve + the two cloud caches,
+which is the rung the Vulkan port landed first and for its stated reason:
+the reference kernel is the smallest thing that can be WRONG in an
+interesting way. The wavefront ladder, replay and display are C2b/C2c; the
+`Variant` enum, the push RING and the per-(entry, variant) bind-group table
+are already shaped for them, so those arms are new arms rather than new
+mechanisms.
+
+### What is derived, and from what
+
+`vk/layout.rs` reads `crate::reflect` (a SPIR-V parse). `webgpu/layout.rs`
+reads the new `wgsl::bindings`, which walks the **naga IR** — one step
+further down, and for two reasons that are not style:
+
+- **WebGPU puts read-only-vs-read-write in the layout ENTRY.** Vulkan has one
+  `STORAGE_BUFFER` type and spells read-only as a SPIR-V decoration the
+  layout never sees (`reflect::DescKind::StorageBuffer` says exactly this).
+  The access mode a WGSL global carries is what a browser's compiler reads,
+  so taking the layout from the same module the text came from makes the two
+  unable to disagree. Deriving it from `t` vs `u` would restate the
+  register-shift rule with nothing pinning the two statements together.
+- **`reflect` is `cfg(any(unix, windows))`.** It reads SPIR-V, which the
+  shipped page will not carry. `wgsl::bindings` is pure and compiles on
+  wasm, so Stage E can BAKE its output and the browser builds the same
+  layouts from data. A derivation that only ran natively would leave the
+  browser's layouts hand-written — the liability the whole derivation exists
+  to remove.
+
+`wgsl::BindKind` is a THIRD vocabulary (not naga's, not wgpu's) for
+`reflect::DescKind`'s own argument: the module is pure, its output is
+bake-able, and a storage format it does not map is an ERROR rather than a
+pass-through.
+
+**One layout per ENTRY POINT, one bind group per (entry, variant).** Not the
+spec's no-PARTIALLY_BOUND clause alone — C1 measured it: a dispatch's usage
+scope comes from the pipeline LAYOUT, so a shared layout carrying `args` as
+read-write storage makes the indirect fill conflict with itself. Bind groups
+are still built once at construction, so a dispatch costs a
+`set_bind_group` and no descriptor traffic.
+
+**`b1` is a dynamic-offset uniform RING.** D3D12 has root constants, Vulkan
+has `vkCmdUpdateBuffer`; WebGPU has neither, and every host write in a
+recording happens before the submit. All push rows a frame needs are written
+up front at the device's own `min_uniform_buffer_offset_alignment` and
+selected per dispatch by offset. This is the ONE hand-made entry in a derived
+layout, so it is a parameter of `layout::build_unit` named at exactly one
+call site.
+
+**The device ask is `wgsl::BUDGET`.** The limits C2 requests and the limits
+W5 proved the corpus fits under are ONE constant, asserted equal in
+`webgpu::device::self_test` field by field — a corpus audited green can never
+be run under a limit it was never audited against. Two rows are scene
+properties and cannot come from BUDGET (`device::Ask`): the WEB_TEX bucket
+count and the largest single buffer. Both are computed with no device in
+hand, because the ask is what a device is created WITH — which is what a page
+must do too.
+
+The corpus itself is assembled by `gfx::shaders::web_keys` / `web_unit` /
+`web_trace_unit`, now SHARED with `--check-wgsl`'s `web_units`. The text this
+tracer compiles is byte-for-byte the text that gate validates and
+`goldens/web_corpus.txt` pins. Without that sharing the golden would pin text
+nothing executes and the executed text would be pinned by nothing.
+
+### Two browser constraints the corpus did not know about
+
+Both were MEASURED as failures on the first J6 run, and both are facts about
+WebGPU rather than wgpu quirks.
+
+**1. `read_write` storage textures.** WebGPU allows that access for exactly
+three formats (`r32uint`, `r32sint`, `r32float`). `cs_resolve` only ever
+STORES to `hdr`, but DXC emits no `NonReadable`, so naga reads the access as
+`LOAD | STORE`, the derived layout says `ReadWrite`, and
+`createBindGroupLayout` refuses:
+
+```
+Binding index 2014: ReadWrite access to storage textures with format
+Rgba32Float is not supported
+```
+
+Fixed by a third SPIR-V pass, `wgsl::mark_write_only`, joining
+`split_chains` and `spill_values` in `normalize`: decorate every storage
+image that no `OpImageRead` / `OpImageSparseRead` / `OpImageFetch` /
+`OpImageTexelPointer` names as `NonReadable`. It states a fact about the
+shader that HLSL has no syntax for. Sound by construction — a module that
+genuinely reads and writes one is left alone and still refused downstream,
+correctly, because a browser cannot run it. spirv-val accepts the added
+decoration (W2 stayed 34/34). Teeth are word-level over a synthetic stream
+in `wgsl::self_test` (decorated when never read; untouched when read;
+untouched with no storage image at all), and the end-to-end tooth is
+structural: if the pass stops firing, J6 cannot create the layout — which is
+how it was found.
+
+**2. The storage texture's FORMAT.** WebGPU's layout entry names the format
+and requires it to equal the texture's. HLSL has no format syntax for a UAV,
+so DXC picks `rgba32f` for an unannotated `float4` — and `hdr` is RGBA16F.
+`resolve.hlsl` now carries `[[vk::image_format("rgba16f")]]` under `#ifdef
+WEB`: SPIR-V-only and WEB-only, so DXIL and the native SPIR-V corpus stay
+byte-identical (Vulkan's layout carries no format, so the annotation would
+buy it nothing and would move recorded numbers for stages that never wanted
+it). W7's golden moved by exactly one line — the resolve unit's HLSL hash —
+with every COUNT unchanged, which is the signal that matters.
+
+### And one about reading the result back
+
+`hit 13655 | sky 0 | class-mismatch 5545` on the first scored frame, with a
+max relative `t` error of 2.01e-6 on the pixels it DID classify. The render
+was already right; the READING was wrong. WGSL has no infinity, so the `WEB`
+arm of `trace_common.hlsli` defines `INF` as `FLT_MAX` — a browser-corpus
+miss writes a FINITE float, and `t.is_finite()`, the classifier every native
+gate uses, reports sky as geometry.
+
+The predicate now lives once, in `gfx::shaders::WEB_INF` / `web_miss`, for
+every host-side consumer — this gate today, Stage D's overlay tomorrow. A
+cargo test pins three claims no GPU can reach: the HLSL still spells
+`FLT_MAX` as `3.402823466e38`, that literal is exactly `f32::MAX`, and the
+`WEB` arm still routes `INF` to it.
+
+### Measured (RTX 4090 / Vulkan)
+
+| scene | res | frames | hit / sky | class-mismatch | rel-t > 1e-3 | max rel t | radiance mean rel |
+|---|---|---|---|---|---|---|---|
+| procedural (79.7k tris) | 400x300 | 16 | 85346 / 34654 | 0 | 1 | 1.43e-2 | 0.213% |
+| procedural | 160x120 | 16 | 13655 / 5545 | 0 | 0 | 2.01e-6 | 0.441% |
+| damaged-helmet (15.5k, 5 tex / 2 buckets) | 400x300 | 16 | 85414 / 34586 | 0 | 0 | 8.35e-6 | 0.074% |
+| bistro (2.84M, 187 tex / 21 buckets) | 200x150 | 4 | 21342 / 8658 | 0 | 0 | 2.31e-5 | 0.024% |
+
+Bars are V6's, unchanged: class-mismatch ≤ 0.05%, rel-t violations ≤ 0.01%,
+radiance ≤ 2%, non-finite exactly 0. The single 1.43e-2 rel-t pixel at
+400x300 is one grazing hit out of 120000 — both sides run the SAME software
+intersector here (`rt_sw.hlsli` is a port of `bvh.rs`'s traversal, not a
+second one), so V6's two-intersector grazing-edge set does not exist on this
+backend and the residual is f32 ordering.
+
+Resolution and frame count follow the ADAPTER (a departure from V6, stated
+on the line): a software adapter running a software intersector gets 160x120
+and 4 frames, because lavapipe in CI is two orders of magnitude off hardware.
+Every verdict still runs; the numbers there are coverage, not quotable.
+`FR_WGPU_RES` / `FR_WGPU_AB_FRAMES` override both.
+
+### THE BROWSER GO/NO-GO TABLE (J1, per scene)
+
+Every row where the ask exceeds the WebGPU default is a row a page must
+request and a browser may refuse.
+
+| limit | default | procedural | helmet | bistro |
+|---|---|---|---|---|
+| `max_bindings_per_bind_group` | 1000 | **3002** | **3002** | **3002** |
+| `max_storage_buffers_per_shader_stage` | 8 | **32** | **32** | **32** |
+| `max_storage_textures_per_shader_stage` | 4 | **12** | **12** | **12** |
+| `max_sampled_textures_per_shader_stage` | 16 | 16 | **18** | **37** |
+| `max_storage_buffer_binding_size` | 128 MB | 128 MB | 128 MB | **955.6 MB** |
+| `max_buffer_size` | 256 MB | 256 MB | 256 MB | **955.6 MB** |
+
+The 4090 grants all of it (`max_bindings_per_bind_group` 4294967295,
+per-stage counts 524288, `max_buffer_size` 4294967295). Whether a BROWSER
+does is still the open question C1 named — but it is now asked with real
+numbers instead of estimates, and the binding ceiling is the one to watch:
+3002 is 3x the default and comes straight from DXC's `s` register shift.
+
+**And a size finding for Stage E/H.** Bistro's browser texture plan is
+**~5.2 GB of RGBA8** (187 textures with full mip chains — uploaded and
+rendered here on a 24 GB card). That is over wasm32's entire 4 GB address
+space on its own, so BC7 (`texture-compression-bc`, filed under Stage L) is
+not a download optimization for bistro — it is a PRECONDITION for bistro
+existing in a browser at all. Stage H's world-ring budget must be measured
+against the texture plan, not the geometry.
+
+### Ladder run
+
+cargo test, `--check-wgsl` (W0–W7; golden regenerated for the one moved
+hash, then matched), `--check-wgpu` on three scenes, `--check-spirv`,
+`--check-gpu`, `--check-dxr`, wasm `cargo check`, plain `--check` LAST with
+goldens byte-identical. CI: `--check-wgpu`'s J-loop gains J6 plus two
+positive greps for its verdict lines (a tracer that built and never rendered
+would otherwise still print the upload line and read as PASSED). The gate
+arms `--sw-rays` itself, exactly as `--check-wgsl` does, so a bare invocation
+is sufficient.
+
+## Stage C2b (2026-08-20, same session): the WAVEFRONT QUADTREE — `--check-wgpu` J7
+
+The browser's actual render path. Seed -> depth_full x (prep-args -> level)
+-> the leaf and sky terminal fills, statically recorded: every scheduling
+decision after the seed is a GPU-written counter feeding
+`dispatch_workgroups_indirect`, so an empty level dispatches zero groups
+rather than being skipped by the CPU. There is no readback anywhere in the
+frame, which is the property the whole design rests on.
+
+**The result, on the first run and on all three scenes: BITWISE IDENTICAL to
+the reference kernel.** 0 of 360000 channels differ at 400x300; claim-
+violation, false-sky and tmin-overshoot all exactly 0; the leaf and sky
+rects partition the screen exactly; no info sentinel survives; both tile
+queues drain; overflow and cut-pool fallbacks both 0.
+
+That bitwise result is stronger than either native backend's own bar and the
+reason is structural rather than luck: under `--sw-rays` there is only ONE
+intersector. `--check-vk` V7 must tolerate a grazing-edge set because
+hardware RayQuery is not `moller_trumbore`; here both kernels run
+`rt_sw.hlsli`, which is a port of `bvh.rs`'s traversal and not a second
+implementation, so agreement is exact or it is a bug.
+
+### The push RING, and the hazard it deletes
+
+The Vulkan twin rewrites `b1` twice per level with `vkCmdUpdateBuffer`, and
+its `push()` carries TWO barriers — the read-after-write one, and a
+write-after-read one whose omission silently cost the entire ladder past
+level 0 on that backend's first run (the transfer executed ahead of the
+dispatch it textually followed, so `cs_prep` read the NEXT level's `push3`
+and wrote its indirect args to the wrong slot; nothing faulted and validation
+was clean).
+
+WebGPU cannot make that mistake, because it cannot express the operation: a
+host write lands before the submit, full stop. So the ladder is built as
+DATA first — a `Vec<Step>` naming each dispatch's entry, variant, push value
+and launch shape — and walked twice: once to write every row into the ring,
+once to record. **Each step gets its own ring row**, so a row's lifetime is
+exactly one dispatch and the WAR hazard has nowhere to live. The stride is
+the device's own granted `min_uniform_buffer_offset_alignment`, read back
+rather than assumed to be the 256-byte default.
+
+### No barriers, again
+
+The whole ladder — 26 dispatches at depth 4, half of them indirect, over
+queues written by one dispatch and consumed by the next — records into ONE
+compute pass with no explicit synchronization at all. WebGPU's per-dispatch
+usage scopes are the edges. That this is sufficient was J3's claim on the
+smoke; J7 is the claim at scale, and it holds. The one thing that had to be
+true for it: `cs_level` must not DECLARE `args`, or its layout would carry
+that buffer as read-write storage while the same dispatch reads it as
+INDIRECT — the self-conflict C1 measured. DXC strips it, and the derived
+layout is what makes that observable rather than assumed.
+
+### Teeth, proven both ways — and a hole the plant found in the gate
+
+A planted ping-pong bug (both ladder variants bound queue A as `qin`) turned
+J7 red on three verdicts at once: rect area 0/120000, 120000 info sentinels,
+4 dangling tiles.
+
+**But the image A/B compared CLEAN on that plant** — 0/360000 channels
+differing — because the ladder emitted zero terminal records and `accum`
+still held the reference frame nothing had overwritten. An operation that
+never happened compares clean against its own oracle: the M3d lesson,
+re-learned on a fourth backend. The gate now POISONS `accum` and `tbuf` with
+`0xEEEEEEEE` before the wavefront frame and asserts zero survivors; on the
+re-planted run that reads 360000 accum + 120000 tbuf survivors and fails,
+and on correct code it reads 0 and 0. `write_buffer`, not `clear_buffer` —
+WebGPU can only clear to zeros, and zero is a legitimate radiance.
+
+### Measured (RTX 4090 / Vulkan, release)
+
+| scene | res | depth | leaves / sky | splits / blocked / cuts | coverage | soundness | bitwise |
+|---|---|---|---|---|---|---|---|
+| procedural | 400x300 | 4 (even) | 192 / 4 | 65 / 64 / 113 | 120000/120000 | 0 / 0 / 0 | 0/360000 |
+| procedural | 160x120 | 3 (odd) | 48 / 4 | 17 / 16 / 29 | 19200/19200 | 0 / 0 / 0 | 0/57600 |
+| damaged-helmet | 400x300 | 4 | 192 / 4 | 65 / 64 / 113 | 120000/120000 | 0 / 0 / 0 | 0/360000 |
+| bistro (2.84M) | 200x150 | 3 | 48 / 4 | 17 / 16 / 29 | 30000/30000 | 0 / 0 / 0 | 0/90000 |
+
+Both DEPTH PARITIES are covered, which matters because the drained-queue
+check is parity-selected (`cs_prep` zeroes only the OUT counter, so which
+tile queue must be empty at the end depends on `depth_full % 2`). 400x300
+gives depth 4, 160x120 gives 3 — a parity-selected gate is half a gate until
+both parities have run.
+
+### Not in this rung
+
+The hemisphere tier (`cs_hemi_root`/`cs_hemi_cell`/`cs_hemi_leaf`/
+`cs_compose` and their two queue parities) and structure REPLAY are Stage
+C2c. `render_wavefront` REFUSES a frame that asks for a bounce tier rather
+than quietly rendering without one — an ambient term dropped in silence is
+exactly the `BOUNCE_Q.ao_samples` failure mode this tree already has a rule
+about. The `Variant` enum, the step program and the per-(entry, variant)
+bind-group table are shaped so both arrive as new arms rather than new
+mechanisms.
+
+## Stage C2 review round (2026-08-20, same session): what a read-through found
+
+C2a/C2b were read end to end before landing. Ten findings; the two that
+mattered are below, and both were the same shape — a claim stated more
+strongly in a comment than the code could support.
+
+### J7's image A/B was gated on a statistic that cancels
+
+The A/B computed a BITWISE difference count and printed it, then gated on
+`|Σref − Σwav| / Σref ≤ 0.5%`. A signed sum over every channel of the frame
+cancels: any PERMUTATION of the ladder's output scores exactly zero on it.
+
+MEASURED rather than argued. Rotating the ladder's accumulator by 137 pixels
+— every channel in the frame misplaced, `0/360000` becoming `359985/360000`
+bitwise — gives:
+
+| verdict | planted arm |
+|---|---|
+| sum rel diff | **0.0000%** (bit-unchanged, as a permutation must be) |
+| coverage (rect partition, sentinels, dangling queue) | clean |
+| all three soundness counters | 0 |
+| poison survivors | 0 accum, 0 tbuf |
+
+Every other J7 verdict passes that plant, and for a structural reason: a
+permutation writes every pixel, so the poison sentinel — the thing added in
+C2b precisely to catch a ladder that never ran — cannot see it either. The
+gate would have shipped green on a renderer that put every tile's light in
+the wrong place.
+
+The gated statistic is now the per-channel MEAN ABSOLUTE difference,
+expressed as a fraction of the frame's own mean (so the bar travels across
+scenes and exposures) with the reference mean floored so a dark frame gets no
+free pass. Bar 0.1%; the plant scores **36.04%**. The sum ratio is still
+printed as a SEPARATE diagnosis — large sum with small mean-abs is uniform
+bias, the reverse is misplaced light — and J6 keeps the sum ratio as its
+gated one, correctly: its two sides draw independent sample streams, so
+convergence is the only answerable question there.
+
+Bitwise identity is reported, not gated. It measures 0 on all three scenes
+and both depth parities on the 4090, but no CI adapter has reported yet, and
+a claim this gate has not earned is not one to assert.
+
+### `mark_write_only` claimed soundness it did not have
+
+The pass decorates a storage image `NonReadable` when it sees no read — and a
+WRONG decoration is undefined behaviour rather than an error, because
+spirv-val does not check the claim and naga simply believes it. The first
+version asked an ENUMERATED question ("did one of four opcode shapes name
+it"), so an image reaching a read through `OpCopyObject`, `OpPhi`, `OpSelect`
+or a function parameter was invisible and its variable would have been
+decorated while genuinely read.
+
+It now asks the TOTAL one: **is every occurrence of the four read opcodes in
+this module attributable to a variable I know?** Image values are followed
+through the laundering opcodes to a fixed point (a fixed point, not one
+forward pass, because `OpPhi` may name a value defined later); an image
+handed to `OpFunctionCall` or stored through `OpStore` escapes analysis and
+marks its variable READ; and a read that resolves to nothing makes the pass
+**decorate nothing at all** and hand the module on untouched. Declining to
+claim is always available and always safe — the cost is the same loud
+`createBindGroupLayout` refusal that motivated the pass.
+
+The precision that keeps that bail-out from firing on ordinary work is
+tracking SAMPLED images too: a fetch that resolves to a sampled variable is
+simply not this pass's business, while one that resolves to NOTHING is the
+alarm. Without that distinction the bail would disable the pass on every unit
+that reads a texture. Four new `wgsl::self_test` arms, all DXC-free and
+wasm-safe: laundered-through-`OpCopyObject`, escaped-into-`OpFunctionCall`,
+unresolvable-read-bails, and sampled-fetch-does-not-suppress.
+
+Separately, the undecorated-module arm advanced its insertion point to the
+LAST type/constant/function instruction rather than the first (`max` inside a
+loop over a monotonic index), which would have spliced an `OpDecorate` into
+the middle of a function body — opcode 59 is `OpVariable`, which lives there
+too. Unreachable through DXC, which decorates every resource, but it was
+written as the total-function arm and was not one.
+
+### The rest
+
+- **The ask is resolution-keyed now.** `ask_for` covered the scene's buffers
+  and not the TRACER's, which are resolution-derived — `accum` alone (12 B
+  per pixel) is the largest buffer at 400x300 on the default scene, and
+  passes the 128 MB default `max_storage_buffer_binding_size` at 8K. The
+  ladder's caps come from one `webgpu::tracer::caps_for` that the ask and the
+  allocation both call, so they cannot disagree; the ftree row's per-node size
+  is `size_of::<QFNode>()` rather than a transcribed 128.
+- **The device is scene-keyed from J1, not from J6**, and three doc sites said
+  otherwise. The smoke KERNEL is scene-free; the DEVICE J2/J3 run on is not.
+- **The dummy buffer could not serve its own uniform fall-through** (usage was
+  `STORAGE|COPY_SRC|COPY_DST`). Unreachable today — only `b0`/`b1` are uniform
+  and both always resolve — but the arm exists to be a net.
+- Dead code removed (`EntryLayout::live_groups`, `StorageFmt::name`), a
+  swallowed readback error named, and `run_steps` no longer requires a ladder
+  on the reference-only path.
+
+Re-verified after the fixes: `cargo test` 40/40, `--check-wgsl` W0–W7 (34/34,
+golden matches), `--check-wgpu` on procedural / helmet / bistro and both depth
+parities, `--check-spirv`, `--check-gpu`, `--check-dxr`, wasm `cargo check`,
+then plain `--check` LAST with the tracked goldens byte-identical.
+
+Next: C2c — the hemisphere tiers and replay (J8/J9), then the display stage
+(J18), and then Stage D: the web shell, and the first frustracer pixels in a
+browser tab.
