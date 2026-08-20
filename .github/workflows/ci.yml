@@ -690,80 +690,43 @@ jobs:
             vk.log
           if-no-files-found: warn
 
-  # THE METAL 4 PROBE — `workflow_dispatch` only, and deliberately shaped like
-  # the one `check-metal` itself started as (see the block below: run
-  # 31626195554 answered three unknowns, which is why that job's `if` is gone).
+  # THE `probe-metal4` JOB WAS RETIRED IN D4, and its findings are kept here
+  # because they are still the decision rules — only the instrument changed.
   #
-  # IT ANSWERS ONE QUESTION AND THE WHOLE MTL4 LADDER RIDES ON IT: does the
-  # Apple Paravirtual device support Metal 4? If it does not, every MTL4 rung
-  # loses its GPU half at once — and this is the only real GPU coverage this
-  # workflow has on any platform, so the instrument that would report the
-  # breakage IS the instrument that broke. The K4/K8 guards make that red rather
-  # than silently green, but red-forever on an environment fact is not coverage
-  # either; that is the --check-metalfx situation this file already refuses to
-  # repeat.
+  # It was a `workflow_dispatch`-only Swift script asking a runner whether it
+  # could make an MTL4 queue, an argument table and a residency set. It asserted
+  # nothing on purpose, and it was NEVER DISPATCHED — not once, `gh run list`
+  # shows zero workflow_dispatch runs — so it answered none of the questions it
+  # was written for. D4 made it redundant rather than merely unused: every one
+  # of them is now answered by `--check-mtl` K1 and K9 on EVERY run of this
+  # workflow. A probe that reports is strictly worse than a gate that runs, once
+  # the gate exists.
   #
-  # Three separate decisions read three separate lines of its output:
+  # THE QUESTION IT EXISTED FOR IS STILL OPEN FOR THIS RUNNER: does the Apple
+  # Paravirtual device support Metal 4? If it does not, the MTL4 rungs lose
+  # their GPU half here — and this is the only real GPU coverage this workflow
+  # has on any platform, so the instrument that would report the breakage IS the
+  # instrument that broke. That is why the K9 guard below matches `SKIP K9` too.
+  #
+  # Three decisions still read three facts, and K1/K9 now print all three:
   #   * `metal4 family: false` → the MTL4 rungs are off the table for anything
-  #     CI must verify. The MSL >= 3.1 atomics work is unaffected — it needs no
-  #     Metal 4 API at all — and would ship alone.
-  #   * `argbuf tier: Tier1` → K7 (the unbounded texs[] array) has never had CI
-  #     coverage and never will, which changes what a rung is allowed to assume
-  #     about its own teeth. K1 already SKIPs on tier 1; this says so up front
-  #     instead of after a red run.
-  #   * `mtlfx supportsDevice: false` → EXPECTED (run 31630969341), and it means
-  #     the MetalFX MTL4 port is untestable here in either direction. That is a
-  #     scheduling fact, not a failure.
+  #     CI must verify. (D2's MSL >= 3.1 atomics work needed no Metal 4 API at
+  #     all, which is why it shipped first and shipped alone.)
+  #   * `arg-buffers tier 1` → K7 (the unbounded texs[] array) has never had CI
+  #     coverage and never will, which changes what a rung may assume about its
+  #     own teeth. K1 already SKIPs on tier 1.
+  #   * `mtlfx supportsDevice: false` → EXPECTED (run 31630969341): the MetalFX
+  #     MTL4 port is untestable here in either direction. A scheduling fact,
+  #     not a failure.
   #
-  # NO RUST, NO SUBMODULES, NO CACHE, NO DXC — `swift -` needs no project file,
-  # so this is ~1 runner-minute against check-metal's 6m21s. It asserts NOTHING
-  # on purpose: every line is a measurement, and a probe that fails on an answer
-  # cannot report the answer. Read the log.
-  #
-  # Reference output, Apple M1 / macOS 26.5.1 / Xcode 26.6, 2026-08-19:
-  #   device: Apple M1 | metal3 family: true | metal4 family: true
-  #   argbuf tier: 1 (Tier2) | mtl4 queue/compiler/argtable/residency/allocator: all true
+  # Reference, Apple M1 / macOS 26.5.1 / Xcode 26.6, 2026-08-19 — the DEV box,
+  # never this runner:
+  #   metal3 family: true | metal4 family: true | argbuf tier Tier2
+  #   mtl4 queue/compiler/argtable/residency/allocator: all true
   #   mtlfx supportsDevice: true
-  probe-metal4:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
-    timeout-minutes: 10
-    steps:
-      # `sw_vers` FIRST and on its own line: Metal 4 is macOS 26.0+, so an image
-      # downgrade is the single most likely cause of a future flip in every line
-      # below it, and it should be one grep away rather than a mystery.
-      - name: Runner identity
-        run: |
-          sw_vers
-          xcodebuild -version || true
-          xcrun -sdk macosx --show-sdk-version || true
-
-      - name: Metal 4 capability probe
-        run: |
-          cat > probe.swift <<'SWIFT'
-          import Metal
-          import MetalFX
-
-          guard let d = MTLCreateSystemDefaultDevice() else {
-              print("device: NONE"); exit(1)
-          }
-          // Decoded, not raw: MTLArgumentBuffersTier.tier2 has rawValue 1, and a
-          // bare "1" in a log reads as tier 1 to every future reader.
-          let tier = d.argumentBuffersSupport == .tier2 ? "Tier2" : "Tier1"
-          print("device:", d.name)
-          print("unified:", d.hasUnifiedMemory)
-          print("metal3 family:", d.supportsFamily(.metal3))
-          print("metal4 family:", d.supportsFamily(.metal4))
-          print("argbuf tier:", d.argumentBuffersSupport.rawValue, "(\(tier))")
-          print("mtl4 queue:", d.makeMTL4CommandQueue() != nil)
-          print("mtl4 compiler:", ((try? d.makeCompiler(descriptor: MTL4CompilerDescriptor())) ?? nil) != nil)
-          print("argtable:", ((try? d.makeArgumentTable(descriptor: MTL4ArgumentTableDescriptor())) ?? nil) != nil)
-          print("residency set:", ((try? d.makeResidencySet(descriptor: MTLResidencySetDescriptor())) ?? nil) != nil)
-          print("cmd allocator:", d.makeCommandAllocator() != nil)
-          print("mtlfx supportsDevice:", MTLFXTemporalScalerDescriptor.supportsDevice(d))
-          SWIFT
-          swift probe.swift
-
+  # D4 re-confirmed the first two through the gate itself: `--check-mtl` K1
+  # prints `metal4 family true` and K9 builds queue + allocator + shared event.
+  #
   # THE METAL JOB — the only REAL GPU coverage this workflow has, because
   # macos-latest is macos-26-arm64 and the Linux/Windows runners have no GPU at
   # all. --check-fsr3 is staged like --check-vk (U0 pure staging math | U1 the
@@ -995,6 +958,21 @@ jobs:
       # absent, so PASSED alone would go green on a runner that lost either. K4
       # is the line only a real dispatch prints.
       #
+      # THE K9 GUARD IS DELIBERATELY THE WEAK FORM, AND K10 IS DELIBERATELY NOT
+      # GUARDED AT ALL. D4 added the Metal 4 submission path; it needs macOS 26
+      # AND a device that implements MTL4, and this runner is an Apple
+      # Paravirtual device that NOTHING has ever probed for it — the
+      # `probe-metal4` job that was supposed to answer this was
+      # workflow_dispatch-only and never ran once, which is why D4 retired it in
+      # favour of --check-mtl reporting the same facts on every run. So the
+      # guard asserts only that the STAGE RAN: `K9` and `SKIP K9` both match,
+      # because both are legitimate answers and only their absence means the
+      # stage was removed. Read the first green run's K9 line — it prints
+      # `metal4 family` either way — and tighten onto K10 in a FOLLOW-UP if it
+      # says the runner has Metal 4. Tightening it here would be the
+      # --check-metalfx mistake this file already records one screen down: a
+      # guard on a line that has not been proven to run.
+      #
       # K8 IS THE SECOND GUARD AND IT IS K8 RATHER THAN K6 ON PURPOSE. C3 added
       # three stages; K8 is the LAST of them and the only one that proves the
       # multi-set derivation ran, so a K6-only guard would go green on a build
@@ -1041,6 +1019,8 @@ jobs:
             || { echo "::error::--check-mtl dispatched nothing — a stage skipped:"; grep -E "SKIP K[0-9]" mtl.log || true; rc=1; }
           grep -q "check-mtl: K8" mtl.log \
             || { echo "::error::--check-mtl bound no textures, samplers or second set — the C3 stages skipped:"; grep -E "SKIP K[0-9]" mtl.log || true; rc=1; }
+          grep -qE "check-mtl: (K9|SKIP K9)" mtl.log \
+            || { echo "::error::--check-mtl did not reach the Metal 4 stage at all — K9 prints on BOTH branches, so neither line means the stage is gone:"; grep -E "K9|K10|metal4" mtl.log || true; rc=1; }
           exit $rc
 
       - uses: actions/upload-artifact@v4

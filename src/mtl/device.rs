@@ -19,11 +19,14 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLArgumentBuffersTier, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin,
-    MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLSize, MTLStorageMode,
-    MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue,
+    MTL4ComputeCommandEncoder, MTLArgumentBuffersTier, MTLBlitCommandEncoder, MTLBuffer,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLGPUFamily, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResidencySet, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLSamplerState, MTLSharedEvent, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage,
 };
 use std::ffi::c_void;
 
@@ -87,9 +90,15 @@ impl Mtl {
     /// native image atomics, so nothing is buffer-backed, no pipeline is
     /// specialized on the alignment, and a number no code consumes on an
     /// identity line is worse than absent: it reads as a live constraint.
+    ///
+    /// **`metal4 family` joined it in D4 for the reason the alignment left.**
+    /// It is what separates "this machine cannot do Metal 4" from "this machine
+    /// says it can and something else went wrong", and K9 SKIPs on the second
+    /// half of that sentence rather than the first — see `metal4_family`, which
+    /// is reported and never gates.
     pub fn line(&self) -> String {
         format!(
-            "{} | unified {} | arg-buffers tier {}",
+            "{} | unified {} | arg-buffers tier {} | metal4 family {}",
             self.device.name(),
             self.device.hasUnifiedMemory(),
             match self.arg_buffers_tier() {
@@ -97,6 +106,7 @@ impl Mtl {
                 MTLArgumentBuffersTier::Tier2 => "2",
                 _ => "?",
             },
+            self.metal4_family(),
         )
     }
 
@@ -119,6 +129,50 @@ impl Mtl {
     /// wants the real thing.
     pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    /// Does the device claim the `Metal4` GPU family?
+    ///
+    /// REPORTED, never used as the gate on anything, and the two are not the
+    /// same question. `mtl4()` below decides availability by asking for the
+    /// object it actually needs; this is the capability bit Apple publishes,
+    /// and it is on the identity line so a run where the two DISAGREE is
+    /// legible instead of mysterious. The CI runner is an Apple Paravirtual
+    /// device that nothing has ever probed for Metal 4, so that disagreement is
+    /// a live possibility rather than a hypothetical.
+    pub fn metal4_family(&self) -> bool {
+        self.device.supportsFamily(MTLGPUFamily::Metal4)
+    }
+
+    /// The Metal 4 submission objects, or `None` on a system without them.
+    ///
+    /// **`None` IS AN ENVIRONMENT FACT AND A FAILURE IS NOT**, the same split
+    /// `MtlError::absent` draws one level up. `newMTL4CommandQueue` returning
+    /// nil means this macOS predates Metal 4 or this device does not implement
+    /// it — a loud SKIP. A device that HANDS OVER a Metal 4 queue and then
+    /// refuses an allocator or a shared event is broken, and that is an `Err`.
+    ///
+    /// Probed at RUNTIME rather than gated at build time, following the reason
+    /// `mfxdn` states at length: a build.rs check keys on the BUILD host, which
+    /// is the `cfg(windows)`-describes-the-HOST defect class, and a CI image or
+    /// a cross-compile would decide it for a machine it knows nothing about.
+    /// Unlike `mfxdn` this needs no `AnyClass::get` dance — every MTL4 type
+    /// here is a PROTOCOL reached through a method that returns nil, never an
+    /// `extern_class!` whose absence would panic.
+    pub fn mtl4(&self) -> Result<Option<Mtl4>, String> {
+        let Some(queue) = self.device.newMTL4CommandQueue() else { return Ok(None) };
+        let allocator = self
+            .device
+            .newCommandAllocator()
+            .ok_or("the device gave an MTL4 command queue and then refused a command allocator")?;
+        // THE ONLY WAY THE CPU CAN WAIT. MTL4 has no `waitUntilCompleted` —
+        // `MTL4CommandQueue` offers `commit:count:` and nothing that blocks —
+        // so the queue signals this event and `Mtl4::compute` blocks on it.
+        let event = self
+            .device
+            .newSharedEvent()
+            .ok_or("the device gave an MTL4 command queue and then refused a shared event")?;
+        Ok(Some(Mtl4 { queue, allocator, event, signalled: std::cell::Cell::new(0) }))
     }
 
     /// Which argument-buffer tier the device supports.
@@ -524,6 +578,200 @@ impl Mtl {
         let staging = self.texture(w, h, format, MTLStorageMode::Shared)?;
         self.clear(&staging, w, h, bpp);
         self.blit(&staging, tex, w, h)
+    }
+}
+
+/// The Metal 4 submission objects — `Mtl`'s peer, not its replacement.
+///
+/// `Mtl` keeps the device, the buffers and the `MTLCommandQueue`; this owns
+/// only what MTL4 adds, so both paths allocate from ONE device and dispatch ONE
+/// set of pipelines. That is what makes `mtl4`'s byte-compare against `smoke`
+/// a comparison of SUBMISSION and nothing else.
+///
+/// # Three things MTL4 removed, and each one costs a line here
+///
+/// * **No implicit hazard tracking.** `MTLComputeCommandEncoder` defaults to
+///   `MTLDispatchTypeSerial` and the driver orders and hazard-tracks the
+///   dispatches — `smoke::pass` says so, and says `vk/headless.rs`'s barrier
+///   apparatus therefore "has no analogue here". Under MTL4 it has one:
+///   `mtl4::pass` must issue explicit barriers between the three dispatches.
+/// * **No implicit residency.** There is no `useResource:` on any MTL4 encoder
+///   (checked against every binding in the crate), and the argument table takes
+///   a raw GPU ADDRESS, so nothing infers residency from what was bound.
+/// * **No `waitUntilCompleted`.** Hence `event` and `signalled` below.
+///
+/// # And a fourth it removed that costs NO line here, deliberately
+///
+/// **There is no `error` on an MTL4 command buffer, and this path therefore
+/// checks none.** `Mtl::run` next door checks `cb.error()` and says why —
+/// *"the only channel a committed buffer has; dropping it silently is how a
+/// failed dispatch reads as a black image"* — and MTL4 has no synchronous
+/// equivalent anywhere: not on the queue, not on the command buffer, not on
+/// the event. The whole channel is `MTL4CommitFeedback::error`, delivered as a
+/// BLOCK through `MTL4CommitOptions::addFeedbackHandler:` and
+/// `commit:count:options:`, on a dispatch queue.
+///
+/// It is not wired, and the reason is that wiring it naively would be a probe
+/// that has not been shown to REACH its target — the `FR_ABL` trap this
+/// project has fallen into four times. The callback is asynchronous and
+/// ordered against nothing this function waits on, so reading a captured error
+/// after `waitUntilSignaledValue:` returns would report "no error" both when
+/// there was none and when the handler had simply not run yet, and the two are
+/// indistinguishable from here. Doing it properly means making the FEEDBACK
+/// the completion signal instead of the event, which is a different design for
+/// the wait rather than a check bolted onto this one.
+///
+/// What that costs today is diagnosis, not coverage: `smoke::verify` reads
+/// every word of the result, so a faulted submission fails the gate on its
+/// DATA. It fails with "out[0] is 0xDEADBEEF" where Metal 3 would have said
+/// which command buffer died and why. **A rung that extends this path beyond
+/// the smoke chain should wire the handler first**, because the further the
+/// work gets from a fully-verified 619-word readback, the more of that
+/// distinction stops being cosmetic.
+///
+/// # `signalled` is a monotone counter, not a fence index
+///
+/// Each `compute` takes the next value, signals it AFTER the commit, and blocks
+/// until the event reaches it. Reusing one value across passes would make the
+/// second wait return instantly on the first pass's signal — a readback racing
+/// a live GPU on unified memory, which is exactly the failure `Mtl::compute`'s
+/// "read outside the closure" comment describes, with no diagnostic.
+pub struct Mtl4 {
+    queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
+    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    signalled: std::cell::Cell<u64>,
+}
+
+/// How long `compute` will wait for a submission before calling it a failure.
+///
+/// A NUMBER RATHER THAN `u64::MAX`, because the failure this bounds is a gate
+/// that never returns. The smoke chain is three dispatches over 619 words and
+/// completes in single-digit milliseconds on an M1; two seconds is three orders
+/// of magnitude of headroom and still far inside CI's 10-minute step budget.
+/// `smoke.rs`'s `GRID_POISON` exists to prevent the OTHER version of this — a
+/// dispatch that runs 5e10 threadgroups — and this covers the case where the
+/// work never starts at all.
+const MTL4_WAIT_MS: u64 = 2_000;
+
+impl Mtl4 {
+    /// `Mtl::compute`'s twin: encode one compute pass, submit it, and block.
+    ///
+    /// The shape is deliberately identical — the closure returns a `Result` so
+    /// a binding error is reported before the command buffer's own, which is
+    /// usually its downstream consequence — and the differences are all MTL4's:
+    /// an allocator to begin against, an explicit `endCommandBuffer`, and a
+    /// signal-and-wait instead of `waitUntilCompleted`.
+    ///
+    /// **THE ALLOCATOR IS RESET AFTER THE WAIT, NEVER BEFORE — AND NOT AT ALL
+    /// IF THE WAIT TIMES OUT.** It owns the memory the encoded commands live
+    /// in, so resetting it while the GPU is still reading them is a
+    /// use-after-free that would present as corrupted output rather than as an
+    /// error — the same class as the readback race above, and invisible for the
+    /// same reason. The timeout branch is the one place where the GPU is
+    /// PROVABLY still reading, so it returns the error and leaks the allocator
+    /// rather than resetting on the strength of a wait that did not happen.
+    pub fn compute<F>(&self, m: &Mtl, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&ProtocolObject<dyn MTL4ComputeCommandEncoder>) -> Result<(), String>,
+    {
+        let cb = m.device().newCommandBuffer().ok_or("newCommandBuffer() returned nil")?;
+        cb.beginCommandBufferWithAllocator(&self.allocator);
+        let inner = {
+            let enc = cb
+                .computeCommandEncoder()
+                .ok_or("MTL4CommandBuffer::computeCommandEncoder() returned nil")?;
+            let r = f(&enc);
+            enc.endEncoding();
+            r
+        };
+        cb.endCommandBuffer();
+
+        // `commit:count:` takes a C ARRAY of command buffers, so even one needs
+        // a slot to point at. Built here rather than at the call site because
+        // the lifetime is the delicate part: `cb` must outlive the call, and it
+        // does — `one` borrows it and both live to the end of this function.
+        let mut one = [std::ptr::NonNull::from(&*cb)];
+        // SAFETY: `count` is 1 and `one` holds exactly one valid, non-null
+        // pointer to a command buffer that outlives the call.
+        unsafe { self.queue.commit_count(std::ptr::NonNull::from(&mut one[0]), 1) };
+
+        let want = self.signalled.get() + 1;
+        self.signalled.set(want);
+        self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), want);
+        if !self.event.waitUntilSignaledValue_timeoutMS(want, MTL4_WAIT_MS) {
+            // RETURNED WITHOUT RESETTING, and that is the whole point of the
+            // paragraph above. A wait that timed out is the ONE case where the
+            // GPU is provably still holding the commands this allocator owns,
+            // so resetting on the way out would be precisely the use-after-free
+            // the success path is careful to avoid — committed on the strength
+            // of a wait that, by hypothesis, did not happen. Leaking the
+            // allocator instead ends the gate with a message a reader can act
+            // on; the process is failing either way, and only one of the two
+            // endings is defined behaviour.
+            return Err(format!(
+                "the MTL4 submission did not signal {want} within {MTL4_WAIT_MS} ms — the \
+                 command buffer never completed"
+            ));
+        }
+        self.allocator.reset();
+        inner
+    }
+
+    /// A residency set holding `allocations`, committed, requested and attached
+    /// to the queue.
+    ///
+    /// **ALL FOUR STEPS, and none of them is optional.** `addAllocation:`
+    /// alone leaves the set uncommitted (its own doc says so); `commit` without
+    /// `requestResidency` describes a set nothing has been asked to page in;
+    /// and a set the QUEUE does not hold applies to no submission. Each
+    /// omission fails the same way — the resource is simply not there when the
+    /// shader reads through its address — which is why they are one function
+    /// rather than four calls at a call site.
+    ///
+    /// Returns the set, which the caller must keep alive for the submission,
+    /// and its `allocationCount` — `smoke::Pass::resident`'s value on this
+    /// path, and the anti-vacuity number for a set that silently came back
+    /// empty.
+    pub fn residency(
+        &self,
+        m: &Mtl,
+        allocations: &[&ProtocolObject<dyn objc2_metal::MTLAllocation>],
+    ) -> Result<(Retained<ProtocolObject<dyn MTLResidencySet>>, usize), String> {
+        let desc = objc2_metal::MTLResidencySetDescriptor::new();
+        let set = m
+            .device()
+            .newResidencySetWithDescriptor_error(&desc)
+            .map_err(|e| format!("newResidencySetWithDescriptor: {e}"))?;
+        for a in allocations {
+            set.addAllocation(a);
+        }
+        set.commit();
+        set.requestResidency();
+        self.queue.addResidencySet(&set);
+        let n = set.allocationCount();
+        Ok((set, n))
+    }
+
+    /// Detach a set the queue no longer needs.
+    ///
+    /// Paired with `residency` rather than left to `Drop`: the queue holds a
+    /// strong reference, so a set that is never removed keeps its allocations
+    /// resident for the life of the queue. Harmless for one gate run and wrong
+    /// as a pattern — and `--check-mtl` runs the chain twice, so a leak here
+    /// would be a second set covering the first's buffers, which is precisely
+    /// the state that would make a residency TOOTH stop biting.
+    ///
+    /// **CALL IT ONLY WHERE THE SUBMISSION IS KNOWN TO HAVE COMPLETED.** It
+    /// revokes the backing for every allocation in the set, so calling it while
+    /// work is still in flight — after `compute` reports a TIMEOUT, say — is
+    /// the very use-after-free the set exists to prevent, arriving through the
+    /// cleanup path. `mtl4::pass` therefore skips it on failure and says so;
+    /// an over-long residency in a process that is failing anyway costs
+    /// nothing, and the other ending is undefined.
+    pub fn drop_residency(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        self.queue.removeResidencySet(set);
+        set.endResidency();
     }
 }
 

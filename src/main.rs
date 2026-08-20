@@ -16063,6 +16063,143 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
     i32::from(!ok)
 }
 
+/// `--check-mtl` K9-K10: the same smoke chain through the **Metal 4** API.
+///
+/// K9 builds the MTL4 submission objects or SKIPs; K10 runs the chain, holds it
+/// to `smoke::verify` — the SAME function the Metal 3 path is held to — and
+/// then compares the two paths' readbacks word for word.
+///
+/// # The SKIP is this stage's vacuity hazard, and it is stated rather than
+/// hidden
+///
+/// A machine without Metal 4 exits 0 having proved nothing here, which is the
+/// right behaviour and also the thing that could make a green CI job silent
+/// about a broken rung. Two things push back on it. The identity line prints
+/// `metal4 family`, so a run that SKIPPED while the device claimed the family
+/// is visibly odd rather than merely quiet; and `FR_MTL4_OFF` forces the SKIP
+/// branch on a machine that does have MTL4, so the branch itself is reachable
+/// for inspection. The CI guard is deliberately NOT tightened onto K10 in the
+/// commit that adds it — the runner is an Apple Paravirtual device and nothing
+/// has ever probed it for Metal 4, and `.github/workflows/ci.yml` records at
+/// length what happens when a guard is tightened onto a line that was never
+/// proven to run.
+///
+/// # Why K10 re-runs the Metal 3 pass instead of reusing K4's
+///
+/// K4 reports residency counts, not its `Pass`. Rather than widen
+/// `smoke::run`'s signature so one stage can reach into another's result, K10
+/// takes its own Metal 3 pass for the comparison — the self-containment
+/// argument `--check-fsr3`'s U0 makes in as many words. It costs one extra
+/// three-dispatch submission, and it means K10's claim does not depend on K4
+/// having run at all.
+#[cfg(target_os = "macos")]
+fn run_mtl4(m: &mtl::device::Mtl, pipes: &mtl::smoke::Pipes, plant: mtl::mtl4::Plant) -> bool {
+    // ---- K9: the MTL4 objects. Absence is an environment fact, so it SKIPs. --
+    if plant.off {
+        println!(
+            "check-mtl: SKIP K9 FR_MTL4_OFF armed — the Metal 4 path is reported absent on \
+             a device that reports `metal4 family {}`",
+            m.metal4_family()
+        );
+        return true;
+    }
+    let g = match m.mtl4() {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            // The family bit rides the message because the interesting case is
+            // the DISAGREEMENT: a device claiming Metal 4 and refusing a Metal
+            // 4 queue is a different problem from a Mac that predates it.
+            println!(
+                "check-mtl: SKIP K9 no MTL4 command queue (newMTL4CommandQueue returned nil; \
+                 device reports `metal4 family {}`) — Metal 4 is macOS 26.0+",
+                m.metal4_family()
+            );
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K9 {e}");
+            return false;
+        }
+    };
+    println!(
+        "check-mtl: K9 MTL4 queue + allocator + shared event OK | metal4 family {} | \
+         pipelines SHARED with the Metal 3 path (MTL4Compiler not needed)",
+        m.metal4_family()
+    );
+
+    // ---- K10: the chain, verified and then cross-checked. ----
+    let mut ok = true;
+    match mtl::mtl4::run(m, &g, pipes, plant) {
+        Ok((r_n, r_0)) => {
+            // ANTI-VACUITY, and the number is NOT K4's 6 — nor the 9 the first
+            // draft of this line expected. K4 counts `useResource:` CALLS, and
+            // there are six; this counts DISTINCT ALLOCATIONS, and there are
+            // seven. The four data buffers (`push`, `counters`, `args`,
+            // `outbuf`) plus the three ArgBufs' own buffers, which the Metal 3
+            // path never has to declare because it binds them as objects.
+            //
+            // The gap between 6+3 and 7 is `counters`, which all three kernels
+            // reach: `mtl4::pass` deduplicates by identity because
+            // `MTLResidencySet` does too — MEASURED, it answered 7 to nine
+            // `addAllocation:` calls, and a gate comparing against the call
+            // count would have failed on correct code forever.
+            //
+            // NOT ASSERTED WHEN `FR_MTL4_NO_RESIDENCY` IS ARMED, and skipping
+            // it is what makes that lever's answer worth anything. The plant
+            // builds no set at all, so this count is 0 BY CONSTRUCTION — a gate
+            // that failed on it would be reporting that it noticed its own
+            // plant, and the run would exit 1 while proving nothing whatever
+            // about what the GPU does with an unbacked address. The first draft
+            // did exactly that and the "observable" it printed was circular.
+            // With the assertion out of the way, only the DATA can fail.
+            if !plant.no_residency && (r_n != 7 || r_0 != 7) {
+                eprintln!(
+                    "check-mtl: FAIL K10 residency set holds {r_n}/{r_0} allocations, \
+                     expected 7 (4 distinct buffers + 3 argument buffers)"
+                );
+                ok = false;
+            }
+            println!(
+                "check-mtl: K10 MTL4 seed -> prep -> indirect fill OK at {} and at 0 | \
+                 {r_n} allocations resident | argument table by GPU ADDRESS",
+                mtl::smoke::FILL_N
+            );
+        }
+        Err(e) => {
+            eprintln!("check-mtl: FAIL K10 mtl4 smoke: {e}");
+            ok = false;
+        }
+    }
+
+    // The cross-API compare. Skipped when the chain above already failed —
+    // comparing a known-bad readback against a good one produces a second,
+    // derivative failure message that sends a reader to the wrong place.
+    if ok {
+        let n = mtl::smoke::FILL_N;
+        let three = mtl::smoke::pass(m, pipes, n, mtl::smoke::Plant::default());
+        let four = mtl::mtl4::pass(m, &g, pipes, n, plant);
+        match (three, four) {
+            (Ok(a), Ok(b)) => match mtl::mtl4::cross_check(&a, &b) {
+                Ok(()) => println!(
+                    "check-mtl: K10 cross-API compare OK — {} words, indirect args and \
+                     counters IDENTICAL between MTLCommandQueue and MTL4CommandQueue \
+                     over one shader and one pipeline",
+                    a.out.len()
+                ),
+                Err(e) => {
+                    eprintln!("check-mtl: FAIL K10 cross-API compare: {e}");
+                    ok = false;
+                }
+            },
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("check-mtl: FAIL K10 cross-API compare could not run: {e}");
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
 /// K6/K7/K8 — `mtlbind.hlsl` bound and DISPATCHED: textures, samplers, an
 /// unbounded array, and the two descriptor sets C2 explicitly could not reach.
 ///
@@ -16460,17 +16597,34 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
     // Two plant families, deliberately separate: `must_fail()` is per-family,
     // so the verdict can say WHICH one failed to bite.
     let tplant = mtl::texprobe::Plant::from_env();
-    if plant.any() || tplant.any() {
+    // The third family, D4's. Separate for the same reason the first two are.
+    let gplant = mtl::mtl4::Plant::from_env();
+    if plant.any() || tplant.any() || gplant.any() {
         // Loud on departure, and it says what it expects: a plant that ran and
         // PASSED is the finding, not a quiet success.
+        //
+        // **THE "MUST fail" HALF IS NOW CONDITIONAL, and it always should have
+        // been.** Every family carries MEASUREMENT levers as well as teeth —
+        // `FR_MTL_NO_RESIDENCY` was one before D4 arrived — and for those a
+        // PASS is the expected outcome, so a banner promising failure was
+        // telling a reader the opposite of what the K5 NOTE below would tell
+        // them twenty lines later. It keys off `must_fail()` across all three
+        // families, which is the same predicate the verdict enforces.
+        let teeth = plant.must_fail() || tplant.must_fail() || gplant.must_fail();
         println!(
-            "check-mtl: PLANT {} armed — this run MUST fail; a pass is the finding",
-            [plant.line(), tplant.line()]
+            "check-mtl: PLANT {} armed — {}",
+            [plant.line(), tplant.line(), gplant.line()]
                 .iter()
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            if teeth {
+                "this run MUST fail; a pass is the finding"
+            } else {
+                "these are MEASUREMENTS, not teeth — the run is expected to pass and the \
+                 K5 NOTEs below are the result"
+            }
         );
     }
 
@@ -16679,6 +16833,12 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
         // ---- K6/K7/K8: textures, samplers, and the sets C2 could not reach. --
         ok &= run_mtl_texprobe(&m, &msl, &sp, tplant);
 
+        // ---- K9/K10: the same chain through METAL 4. ----
+        // Takes `pipes` rather than rebuilding: the two paths SHARE the
+        // pipeline objects, which is what lets K10's byte-compare be about
+        // submission and nothing else. See `mtl::mtl4`'s header.
+        ok &= run_mtl4(&m, &pipes, gplant);
+
         // ---- K5: the verdict. ----
         // A TOOTH that did not bite is a defect in the gate, so it fails here.
         // It stays K5 rather than becoming K9: the number means "the verdict",
@@ -16722,6 +16882,40 @@ fn run_check_mtl(scene: &scene::Scene) -> i32 {
                 plant.line()
             );
             ok = false;
+        }
+        if gplant.must_fail() && ok {
+            eprintln!(
+                "check-mtl: FAIL K5 the plant {} did not make the gate fail — \
+                 that is the finding, not a pass",
+                gplant.line()
+            );
+            ok = false;
+        }
+        // THE TWO MTL4 LEVERS WHOSE CLASS THIS RUNG MEASURED RATHER THAN
+        // PREDICTED. Both are reported either way, the `FR_MTL_NO_RESIDENCY`
+        // shape — and unlike that one, each makes a claim about a guarantee
+        // MTL4 REMOVED, so "changed nothing" is a finding about the platform
+        // and not merely about this device's memory model.
+        if gplant.no_residency {
+            println!(
+                "check-mtl: K5 NOTE FR_MTL4_NO_RESIDENCY {} — MTL4 has no `useResource:` \
+                 and the argument table binds by raw GPU ADDRESS, yet an unbacked address \
+                 is {} on this device: MEASURED to behave exactly like the Metal 3 twin, \
+                 invisible until MTL_SHADER_VALIDATION=1. Binding by address does not by \
+                 itself make the omission observable on unified memory",
+                if ok { "changed nothing" } else { "changed the result" },
+                if ok { "UNOBSERVABLE" } else { "observable" }
+            );
+        }
+        if gplant.no_barrier {
+            println!(
+                "check-mtl: K5 NOTE FR_MTL4_NO_BARRIER {} — MTL4 does not hazard-track \
+                 between dispatches the way MTLDispatchTypeSerial does, so dropping the \
+                 seed->prep->fill barriers is {} on this device (measured: a deterministic \
+                 read-before-write neither validation layer reports)",
+                if ok { "changed nothing" } else { "changed the result" },
+                if ok { "UNOBSERVABLE" } else { "observable" }
+            );
         }
         // The residency lever is a MEASUREMENT, not a tooth, and is reported
         // either way — see `mtl::smoke::Plant`. Measured on an M1: the omission
