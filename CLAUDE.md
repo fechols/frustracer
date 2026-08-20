@@ -93,7 +93,7 @@ of NVIDIA's NRD entry names.
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
 | `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V20 |
 | `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
-| `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip (W0 is DXC-free) |
+| `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip + W5 layout audit + W6 hostile scan + W7 tracked corpus golden (`goldens/web_corpus.txt`, regenerated via `--write-golden`; W0 is DXC-free) |
 | `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe + the indirect smoke (J0 is pure) |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
@@ -292,7 +292,8 @@ lights|tonemap` `--exposure-bias EV` `--autoexp-spike-guard` / `-strength`
 `--no-vsync` · `--move-ease S` / `--no-move-ease` · `--no-audio` · `--no-settings` ·
 `--prefer-nvidia|amd|intel`
 
-**Headless modes** — the 16 `--check*` gates · `--spin still|path` + `--spin-frames|-warmup|
+**Headless modes** — the 16 `--check*` gates · `--write-golden` (regenerates the `--check-wgsl`
+W7 corpus golden; refused unless W0–W6 green) · `--spin still|path` + `--spin-frames|-warmup|
 -hybrid|-plain` · `--cinematic <preset>` + the `--cinematic-*` family (res/fps/frames/samples/
 island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `--frd-lab-*` ·
 `--bloom-lab [wobble]` (glare shift-variance probe; scene-free, GPU-free) · `--qa [port]`

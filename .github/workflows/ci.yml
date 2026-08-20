@@ -640,6 +640,17 @@ jobs:
             echo "::error::--check-wgsl's normalization touched nothing — the probe-reach alarm"
             exit 1
           fi
+          # W5 (layout audit), W6 (hostile scan + planted WEB_TEX-off arm),
+          # W7 (the tracked corpus golden — this run's Linux DXC vs the
+          # golden the Windows dev box wrote is the cross-platform pin).
+          # Trailing spaces are load-bearing: "check-wgsl: W7 " cannot match
+          # a "SKIP W7" line, so a scene-keyed or degraded run cannot pass.
+          for s in W5 W6 W7; do
+            grep -q "check-wgsl: $s " wgsl.log \
+              || { echo "::error::--check-wgsl printed no $s line at all — that stage did not run and did not say so"; exit 1; }
+          done
+          grep -q "WEB_TEX-off" wgsl.log \
+            || { echo "::error::--check-wgsl's planted WEB_TEX-off arm left no trace — W6's tooth did not run"; exit 1; }
           # The WebGPU host (Stage C1): a wgpu device EXECUTING what that
           # chain emits — over the same lavapipe this job already installs
           # (wgpu's Vulkan backend finds the ICD the way ash does), with the

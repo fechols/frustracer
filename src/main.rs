@@ -397,6 +397,7 @@ fn main() {
         check_metalfx,
         check_spirv,
         check_wgsl,
+        write_golden,
         check_wgpu,
         check_msl,
         check_mtl,
@@ -425,6 +426,17 @@ fn main() {
         mut world_flag,
         ..
     } = parsed;
+
+    // Refused HERE, before anything loads: --write-golden is a gate modifier,
+    // and a bare invocation would otherwise sail past every headless dispatch
+    // and open an interactive session (measured — it did).
+    if write_golden && !check_wgsl {
+        eprintln!(
+            "--write-golden only composes with --check-wgsl (it regenerates the W7 corpus \
+             golden, and only a green W0-W6 run may write it)"
+        );
+        std::process::exit(2);
+    }
 
     // Settings side channels the parse loop couldn't carry through &mut Opts.
     // A file-forced FSR level flips the adapter-preference default exactly
@@ -1428,7 +1440,9 @@ fn main() {
     if check_wgsl {
         // Uncfg'd like the gate: W0 (the naga round-trip) runs on any target,
         // wasm included; W1+ skip loudly where no DXC drop can load.
-        let code = run_check_wgsl(&scene);
+        // `structural` is the default-scene predicate (the check-<tag>.png
+        // routing rule) — W7's golden pins the default corpus only.
+        let code = run_check_wgsl(&scene, structural, write_golden);
         std::process::exit(code);
     }
     if check_wgpu {
@@ -15196,13 +15210,28 @@ fn web_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, Strin
 /// is present — naga and the reference validator catch different things) |
 /// W3 naga spv-in | W4 validate at the WebGPU-core capability floor + WGSL
 /// out + RE-PARSE the emitted text (the round-trip: the text is what a
-/// browser's compiler eats, and naga's writer and reader are separate code).
+/// browser's compiler eats, and naga's writer and reader are separate code) |
+/// W5 per-entry layout audit vs `wgsl::BUDGET` (the C2 ask-limits contract) |
+/// W6 hostile-construct scan + the planted WEB_TEX-off arm | W7 the tracked
+/// corpus golden (`goldens/web_corpus.txt`), default scene only.
+///
+/// `default_scene` = main's `structural` predicate (the check-`<tag>`.png
+/// routing rule): the golden pins the DEFAULT corpus, and a scene-keyed run
+/// must neither compare against it nor overwrite it. `write_golden` =
+/// `--write-golden`, which refuses unless W0–W6 are green in this same run.
 ///
 /// Wx failures during bring-up are the PRODUCT, not noise: what naga refuses
 /// on this corpus is the work-list for the corpus fixes (the F2/WEB_TEX
 /// stage), exactly as `--check-msl`'s refusals were for the Metal port.
-fn run_check_wgsl(scene: &scene::Scene) -> i32 {
+fn run_check_wgsl(scene: &scene::Scene, default_scene: bool, write_golden: bool) -> i32 {
     let mut ok = true;
+    if write_golden && !default_scene {
+        eprintln!(
+            "check-wgsl: --write-golden REFUSED on a scene-keyed run — the golden pins the \
+             default corpus (drop the scene argument)"
+        );
+        return 2;
+    }
 
     // ---- W0: the pure half. No DXC, no GPU, no file on disk. ----
     match wgsl::self_test() {
@@ -15218,6 +15247,10 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = scene;
+        if write_golden {
+            eprintln!("check-wgsl: --write-golden REFUSED — the golden needs W1+ (a DXC target)");
+            return 2;
+        }
         println!(
             "check-wgsl: SKIP W1 (no dynamic loader for DXC on this target — W0 is the pure \
              half; W1+ run on native CI)"
@@ -15244,6 +15277,10 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
         let dxc = match crate::spirv::Spirv::load(&dir) {
             Ok(d) => d,
             Err(e) => {
+                if write_golden {
+                    eprintln!("check-wgsl: --write-golden REFUSED — the golden needs W1+ ({e})");
+                    return 2;
+                }
                 println!("check-wgsl: SKIP W1 ({e})");
                 return i32::from(!ok);
             }
@@ -15282,7 +15319,10 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
         }
         let tmp = std::env::temp_dir().join(format!("frustracer-wgsl-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
-        let mut modules: Vec<(String, Vec<u32>)> = Vec::new();
+        // (what, target, words) — the target rides along for the W7 golden's
+        // entry lines (the profile model of a vs_6_0 module is meaningless
+        // without saying so).
+        let mut modules: Vec<(String, String, Vec<u32>)> = Vec::new();
         let (mut failed, mut validated) = (0usize, 0usize);
         let mut split_clones = 0usize;
         for (name, src, shape) in &units {
@@ -15356,7 +15396,7 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
                         let _ = std::fs::remove_file(&path);
                     }
                 }
-                modules.push((what, words));
+                modules.push((what, target, words));
             }
         }
         let _ = std::fs::remove_dir(&tmp);
@@ -15391,7 +15431,12 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
             }
         }
         let (mut parsed, mut tripped) = (0usize, 0usize);
-        for (what, words) in &modules {
+        // (what, target, Profile) in module order — W5 audits them, W7's
+        // golden serializes them; module order IS unit order, which is what
+        // lets the golden assembly group entries under their unit below.
+        let mut profiles: Vec<(String, String, wgsl::Profile)> = Vec::new();
+        let (mut scanned, mut scan_dirty) = (0usize, 0usize);
+        for (what, target, words) in &modules {
             let stem = what.replace(['[', ']', ':', '+'], "_");
             if let Some(d) = dump.as_ref() {
                 let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -15424,6 +15469,15 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
                     continue;
                 }
             };
+            // W5's raw material, collected while the module is alive (the
+            // loop drops it; nothing whole-corpus survives but the words).
+            match wgsl::profile(&module) {
+                Ok(p) => profiles.push((what.clone(), target.clone(), p)),
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W5 {what}: {e}");
+                    ok = false;
+                }
+            }
             let text = match wgsl::emit_wgsl(&module, &info) {
                 Ok(t) => t,
                 Err(e) => {
@@ -15434,6 +15488,14 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
             };
             if let Some(d) = dump.as_ref() {
                 let _ = std::fs::write(d.join(format!("{stem}.wgsl")), &text);
+            }
+            // W6's text half, on the text the browser's compiler will eat.
+            scanned += 1;
+            let hits = wgsl::scan_wgsl(&text);
+            if !hits.is_empty() {
+                eprintln!("check-wgsl: FAIL W6 {what}: hostile constructs: {}", hits.join(", "));
+                ok = false;
+                scan_dirty += 1;
             }
             match wgsl::parse_wgsl(&text).and_then(|re| wgsl::validate(&re).map(|_| ())) {
                 Ok(()) => tripped += 1,
@@ -15448,6 +15510,265 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
             modules.len(),
             modules.len()
         );
+
+        // ---- W5: the per-entry layout audit vs the C2 ask-limits budget. ----
+        // `wgsl::BUDGET` is what the browser session will ASK for, not the
+        // WebGPU defaults — the audit proves the corpus fits the ask; whether
+        // browsers grant it is C2's go/no-go. Buckets are scene-keyed and
+        // audited against the scene's own plan, never the fixed budget.
+        let plan_buckets = gfx::texweb::plan(scene).buckets.len() as u32;
+        for (what, _, p) in &profiles {
+            for v in wgsl::audit(what, p) {
+                eprintln!("check-wgsl: FAIL W5 {v}");
+                ok = false;
+            }
+            if p.buckets > plan_buckets {
+                eprintln!(
+                    "check-wgsl: FAIL W5 {what}: {} web_bucket_* bindings vs the scene plan's \
+                     {plan_buckets}",
+                    p.buckets
+                );
+                ok = false;
+            }
+        }
+        // Anti-vacuity, both probes: a corpus where the Frame pin reached
+        // nothing (renamed cbuffer, stripped OpName) or where no module
+        // classified a bucket (on a bucketed scene) is a gate scoring air.
+        if !profiles.is_empty() && profiles.iter().all(|(_, _, p)| p.frame_span.is_none()) {
+            eprintln!(
+                "check-wgsl: FAIL W5 no module reported a Frame span — the cbuffer pin \
+                 reached nothing (renamed? OpName stripped?)"
+            );
+            ok = false;
+        }
+        if plan_buckets > 0 && profiles.iter().all(|(_, _, p)| p.buckets == 0) {
+            eprintln!(
+                "check-wgsl: FAIL W5 the scene plans {plan_buckets} buckets but no module \
+                 classified a web_bucket_* binding — the classifier reached nothing"
+            );
+            ok = false;
+        }
+        let worst = |f: &dyn Fn(&wgsl::Profile) -> u32| {
+            profiles.iter().map(|(_, _, p)| f(p)).max().unwrap_or(0)
+        };
+        let b = &wgsl::BUDGET;
+        let frame = profiles.iter().find_map(|(_, _, p)| p.frame_span);
+        // `tex`: worst fixed / the budget, then the scene's bucket count and
+        // the worst per-entry TOTAL vs WebGPU's untouched 16/stage default —
+        // the honest browser-headroom number (a naive fixed+buckets sum mixes
+        // two different modules' worsts and overstated it, measured).
+        println!(
+            "check-wgsl: W5 layout audit {} modules | worst sb {}/{} st {}/{} tex {}/{} \
+             +{plan_buckets} buckets (worst total {} vs 16 default/stage) samp {}/{} \
+             ub {}/{} | gs max {}/{} B | Frame {} -> stride {}",
+            profiles.len(),
+            worst(&|p| p.storage_bufs),
+            b.storage_bufs,
+            worst(&|p| p.storage_tex),
+            b.storage_tex,
+            worst(&|p| p.sampled - p.buckets),
+            b.sampled_fixed,
+            worst(&|p| p.sampled),
+            worst(&|p| p.samplers),
+            b.samplers,
+            worst(&|p| p.uniform_bufs),
+            b.uniform_bufs,
+            worst(&|p| p.groupshared),
+            b.groupshared,
+            frame.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            b.frame_stride,
+        );
+
+        // ---- W6: the planted WEB_TEX-off arm, every run. ----
+        // A trace unit assembled WITHOUT the texweb block keeps the bindless
+        // texs[] — exactly the leak the scan + capability floor exist to
+        // refuse. Planting it each run proves the refusal machinery still
+        // fires (a scan that never flags anything proves nothing); the
+        // probe-reach reflect step proves the planted module really carries
+        // the unbounded table before any refusal is credited.
+        {
+            use gfx::shaders as sh;
+            use gfx::vocab::Vendor;
+            let t = sh::trace_sources(&sh::TraceKeys {
+                scene,
+                vendor: Vendor::Nvidia,
+                sway_armed: false,
+            });
+            let texoff = format!("{}\n{}", sh::web_defs(), t.leaf);
+            let verdict: Result<String, String> = (|| {
+                let entry = compute_entries(&texoff)
+                    .into_iter()
+                    .next()
+                    .ok_or("no entry point in the planted unit")?;
+                let words = dxc
+                    .compile_args(
+                        &texoff,
+                        &entry,
+                        "cs_6_5",
+                        "webtexoff-leaf",
+                        false,
+                        &["-fspv-target-env=vulkan1.1"],
+                    )
+                    .map_err(|e| format!("compile: {e}"))?;
+                let words = wgsl::normalize(&words);
+                let descs =
+                    crate::reflect::reflect(&words).map_err(|e| format!("reflect: {e}"))?;
+                if !descs.iter().any(|d| {
+                    matches!(d.kind, crate::reflect::DescKind::SampledImage) && d.count == 0
+                }) {
+                    return Err("the planted unit carries no unbounded texs[] — the arm \
+                                proves nothing"
+                        .into());
+                }
+                let module = match wgsl::parse_spv(&words) {
+                    Err(_) => return Ok("W3 parse refused it".into()),
+                    Ok(m) => m,
+                };
+                let info = match wgsl::validate(&module) {
+                    Err(_) => return Ok("W4 validate refused it".into()),
+                    Ok(i) => i,
+                };
+                let text = match wgsl::emit_wgsl(&module, &info) {
+                    Err(_) => return Ok("W4 wgsl-out refused it".into()),
+                    Ok(t) => t,
+                };
+                if !wgsl::scan_wgsl(&text).is_empty() {
+                    return Ok("the text scan flagged it".into());
+                }
+                Err("the planted WEB_TEX-off unit sailed through unflagged — a real bindless \
+                     leak would too"
+                    .into())
+            })();
+            match verdict {
+                Ok(how) => println!(
+                    "check-wgsl: W6 hostile scan {}/{scanned} texts clean | planted \
+                     WEB_TEX-off leaf refused ({how}) — the tooth bit",
+                    scanned - scan_dirty
+                ),
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W6 planted arm: {e}");
+                    ok = false;
+                }
+            }
+        }
+
+        // ---- W7: the tracked corpus golden (default scene only). ----
+        // What the golden pins: per unit, the fnv1a64 of its assembled HLSL
+        // (\r-stripped — Windows checkouts are CRLF, CI is LF); per compiled
+        // entry, its whole W5 profile. Hashes moving on a shaders/ edit is
+        // expected churn; COUNTS moving is the signal. spirv.rs's S-side
+        // cross-job pin names this golden as the shape it was waiting for.
+        let golden_path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/goldens/web_corpus.txt"
+        ));
+        if !default_scene {
+            println!(
+                "check-wgsl: SKIP W7 (scene-keyed corpus — the golden pins the default scene)"
+            );
+        } else if profiles.len() != modules.len() {
+            // Earlier stages already reddened the run; a partial-corpus
+            // compare would only bury their message under diff noise.
+            println!("check-wgsl: SKIP W7 (corpus incomplete — earlier stages failed)");
+        } else {
+            use std::fmt::Write as _;
+            let mut g = String::new();
+            let _ = writeln!(g, "web-corpus v1 buckets={plan_buckets}");
+            let mut pi = 0usize;
+            for (name, src, _) in &units {
+                let bytes: Vec<u8> = src.bytes().filter(|&b| b != b'\r').collect();
+                let _ = writeln!(g, "unit {name} hlsl=fnv1a64:{:016x}", wgsl::fnv1a64(&bytes));
+                let prefix = format!("{name}:");
+                while pi < profiles.len() && profiles[pi].0.starts_with(&prefix) {
+                    let (what, target, p) = &profiles[pi];
+                    let _ = writeln!(
+                        g,
+                        "{}",
+                        wgsl::golden_entry_line(&what[prefix.len()..], target, p)
+                    );
+                    pi += 1;
+                }
+            }
+            let _ = writeln!(g, "modules={}", profiles.len());
+            if pi != profiles.len() {
+                eprintln!(
+                    "check-wgsl: FAIL W7 golden assembly desynced ({pi} of {} profiles \
+                     grouped) — unit/entry naming drifted",
+                    profiles.len()
+                );
+                ok = false;
+            } else if write_golden {
+                if !ok {
+                    eprintln!(
+                        "check-wgsl: --write-golden REFUSED — W0-W6 must be green in the \
+                         same run"
+                    );
+                    println!("CHECK-WGSL FAILED");
+                    return 1;
+                }
+                if let Some(dir) = golden_path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                match std::fs::write(&golden_path, g.as_bytes()) {
+                    Ok(()) => println!(
+                        "check-wgsl: W7 corpus golden WRITTEN ({} units, {} modules) -> {}",
+                        units.len(),
+                        profiles.len(),
+                        golden_path.display()
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "check-wgsl: FAIL W7 writing {}: {e}",
+                            golden_path.display()
+                        );
+                        ok = false;
+                    }
+                }
+            } else {
+                match std::fs::read(&golden_path) {
+                    Err(e) => {
+                        // A tracked file's absence is a defect, not an
+                        // environment condition — a SKIP here would be
+                        // permanently-green vacuity.
+                        eprintln!(
+                            "check-wgsl: FAIL W7 {} unreadable ({e}) — regenerate with \
+                             --check-wgsl --write-golden",
+                            golden_path.display()
+                        );
+                        ok = false;
+                    }
+                    Ok(bytes) => {
+                        let disk: Vec<u8> = bytes.into_iter().filter(|&b| b != b'\r').collect();
+                        if disk == g.as_bytes() {
+                            println!(
+                                "check-wgsl: W7 corpus golden matches ({} units, {} modules)",
+                                units.len(),
+                                profiles.len()
+                            );
+                        } else {
+                            let d = String::from_utf8_lossy(&disk).into_owned();
+                            match d.lines().zip(g.lines()).enumerate().find(|(_, (a, b))| a != b)
+                            {
+                                Some((i, (a, c))) => eprintln!(
+                                    "check-wgsl: FAIL W7 golden mismatch at line {}:\n  \
+                                     golden: {a}\n  corpus: {c}\n  (a deliberate corpus \
+                                     change regenerates with --check-wgsl --write-golden)",
+                                    i + 1
+                                ),
+                                None => eprintln!(
+                                    "check-wgsl: FAIL W7 golden mismatch (line counts \
+                                     differ: {} vs {})",
+                                    d.lines().count(),
+                                    g.lines().count()
+                                ),
+                            }
+                            ok = false;
+                        }
+                    }
+                }
+            }
+        }
+
         println!("CHECK-WGSL {}", if ok { "PASSED" } else { "FAILED" });
         i32::from(!ok)
     }
@@ -34308,6 +34629,23 @@ fn run_check(
         }
     };
 
+    // The browser generator's pure teeth (naga round-trip, the normalize
+    // passes, the W5 profile/budget audit, the W6 scan, the W7 line format
+    // and fnv1a64 pins) — `--check-wgsl`'s W0 runs the same fn, but THIS
+    // sweep is what the three OS CI jobs execute (they carry no DXC and
+    // never run the wgsl gate), so without this line those teeth had no CI
+    // home outside the one Vulkan job.
+    let wgsl_ok = match wgsl::self_test() {
+        Ok(()) => {
+            eprintln!("wgsl self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("wgsl self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Material-classifier self-test — deterministic spot checks over the
     // real San Miguel naming patterns (keyword precedence, whole-token
     // safety, the name/Ns/illum fallback tiers).
@@ -37126,6 +37464,7 @@ fn run_check(
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
         ("texweb", texweb_ok),
+        ("wgsl", wgsl_ok),
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
         ("surface-point", surfpt_ok),

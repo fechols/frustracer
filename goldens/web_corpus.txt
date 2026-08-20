@@ -1,0 +1,52 @@
+web-corpus v1 buckets=0
+unit reference hlsl=fnv1a64:7c689d070027c1a3
+  entry cs_reference target=cs_6_5 wg=8x8x1 gs=0 ub=1 sb=17 st=0 tex=0+0 samp=0 frame=5616
+unit resolve hlsl=fnv1a64:c65dc270d79e7577
+  entry cs_resolve target=cs_6_5 wg=8x8x1 gs=0 ub=2 sb=1 st=1 tex=0+0 samp=0 frame=5616
+unit wavefront hlsl=fnv1a64:9c0e31f9c28cc98b
+  entry cs_seed target=cs_6_5 wg=1x1x1 gs=0 ub=2 sb=3 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_seed_replay target=cs_6_5 wg=1x1x1 gs=0 ub=0 sb=1 st=0 tex=0+0 samp=0 frame=-
+  entry cs_prep target=cs_6_5 wg=1x1x1 gs=0 ub=1 sb=2 st=0 tex=0+0 samp=0 frame=-
+  entry cs_prep_mul target=cs_6_5 wg=1x1x1 gs=0 ub=1 sb=2 st=0 tex=0+0 samp=0 frame=-
+  entry cs_clear_info target=cs_6_5 wg=256x1x1 gs=0 ub=1 sb=1 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_clear_h target=cs_6_5 wg=256x1x1 gs=0 ub=1 sb=1 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_prep_batch target=cs_6_5 wg=1x1x1 gs=0 ub=2 sb=2 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_seed_probes target=cs_6_5 wg=1x1x1 gs=0 ub=1 sb=1 st=0 tex=0+0 samp=0 frame=-
+  entry cs_level target=cs_6_5 wg=32x1x1 gs=2048 ub=2 sb=8 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_level_wide target=cs_6_5 wg=32x1x1 gs=2060 ub=2 sb=8 st=0 tex=0+0 samp=0 frame=5616
+unit sky hlsl=fnv1a64:7bc3d92e03163644
+  entry cs_sky_lod target=cs_6_5 wg=64x1x1 gs=0 ub=1 sb=1 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_sky target=cs_6_5 wg=64x1x1 gs=0 ub=2 sb=9 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_cloud_shadow target=cs_6_5 wg=64x1x1 gs=0 ub=1 sb=1 st=0 tex=0+0 samp=0 frame=5616
+unit leaf hlsl=fnv1a64:989aebc0ab3301d5
+  entry cs_leaf target=cs_6_5 wg=256x1x1 gs=0 ub=2 sb=20 st=0 tex=0+0 samp=0 frame=5616
+unit leaf_fb hlsl=fnv1a64:9dd28ea01f022be3
+  entry cs_leaf target=cs_6_5 wg=256x1x1 gs=0 ub=2 sb=22 st=0 tex=0+0 samp=0 frame=5616
+unit hemi_wave hlsl=fnv1a64:76e9719871f691ea
+  entry cs_hemi_root target=cs_6_5 wg=32x1x1 gs=2048 ub=2 sb=10 st=0 tex=0+0 samp=0 frame=5616
+  entry cs_hemi_cell target=cs_6_5 wg=32x1x1 gs=2048 ub=2 sb=11 st=0 tex=0+0 samp=0 frame=5616
+unit hemi_leaf hlsl=fnv1a64:2e7f1fd634ee9f88
+  entry cs_hemi_leaf target=cs_6_5 wg=32x1x1 gs=0 ub=1 sb=15 st=0 tex=0+0 samp=0 frame=5616
+unit compose hlsl=fnv1a64:c6a12ee4c687d8d8
+  entry cs_compose target=cs_6_5 wg=256x1x1 gs=0 ub=1 sb=4 st=0 tex=0+0 samp=0 frame=5616
+unit frd-temporal hlsl=fnv1a64:0591ad3b45f82e2a
+  entry cs_frd_temporal target=cs_6_5 wg=8x8x1 gs=0 ub=1 sb=0 st=9 tex=15+0 samp=0 frame=-
+unit frd-blur hlsl=fnv1a64:7dad5aaf1ec78560
+  entry cs_frd_blur target=cs_6_5 wg=16x16x1 gs=0 ub=1 sb=0 st=2 tex=5+0 samp=0 frame=-
+  entry cs_frd_post target=cs_6_5 wg=16x16x1 gs=0 ub=1 sb=0 st=5 tex=9+0 samp=0 frame=-
+unit bloom hlsl=fnv1a64:aaa24a37100bf3e0
+  entry cs_down target=cs_6_0 wg=8x8x1 gs=0 ub=1 sb=0 st=1 tex=1+0 samp=1 frame=-
+  entry cs_up target=cs_6_0 wg=8x8x1 gs=0 ub=1 sb=0 st=1 tex=1+0 samp=1 frame=-
+unit autoexp hlsl=fnv1a64:9b57742cc6abaed8
+  entry cs_reduce target=cs_6_0 wg=16x16x1 gs=1024 ub=1 sb=1 st=0 tex=1+0 samp=0 frame=-
+  entry cs_fold target=cs_6_0 wg=256x1x1 gs=1024 ub=1 sb=2 st=0 tex=0+0 samp=0 frame=-
+unit tonemap hlsl=fnv1a64:30fc0f9773c4d5e9
+  entry vsmain target=vs_6_0 wg=0x0x0 gs=0 ub=0 sb=0 st=0 tex=0+0 samp=0 frame=-
+  entry psmain target=ps_6_0 wg=0x0x0 gs=0 ub=1 sb=0 st=0 tex=2+0 samp=1 frame=-
+unit blit hlsl=fnv1a64:61dd614fa0524a87
+  entry vsmain target=vs_6_0 wg=0x0x0 gs=0 ub=0 sb=0 st=0 tex=0+0 samp=0 frame=-
+  entry psmain target=ps_6_0 wg=0x0x0 gs=0 ub=0 sb=0 st=0 tex=1+0 samp=0 frame=-
+unit hud hlsl=fnv1a64:c445365c24736261
+  entry vsmain target=vs_6_0 wg=0x0x0 gs=0 ub=0 sb=0 st=0 tex=0+0 samp=0 frame=-
+  entry psmain target=ps_6_0 wg=0x0x0 gs=0 ub=1 sb=0 st=0 tex=1+0 samp=0 frame=-
+modules=34

@@ -359,3 +359,83 @@ the emitted block byte-stable — self_test pins the registers),
 Next: W5 (limits/budget audit — now with two measured anchors: 21 buckets on
 bistro, 165 on san-miguel), W6, W7, Stage C2 (the tracer recorder over
 per-entry layouts).
+
+## Round 4 (2026-08-20): W5–W7 — the corpus audits that close the W track
+
+Three stages onto `--check-wgsl`, all machinery in `src/wgsl.rs` (uncfg'd —
+every new fn is pure and wasm-compilable, and its teeth run in W0 AND in
+plain `--check`'s self-test sweep, which is the three OS CI jobs' only view
+of them; they carry no DXC and never run the wgsl gate).
+
+**W5 — the per-entry layout audit.** `wgsl::profile(&naga::Module)` counts
+DECLARED resource globals per class (declared ≈ used — DXC strips dead
+resources, and declared is what a `BindGroupLayout` pays for), plus
+groupshared bytes (`AddressSpace::WorkGroup` + `TypeInner::try_size`), the
+`Frame` uniform's byte span, and IR-level hostiles; it asserts the
+one-module-one-entry corpus invariant. `wgsl::BUDGET` is **the C2 ask-limits
+contract, not the WebGPU defaults** — `audit()` pins the corpus under what
+the browser session will `required_limits`-request, with buckets audited
+against the scene's own plan (scene-keyed) rather than any fixed row.
+
+Measured (first W5 prints): procedural — worst sb 22/32, st 9/12 (both on
+frd_temporal's side of the corpus as predicted), **fixed sampled 15
+(frd_temporal — over the drafted 12; the row was trued to 16 from this
+print, the plan's own rule)**, samplers 1, ub 2, groupshared max 2060 B
+(cs_level_wide; cs_level 2048), Frame 5616 → stride 5632 (== CB_STRIDE,
+the cross-language cbuffer pin, live). Bistro — worst sb 26, buckets 21
+classified through DXC OpNames (the runner's reach probe owns that half; a
+W0 tooth pins the name-prefix half every run, because THE DEFAULT SCENE
+PLANS 0 BUCKETS — it is texture-free, so a bare CI run never exercises the
+classifier via the corpus). **The trace units' sampled textures are pure
+buckets** (0 fixed + 21 on bistro): the worst per-entry sampled total is the
+scene's bucket count itself — bistro 21 vs the untouched 16/stage default,
+the honest number the browser bucket story hangs on. (The first draft of the
+stage line summed frd's fixed 15 with the trace units' 21 buckets into a
+fictional 36 — two different modules' worsts; rewritten to the real
+per-entry max.)
+
+**W6 — the hostile-construct scan.** `wgsl::scan_wgsl` (identifier-exact
+tokens verified against naga 30's WGSL writer: `binding_array`,
+`wgpu_binding_array`, `f16`, `ray_query`, `acceleration_structure`,
+`subgroup*`) runs over every W4-emitted text — belt to `validate()`'s
+`Capabilities::empty()` braces, so it survives a naga bump that widens a
+default. The every-run tooth: a PLANTED WEB_TEX-off leaf (web_defs without
+the texweb block, so the bindless `texs[]` survives) is compiled and pushed
+through the chain each run; a reflect probe first proves it really carries
+the unbounded table (else the arm proves nothing), then the chain must
+refuse it — measured: W3 parse refuses it (the historical ShaderNonUniform
+class). A clean sweep is a FAIL: a real bindless leak would sail through the
+same way.
+
+**W7 — the tracked corpus golden.** `goldens/web_corpus.txt` (plain git,
+`.gitattributes -text`): header + per unit `hlsl=fnv1a64:<hash>` over the
+\r-stripped assembled source (CRLF working trees vs LF CI — hash-strip,
+compare-strip, and the -text pin are three independent guards) + one profile
+line per compiled entry + a module-count tail. LF-only, integers-only,
+deterministic order — `golden_entry_line`'s exact format is itself
+self_test-pinned so format drift cannot masquerade as corpus churn. Missing
+golden = loud FAIL (a tracked file's absence is a defect; a SKIP would be
+permanently-green vacuity); scene-keyed runs SKIP loudly (the golden pins
+the default corpus). `--write-golden` (cli) refuses: without `--check-wgsl`
+(exit 2, guarded right after arg parsing — the first draft guarded at the
+gate dispatch and a bare `--write-golden` opened an interactive session,
+measured), on a scene-keyed run (exit 2), on the W1-SKIP path (exit 2), and
+unless W0–W6 are green in the same run (exit 1). Teeth proven live: one
+corrupted golden byte → FAIL with the first differing line pair; restore →
+match.
+
+CI: the check-vulkan wgsl block gains `for s in W5 W6 W7` positive greps
+(trailing space — `SKIP W7` cannot match) + a `WEB_TEX-off` grep for the
+planted arm. The golden's first Linux compare on that job is the
+cross-platform proof (counts/spans/workgroups are semantically forced and
+the DXC drop is version-pinned; if Linux DXC ever disagrees on a count,
+record and split per-field, never per-OS).
+
+Closing ladder green: cargo test 39/39, `--check-wgsl` bare (W0–W7,
+golden written then matched) + bistro (buckets live, W7 SKIP),
+`--check-spirv`, `--check-gpu`, wasm `cargo check`, plain `--check` LAST
+(now also running `wgsl::self_test` in the sweep), goldens byte-identical.
+
+Next: Stage C2 — the wgpu tracer recorder over per-entry layouts (the W
+track is closed; W5's profile data is the exact per-entry binding
+information C2's `webgpu/layout.rs` consumes).
