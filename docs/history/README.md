@@ -22,7 +22,7 @@ block still works as a complete flag index.
 | [tracing-scheduling.md](tracing-scheduling.md) | 30 KB | cut-seeded rays, the frustum tree, wide levels, `--spp`, `--lock-res` |
 | [gpu-and-dxr.md](gpu-and-dxr.md) | 30 KB | `--gpu`, `--check-gpu`, `--dxr`, `--dxr-inline`, `--dxr-sbt` |
 | [shader-toolchains.md](shader-toolchains.md) | 29 KB | `--check-spirv`, `--check-msl` — the corpus's second and third code generators |
-| [vulkan-backend.md](vulkan-backend.md) | 226 KB | `--check-vk`, stages V0–V20. The largest entry in the notebook |
+| [vulkan-backend.md](vulkan-backend.md) | 226 KB | `--check-vk`, stages V0–V21. The largest entry in the notebook |
 | [metal-backend.md](metal-backend.md) | 60 KB | `--check-fsr3`, `--check-metalfx`, `--check-mtl` |
 | [tooling-and-capture.md](tooling-and-capture.md) | 30 KB | Tracy, `--quinlight`, `--spin`, `--cinematic`, settings, HDR, GPU timing |
 | [profiling.md](profiling.md) | 41 KB | the `## Profiling` section — Tracy, PIX, timestamp queries, the perf campaigns |
@@ -54,7 +54,7 @@ prefix to the suite that owns it and the file where its story lives:
 
 | IDs | suite | file |
 |---|---|---|
-| `V0`–`V20` | `--check-vk` | vulkan-backend.md |
+| `V0`–`V21` | `--check-vk` | vulkan-backend.md |
 | `S0`–`S3` | `--check-spirv` | shader-toolchains.md |
 | `M0`–`M5` | `--check-msl` | shader-toolchains.md |
 | `M1`–`M13` | `--check-gpu` | gpu-and-dxr.md |

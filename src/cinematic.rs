@@ -1320,7 +1320,9 @@ pub fn ffmpeg_still_hdr(png16: &str, out_avif: &str) -> Vec<String> {
 /// the GPU blend state (`SrcBlend = ONE`, `DestBlend = INV_SRC_ALPHA`).
 ///
 /// Known-accept: the GPU composites in float, this in 8-bit with round-half-up,
-/// so the two can differ by 1 LSB. No gate compares them and none is wanted.
+/// so the two can differ by 1 LSB. `--check-vk` V21 compares them — on Vulkan,
+/// the drawn composite against this function, ≤ 1 LSB on every blended texel
+/// (RADV's blender matches it exactly on ~92%, llvmpipe's on 100%).
 #[inline]
 pub fn over_sdr(dst: u32, r: u8, g: u8, b: u8, a: u8) -> u32 {
     if a == 0 {

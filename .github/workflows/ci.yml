@@ -268,13 +268,26 @@ jobs:
       # joystick deps are deliberately absent, and that one IS safe to reason
       # about: SDL only warns and disables those backends, as the same log shows
       # it already doing for a missing ALSA.
-      - name: SDL3 build dependencies
+      #
+      # libfontconfig-dev + pkg-config ARE FOR SLINT (B6b rung 4, the HUD on
+      # Linux): slint's `software-renderer-systemfonts` reaches
+      # yeslogic-fontconfig-sys 6.0.1, whose build.rs does
+      # `pkg_config::find_library("fontconfig").unwrap()` — a hard build error
+      # without the dev package, the same shape as SDL's CheckX11 above, and
+      # the list again comes from the pinned crate's source rather than a
+      # guess. fonts-dejavu-core is NOT for any gate — every gate that touches
+      # the HUD is Slint-free by design (`--check`'s hud-frame/input/hud-events
+      # drive the pure halves; `--check-vk` V21 composites a synthetic frame) —
+      # it is there so an occasional `--cinematic ... --cinematic-hud` on a
+      # runner rasterises glyphs instead of blank boxes.
+      - name: SDL3 + Slint build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
-            libwayland-dev wayland-protocols libdecor-0-dev libegl-dev
+            libwayland-dev wayland-protocols libdecor-0-dev libegl-dev \
+            libfontconfig-dev pkg-config fonts-dejavu-core
 
       - name: Build
         run: cargo build --profile quick
@@ -429,7 +442,8 @@ jobs:
   # spirv-val) and --check-vk (a device consuming it — V0 pure logic, V1 device,
   # V3 the indirect-dispatch chain the whole wavefront design rests on, V6/V7
   # the reference and wavefront tracers scored against the CPU, V8 the hemi
-  # tiers, V9 replay, V10 BC7, V12 the G-buffer pack, V18 the display stage).
+  # tiers, V9 replay, V10 BC7, V12 the G-buffer pack, V18 the display stage,
+  # V21 the HUD composite over it).
   #
   # NOT V14-V17, and this line used to say "V15 NRD" and be wrong. Those four
   # live inside `run_check_vk_feed`, whose first statement is
@@ -500,14 +514,16 @@ jobs:
       # in the same place, so it needs the same packages. Kept as its own step
       # rather than folded into the Vulkan tooling below so the two jobs' lists
       # can be diffed against each other by eye; the price is one extra
-      # `apt-get update`, which is seconds.
-      - name: SDL3 build dependencies
+      # `apt-get update`, which is seconds. The fontconfig/fonts tail is
+      # slint's (B6b rung 4) — see check-linux's step for the why.
+      - name: SDL3 + Slint build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
-            libwayland-dev wayland-protocols libdecor-0-dev libegl-dev
+            libwayland-dev wayland-protocols libdecor-0-dev libegl-dev \
+            libfontconfig-dev pkg-config fonts-dejavu-core
 
       # spirv-val comes from APT, NOT from `install-prerequisites.sh spirv`, and
       # the difference matters for CI specifically: that component has no pin BY
@@ -586,6 +602,15 @@ jobs:
       #     rasterizers agreeing on the pixel mapping is a stronger statement
       #     than either one passing alone. It skips only on a device that
       #     cannot draw at all, which this runner is not.
+      #   * V21 (the HUD composite, B6b rung 4) joins V18 on the same terms
+      #     and for the same reason: it draws `hud.hlsl` premultiplied-over
+      #     V18's offscreen target and reads it back, needs no surface, and
+      #     MEASURED on llvmpipe — where the blender is exactly float-round,
+      #     237/237 mid-alpha texels, and where it caught a real defect RADV
+      #     hid (an uncleared overlay image compositing garbage outside the
+      #     first upload). Its SKIP facts are V18's two, so it is forbidden
+      #     beside V18 and asserted positive in the loop. V19/V20 stay OFF
+      #     both lists (lavapipe segfaults in vkCreateSwapchainKHR).
       #   * V11/V13 are PERMITTED to skip, and the reason that actually FIRES
       #     here is the FFX SOURCE, not the device: this job installs no
       #     FidelityFX SDK, so `fsr3::built()` is false and V13 returns before
@@ -602,7 +627,7 @@ jobs:
       #   * SO THE REAL GAP IS SILENCE, NOT A SKIP LINE, and a forbid-list
       #     structurally cannot see it: V14-V17 print NOTHING here (see the NRD
       #     step's comment). The loop below asserts the POSITIVE for the
-      #     thirteen stages MEASURED to run on llvmpipe. It subsumes the
+      #     fourteen stages MEASURED to run on llvmpipe. It subsumes the
       #     forbid-list — a skipping stage prints `SKIP V6`, not `V6 ` — and it
       #     is the only shape that catches a stage that goes quiet. The
       #     trailing space in the pattern is load-bearing: without it `V1`
@@ -681,12 +706,12 @@ jobs:
           cargo run --profile quick -- --check-vk 2>&1 | tee vk.log
           grep -q "CHECK-VK PASSED" vk.log \
             || { echo "::error::--check-vk did not run (no summary line — it skipped)"; exit 1; }
-          if grep -qE "SKIP (V6|V7|V8|V9|V18)" vk.log; then
+          if grep -qE "SKIP (V6|V7|V8|V9|V18|V21)" vk.log; then
             echo "::error::--check-vk passed vacuously — the tracer or display stages skipped:"
-            grep -E "SKIP (V6|V7|V8|V9|V18)" vk.log
+            grep -E "SKIP (V6|V7|V8|V9|V18|V21)" vk.log
             exit 1
           fi
-          for s in V0 V1 V2 V3 V4 V5 V6 V7 V8 V9 V10 V12 V18; do
+          for s in V0 V1 V2 V3 V4 V5 V6 V7 V8 V9 V10 V12 V18 V21; do
             grep -q "check-vk: $s " vk.log \
               || { echo "::error::--check-vk printed no $s line at all — that stage did not run and did not say so"; exit 1; }
           done

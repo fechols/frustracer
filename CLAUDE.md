@@ -81,7 +81,7 @@ not documentation.
 ## Gates — the test suite
 
 **There are essentially no unit tests.** `--check*` is the suite. The one exception is
-`cargo test`: 25 shader-source gates in `src/gfx/shaders.rs` plus a field-coherence probe in
+`cargo test`: 41 shader-source gates in `src/gfx/shaders.rs` plus a field-coherence probe in
 `src/gfx/guides.rs`, asserting ordering statements inside the HLSL that no CPU-only gate can
 reach — and including a clean-room **licence** scan that our assembled shaders contain none
 of NVIDIA's NRD entry names.
@@ -91,7 +91,7 @@ of NVIDIA's NRD entry names.
 | `--check` | nothing (DLL-free) | the CPU suite + every module `self_test`; writes the goldens |
 | `--check-gpu` | real GPU + DXC | the wavefront tracer — **not in CI** |
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
-| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V20 |
+| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V21 |
 | `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
 | `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip + W5 layout audit + W6 hostile scan + W7 tracked corpus golden (`goldens/web_corpus.txt`, regenerated via `--write-golden`; W0 is DXC-free) |
 | `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe, the indirect smoke, **J6 the browser's reference tracer vs the CPU**, **J7 the wavefront quadtree vs that reference** (J0 is pure; the smoke KERNEL is scene-free but the DEVICE is scene-keyed from J1 on — the ask lands in `required_limits`) |
@@ -326,7 +326,7 @@ binary measures the other arm
 `FR_WGPU_ADAPTER` (adapter pick, index or name substring; `WGPU_BACKEND` rides along free)
 `FR_WGPU_RES` `FR_WGPU_AB_FRAMES` `FR_WGPU_MAP` (J6's frame, its A/B depth, and the
 REAL-vs-dummy bind report — the `FR_VK_RES`/`FR_VK_AB_FRAMES`/`FR_VK_MAP` twins) · dumps: `FR_DUMP_HLSL`
-`FR_SPIRV_DUMP|LIST` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:
+`FR_SPIRV_DUMP|LIST` `FR_SPIRV_NOMEMO` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:
 `FR_CRASH_TEST|FULLDUMP|VERIFY` `FR_NO_CRASH` · plus `FRUSTRACER_STAB` (inter-frame
 stability readout) and `FRUSTRACER_HUD_STATS`.
 
@@ -342,7 +342,7 @@ src/               117 .rs, ~150k lines  (main.rs alone is 39k — session loop,
   gpu/           D3D12: wavefront tracer, DXR pipeline, upscaler/denoiser/FG wiring
   vk/            Vulkan backend (unix)          mtl/   Metal backend (macOS)
   gfx/           backend-neutral core: shader assembly, FrameCb, denoiser vocabulary
-  hud/           Slint software-rendered HUD and pause menu
+  hud/           Slint software-rendered HUD and pause menu (both windows; gpu/hud.rs + vk/hud.rs composite it)
   shaders/       43 HLSL files — the corpus all three backends compile
   bin/frqa.rs    the --qa socket driver
 shim/            15 C++/ObjC++ shims (DLSS-D/G, FFX FSR3 D3D12/VK/Metal, NGX)

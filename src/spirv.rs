@@ -405,13 +405,109 @@ type CreateFn = unsafe extern "C" fn(*const Guid, *const Guid, *mut *mut c_void)
 
 // ---------------------------------------------------------------------------
 
+/// The in-process compile memo — the "SPIR-V memo" B6b rungs 3 and 4 both
+/// recommended. The compiled words depend on nothing but what reaches DXC
+/// (`compile_args` builds the whole argument vector from its parameters; the
+/// source arrives as an in-memory buffer with no include handler, no
+/// filenames, no timestamps), and `gs::TraceKeys` carries no resolution — so
+/// a window resize used to recompile 24 units to the SAME words, ~7.3 s of a
+/// ~7.8 s rebuild. This map returns them instead.
+///
+/// KEYED ON EVERYTHING THAT REACHES DXC: (source, entry, target, debug).
+/// `what` is diagnostic-only and deliberately excluded; a call carrying
+/// `extra` args goes through `compile_args` directly and bypasses the memo —
+/// which is also the gates' fresh-compile handle, so the bypass is a feature
+/// with two names rather than a hole.
+///
+/// The buckets hash the full key but COMPARE the full key: a hash collision
+/// that served the wrong kernel would be a wrong-resource read behind a valid
+/// module — the exact failure class `self_test`'s injectivity sweep exists
+/// for, reachable here through a different door. Storage is bounded by the
+/// corpus (~11 distinct sources per session) and dies with the process, so
+/// there is no version to bump and no lever word to carry.
+///
+/// `FR_SPIRV_NOMEMO=1` kills it (loud once, the `FR_*` convention) for A/B-ing
+/// a suspected stale serve — though `--check-vk`'s end-of-suite hit assert and
+/// `--check-spirv`'s determinism arm exist so that suspicion has a gate to
+/// fall on first.
+#[derive(Default)]
+struct Memo {
+    map: std::cell::RefCell<std::collections::HashMap<u64, Vec<(MemoKey, Vec<u32>)>>>,
+    hits: std::cell::Cell<u32>,
+    misses: std::cell::Cell<u32>,
+}
+
+/// (source, entry, target, debug) — owned only once stored; lookups hash and
+/// compare borrowed halves so a memo HIT allocates nothing but the returned
+/// words.
+type MemoKey = (String, String, String, bool);
+
+impl Memo {
+    fn hash_key(src: &str, entry: &str, target: &str, debug: bool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        entry.hash(&mut h);
+        target.hash(&mut h);
+        debug.hash(&mut h);
+        h.finish()
+    }
+
+    fn get(&self, src: &str, entry: &str, target: &str, debug: bool) -> Option<Vec<u32>> {
+        let map = self.map.borrow();
+        let bucket = map.get(&Self::hash_key(src, entry, target, debug))?;
+        let words = bucket
+            .iter()
+            .find(|((s, e, t, d), _)| s == src && e == entry && t == target && *d == debug)
+            .map(|(_, w)| w.clone())?;
+        self.hits.set(self.hits.get().saturating_add(1));
+        Some(words)
+    }
+
+    fn put(&self, src: &str, entry: &str, target: &str, debug: bool, words: &[u32]) {
+        let h = Self::hash_key(src, entry, target, debug);
+        self.map
+            .borrow_mut()
+            .entry(h)
+            .or_default()
+            .push(((src.into(), entry.into(), target.into(), debug), words.to_vec()));
+        self.misses.set(self.misses.get().saturating_add(1));
+    }
+
+    /// (hits, misses) — a hit is a compile that never reached DXC, a miss is
+    /// a fresh compile this memo stored.
+    fn stats(&self) -> (u32, u32) {
+        (self.hits.get(), self.misses.get())
+    }
+}
+
+/// Whether the compile memo is live — the ONE statement of the
+/// `FR_SPIRV_NOMEMO` predicate, public so the gates that assert "the memo
+/// fired" can exempt an armed kill lever without a second copy of the parse.
+pub fn memo_enabled() -> bool {
+    !memo_off()
+}
+
+/// `FR_SPIRV_NOMEMO=1` — every `compile` reaches DXC. Read once, loud once.
+fn memo_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let armed = std::env::var("FR_SPIRV_NOMEMO").is_ok_and(|v| v != "0");
+        if armed {
+            eprintln!("vk: FR_SPIRV_NOMEMO — the SPIR-V compile memo is OFF, every compile is fresh");
+        }
+        armed
+    })
+}
+
 /// The SPIR-V compiler. One per process is plenty; `Compile` is reentrant but
 /// this holds the library alive and must outlive every blob it produced.
 pub struct Spirv {
     // Dropped last (field order): the compiler object lives inside this
     // library's image, so releasing it after an unload would be a call into
-    // unmapped memory.
+    // unmapped memory. The memo between them is plain data and order-blind.
     compiler: Com,
+    memo: Memo,
     _lib: libloading::Library,
 }
 
@@ -532,13 +628,25 @@ impl Spirv {
         if hr < 0 || raw.is_null() {
             return Err(format!("DxcCreateInstance(DxcCompiler) failed: 0x{hr:08x}"));
         }
-        Ok(Self { compiler: Com(raw), _lib: lib })
+        Ok(Self { compiler: Com(raw), memo: Memo::default(), _lib: lib })
     }
 
-    /// Compile HLSL to SPIR-V. `what` names the unit in errors; an empty
-    /// `entry` omits `-E`, which a `lib_*` target requires (a DXR library
-    /// exports every `[shader(...)]` entry, and naming one is a compile
-    /// error).
+    /// (hits, misses) since load — the instrument `--check-vk`'s end-of-suite
+    /// assert and the window's rebuild split line read. A hit is a compile
+    /// that never reached DXC; a miss is a fresh compile the memo stored.
+    pub fn memo_stats(&self) -> (u32, u32) {
+        self.memo.stats()
+    }
+
+    /// Compile HLSL to SPIR-V, MEMOIZED on (src, entry, target, debug) — see
+    /// `Memo` for why that key is complete and what `FR_SPIRV_NOMEMO` does.
+    /// A caller that needs a provably fresh compile calls `compile_args` with
+    /// `&[]`, which never touches the memo — that is what `--check-spirv`'s
+    /// determinism arm and `--check-vk`'s hit-fidelity check do.
+    ///
+    /// `what` names the unit in errors; an empty `entry` omits `-E`, which a
+    /// `lib_*` target requires (a DXR library exports every `[shader(...)]`
+    /// entry, and naming one is a compile error).
     ///
     /// Returns SPIR-V WORDS, not bytes — `vkCreateShaderModule` takes
     /// `*const u32` and requires 4-byte alignment, which a `Vec<u8>` does not
@@ -551,11 +659,22 @@ impl Spirv {
         what: &str,
         debug: bool,
     ) -> Result<Vec<u32>> {
-        self.compile_args(src, entry, target, what, debug, &[])
+        if memo_off() {
+            return self.compile_args(src, entry, target, what, debug, &[]);
+        }
+        if let Some(words) = self.memo.get(src, entry, target, debug) {
+            return Ok(words);
+        }
+        let words = self.compile_args(src, entry, target, what, debug, &[])?;
+        self.memo.put(src, entry, target, debug, &words);
+        Ok(words)
     }
 
     /// `compile` with per-unit extra arguments appended after the shared set —
-    /// the FRD kernels' `-enable-16bit-types`, matching the DXIL twin.
+    /// the FRD kernels' `-enable-16bit-types`, matching the DXIL twin. NEVER
+    /// memoized (the `extra` args are not in the memo key, so caching here
+    /// would serve an `-enable-16bit-types` module to a plain request), which
+    /// doubles as the fresh-compile handle the gates need.
     pub fn compile_args(
         &self,
         src: &str,
@@ -915,6 +1034,51 @@ pub fn self_test() -> std::result::Result<(), String> {
     }
     if local_size(&[SPIRV_MAGIC]).is_ok() {
         return Err("local_size accepted a blob with no header".into());
+    }
+
+    // The memo, on synthetic data — the DXC-free half of its claim. Hit
+    // fidelity (the words that come back are the words that went in), the
+    // accounting the gates read, and FULL-KEY discrimination: a memo that
+    // keyed on less than every element serves kernel A to a request for
+    // kernel B — a wrong-resource read behind a valid module, the same
+    // failure class the injectivity sweep above guards through another door.
+    // The DXC half (a hit byte-equals a fresh compile) needs a compiler and
+    // lives in --check-spirv's determinism arm and --check-vk's end-of-suite
+    // assert.
+    let m = Memo::default();
+    if m.get("src", "e", "cs_6_5", false).is_some() {
+        return Err("memo hit on an empty map".into());
+    }
+    m.put("src", "e", "cs_6_5", false, &[SPIRV_MAGIC, 1, 2, 3]);
+    match m.get("src", "e", "cs_6_5", false) {
+        Some(w) if w == [SPIRV_MAGIC, 1, 2, 3] => {}
+        other => return Err(format!("memo returned {other:?} for a stored key")),
+    }
+    for (s, e, t, d) in [
+        ("src2", "e", "cs_6_5", false),
+        ("src", "e2", "cs_6_5", false),
+        ("src", "e", "cs_6_0", false),
+        ("src", "e", "cs_6_5", true),
+    ] {
+        if m.get(s, e, t, d).is_some() {
+            return Err(format!(
+                "memo served ({s:?}, {e:?}, {t:?}, debug={d}) from a key differing in one element"
+            ));
+        }
+    }
+    // Two entries under one map do not shadow each other.
+    m.put("src2", "e", "cs_6_5", false, &[9]);
+    if m.get("src2", "e", "cs_6_5", false) != Some(vec![9])
+        || m.get("src", "e", "cs_6_5", false) != Some(vec![SPIRV_MAGIC, 1, 2, 3])
+    {
+        return Err("memo entries shadow each other".into());
+    }
+    // hits: the three successful gets above; misses: the two puts. The four
+    // discrimination probes bump NEITHER — a miss is a stored compile, not a
+    // failed lookup, so the pair reconciles against work done rather than
+    // questions asked.
+    if m.stats() != (3, 2) {
+        return Err(format!("memo stats {:?}, want (3, 2)", m.stats()));
     }
     Ok(())
 }

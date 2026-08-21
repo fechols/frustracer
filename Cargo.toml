@@ -136,24 +136,11 @@ pollster = "1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 intel_tex_2 = "0.5"
 
-# The interactive presentation stack (SDL3 window + D3D12 + Streamline) is
-# Windows-only; headless --check/--check-dlss build everywhere without it.
+# The D3D12 presentation stack (SDL3 window + D3D12 + Streamline) is
+# Windows-only; headless --check/--check-dlss build everywhere without it. The
+# HUD (slint) is NOT here since B6b rung 4 — it lives in the "platforms with a
+# window" table below, beside the Linux SDL3 entry.
 [target.'cfg(windows)'.dependencies]
-# The HUD/pause-menu UI (src/hud/): Slint's SOFTWARE renderer only — no
-# winit/femtovg/skia backends compile (default-features off), because the
-# renderer draws into OUR CPU buffer behind a custom slint::platform::Platform
-# and the result is dirty-rect-uploaded onto the D3D12 swapchain
-# (src/gpu/hud.rs). `software-renderer-systemfonts` rasterizes system fonts at
-# runtime, which is what lets the UI live in a slint! macro with no
-# slint-build/pre-rendered-glyph step. Licensing: Slint is triple-licensed
-# (GPLv3 / Royalty-Free / commercial); this project uses it under the
-# Royalty-Free license (https://slint.dev/terms-and-conditions).
-slint = { version = "1", default-features = false, features = [
-    "std",
-    "compat-1-2",
-    "renderer-software",
-    "software-renderer-systemfonts",
-] }
 sdl3 = { version = "0.18", features = ["build-from-source-static", "raw-window-handle"] }
 # Ogg Vorbis decode for the ambience loops (src/audio.rs) — pure Rust, zero
 # unsafe, no runtime DLL (the --check* DLL-free bar; the rustfft precedent).
@@ -258,6 +245,40 @@ ash = "0.38"
 # tables, so the Windows block is untouched by this.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 sdl3 = { version = "0.18", features = ["build-from-source-static", "ash"] }
+
+# THE PLATFORMS WITH A WINDOW — Windows (src/gpu/) and Linux (src/vk/present.rs)
+# — and therefore the HUD/pause-menu UI (src/hud/), which both windows composite
+# (gpu/hud.rs and vk/hud.rs, B6b rung 4). ONE entry rather than one per target
+# table: cargo unifies features across tables anyway, and a single spelling is
+# what keeps the two windows on one Slint feature set by construction.
+#
+# NOT `cfg(unix)` and not `[dependencies]`, for the sdl3 block's reason: macOS
+# has no window (src/mtl/ is headless and gated) and wasm32 has no Slint, and
+# either would otherwise compile the slint! macro compiler — the largest single
+# dependency closure in this tree — for a presenter that platform has not got.
+# `mod hud` / `mod input` in main.rs carry this same cfg.
+#
+# Slint's SOFTWARE renderer only — no winit/femtovg/skia backends compile
+# (default-features off), because the renderer draws into OUR CPU buffer behind
+# a custom slint::platform::Platform and the result is dirty-rect-uploaded onto
+# the swapchain by the backend's hud module. `software-renderer-systemfonts`
+# rasterizes system fonts at runtime, which is what lets the UI live in a
+# slint! macro with no slint-build/pre-rendered-glyph step. ON LINUX THAT
+# FEATURE HARD-LINKS libfontconfig: slint std → i-slint-renderer-software/std →
+# fontique `system` → yeslogic-fontconfig-sys, whose build.rs pkg-config's
+# `fontconfig` and fails the build without the dev package (CI installs
+# libfontconfig-dev; the binary gains a libfontconfig.so.1 NEEDED). There is no
+# embedded fallback font on Linux, so a box with no system fonts draws no
+# glyphs — loud rather than silent is the trade taken. Licensing: Slint is
+# triple-licensed (GPLv3 / Royalty-Free / commercial); this project uses it
+# under the Royalty-Free license (https://slint.dev/terms-and-conditions).
+[target.'cfg(any(windows, all(unix, not(target_os = "macos"))))'.dependencies]
+slint = { version = "1", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "renderer-software",
+    "software-renderer-systemfonts",
+] }
 
 # The Metal backend (src/mtl/) — FSR3 upscaling, headless and gated. Generated
 # Objective-C bindings, not a framework: objc2 brings no allocator, no render

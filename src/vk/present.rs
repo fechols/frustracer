@@ -1,5 +1,5 @@
 //! The window, its event pump, and the frame loop's presentation half —
-//! B6b rungs 1 (the window), 2 (the input) and 3 (the resize).
+//! B6b rungs 1 (the window), 2 (the input), 3 (the resize) and 4 (the HUD).
 //!
 //! WHAT RUNG 1 ADDED TO THE HEADLESS PRESENT PATH. `swapchain.rs` acquires,
 //! renders, presents and lets the engine recycle, all over
@@ -42,21 +42,33 @@
 //! presentation half; `Swapchain::rebuild` is what makes it possible without
 //! taking the window's surface with it.
 //!
-//! WHAT `pump` STILL DOES NOT DO is `input.rs`'s job: the three-tier `Edges`
-//! drain (SPACE, F, H, P, F1 …) answers a pause menu this backend has no peer
-//! of yet. Continuous STATE for a 500 Hz integrator and per-FRAME EDGES for a
-//! session are two mechanisms on Windows too (`GetAsyncKeyState` beside
-//! `input.rs`), so keeping them apart here is that shape, not a fork of it.
-//! F11 belongs to that same drain, which is why a resize works here and
-//! fullscreen does not.
+//! RUNG 4 MAKES `pump` FORWARD, and keeps it from deciding. `input.rs`'s
+//! `Edges` drain (ESC, F1, F11, the menu's navigation keys) answers a pause
+//! menu, and the menu — Slint's `Hud` — is `Rc`-based and lives on ONE thread,
+//! which on this window is the RENDER thread (it is what feeds the HUD's
+//! inputs and uploads its pixels; putting it on the pump would ship a pose,
+//! a frame time and an hour MAIN-ward every frame and the dirty rects back).
+//! So the pump appends every drained `sdl3::event::Event` to `Ui` (the type
+//! is `Send`, pinned below) and the render thread runs `Edges::feed` over
+//! them with the menu in hand — the SAME routing table `Input::poll` loops on
+//! Windows, so there is one. The mirror pass is unchanged and runs FIRST:
+//! continuous STATE for a 500 Hz integrator and per-FRAME EDGES for a session
+//! are two mechanisms on Windows too (`GetAsyncKeyState` beside `input.rs`).
+//! The three SDL calls only the window's thread may make cross BACK as
+//! requests in `WinSize::want`'s shape: `SDL_SetWindowFullscreen` (F11 — a
+//! resize works here and so, now, does fullscreen), and
+//! `SDL_StartTextInput`/`Stop` (the menu's text rows), plus `fullscreen` as a
+//! level for `pos`. ESC is no longer the pump's quit: it is forwarded and the
+//! session decides (menu, or quit when the HUD failed to build).
 
 use ash::vk;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use crate::vk::device::Vk;
-use crate::vk::display::{self, Passes};
+use crate::vk::display::{self, Draw, Passes};
 use crate::vk::headless::VkHeadless;
+use crate::vk::hud::{HudVk, UploadStats};
 use crate::vk::spirv::Spirv;
 use crate::vk::swapchain::{self, Swapchain};
 
@@ -140,6 +152,72 @@ impl WinSize {
     }
 }
 
+/// What the pump hands the session and what the session asks of the pump —
+/// B6b rung 4's cell beside `WinSize`, with the same WHO-WRITES-WHAT rule.
+///
+/// * `events` — MAIN → RENDER: every event the pump drained, after its mirror
+///   pass, appended in order; `take_events` empties it once per frame. BOUNDED:
+///   past `EVENT_CAP` the pump collapses the queue's `MouseMotion`s before
+///   appending (a hover position is state, not history — the newest is what
+///   matters), which is what keeps a ~8 s tracer rebuild or a ~20 s world load
+///   from growing it without limit while the render thread is away.
+/// * `text_input` — RENDER → MAIN, a LEVEL: "the menu is open". The pump
+///   edge-detects it and calls `SDL_StartTextInput`/`Stop`, which belong to
+///   the window's thread like `SDL_PumpEvents`; printable characters reach
+///   Slint only while it is started.
+/// * `fullscreen_toggle` — RENDER → MAIN, a ONE-SHOT (`WinSize::want`'s
+///   pattern): F11 or `--qa key f11`. The pump toggles and the resulting size
+///   event flows through the ordinary debounce into `rebuild_at`.
+/// * `fullscreen` — MAIN → RENDER, a level, for `pos`.
+///
+/// Under `FR_VK_PUMP_INLINE=1` MAIN is RENDER and the cell is a local queue:
+/// the pump pushes, the loop pops a few lines later. Nothing is special-cased.
+#[derive(Default)]
+pub struct Ui {
+    events: std::sync::Mutex<Vec<sdl3::event::Event>>,
+    text_input: AtomicBool,
+    fullscreen_toggle: AtomicBool,
+    fullscreen: AtomicBool,
+}
+
+/// Past this many queued events the pump collapses the `MouseMotion`s.
+const EVENT_CAP: usize = 8192;
+
+impl Ui {
+    /// The render thread's drain — everything since the last call, in order.
+    pub fn take_events(&self) -> Vec<sdl3::event::Event> {
+        std::mem::take(&mut *self.events.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+    /// The pump's append.
+    fn push_events(&self, evs: &mut Vec<sdl3::event::Event>) {
+        let mut q = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        if q.len() + evs.len() > EVENT_CAP {
+            q.retain(|e| !matches!(e, sdl3::event::Event::MouseMotion { .. }));
+        }
+        q.extend(evs.drain(..));
+    }
+    /// RENDER: the menu is open (SDL text input should be started).
+    pub fn set_text_input(&self, on: bool) {
+        self.text_input.store(on, Relaxed);
+    }
+    /// RENDER: toggle fullscreen (F11).
+    pub fn request_fullscreen_toggle(&self) {
+        self.fullscreen_toggle.store(true, Relaxed);
+    }
+    /// RENDER: is the window fullscreen, as the pump last saw it.
+    pub fn fullscreen(&self) -> bool {
+        self.fullscreen.load(Relaxed)
+    }
+}
+
+// The forwarding rests on `sdl3::event::Event: Send` (sdl3 0.18 says so with
+// an explicit `unsafe impl`). Pinned here so an sdl3 bump that drops it fails
+// at build rather than in review.
+const _: () = {
+    fn assert_send<T: Send>() {}
+    let _ = assert_send::<sdl3::event::Event>;
+};
+
 /// The SDL side: context, window, and the event pump.
 ///
 /// Held together because SDL's own lifetimes require it — the video subsystem
@@ -167,6 +245,9 @@ pub struct Win {
     /// cannot happen inside it. Cleared rather than reallocated, so a 500 Hz
     /// pump allocates nothing in steady state.
     evs: Vec<sdl3::event::Event>,
+    /// What `SDL_StartTextInput` was last told — the pump's edge detector on
+    /// `Ui::text_input`.
+    text_input_on: bool,
 }
 
 impl Win {
@@ -198,6 +279,10 @@ impl Win {
     /// whatever it likes, which is what made the pre-rung-3 window die on its
     /// first frame there.
     pub fn open(w: u32, h: u32, title: &str) -> Result<Win, String> {
+        // The first click on the menu of an UNFOCUSED window must press the
+        // button, not merely focus the window — the Windows session sets the
+        // same hint for the same reason (B6b rung 4).
+        sdl3::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
         let sdl = sdl3::init().map_err(|e| format!("SDL_Init: {e}"))?;
         let video = sdl.video().map_err(|e| format!("SDL video subsystem: {e}"))?;
         let window = video
@@ -213,7 +298,7 @@ impl Win {
         // so deferring this would mean a pad connected mid-session is one the
         // session never hears about.
         let gamepads = sdl.gamepad().map_err(|e| format!("SDL gamepad subsystem: {e}"))?;
-        Ok(Win { sdl, video, window, pump, gamepads, pad: None, evs: Vec::new() })
+        Ok(Win { sdl, video, window, pump, gamepads, pad: None, evs: Vec::new(), text_input_on: false })
     }
 
     /// The instance extensions SDL needs to make a surface for this window —
@@ -261,12 +346,15 @@ impl Win {
     /// reads grows without bound and, on some compositors, a window that never
     /// pumps is declared unresponsive.
     ///
-    /// WHAT IS DELIBERATELY ABSENT is the toggle-edge drain (`input.rs`'s
-    /// `Edges` — SPACE, F, H, P, F1 …). That is a per-FRAME question answered
-    /// against a pause menu this backend has no peer of yet; this is
-    /// continuous STATE for a 500 Hz integrator. Windows keeps the same two
-    /// mechanisms apart for the same reason (`input.rs` beside
-    /// `GetAsyncKeyState`), so this is that shape rather than a fork of it.
+    /// WHAT IS DELIBERATELY NOT DECIDED HERE is the toggle-edge drain
+    /// (`input.rs`'s `Edges` — ESC, F1, F11, the menu keys). That is a
+    /// per-FRAME question answered against a pause menu that lives on the
+    /// render thread; this is continuous STATE for a 500 Hz integrator. So the
+    /// mirror pass runs over every event FIRST, and then every event is
+    /// appended to `ui` for the render thread's `Edges::feed` (rung 4).
+    /// Windows keeps the same two mechanisms apart for the same reason
+    /// (`input.rs` beside `GetAsyncKeyState`), so this is that shape rather
+    /// than a fork of it.
     ///
     /// RUNG 3 ADDS THE EXTENT, in both directions: size events arm `sz.cur`,
     /// and a `sz.want` left by the `--qa resize` verb is applied HERE because
@@ -276,11 +364,36 @@ impl Win {
     /// X11, which round-trips), so the verb drives the ordinary path rather
     /// than a private one — a resize that bypassed SDL would prove the rebuild
     /// works and nothing about the events or the debounce.
-    pub fn pump(&mut self, m: &crate::flycam::Mirror, sz: &WinSize) -> bool {
+    pub fn pump(&mut self, m: &crate::flycam::Mirror, sz: &WinSize, ui: &Ui) -> bool {
         use sdl3::event::{Event, WindowEvent};
         use sdl3::gamepad::Axis;
-        use sdl3::keyboard::Keycode;
         use sdl3::mouse::MouseButton;
+        // The render thread's REQUESTS, applied before the drain so their
+        // events land in this pass (rung 3's `set_size` rule, same reasons).
+        if ui.fullscreen_toggle.swap(false, Relaxed) {
+            // Borderless desktop fullscreen — SDL3's set_fullscreen is a bool,
+            // and fullscreen with no exclusive mode set IS borderless desktop
+            // (the Windows session's F11, verbatim). The resulting size event
+            // flows through the same debounce.
+            let on = self.window.fullscreen_state() == sdl3::video::FullscreenType::Off;
+            if let Err(e) = self.window.set_fullscreen(on) {
+                eprintln!("fullscreen: {e}");
+            }
+        }
+        ui.fullscreen.store(
+            self.window.fullscreen_state() != sdl3::video::FullscreenType::Off,
+            Relaxed,
+        );
+        let want_text = ui.text_input.load(Relaxed);
+        if want_text != self.text_input_on {
+            self.text_input_on = want_text;
+            let ti = self.video.text_input();
+            if want_text {
+                ti.start(&self.window);
+            } else {
+                ti.stop(&self.window);
+            }
+        }
         // Taken and PUT BACK at the end of the pass (there is no early return
         // between — that is what `quit` is for), so the allocation travels
         // with it and a steady-state pump allocates nothing. Draining rather
@@ -329,22 +442,26 @@ impl Win {
         evs.extend(self.pump.poll_iter());
         m.pumped();
         let mut quit = false;
-        for ev in evs.drain(..) {
+        // BY REFERENCE, so the events survive the mirror pass and are handed
+        // on whole to `ui` below. ESC is NOT a quit here since rung 4 — it is
+        // the menu's key, and whether it opens a menu or ends the session is
+        // the render thread's to decide (a session whose `Hud` failed to build
+        // keeps the historical quit). Window-X stays immediate.
+        for ev in &evs {
             match ev {
-                Event::Quit { .. }
-                | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => quit = true,
+                Event::Quit { .. } => quit = true,
 
                 // REPEATS FILTERED. A held key is already down as far as the
                 // mirror is concerned, so an auto-repeat is pure noise — and
                 // the whole point of the compare-before-store inside `key` is
                 // that an idle session writes nothing.
                 Event::KeyDown { scancode: Some(sc), repeat: false, .. } => {
-                    if let Some(a) = crate::flycam::action_for_scancode(sc) {
+                    if let Some(a) = crate::flycam::action_for_scancode(*sc) {
                         m.key(a, true);
                     }
                 }
                 Event::KeyUp { scancode: Some(sc), .. } => {
-                    if let Some(a) = crate::flycam::action_for_scancode(sc) {
+                    if let Some(a) = crate::flycam::action_for_scancode(*sc) {
                         m.key(a, false);
                     }
                 }
@@ -355,7 +472,7 @@ impl Win {
                 // screen edge, and this is the same quantity with the same
                 // edge behaviour. Capturing the pointer would be a different
                 // feel, which is the wrong thing for a parity rung.
-                Event::MouseMotion { xrel, yrel, .. } => m.look(xrel, yrel),
+                Event::MouseMotion { xrel, yrel, .. } => m.look(*xrel, *yrel),
                 // A button event only reaches us when it landed on our window,
                 // so this IS `drag_may_start`'s hit-test — the compositor
                 // already did it.
@@ -403,9 +520,9 @@ impl Win {
                 // the handle has to be held for as long as we want them — so
                 // `pad` is a field rather than a local. First one wins, which
                 // is XInput slot 0's rule on the other side.
-                Event::ControllerDeviceAdded { which, .. } => self.open_pad(which, m),
+                Event::ControllerDeviceAdded { which, .. } => self.open_pad(*which, m),
                 Event::ControllerDeviceRemoved { which, .. } => {
-                    if self.pad.as_ref().is_some_and(|p| p.id().is_ok_and(|id| id == which)) {
+                    if self.pad.as_ref().is_some_and(|p| p.id().is_ok_and(|id| id == *which)) {
                         self.pad = None;
                         m.pad_present(false);
                     }
@@ -419,13 +536,16 @@ impl Win {
                         Axis::TriggerLeft => 4,
                         Axis::TriggerRight => 5,
                     };
-                    m.pad_axis(i, value);
+                    m.pad_axis(i, *value);
                 }
-                Event::ControllerButtonDown { button, .. } => pad_button(m, button, true),
-                Event::ControllerButtonUp { button, .. } => pad_button(m, button, false),
+                Event::ControllerButtonDown { button, .. } => pad_button(m, *button, true),
+                Event::ControllerButtonUp { button, .. } => pad_button(m, *button, false),
                 _ => {}
             }
         }
+        // Everything, to the session — drained out of `evs` so its capacity
+        // stays with this pump.
+        ui.push_events(&mut evs);
         self.evs = evs;
         !quit
     }
@@ -450,8 +570,9 @@ impl Win {
 }
 
 /// The four pad buttons the integrator knows, in `Mirror`'s bit order.
-/// Everything else on the pad is deliberately unbound here — face buttons
-/// belong to a menu this backend has no peer of yet.
+/// Everything else on the pad is deliberately unbound HERE — Start, the face
+/// buttons and the D-pad's menu role are `input::Edges::feed`'s (the pump
+/// forwards every event, and the render thread routes them; rung 4).
 fn pad_button(m: &crate::flycam::Mirror, b: sdl3::gamepad::Button, down: bool) {
     use sdl3::gamepad::Button;
     let i = match b {
@@ -579,11 +700,24 @@ pub enum Frame {
     Stale,
 }
 
-/// The swapchain, the display pipelines, and one frame's present.
+/// The swapchain, the display pipelines, the HUD overlay, and one frame's
+/// present.
 pub struct Presenter {
     pub sc: Swapchain,
     passes: Passes,
     pub pacing: Pacing,
+    /// The HUD's GPU half (B6b rung 4): the overlay image and its uploads,
+    /// sized to the swapchain and rebuilt with it. `Passes` owns the composite
+    /// pipeline and `bind_overlay` joins the two.
+    hud: HudVk,
+    /// The session's per-frame answer to "is the HUD/menu on screen". Staging
+    /// continues while false so re-showing needs no special case.
+    hud_visible: bool,
+    /// A TONEMAPPED frame has been presented — what licenses the pause menu's
+    /// hold (`present` without a `render_frame` re-reads the upscaler's
+    /// output, which exists only after the first one). `present_page` does not
+    /// set it: a loading page has no frame behind it.
+    pub frame_presented: bool,
 }
 
 impl Presenter {
@@ -611,7 +745,23 @@ impl Presenter {
                 return Err(e);
             }
         };
-        Ok(Presenter { sc, passes, pacing: Pacing::new(2.0) })
+        let hud = match HudVk::new(hg, sc.w, sc.h) {
+            Ok(h) => h,
+            Err(e) => {
+                passes.destroy(&hg.vk);
+                sc.destroy(&hg.vk);
+                return Err(e);
+            }
+        };
+        passes.bind_overlay(&hg.vk, hud.image.view);
+        Ok(Presenter {
+            sc,
+            passes,
+            pacing: Pacing::new(2.0),
+            hud,
+            hud_visible: false,
+            frame_presented: false,
+        })
     }
 
     /// Rebuild the swapchain at a new extent — the presentation half of a live
@@ -649,7 +799,43 @@ impl Presenter {
                 self.sc.fmt
             );
         }
+        // The HUD image follows the NEGOTIATED extent (rung 4), and the
+        // overlay is re-bound UNCONDITIONALLY: a fresh `Passes` has an
+        // unwritten `hud_set`, and a rebuilt image is a new view. `crate::hud`
+        // is told by the session (`set_size` by comparison), which forces the
+        // full-window first frame that fills the new image.
+        if self.hud.size() != (self.sc.w, self.sc.h) {
+            let mut fresh = HudVk::new(hg, self.sc.w, self.sc.h)?;
+            // The cumulative upload counter is the SESSION's probe, not the
+            // image's: a `--qa` driver reading `hud_uploads` across a resize
+            // must see it monotonic, not reset to the forced full-window rect.
+            fresh.carry_stats(self.hud.stats());
+            self.hud.destroy(&hg.vk);
+            self.hud = fresh;
+        }
+        self.passes.bind_overlay(&hg.vk, self.hud.image.view);
         Ok(())
+    }
+
+    /// Stage a HUD frame's dirty rects for the next present (`crate::hud`'s
+    /// `frame`/`loading_frame` output). Appends; an empty frame is a no-op.
+    pub fn hud_stage(&mut self, f: crate::gfx::hud_frame::HudFrame) {
+        self.hud.stage(f);
+    }
+
+    /// The session's per-frame visibility answer (`hd.visible() || menu_open`).
+    pub fn set_hud_visible(&mut self, on: bool) {
+        self.hud_visible = on;
+    }
+
+    /// The overlay image's extent — what `crate::hud` must be sized to.
+    pub fn hud_size(&self) -> (u32, u32) {
+        self.hud.size()
+    }
+
+    /// Cumulative HUD upload totals — the live dirty-rect probe for `pos`.
+    pub fn hud_stats(&self) -> UploadStats {
+        self.hud.stats()
     }
 
     /// Point the display stage at the image it should tonemap.
@@ -680,7 +866,31 @@ impl Presenter {
     /// A stale PRESENT is the other way round — the submit already ran and
     /// `wait_submit` still has to happen — so that arm falls through to the
     /// wait and reports afterwards.
+    ///
+    /// RUNG 4 ADDS THE HUD to the same recording: `HudVk::record_upload` FIRST
+    /// (the staged rects, if any — it records nothing at all when there are
+    /// none), then `record_frame` with the overlay drawn iff the session said
+    /// visible AND the image has been uploaded — the structural off-state V21
+    /// pins. ONE insertion point: the loading page (`present_page`) and every
+    /// future arm go through `record_frame` too.
     pub fn present(&mut self, hg: &VkHeadless, params: display::Params) -> Result<Frame, String> {
+        let r = self.present_with(hg, params, Draw::Tonemap);
+        if matches!(r, Ok(Frame::Presented)) {
+            self.frame_presented = true;
+        }
+        r
+    }
+
+    /// The LOADING PAGE: a cleared swapchain image with the HUD composited
+    /// over it — no tonemap, no source, so it is legal before any tracer
+    /// exists (B6b rung 4). `Draw::None` binds nothing the tonemap set would
+    /// need, which is what keeps its unwritten `t0` from being consulted.
+    pub fn present_page(&mut self, hg: &VkHeadless) -> Result<Frame, String> {
+        let params = display::Params::new(crate::tone::ToneParams::SDR, 1.0, (0.0, 0.0, 0.0));
+        self.present_with(hg, params, Draw::None)
+    }
+
+    fn present_with(&mut self, hg: &VkHeadless, params: display::Params, draw: Draw) -> Result<Frame, String> {
         self.passes.set_params(&hg.vk, params)?;
         let idx = match self.sc.acquire() {
             Ok(i) => i,
@@ -693,8 +903,14 @@ impl Presenter {
         let (w, h) = (self.sc.w, self.sc.h);
         let passes = &self.passes;
         let sc = &self.sc;
+        let hud = &mut self.hud;
+        let visible = self.hud_visible;
         hg.run_present(&wait, &stages, &signal, |d, cmd| {
-            passes.record_to(d, cmd, img, view, w, h, true);
+            hud.record_upload(d, cmd);
+            // `drawable()` AFTER the upload: the first staged frame uploads
+            // and composites in one recording.
+            let overlay = visible && hud.drawable();
+            passes.record_frame(d, cmd, img, view, w, h, draw, overlay);
             sc.to_present_layout(d, cmd, idx);
         })?;
         let stale = match self.sc.present(&hg.vk, idx) {
@@ -714,6 +930,7 @@ impl Presenter {
 
     pub fn destroy(&self, vkd: &Vk) {
         self.sc.destroy(vkd);
+        self.hud.destroy(vkd);
         self.passes.destroy(vkd);
     }
 }

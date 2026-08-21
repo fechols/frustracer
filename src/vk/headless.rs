@@ -29,6 +29,16 @@ use std::ffi::CString;
 use super::device::{Buffer, Vk, VkError};
 use super::spirv::{self, Reg, Spirv};
 
+/// How many frames this harness can have in flight — ONE. One command buffer,
+/// one fence, and `wait_submit` before the next `reset_command_pool`
+/// (`vk::present::Presenter::present` documents the bubble that costs). It is
+/// a named constant rather than an implicit 1 so the modules that size a
+/// per-frame ring from it — `vk::hud::HudVk`'s staging slices, the shape
+/// `gpu/hud.rs` takes from `d3d12::FRAMES_IN_FLIGHT` — follow a fence ring
+/// here the day one lands, by construction rather than by a comment that says
+/// to remember.
+pub const FRAMES_IN_FLIGHT: usize = 1;
+
 pub struct VkHeadless {
     pub vk: Vk,
     pool: vk::CommandPool,
