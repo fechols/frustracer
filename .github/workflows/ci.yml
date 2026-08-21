@@ -665,18 +665,43 @@ jobs:
             echo "::error::--check-wgsl's normalization touched nothing — the probe-reach alarm"
             exit 1
           fi
-          # The WebGPU host (Stage C1): a wgpu device EXECUTING what that
+          # W5 (layout audit), W6 (hostile scan + planted WEB_TEX-off arm),
+          # W7 (the tracked corpus golden — this run's Linux DXC vs the
+          # golden the Windows dev box wrote is the cross-platform pin).
+          # Trailing spaces are load-bearing: "check-wgsl: W7 " cannot match
+          # a "SKIP W7" line, so a scene-keyed or degraded run cannot pass.
+          for s in W5 W6 W7; do
+            grep -q "check-wgsl: $s " wgsl.log \
+              || { echo "::error::--check-wgsl printed no $s line at all — that stage did not run and did not say so"; exit 1; }
+          done
+          grep -q "WEB_TEX-off" wgsl.log \
+            || { echo "::error::--check-wgsl's planted WEB_TEX-off arm left no trace — W6's tooth did not run"; exit 1; }
+          # The WebGPU host (Stages C1/C2): a wgpu device EXECUTING what that
           # chain emits — over the same lavapipe this job already installs
           # (wgpu's Vulkan backend finds the ICD the way ash does), with the
           # same DXC drop feeding J2. Positive assertions per the doctrine
           # below; the J-loop's trailing space is load-bearing (J1 must not
           # match a future J18).
+          #
+          # J6 is the browser's TRACER against the CPU reference; J7 is the
+          # WAVEFRONT QUADTREE against that reference, with the soundness
+          # counters at exactly 0. Both run on llvmpipe here, so the gate
+          # drops to a small frame on a software adapter deliberately (it says
+          # so on the line) — the verdicts are the same, the numbers are not
+          # for quoting.
           cargo run --profile quick -- --check-wgpu 2>&1 | tee wgpu.log
           grep -q "CHECK-WGPU PASSED" wgpu.log \
             || { echo "::error::--check-wgpu failed (or printed no summary)"; exit 1; }
-          for s in J0 J1 J2 J3; do
+          for s in J0 J1 J2 J3 J6 J7; do
             grep -q "check-wgpu: $s " wgpu.log \
               || { echo "::error::--check-wgpu printed no $s line at all — that stage did not run and did not say so"; exit 1; }
+          done
+          # Their own anti-vacuity: every verdict line must be there. A tracer
+          # that built and never rendered would still print the upload line,
+          # and "PASSED" would then mean nothing.
+          for v in "J6 primary visibility" "J6 radiance A/B" "J7 coverage" "J7 soundness" "J7 wavefront vs reference image"; do
+            grep -q "check-wgpu: $v" wgpu.log \
+              || { echo "::error::--check-wgpu printed no '$v' verdict — that comparison did not run"; exit 1; }
           done
           cargo run --profile quick -- --check-vk 2>&1 | tee vk.log
           grep -q "CHECK-VK PASSED" vk.log \
@@ -704,80 +729,43 @@ jobs:
             vk.log
           if-no-files-found: warn
 
-  # THE METAL 4 PROBE — `workflow_dispatch` only, and deliberately shaped like
-  # the one `check-metal` itself started as (see the block below: run
-  # 31626195554 answered three unknowns, which is why that job's `if` is gone).
+  # THE `probe-metal4` JOB WAS RETIRED IN D4, and its findings are kept here
+  # because they are still the decision rules — only the instrument changed.
   #
-  # IT ANSWERS ONE QUESTION AND THE WHOLE MTL4 LADDER RIDES ON IT: does the
-  # Apple Paravirtual device support Metal 4? If it does not, every MTL4 rung
-  # loses its GPU half at once — and this is the only real GPU coverage this
-  # workflow has on any platform, so the instrument that would report the
-  # breakage IS the instrument that broke. The K4/K8 guards make that red rather
-  # than silently green, but red-forever on an environment fact is not coverage
-  # either; that is the --check-metalfx situation this file already refuses to
-  # repeat.
+  # It was a `workflow_dispatch`-only Swift script asking a runner whether it
+  # could make an MTL4 queue, an argument table and a residency set. It asserted
+  # nothing on purpose, and it was NEVER DISPATCHED — not once, `gh run list`
+  # shows zero workflow_dispatch runs — so it answered none of the questions it
+  # was written for. D4 made it redundant rather than merely unused: every one
+  # of them is now answered by `--check-mtl` K1 and K9 on EVERY run of this
+  # workflow. A probe that reports is strictly worse than a gate that runs, once
+  # the gate exists.
   #
-  # Three separate decisions read three separate lines of its output:
+  # THE QUESTION IT EXISTED FOR IS STILL OPEN FOR THIS RUNNER: does the Apple
+  # Paravirtual device support Metal 4? If it does not, the MTL4 rungs lose
+  # their GPU half here — and this is the only real GPU coverage this workflow
+  # has on any platform, so the instrument that would report the breakage IS the
+  # instrument that broke. That is why the K9 guard below matches `SKIP K9` too.
+  #
+  # Three decisions still read three facts, and K1/K9 now print all three:
   #   * `metal4 family: false` → the MTL4 rungs are off the table for anything
-  #     CI must verify. The MSL >= 3.1 atomics work is unaffected — it needs no
-  #     Metal 4 API at all — and would ship alone.
-  #   * `argbuf tier: Tier1` → K7 (the unbounded texs[] array) has never had CI
-  #     coverage and never will, which changes what a rung is allowed to assume
-  #     about its own teeth. K1 already SKIPs on tier 1; this says so up front
-  #     instead of after a red run.
-  #   * `mtlfx supportsDevice: false` → EXPECTED (run 31630969341), and it means
-  #     the MetalFX MTL4 port is untestable here in either direction. That is a
-  #     scheduling fact, not a failure.
+  #     CI must verify. (D2's MSL >= 3.1 atomics work needed no Metal 4 API at
+  #     all, which is why it shipped first and shipped alone.)
+  #   * `arg-buffers tier 1` → K7 (the unbounded texs[] array) has never had CI
+  #     coverage and never will, which changes what a rung may assume about its
+  #     own teeth. K1 already SKIPs on tier 1.
+  #   * `mtlfx supportsDevice: false` → EXPECTED (run 31630969341): the MetalFX
+  #     MTL4 port is untestable here in either direction. A scheduling fact,
+  #     not a failure.
   #
-  # NO RUST, NO SUBMODULES, NO CACHE, NO DXC — `swift -` needs no project file,
-  # so this is ~1 runner-minute against check-metal's 6m21s. It asserts NOTHING
-  # on purpose: every line is a measurement, and a probe that fails on an answer
-  # cannot report the answer. Read the log.
-  #
-  # Reference output, Apple M1 / macOS 26.5.1 / Xcode 26.6, 2026-08-19:
-  #   device: Apple M1 | metal3 family: true | metal4 family: true
-  #   argbuf tier: 1 (Tier2) | mtl4 queue/compiler/argtable/residency/allocator: all true
+  # Reference, Apple M1 / macOS 26.5.1 / Xcode 26.6, 2026-08-19 — the DEV box,
+  # never this runner:
+  #   metal3 family: true | metal4 family: true | argbuf tier Tier2
+  #   mtl4 queue/compiler/argtable/residency/allocator: all true
   #   mtlfx supportsDevice: true
-  probe-metal4:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
-    timeout-minutes: 10
-    steps:
-      # `sw_vers` FIRST and on its own line: Metal 4 is macOS 26.0+, so an image
-      # downgrade is the single most likely cause of a future flip in every line
-      # below it, and it should be one grep away rather than a mystery.
-      - name: Runner identity
-        run: |
-          sw_vers
-          xcodebuild -version || true
-          xcrun -sdk macosx --show-sdk-version || true
-
-      - name: Metal 4 capability probe
-        run: |
-          cat > probe.swift <<'SWIFT'
-          import Metal
-          import MetalFX
-
-          guard let d = MTLCreateSystemDefaultDevice() else {
-              print("device: NONE"); exit(1)
-          }
-          // Decoded, not raw: MTLArgumentBuffersTier.tier2 has rawValue 1, and a
-          // bare "1" in a log reads as tier 1 to every future reader.
-          let tier = d.argumentBuffersSupport == .tier2 ? "Tier2" : "Tier1"
-          print("device:", d.name)
-          print("unified:", d.hasUnifiedMemory)
-          print("metal3 family:", d.supportsFamily(.metal3))
-          print("metal4 family:", d.supportsFamily(.metal4))
-          print("argbuf tier:", d.argumentBuffersSupport.rawValue, "(\(tier))")
-          print("mtl4 queue:", d.makeMTL4CommandQueue() != nil)
-          print("mtl4 compiler:", ((try? d.makeCompiler(descriptor: MTL4CompilerDescriptor())) ?? nil) != nil)
-          print("argtable:", ((try? d.makeArgumentTable(descriptor: MTL4ArgumentTableDescriptor())) ?? nil) != nil)
-          print("residency set:", ((try? d.makeResidencySet(descriptor: MTLResidencySetDescriptor())) ?? nil) != nil)
-          print("cmd allocator:", d.makeCommandAllocator() != nil)
-          print("mtlfx supportsDevice:", MTLFXTemporalScalerDescriptor.supportsDevice(d))
-          SWIFT
-          swift probe.swift
-
+  # D4 re-confirmed the first two through the gate itself: `--check-mtl` K1
+  # prints `metal4 family true` and K9 builds queue + allocator + shared event.
+  #
   # THE METAL JOB — the only REAL GPU coverage this workflow has, because
   # macos-latest is macos-26-arm64 and the Linux/Windows runners have no GPU at
   # all. --check-fsr3 is staged like --check-vk (U0 pure staging math | U1 the
@@ -934,6 +922,21 @@ jobs:
       # Metal toolchain or the GPU. --check-fsr3 is guarded HARD on its U4 line,
       # because U1-U4 are PROVEN to run here.
       #
+      # ITS THIRD GUARD IS A COUPLING CHECK, not a duplicate of PASSED. D2
+      # raised build.rs::MSL_VERSION to 30100 so spirv-cross emits NATIVE image
+      # atomics, and deleted the buffer-backed emulation from
+      # shim/ffx_fsr3_metal.mm. Those two halves must move together, and the
+      # failure when they do not is SILENT: measured at MSL 30000 against the D2
+      # shim, U4 still passes all nine of its assertions with plausible but
+      # different numbers (history 2.579e-2 against 2.197e-2, depth 9.688e-3
+      # against 1.218e-2). U1's emulation-site count is the only thing that
+      # catches it, so a run that never prints it has not checked the coupling.
+      # THE LEADING COMMA IN THAT GREP IS LOAD-BEARING. U1 prints its table line
+      # whether or not the count assertion fired, so the bare pattern "0 image-
+      # atomic emulation sites" is a SUBSTRING of "20 image-atomic emulation
+      # sites" -- and 20 is exactly what FR_FFX_MSL=30000 produces. Without the
+      # comma this guard goes green on the one input it was written to catch.
+      #
       # --check-metalfx IS GUARDED ONLY ON PASSED, AND IT IS NEAR-VACUOUS HERE.
       # Say it plainly, because a green job printing `check-metalfx: PASSED` may
       # not otherwise read that way: run 31630969341 reports
@@ -994,6 +997,35 @@ jobs:
       # absent, so PASSED alone would go green on a runner that lost either. K4
       # is the line only a real dispatch prints.
       #
+      # THE K9 GUARD STAYS THE WEAK FORM, AND K10/K11 STAY UNGUARDED — AND THAT
+      # IS NOW A MEASUREMENT RATHER THAN A PRECAUTION. D4 added the Metal 4
+      # submission path, which needs macOS 26 AND a device that implements MTL4.
+      # D4 landed the weak guard because nothing had ever probed this runner
+      # (the `probe-metal4` job meant to answer it was workflow_dispatch-only
+      # and never ran once, which is why D4 retired it in favour of --check-mtl
+      # reporting the same facts on every run), and said to read the first green
+      # run and tighten if the answer allowed.
+      #
+      # THE ANSWER CAME BACK NO. Run 32309810963, 2026-08-19, this job:
+      #
+      #   check-mtl: K1 Apple Paravirtual device | unified true
+      #              | arg-buffers tier 2 | metal4 family false
+      #   check-mtl: SKIP K9 no MTL4 command queue (newMTL4CommandQueue
+      #              returned nil; device reports `metal4 family false`)
+      #
+      # --check-fsr3 U2 and --check-metalfx X1 print `metal4 family false` from
+      # the same device on the same run, so it is the device and not a
+      # gate-local quirk. The guard therefore CANNOT be tightened until GitHub's
+      # macOS image moves to macOS 26, and `SKIP K9` is not a degraded answer
+      # here — it is the only one this runner can give.
+      #
+      # SO READ A GREEN check-metal NARROWLY. It proves the MTL4 stage was
+      # REACHED and took its skip. It proves nothing about K10's barriers,
+      # residency set or cross-API byte-compare, and nothing about K11's commit
+      # feedback: those are M1-only teeth, run by hand. `FR_MTL4_OFF` exercises
+      # the same skip branch locally, which is more useful than it looked when
+      # it was written — the skip is the ONLY MTL4 branch CI ever takes.
+      #
       # K8 IS THE SECOND GUARD AND IT IS K8 RATHER THAN K6 ON PURPOSE. C3 added
       # three stages; K8 is the LAST of them and the only one that proves the
       # multi-set derivation ran, so a K6-only guard would go green on a build
@@ -1026,6 +1058,8 @@ jobs:
             || { echo "::error::--check-fsr3 did not pass"; rc=1; }
           grep -q "check-fsr3: U4 upscale" fsr3.log \
             || { echo "::error::--check-fsr3 did not run a real upscale — the GPU half skipped:"; grep -E "SKIP U[0-9]" fsr3.log || true; rc=1; }
+          grep -q ", 0 image-atomic emulation sites" fsr3.log \
+            || { echo "::error::--check-fsr3 did not report a clean image-atomic emulation count — the shader half and shim/ffx_fsr3_metal.mm may be out of step (D2):"; grep -E "U1|PLANT" fsr3.log || true; rc=1; }
           grep -q "check-metalfx: PASSED" metalfx.log \
             || { echo "::error::--check-metalfx did not pass"; rc=1; }
           grep -q "CHECK-MSL PASSED" msl.log \
@@ -1038,6 +1072,8 @@ jobs:
             || { echo "::error::--check-mtl dispatched nothing — a stage skipped:"; grep -E "SKIP K[0-9]" mtl.log || true; rc=1; }
           grep -q "check-mtl: K8" mtl.log \
             || { echo "::error::--check-mtl bound no textures, samplers or second set — the C3 stages skipped:"; grep -E "SKIP K[0-9]" mtl.log || true; rc=1; }
+          grep -qE "check-mtl: (K9|SKIP K9)" mtl.log \
+            || { echo "::error::--check-mtl did not reach the Metal 4 stage at all — K9 prints on BOTH branches, so neither line means the stage is gone:"; grep -E "K9|K10|metal4" mtl.log || true; rc=1; }
           exit $rc
 
       - uses: actions/upload-artifact@v4

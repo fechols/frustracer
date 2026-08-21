@@ -1014,6 +1014,36 @@ pub fn committed_tex_mips(
     Ok(res.unwrap())
 }
 
+/// `committed_tex_mips` with array layers — the WEB_TEX buckets are the one
+/// Texture2DArray in the renderer (subresource index = layer * mips + mip).
+pub fn committed_tex_array(
+    device: &ID3D12Device,
+    w: u32,
+    h: u32,
+    mips: u16,
+    layers: u16,
+    format: DXGI_FORMAT,
+    flags: D3D12_RESOURCE_FLAGS,
+    initial: D3D12_RESOURCE_STATES,
+) -> Result<ID3D12Resource> {
+    let mut desc = tex2d_desc(w, h, format, flags);
+    desc.MipLevels = mips;
+    desc.DepthOrArraySize = layers;
+    let mut res: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &default_heap(),
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            initial,
+            None,
+            &mut res,
+        )
+    }
+    .map_err(|e| format!("CreateCommittedResource(texarray {w}x{h} m{mips} x{layers} {format:?}): {e}"))?;
+    Ok(res.unwrap())
+}
+
 /// Persistently-mapped upload buffer.
 pub struct UploadBuffer {
     pub resource: ID3D12Resource,

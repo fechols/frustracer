@@ -81,7 +81,7 @@ not documentation.
 ## Gates — the test suite
 
 **There are essentially no unit tests.** `--check*` is the suite. The one exception is
-`cargo test`: 40 shader-source gates in `src/gfx/shaders.rs` plus a field-coherence probe in
+`cargo test`: 41 shader-source gates in `src/gfx/shaders.rs` plus a field-coherence probe in
 `src/gfx/guides.rs`, asserting ordering statements inside the HLSL that no CPU-only gate can
 reach — and including a clean-room **licence** scan that our assembled shaders contain none
 of NVIDIA's NRD entry names.
@@ -93,8 +93,8 @@ of NVIDIA's NRD entry names.
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
 | `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V21 |
 | `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
-| `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip (W0 is DXC-free) |
-| `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe + the indirect smoke (J0 is pure) |
+| `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip + W5 layout audit + W6 hostile scan + W7 tracked corpus golden (`goldens/web_corpus.txt`, regenerated via `--write-golden`; W0 is DXC-free) |
+| `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe, the indirect smoke, **J6 the browser's reference tracer vs the CPU**, **J7 the wavefront quadtree vs that reference** (J0 is pure; the smoke KERNEL is scene-free but the DEVICE is scene-keyed from J1 on — the ask lands in `required_limits`) |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
 | `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |
@@ -292,7 +292,8 @@ lights|tonemap` `--exposure-bias EV` `--autoexp-spike-guard` / `-strength`
 `--no-vsync` · `--move-ease S` / `--no-move-ease` · `--no-audio` · `--no-settings` ·
 `--prefer-nvidia|amd|intel`
 
-**Headless modes** — the 16 `--check*` gates · `--spin still|path` + `--spin-frames|-warmup|
+**Headless modes** — the 16 `--check*` gates · `--write-golden` (regenerates the `--check-wgsl`
+W7 corpus golden; refused unless W0–W6 green) · `--spin still|path` + `--spin-frames|-warmup|
 -hybrid|-plain` · `--cinematic <preset>` + the `--cinematic-*` family (res/fps/frames/samples/
 island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `--frd-lab-*` ·
 `--bloom-lab [wobble]` (glare shift-variance probe; scene-free, GPU-free) · `--qa [port]`
@@ -309,9 +310,20 @@ island/gi/overlay/hud/hdr/exposure/out/encode/dry-run) · `--frd-lab <kind>` + `
 ablation and probes: `FR_ABL` `FR_BALLAST` `FR_WIDTH` `FR_ORACLE` `FR_RANGE` `FR_REF` ·
 tuning sweeps: `FR_LEAF` `FR_LGROUP` `FR_LSTACK` `FR_WIDE` `FR_STACK_LAYOUT` `FR_FRD_GROUP` ·
 per-feature A/B: `FR_NGXFG_*` `FR_NGXRR_*` `FR_NRD_*` `FR_FRD_*` `FR_MFX*` `FR_AEXP_*`
-`FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` · Vulkan: `FR_VK_*`
+`FR_MTL_*` (the `--check-mtl` plants: eight teeth and measurements over the argument-buffer
+map, the threadgroup size and residency) · `FR_MTL4_*` (the Metal 4 path's five: the argument
+table's bind point, the inter-dispatch barriers and the commit-feedback handler are TEETH,
+residency is a measurement, and `FR_MTL4_OFF` forces the SKIP branch on a box that has
+MTL4) · `FR_FFX_MSL` — **the one
+BUILD-time lever**, so it needs `cargo build` and the gate run to see it alike, and a stale
+binary measures the other arm
+`FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` `FR_WEB_TEX`
+(the wavefront samples texweb buckets — the browser texture plan on native D3D12;
+`--check-gpu` M15 owns it) · Vulkan: `FR_VK_*`
 (device pick, validation, res parity, drop-binding teeth, the window's pump arm) · WebGPU:
-`FR_WGPU_ADAPTER` (adapter pick, index or name substring; `WGPU_BACKEND` rides along free) · dumps: `FR_DUMP_HLSL`
+`FR_WGPU_ADAPTER` (adapter pick, index or name substring; `WGPU_BACKEND` rides along free)
+`FR_WGPU_RES` `FR_WGPU_AB_FRAMES` `FR_WGPU_MAP` (J6's frame, its A/B depth, and the
+REAL-vs-dummy bind report — the `FR_VK_RES`/`FR_VK_AB_FRAMES`/`FR_VK_MAP` twins) · dumps: `FR_DUMP_HLSL`
 `FR_SPIRV_DUMP|LIST` `FR_SPIRV_NOMEMO` `FR_MSL_LIST` `FR_CHECK_AB_DUMP` `FR_SPLIT_AUDIT` · crash:
 `FR_CRASH_TEST|FULLDUMP|VERIFY` `FR_NO_CRASH` · plus `FRUSTRACER_STAB` (inter-frame
 stability readout) and `FRUSTRACER_HUD_STATS`.

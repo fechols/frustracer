@@ -181,7 +181,9 @@ pub struct Plant {
     /// So it is `FR_MTL_NO_RESIDENCY` on a different subject rather than a
     /// finer one, and that is still worth having: `cs_arr` is the only pass
     /// that reaches TEXTURES through an argument buffer, and textures — not
-    /// buffers — are the class the four `ffx_fsr3_metal.mm` GOTCHAs live in.
+    /// buffers — are the class the `ffx_fsr3_metal.mm` GOTCHAs live in. (Four
+    /// when this was written; D2 retired GOTCHA 2 and 3 with the image-atomic
+    /// emulation, and the surviving two are still both texture-side.)
     /// The buffer answer does not carry over on its own.
     ///
     /// **MEASURED, and it changed the buffer answer too.** Apple M1, macOS

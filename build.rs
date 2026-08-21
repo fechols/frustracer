@@ -371,6 +371,18 @@ fn generate_fsr3_metallibs(prebuilt: &std::path::Path) -> usize {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let lib_dir = out_dir.join("ffx_fsr3");
 
+    // BEFORE ANY EARLY RETURN. Without this cargo has no reason to re-run the
+    // script when only the environment moved, so an armed FR_FFX_MSL would
+    // change nothing at all and read as "the lever has no effect" — the
+    // probe-reach trap CLAUDE.md records against `FR_ABL`, in build-script
+    // currency. It is the second `rerun-if-env-changed` in this file; the
+    // `SPIRV_CROSS`/`METAL`/`METALLIB` tool overrides still have none.
+    println!("cargo:rerun-if-env-changed=FR_FFX_MSL");
+    // Read ONCE: this is what announces an armed lever, and 80 identical
+    // cargo:warnings would read as a malfunction rather than a departure (the
+    // `FR_MFXDN_NORMALS` announce-once rule).
+    let cross_args = spirv_cross_args();
+
     // CONTENT-ADDRESSED CACHE, KEYED ON THE TOOLS AND THE RECIPE AS WELL AS THE
     // INPUT. The file name is FNV-1a of the SPIR-V, so an existing
     // `<hash>.metallib` is current with respect to its INPUT by construction —
@@ -385,7 +397,7 @@ fn generate_fsr3_metallibs(prebuilt: &std::path::Path) -> usize {
     // build re-runs 240 subprocesses (measured ~55 s).
     let stamp_want = format!(
         "v2 {} {RECIPE}\n{}\n{}\n",
-        SPIRV_CROSS_ARGS.join(" "),
+        cross_args.join(" "),
         tool_version(&mut std::process::Command::new(
             std::env::var("SPIRV_CROSS").unwrap_or_else(|_| "spirv-cross".into())
         )),
@@ -459,12 +471,35 @@ fn generate_fsr3_metallibs(prebuilt: &std::path::Path) -> usize {
             failures.push(format!("{name}: write {spv}: {e}"));
             continue;
         }
-        match transpile_ffx_metallib(&spv, &stem.display().to_string(), &spirv) {
+        match transpile_ffx_metallib(&spv, &stem.display().to_string(), &spirv, &cross_args) {
             Ok(()) => emitted.push(hash),
             Err(e) => failures.push(format!("{name}: {e}")),
         }
     }
     let _ = std::fs::write(&stamp_path, &stamp_want);
+
+    // THE TWO NUMBERS THE GATE CANNOT DERIVE FOR ITSELF. A build-time lever is
+    // invisible at runtime unless the build says what it did, and a gate that
+    // cannot tell which arm it is running cannot assert anything about either.
+    // `option_env!` on the reading side, so a tree that never ran this arm
+    // still compiles.
+    let atomic_sites = count_atomic_emulation(&lib_dir);
+    println!(
+        "cargo:rustc-env=FR_FFX_MSL_BUILT={}",
+        cross_args
+            .iter()
+            .position(|a| a == "--msl-version")
+            .and_then(|i| cross_args.get(i + 1))
+            .map_or(MSL_VERSION, |v| v.as_str())
+    );
+    println!("cargo:rustc-env=FR_FFX_ATOMIC_SITES={atomic_sites}");
+    // THE PIN ITSELF, so the gate never spells it a second time. `MSL_VERSION`
+    // is a constant duplicated across sites the moment a comparison against it
+    // is written down in Rust, and CLAUDE.md's rule for that class is lockstep
+    // or a pin. This is the pin: `--check-fsr3` asks whether BUILT differs from
+    // DEFAULT rather than whether it differs from a literal, so promoting the
+    // version here cannot leave a gate announcing a PLANT on every clean run.
+    println!("cargo:rustc-env=FR_FFX_MSL_DEFAULT={MSL_VERSION}");
 
     // Sorted, because read_dir is unordered and the table is compiled into the
     // binary — an unstable order would make two builds of one tree differ. The
@@ -498,7 +533,7 @@ fn generate_fsr3_metallibs(prebuilt: &std::path::Path) -> usize {
     // this is the only forensic trail a past build leaves.
     println!(
         "cargo:warning=FSR3-Metal: {}/{found} non-wave64 permutations -> metallib \
-         ({cached} cached, {} failed) [{}]",
+         ({cached} cached, {} failed, {atomic_sites} image-atomic emulation) [{}]",
         emitted.len(),
         failures.len(),
         stamp_want.lines().nth(1).unwrap_or("?")
@@ -616,6 +651,52 @@ fn spirv_local_size(spv: &[u8]) -> Option<[u32; 3]> {
     None
 }
 
+/// The MSL language level spirv-cross emits, and it is a MEASURED THRESHOLD
+/// rather than a preference — the one flag value in this file that changes what
+/// the shim has to contain.
+///
+/// **At 30100 spirv-cross emits NATIVE Metal image atomics; at 30000 it
+/// EMULATES them.** Measured over all 80 committed permutations (2026-08-19,
+/// spirv-cross 2026-07-06):
+///
+/// ```text
+///   30000 -> 30100 : 20 of 80 permutations change
+///   binding names REMOVED : 20, every one a `*_atomic` BUFFER
+///   binding names ADDED   : 0
+///   indices MOVED for a name present at both : 0
+/// ```
+///
+/// The change is purely SUBTRACTIVE on the binding surface, which is what makes
+/// it safe for `ffx_metal`'s discrete binds: the companion `device atomic_uint*`
+/// disappears and every surviving resource keeps its index. What goes with it is
+/// `spvLinearTextureAlignmentOverride [[function_constant(65535)]]`,
+/// `spvImage2DAtomicCoord`, and the whole buffer-aliasing apparatus that was
+/// GOTCHA 2 and GOTCHA 3 in `shim/ffx_fsr3_metal.mm`. Two FFX resources are
+/// involved: `rw_reconstructed_previous_nearest_depth` (16 permutations) and
+/// `rw_spd_global_atomic` (4, the SPD passes).
+///
+/// **30100 IS THE THRESHOLD AND THE PIN IS DELIBERATELY NOT HIGHER.** 30200 is
+/// byte-identical to 30100; 40000 is NOT, and the difference is not cosmetic —
+/// it rewrites nine barrier sites in the four SPD permutations
+/// (`threadgroup_barrier(mem_device|mem_threadgroup|mem_texture)` becomes
+/// `atomic_thread_fence(…, seq_cst, thread_scope_threadgroup)` plus a narrow
+/// `threadgroup_barrier`) and adds `memory_coherence_device`. SPD is a
+/// CROSS-THREADGROUP reduction and U4's quality comparison is report-only, so a
+/// subtly wrong reduction there is the silent-failure class. `FR_FFX_MSL=40000`
+/// exists to measure it; promoting the pin needs evidence, not tidiness.
+///
+/// Each emission also implies a `-std` floor, which matters because
+/// `transpile_ffx_metallib` passes NO `-std` and takes the SDK default
+/// (`__METAL_VERSION__` 400 on SDK 26). Measured:
+///
+/// ```text
+///   emit 30000 -> compiles at -std=metal3.0 and up
+///   emit 30100 -> needs 3.1  ("no member named 'atomic_fetch_add' in texture2d<uint,…>")
+///   emit 40000 -> needs 3.2  ("use of undeclared identifier 'memory_coherence_device'")
+/// ```
+#[cfg(not(windows))]
+const MSL_VERSION: &str = "30100";
+
 /// The spirv-cross invocation, in ONE place because it rides the cache stamp
 /// verbatim — editing it invalidates every cached metallib by construction,
 /// which is not true of anything expressed only at the call site.
@@ -625,8 +706,89 @@ fn spirv_local_size(spv: &[u8]) -> Option<[u32; 3]> {
 /// discretely (`setTexture:atIndex:` straight from the shaderblob reflection
 /// tables) instead of building descriptor sets. No push-constant relocation —
 /// FFX uses a real constant buffer, never `[[buffer(0)]]`.
+///
+/// **Read through `spirv_cross_args()`, never directly** — that is where
+/// `FR_FFX_MSL` substitutes the version, and the stamp must see the EFFECTIVE
+/// list or an armed lever would serve the cache it was meant to invalidate.
 #[cfg(not(windows))]
-const SPIRV_CROSS_ARGS: &[&str] = &["--msl", "--msl-version", "30000", "--msl-decoration-binding"];
+const SPIRV_CROSS_ARGS: &[&str] =
+    &["--msl", "--msl-version", MSL_VERSION, "--msl-decoration-binding"];
+
+/// `SPIRV_CROSS_ARGS` with `FR_FFX_MSL`'s version substituted.
+///
+/// The FR_LEAF valued-lever rule (`src/render.rs::leaf_tile`): loud on
+/// departure, and loud on an ILLEGAL value rather than silently reverting — a
+/// mistyped sweep cell that measures the shipping config while believing it
+/// measured the lever is the failure these levers exist to prevent.
+///
+/// **This is the tree's FIRST build-time lever, and it needs two things that a
+/// runtime one does not.** `cargo:rerun-if-env-changed=FR_FFX_MSL` (emitted by
+/// the caller) or cargo never re-runs this script and the lever is inert; and
+/// participation in the `.toolstamp`, which comes free because the stamp quotes
+/// this function's output verbatim.
+#[cfg(not(windows))]
+fn spirv_cross_args() -> Vec<String> {
+    let v = match std::env::var("FR_FFX_MSL") {
+        Err(_) => MSL_VERSION.to_string(),
+        Ok(v) if ["30000", "30100", "30200", "40000"].contains(&v.as_str()) => {
+            println!(
+                "cargo:warning=FSR3-Metal: FR_FFX_MSL={v} (default {MSL_VERSION}) — \
+                 spirv-cross MSL language level{}",
+                if v == "30000" {
+                    ", which RESTORES the image-atomic emulation the shim no longer implements"
+                } else {
+                    ""
+                }
+            );
+            v
+        }
+        Ok(v) => {
+            println!(
+                "cargo:warning=FSR3-Metal: FR_FFX_MSL={v:?} is not one of \
+                 30000/30100/30200/40000 — using {MSL_VERSION}"
+            );
+            MSL_VERSION.to_string()
+        }
+    };
+    // POSITIONAL — the token AFTER `--msl-version`, never "every arg that
+    // happens to equal MSL_VERSION". `msl::self_test` states the rule for the
+    // sibling arg set in as many words: a value match that asks whether a string
+    // appears anywhere fires on any OTHER flag's argument that happens to match,
+    // and goes wrong without moving a line of this function.
+    let mut out: Vec<String> = SPIRV_CROSS_ARGS.iter().map(|a| (*a).to_string()).collect();
+    let at = out
+        .iter()
+        .position(|a| a == "--msl-version")
+        .expect("SPIRV_CROSS_ARGS must carry --msl-version");
+    out[at + 1] = v;
+    out
+}
+
+/// How many emitted `.metal` files still carry spirv-cross's image-atomic
+/// EMULATION — the `overlap_check` idiom (`src/mtl/msl.rs`), a string scan over
+/// output already on disk.
+///
+/// Scanned from `lib_dir` rather than tallied in the transpile loop on purpose:
+/// a cached build never enters that loop, and a count that read 0 because
+/// nothing ran would be exactly the vacuous pass this number exists to prevent.
+/// The `.metal` files persist (unlike `msl::compile_lib`, which deletes its
+/// intermediates), and a version change wipes the whole directory via the stamp,
+/// so what is on disk always matches the current args.
+#[cfg(not(windows))]
+fn count_atomic_emulation(lib_dir: &std::path::Path) -> usize {
+    // Three independent markers. Any one of them is the emulation; requiring all
+    // three would go silent the day spirv-cross renames one.
+    const MARKS: [&str; 3] =
+        ["spvImage2DAtomicCoord", "spvLinearTextureAlignment", "function_constant(65535)"];
+    let Ok(rd) = std::fs::read_dir(lib_dir) else { return 0 };
+    rd.filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "metal"))
+        .filter(|e| {
+            std::fs::read_to_string(e.path())
+                .is_ok_and(|s| MARKS.iter().any(|m| s.contains(m)))
+        })
+        .count()
+}
 
 /// The half of the recipe that is not a flag list, and therefore has to be
 /// bumped BY HAND when either of the two rules it names changes:
@@ -640,7 +802,12 @@ const RECIPE: &str = "hdr=le-u32x3 sampler=-1000";
 
 /// SPIR-V -> MSL -> AIR -> metallib for one FFX permutation.
 #[cfg(not(windows))]
-fn transpile_ffx_metallib(spv: &str, stem: &str, spv_bytes: &[u8]) -> Result<(), String> {
+fn transpile_ffx_metallib(
+    spv: &str,
+    stem: &str,
+    spv_bytes: &[u8],
+    cross_args: &[String],
+) -> Result<(), String> {
     let spirv_cross =
         std::env::var("SPIRV_CROSS").unwrap_or_else(|_| "spirv-cross".to_string());
     let msl = format!("{stem}.metal");
@@ -653,7 +820,7 @@ fn transpile_ffx_metallib(spv: &str, stem: &str, spv_bytes: &[u8]) -> Result<(),
         .ok_or("no OpExecutionMode LocalSize (a threadgroup size we cannot dispatch)")?;
 
     let st = std::process::Command::new(&spirv_cross)
-        .args(SPIRV_CROSS_ARGS)
+        .args(cross_args)
         .arg("--output")
         .arg(&msl)
         .arg(spv)

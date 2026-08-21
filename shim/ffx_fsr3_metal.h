@@ -18,17 +18,25 @@
 // scalars and a v1.1.x struct layout can never drift out of step with a Rust
 // transcription of it — there is no transcription.
 //
-// TEXTURE OWNERSHIP DIFFERS FROM THE VULKAN HALF, and deliberately. There,
-// `src/vk/fsr3.rs` owns all seven images and hands the handles down. Here the
-// four I/O planes (colour, depth, motion, output) are still Rust's, but FFX's
-// three cross-frame temporals are SHIM-OWNED, because one of them —
-// `reconstructedPrevNearestDepth`, an R32_UINT image-atomic target — must be
-// BUFFER-BACKED with a row stride derived from the device's linear-texture
-// alignment. That requirement is not a property of Metal or of FFX: it is a
-// property of how spirv-cross EMULATED image atomics when this tree transpiled
-// the SPIR-V (see the .mm), so the authority on it is the same file that loads
-// those metallibs. Putting it in Rust would export a transpiler artifact into
-// the backend's resource vocabulary for no gain.
+// TEXTURE OWNERSHIP DIFFERS FROM THE VULKAN HALF. There, `src/vk/fsr3.rs` owns
+// all seven images and hands the handles down. Here the four I/O planes
+// (colour, depth, motion, output) are still Rust's and FFX's three cross-frame
+// temporals are SHIM-OWNED.
+//
+// THE ORIGINAL REASON FOR THAT SPLIT IS GONE, and it is recorded rather than
+// quietly restated. One temporal — `reconstructedPrevNearestDepth`, an R32_UINT
+// image-atomic target — used to require BUFFER-BACKING at a row stride derived
+// from the device's linear-texture alignment, which was not a property of Metal
+// or of FFX but of how spirv-cross EMULATED image atomics; the authority on a
+// transpiler artifact had to be the same file that loads those metallibs. D2
+// raised `build.rs::MSL_VERSION` to 30100, spirv-cross emits native image
+// atomics, and that temporal is now an ordinary texture like the other two.
+//
+// THE OWNERSHIP DID NOT MOVE BACK, and that is a decision rather than an
+// oversight: the three would still need somewhere to live, and relocating them
+// into Rust is a change with its own resource-vocabulary and lifetime cost that
+// this rung did not price. What was load-bearing is now merely conventional —
+// so if a future rung wants all seven in Rust, nothing here argues against it.
 
 #pragma once
 

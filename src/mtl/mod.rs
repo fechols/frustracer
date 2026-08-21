@@ -66,8 +66,8 @@
 //! rather than five `Option`s on `Trio` precisely because of that un-share
 //! condition — its own doc gives the argument.
 //!
-//! `msl`, `bind`, `smoke` and `texprobe` are the modules here that are not
-//! G-buffer consumers. They are the tracer's first three rungs rather than more
+//! `msl`, `bind`, `smoke`, `texprobe` and `mtl4` are the modules here that are
+//! not G-buffer consumers. They are the tracer's own rungs rather than more
 //! arms beside the others:
 //!
 //! * `msl` (C1) — the corpus's third code generator, HLSL -> SPIR-V -> MSL ->
@@ -89,6 +89,20 @@
 //!   and the tier-2 unbounded `texs[]` array. Its subject `mtlbind.hlsl` had
 //!   been in the shared corpus and executed by nothing, which is the exact gap
 //!   the `samp_lin` miscompile hid in for eight months. `--check-mtl` K6/K7/K8.
+//! * `mtl4` (D4) — the same smoke chain through the **Metal 4** API:
+//!   `MTL4CommandQueue`, `MTL4CommandBuffer`, `MTL4CommandAllocator`,
+//!   `MTL4ArgumentTable` and `MTLResidencySet`. It is what makes `grep -rn MTL4
+//!   src/ shim/` answer for the first time. The pipeline objects are SHARED
+//!   with `smoke`, the verifier is `smoke::verify` UNCHANGED, and K10 compares
+//!   the two paths' readbacks word for word — one shader, one pipeline, two
+//!   submission APIs, identical bytes. `--check-mtl` K9/K10.
+//!
+//!   D4b then gave it the one thing MTL4 removed and D4 left unreplaced: an
+//!   ERROR CHANNEL. `MTL4CommitFeedback` is both halves of it — MTL4 has no
+//!   synchronous `error` and no `waitUntilCompleted` — so the wait is built ON
+//!   the handler rather than beside it, and the shared event is gone. Reach is
+//!   structural rather than asserted: nothing else can unblock the submission,
+//!   which `FR_MTL4_NO_FEEDBACK` proves by timing out. `--check-mtl` K11.
 //!
 //! It also retired the premise the tracer plan was written on: **spirv-cross
 //! lowers `RayQuery` to Metal**, so `leaf`/`reference`/`leaf_fb`/`hemi_leaf`
@@ -109,6 +123,7 @@ pub mod mfx;
 pub mod mfxdn;
 pub mod mfxfi;
 pub mod msl;
+pub mod mtl4;
 pub mod planes;
 pub mod smoke;
 pub mod texprobe;

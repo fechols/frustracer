@@ -326,9 +326,18 @@ slint = { version = "1", default-features = false, features = [
 # permission, and the two statements never had to meet.
 #
 # Corrected rather than deleted, because the wrong one is the one a reader
-# reaches first. What is true is the narrower claim: `grep -rn MTL4 src/ shim/`
-# is EMPTY, so no MTL4 API is called anywhere in our own code — `MTL4Compiler`
-# is in the build without a caller.
+# reaches first. What was true at C2 is the narrower claim: `grep -rn MTL4 src/
+# shim/` was EMPTY, so no MTL4 API was called anywhere in our own code —
+# `MTL4Compiler` was in the build without a caller.
+#
+# AND THAT IS NO LONGER TRUE EITHER, as of D4. `src/mtl/mtl4.rs` runs the smoke
+# chain through MTL4CommandQueue / MTL4CommandBuffer / MTL4CommandAllocator /
+# MTL4ArgumentTable / MTLResidencySet, so the grep now answers. Kept in place
+# and dated rather than rewritten to the present tense: the lesson above is
+# about a stay-out list going stale without anyone lying, and a reader who
+# arrives with that expectation needs to see BOTH the intention and the two
+# separate days it stopped holding. `MTL4Compiler` remains the one MTL4 feature
+# in the graph with no caller of ours — see the D4 block in the feature list.
 #
 # NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
 # are pulled in and compile there); this is additive and touches neither.
@@ -337,6 +346,22 @@ objc2 = "0.6"
 # NOTE objc2-foundation is deliberately NOT a direct dependency: nothing under
 # src/ names it, and the one Foundation type that reaches us (NSError, off
 # MTLCommandBuffer::error) arrives through objc2-metal's own dependency on it.
+#
+# block2 IS a direct dependency, and the asymmetry is not an oversight. The rule
+# above works because we only ever RECEIVE an NSError — objc2-metal hands it to
+# us and we call one method on it. D4b has to CONSTRUCT something: MTL4's only
+# error channel is a callback, `MTL4CommitOptions::addFeedbackHandler:` takes a
+# block, and objc2-metal does NOT re-export block2 (checked: its lib.rs
+# re-exports only its own modules), so `RcBlock::new` is reachable only by
+# naming the crate ourselves.
+#
+# It costs no compile. `cargo tree --target aarch64-apple-darwin` (2026-08-19)
+# already showed block2 0.6 in this build twice over — objc2-metal enables it
+# for objc2-metal-fx's MTLFX* features, and wgpu-hal enables it independently.
+# Naming it here converts an accident into an intention, which is exactly the
+# lesson the MTL4Compiler note below records: a stay-out list states an
+# INTENTION, and an invisible widening does not ask its permission.
+block2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
     # MTLAllocation is not optional decoration: the MTLTexture TRAIT is
@@ -378,6 +403,73 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     # C3 — the corpus's own samplers, encoded INTO those argument buffers. See
     # the scope-change note above; this line replaces a "stays out" claim.
     "MTLSampler",
+    # D4 — THE METAL 4 SUBMISSION PATH (`src/mtl/mtl4.rs`). This block is what
+    # turns "no MTL4 API is called anywhere in our own code" from true to false;
+    # the note above the dependency table is corrected rather than deleted.
+    #
+    # MTL4Compiler is NOT here, and its absence is a measurement rather than an
+    # omission: `MTL4ComputeCommandEncoder::setComputePipelineState:` takes a
+    # plain `MTLComputePipelineState` — the object `bind::Kernel` already builds
+    # through the Metal 3 route — so the new path SHARES the pipeline with the
+    # old one and the byte-compare between them has one fewer variable. (It is
+    # in the graph anyway, pulled in by `objc2-metal-fx`; see the note below.)
+    "MTL4CommandQueue",
+    "MTL4CommandBuffer",
+    "MTL4CommandAllocator",
+    "MTL4CommandEncoder",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ArgumentTable",
+    # MANDATORY, not optional bookkeeping. MTL4 has NO `useResource:` on any
+    # encoder — checked against every `MTL4*` binding in the crate — so
+    # residency is expressible only through this, and `MTL4ArgumentTable`'s
+    # `setAddress:atIndex:` takes a RAW GPU ADDRESS rather than a buffer
+    # object, which is why: Metal can no longer infer residency from what was
+    # bound. A resource bound but not resident is a use-after-free on this
+    # path, not a validation message.
+    "MTLResidencySet",
+    # `MTLBuffer::gpuAddress()` and the argument table's `setAddress:` both
+    # live behind it — the type, not a capability.
+    "MTLGPUAddress",
+    # D4b — THE COMMIT-FEEDBACK CHANNEL, which is BOTH the error report and the
+    # completion signal. Those are one feature rather than two because MTL4
+    # makes them one thing: there is no `waitUntilCompleted`, and there is no
+    # synchronous `error` anywhere either — not on the queue, not on the command
+    # buffer, not on the allocator (checked against all 32 generated `MTL4*`
+    # files). `MTL4CommitFeedback` is the only channel that carries either, so
+    # the wait is built ON it rather than beside it.
+    #
+    # D4 shipped the beside-it version — `MTLEvent` plus
+    # `waitUntilSignaledValue:timeoutMS:` — and `Mtl4`'s own doc explained at
+    # length why the error half could not simply be bolted on: a handler ordered
+    # against nothing the wait observes reports "no error" identically when it
+    # has not run yet. `MTLEvent` is gone from this list with that wait, and
+    # NOTHING ELSE IN THE TREE USED IT (`grep MTLSharedEvent src/` had one
+    # consumer, the function being replaced).
+    "MTL4CommitFeedback",
+    # The handler is a BLOCK, so it needs `block2` — which costs nothing, and
+    # that is a measurement rather than a hope. `cargo tree --target
+    # aarch64-apple-darwin` (2026-08-19) already shows `block2` 0.6 compiled
+    # into this build, pulled in by `objc2-metal` through `objc2-metal-fx`'s
+    # `MTLFX*` features. Enabling it here turns on binding code in a crate
+    # already being compiled against a crate already being compiled.
+    #
+    # `dispatch2` is DELIBERATELY NOT HERE and would be the only real cost:
+    # `MTL4CommandQueueDescriptor::feedbackQueue` is gated behind it and IS NOT
+    # NEEDED, because the binding's own doc settles it — *"If you set the value
+    # of property to `nil`, the default, Metal allocates an internal dispatch
+    # queue to service feedback notifications."* We set nothing and Metal
+    # provides the serial queue. (Which is also why the handler runs on ANOTHER
+    # THREAD, and why `Mtl4`'s rendezvous is a Mutex/Condvar rather than the
+    # `Cell` the event-based wait could use.)
+    "block2",
+    # `MTL4CommitFeedback::GPUStartTime`/`GPUEndTime` are behind it, and they
+    # are not a nicety: they are this rung's PROOF THE HANDLER REACHED US.
+    # Timestamps the platform fills in are evidence the block ran with real
+    # data; "no error" from a block that never ran is the `FR_ABL` probe-reach
+    # trap, which this project has fallen into four times. Free as well —
+    # `objc2-core-foundation` is already in the build graph (5 occurrences in
+    # the same `cargo tree` run).
+    "objc2-core-foundation",
 ] }
 # Named directly as of C2, which overturns the note this replaces ("deliberately
 # NOT a direct dependency: nothing under src/ names it"). Rust-side pipeline

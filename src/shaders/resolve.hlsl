@@ -4,6 +4,20 @@
 // trace_common.hlsli pasted first.
 
 RWStructuredBuffer<float> accum : register(u0);
+#ifdef WEB
+// WebGPU's bind-group layout entry NAMES the storage texture's format and
+// requires it to equal the texture's own. HLSL has no format syntax for a
+// UAV, so DXC's SPIR-V picks `rgba32f` for an unannotated `float4` — which
+// is not what this image is, and a browser refuses the mismatch rather than
+// reinterpreting it. `[[vk::image_format]]` is the one place the shader can
+// say what the comment below has always said.
+//
+// SPIR-V-ONLY AND WEB-ONLY. DXIL has no such concept, and the native SPIR-V
+// corpus (`--check-spirv`, `--check-vk`) is deliberately left byte-identical
+// — Vulkan's layout carries no format, so the annotation would buy it
+// nothing and would move recorded numbers for stages that never wanted it.
+[[vk::image_format("rgba16f")]]
+#endif
 RWTexture2D<float4> hdr : register(u14); // typed UAV -> descriptor table (base = NUM_UAVS)
 
 cbuffer Push : register(b1) { float inv_samples; uint _pp0; uint _pp1; uint _pp2; }

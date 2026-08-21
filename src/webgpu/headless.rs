@@ -44,8 +44,8 @@ pub struct WgpuHeadless {
 }
 
 impl WgpuHeadless {
-    pub fn new() -> Result<WgpuHeadless, super::device::WgpuError> {
-        Ok(WgpuHeadless { dev: Wgpu::new()? })
+    pub fn new(ask: super::device::Ask) -> Result<WgpuHeadless, super::device::WgpuError> {
+        Ok(WgpuHeadless { dev: Wgpu::new(ask)? })
     }
 
     /// Record with `f`, submit, and block until the GPU is done. The poll is

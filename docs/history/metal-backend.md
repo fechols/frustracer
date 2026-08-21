@@ -1162,4 +1162,611 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # it is recorded in smoke::Plant rather than fixed, and the
                                       # run-list means each lever, and SEPARATELY the layers on a
                                       # clean run -- not the cross product.
+
+                                      # D2 -- THE IMAGE-ATOMIC EMULATION DIES (2026-08-19, Apple M1,
+                                      # macOS 26.5.1, Xcode 26.6, spirv-cross 2026-07-06). The one rung
+                                      # of the Metal 4 ladder that needs no Metal 4 API at all, and its
+                                      # product is a DELETION: build.rs::MSL_VERSION 30000 -> 30100 makes
+                                      # spirv-cross emit NATIVE Metal image atomics, which retires GOTCHA
+                                      # 2 and GOTCHA 3 of the four in ffx_fsr3_metal.mm along with the
+                                      # buffer-backed emulation itself.
+                                      #
+                                      # 83 LINES OF CODE, COUNTED RATHER THAN ESTIMATED. The plan said
+                                      # "~150-200 lines" and that was an estimate that would have
+                                      # shipped as a measurement. ffx_fsr3_metal.mm is -143/+95, but 58
+                                      # of the deletions and 93 of the additions are comment or blank:
+                                      # 85 lines of code out, 2 in. mtl::device::linear_tex_align adds 7
+                                      # more. The comment count going UP while the code count goes down
+                                      # is the intended shape -- every deleted site keeps a note saying
+                                      # what left, because GOTCHA numbering is cited from smoke.rs,
+                                      # main.rs and this file.
+                                      #
+                                      # MEASURED FIRST, over all 80 committed permutations, because the
+                                      # plan this rung was written from got two things wrong.
+                                      #
+                                      #   30000 -> 30100  20 of 80 permutations change
+                                      #                   binding names REMOVED : 20, all *_atomic BUFFERs
+                                      #                   binding names ADDED   : 0
+                                      #                   indices MOVED         : 0
+                                      #
+                                      # THE CHANGE IS PURELY SUBTRACTIVE ON THE BINDING SURFACE, and that
+                                      # is what made it safe for ffx_metal's discrete binds: the companion
+                                      # `device atomic_uint*` disappears and every surviving resource keeps
+                                      # its index. Two FFX resources are involved --
+                                      # rw_reconstructed_previous_nearest_depth (16 permutations) and
+                                      # rw_spd_global_atomic (4, the SPD passes).
+                                      #
+                                      # THE PLAN SAID 30100/30200/40000 WERE BYTE-IDENTICAL. They are not.
+                                      # 3.1 is the exact threshold where the emulation dies; 4.0 ALSO
+                                      # rewrites nine barrier sites in the four SPD permutations --
+                                      # threadgroup_barrier(mem_device|mem_threadgroup|mem_texture) becomes
+                                      # atomic_thread_fence(..., seq_cst, thread_scope_threadgroup) plus a
+                                      # narrow threadgroup_barrier -- and adds memory_coherence_device. SPD
+                                      # is a CROSS-THREADGROUP reduction and U4's quality comparison is
+                                      # report-only, so a subtly wrong reduction there is the
+                                      # silent-failure class. The pin is the threshold, and 4.0 became
+                                      # FR_FFX_MSL=40000, a measurement rather than a bundled assumption.
+                                      #
+                                      # THE PLAN ALSO SAID RECIPE MUST BE BUMPED. It must not.
+                                      # SPIRV_CROSS_ARGS rides the .toolstamp VERBATIM, so editing the
+                                      # version token wipes all 80 metallibs by construction (confirmed:
+                                      # the first build after the change reported "0 cached"). RECIPE is
+                                      # for changes to build.rs's own Rust that alter emitted bytes
+                                      # INVISIBLY -- the 12-byte header format and the -1000 sampler remap.
+                                      # Bumping it anyway would have taught the next reader the wrong rule.
+                                      #
+                                      # EACH EMISSION IMPLIES A -std FLOOR, which matters because
+                                      # transpile_ffx_metallib passes NO -std and takes the SDK default
+                                      # (__METAL_VERSION__ 400 on SDK 26):
+                                      #
+                                      #   emit 30000   compiles at -std=metal3.0 and up
+                                      #   emit 30100   needs 3.1  "no member named 'atomic_fetch_add'"
+                                      #   emit 40000   needs 3.2  "undeclared identifier
+                                      #                            'memory_coherence_device'"
+                                      #
+                                      # So 30100 raises the implicit floor one step and stays independent
+                                      # of D1's coming -std pin; 40000 would couple them.
+                                      #
+                                      # GOTCHA 4 GOT WIDER, AND THAT IS THE ONLY NON-DELETION HERE. R32_UINT
+                                      # surfaces could not carry MTLTextureUsageRenderTarget while they were
+                                      # buffer-backed (Metal forbids the combination -- which is what GOTCHA
+                                      # 3 existed to work around), so they were the standing exception to
+                                      # GOTCHA 4. As ordinary textures they take the usage bit like
+                                      # everything else, and FFX's reset-frame CLEAR_FLOAT on
+                                      # reconstructed-prev-depth goes through the render pass rather than a
+                                      # blit fill of a backing buffer. This was the rung's predicted risk
+                                      # and it is invisible without the validation layers.
+                                      #
+                                      # THE C2 DEBT IS DISCHARGED, and the answer retired the hypothesis
+                                      # this rung was written on. The recorded --check-fsr3 U4 verdict
+                                      # "uniformly zero under validation" (above) was the reason to suspect
+                                      # GOTCHA 2 of causing it. Measured BEFORE any change, on this M1:
+                                      #
+                                      #   config                    exit  energy  history    vs-bilinear
+                                      #   plain                     0     1.000x  2.197e-2   2.962e-2
+                                      #   MTL_DEBUG_LAYER=1         0     1.000x  2.197e-2   2.962e-2
+                                      #   MTL_SHADER_VALIDATION=1   0     1.000x  2.197e-2   2.962e-2
+                                      #
+                                      # --check-fsr3 PASSES under both layers on real silicon, U4 producing
+                                      # identical numbers -- it does NOT read "the dispatch wrote nothing".
+                                      # That verdict is PARAVIRTUAL-RUNNER-SPECIFIC, not a property of the
+                                      # FSR3 arm, which resolves the confound C2 recorded and C3 narrowed.
+                                      # The layers' only visible effect is on the accumulating-frame f16 ULP
+                                      # count: 1800 ch plain, 132 under DEBUG_LAYER, 0 under
+                                      # SHADER_VALIDATION -- monotone, and the last one is exactly the
+                                      # "drops to EXACTLY ZERO" corroboration that
+                                      # main.rs::fsr3_upscale_check already records (grep the phrase --
+                                      # cited by NAME because this rung's own edits above it moved the
+                                      # line number by 60 between writing this entry and reviewing it).
+                                      # --check-mtl also passes under each layer separately.
+                                      #
+                                      # AFTER, same box, same session (the metallib table shrank 1148 KiB
+                                      # -> 1121 KiB): plain / DEBUG_LAYER / SHADER_VALIDATION all PASSED,
+                                      # every U4 number identical to four significant figures -- energy
+                                      # 1.000x, history 2.197e-2, vs-bilinear 2.962e-2, jitter 2.592e-2,
+                                      # depth 1.218e-2, motion 3.502e-2, 11 pipelines.
+                                      #
+                                      # AND THE FINDING THE TOOTH TURNED UP, which is why U1 gained an
+                                      # assertion rather than the rung trusting U4. Armed at FR_FFX_MSL=30000
+                                      # -- the emulation back in the shaders, gone from the shim -- U4 STILL
+                                      # PASSES ALL NINE OF ITS ASSERTIONS:
+                                      #
+                                      #   metric        correct (30100)   mismatched (30000)   U4 bound
+                                      #   energy        1.000x            0.999x               0.5..2.0
+                                      #   history       2.197e-2          2.579e-2             >= 1e-3
+                                      #   vs-bilinear   2.962e-2          3.090e-2             >= 5e-3
+                                      #   jitter        2.592e-2          2.303e-2             >= 1e-3
+                                      #   depth         1.218e-2          9.688e-3             >= 1e-3
+                                      #
+                                      # An unbound atomic argument does not crash and does not zero the
+                                      # output; it DEGRADES it, by 17% on history and 20% on depth, well
+                                      # inside every bound U4 has. This is the invariants-that-fail-silently
+                                      # class exactly, and the only thing that catches it is U1's
+                                      # emulation-site count -- which is why that count is asserted and why
+                                      # CI greps for it as a third fsr3 guard.
+                                      #
+                                      # FR_FFX_MSL IS THIS TREE'S FIRST BUILD-TIME LEVER and needs two
+                                      # things a runtime one does not. cargo:rerun-if-env-changed=FR_FFX_MSL
+                                      # (build.rs had exactly one such line before, Windows-only, for
+                                      # FRUSTRACER_DLSS_SDK) or cargo never re-runs the script and the lever
+                                      # is inert -- the FR_ABL probe-reach trap in build-script currency. And
+                                      # cargo:rustc-env, because a gate cannot read the environment to
+                                      # discover what the BUILD did; build.rs states FR_FFX_MSL_BUILT and
+                                      # FR_FFX_ATOMIC_SITES, and U1 reads them back with option_env!.
+                                      #
+                                      # It is a TWO-STEP tooth -- rebuild, then run -- and the run-list says
+                                      # so. The vacuity hazard specific to the class is why the tooth is a
+                                      # VERSION rather than a failure: a lever that made spirv-cross fail
+                                      # outright would empty the table, unset cfg(ffx_fsr3_metal), and U1
+                                      # would SKIP and exit 0. At 30000 the transpile still succeeds, the
+                                      # table stays full, and the assertion fires.
+                                      #
+                                      #   lever              class        observable
+                                      #   FR_FFX_MSL=30000   TOOTH        20 sites; FAIL U1; exit 1
+                                      #   FR_FFX_MSL=40000   MEASUREMENT  0 sites; PASSED; every U4 number
+                                      #                                   IDENTICAL to 30100 (table 1122 KiB
+                                      #                                   vs 1121). Evidence for a future
+                                      #                                   promotion, not a reason to promote:
+                                      #                                   one box, one scene, and the SPD
+                                      #                                   barrier rewrite is what it would buy.
+                                      #   FR_FFX_MSL=31337   (illegal)    loud, reverts to 30100, serves cache
+                                      #
+                                      # FR_FFX_BUFBACK was DESIGNED AND NOT TAKEN -- the FR_MTL_SET_SWAP
+                                      # precedent. Keeping the emulation alive behind a branch forfeits the
+                                      # deletion, which is the whole product, and FR_FFX_MSL=30000 already
+                                      # covers the claim structurally. FR_FFX_FCV65535 was dropped too: the
+                                      # plan predicted "pipeline creation must fail", and the emitted corpus
+                                      # at 30100 declares ZERO function constants, so setting one Metal
+                                      # ignores proves nothing. The specialized
+                                      # newFunctionWithName:constantValues: form STAYS, with an EMPTY value
+                                      # set -- Metal refuses the plain variant on any function that declares
+                                      # a constant, and empty values fail LOUDLY if spirv-cross reintroduces
+                                      # one instead of silently specializing it to a stale number.
+                                      #
+                                      # WHAT REVIEWING THIS RUNG FOUND, recorded because three of the four
+                                      # are the failure classes this file spends its length on and they
+                                      # were shipped BY the person who wrote those warnings down.
+                                      #
+                                      #   * THE CI GUARD WAS VACUOUS ON ITS OWN TEST CASE. `grep -q "0
+                                      #     image-atomic emulation sites"` matches "20 image-atomic
+                                      #     emulation sites" as a SUBSTRING, and 20 is precisely what
+                                      #     FR_FFX_MSL=30000 produces. U1 prints its table line whether or
+                                      #     not the assertion fired, so the guard went green on the exact
+                                      #     input it was written for. The leading ", " is now load-bearing
+                                      #     and both ends say so.
+                                      #   * THE GATE FAILED OPEN ON A MISSING COUNT. `option_env!(...)
+                                      #     .unwrap_or(0)` reads an absent FR_FFX_ATOMIC_SITES as a clean
+                                      #     zero. Unreachable today -- cfg(ffx_fsr3_metal) is only set on
+                                      #     the path that emits it -- and unreachable is not a reason to
+                                      #     pick the wrong default. Absent is now a FAIL.
+                                      #   * MSL_VERSION HAD AN UNPINNED SECOND COPY. U1 compared `built !=
+                                      #     "30100"` against a literal, so promoting the pin in D1 would
+                                      #     have left every clean run announcing a PLANT that says "this
+                                      #     run MUST fail". build.rs now publishes FR_FFX_MSL_DEFAULT and
+                                      #     the gate compares against that.
+                                      #   * A LINE CITATION ROTTED BEFORE THE COMMIT. This entry cited
+                                      #     main.rs:22715; the same rung's edits to that file had already
+                                      #     moved the text to :22775. Cited by name now -- the identical
+                                      #     repair this rung made to smoke.rs's GOTCHA 1 reference.
+                                      #
+                                      # And one over-claim removed rather than fixed: the CLEAR_FLOAT arm
+                                      # said a nonzero clear "would now be serviced correctly". It would be
+                                      # serviced as an INTEGER conversion of the float, which is not
+                                      # obviously the same thing, and FFX issues no such request to measure
+                                      # against. Zero -- the only value asked for -- is exact either way.
+                                      #
+                                      # Touch build.rs::MSL_VERSION / spirv_cross_args / count_atomic_emulation
+                                      # / shim/ffx_fsr3_metal.mm's GOTCHA sites / mtl::device::line ->
+                                      # run --check-fsr3 clean, then FR_FFX_MSL=30000 REBUILD + run (must
+                                      # exit 1 on U1), then FR_FFX_MSL=40000 rebuild + run (reported, not
+                                      # asserted), then rebuild at the default -- the lever is a BUILD-time
+                                      # one and a stale binary measures the wrong arm; --check-fsr3 AND
+                                      # --check-mtl once under MTL_DEBUG_LAYER=1 and once under
+                                      # MTL_SHADER_VALIDATION=1 SEPARATELY (GOTCHA 4 widened and the layers
+                                      # are the only thing that sees it); --check-msl on the procedural scene
+                                      # AND san-miguel-low-poly AND --sw-rays; --check-spirv; --check-metalfx;
+                                      # --check + cargo test; then restore the Windows goldens.
+                                      #
+                                      # D4 -- THE METAL 4 SUBMISSION PATH (2026-08-19, Apple M1,
+                                      # macOS 26.5.1, Xcode 26.6, SDK 26.5). The rung where the
+                                      # campaign question flips: `grep -rn MTL4 src/ shim/` was EMPTY
+                                      # through C3 and D2, and `src/mtl/mtl4.rs` is the answer. The same
+                                      # smoke.hlsl the other three backends run, submitted through
+                                      # MTL4CommandQueue / MTL4CommandBuffer / MTL4CommandAllocator /
+                                      # MTL4ArgumentTable / MTLResidencySet. --check-mtl K9 and K10.
+                                      #
+                                      # THE CLAIM IS THE CROSS-COMPARE, NOT THE COMPILE: one shader, one
+                                      # PIPELINE OBJECT, two submission APIs, 619 words identical,
+                                      # verified by smoke::verify UNCHANGED. That last part is the
+                                      # anti-vacuity half -- a second verifier written the same day by
+                                      # the same hand agreeing with the first proves nothing, so mtl4::
+                                      # pass returns a smoke::Pass and is held to the function the Metal
+                                      # 3 path already answers to.
+                                      #
+                                      #   check-mtl: K9 MTL4 queue + allocator + shared event OK |
+                                      #              metal4 family true | pipelines SHARED with the
+                                      #              Metal 3 path (MTL4Compiler not needed)
+                                      #   check-mtl: K10 MTL4 seed -> prep -> indirect fill OK at 555
+                                      #              and at 0 | 7 allocations resident | argument table
+                                      #              by GPU ADDRESS
+                                      #   check-mtl: K10 cross-API compare OK -- 619 words, indirect
+                                      #              args and counters IDENTICAL
+                                      #
+                                      # FOUR THINGS WERE MEASURED BEFORE ANY CODE, AND TWO OF THEM
+                                      # CHANGED THE LADDER. All read-only, off the objc2-metal 0.3.2
+                                      # bindings and the SDK headers.
+                                      #
+                                      # 1. MTL4 HAS NO useResource: ON ANY ENCODER. Checked against
+                                      # every MTL4*.rs binding in the crate, not inferred from prose.
+                                      # Residency is expressible only as MTLResidencySet, and
+                                      # MTL4ArgumentTable::setAddress:atIndex: takes a RAW MTLGPUAddress
+                                      # rather than a buffer -- which is WHY. So D3, planned as its own
+                                      # rung ("residency sets"), has no rung of its own: residency is not
+                                      # something you add to MTL4, it is something MTL4 refuses to work
+                                      # without. D3 dissolved into D4.
+                                      #
+                                      # 2. MTL4Compiler IS NOT NEEDED, and the ladder assumed it was.
+                                      # MTL4ComputeCommandEncoder::setComputePipelineState: takes a plain
+                                      # MTLComputePipelineState -- the object bind::Kernel already builds.
+                                      # That SHRINKS the rung and STRENGTHENS its claim: the two paths
+                                      # share the pipeline, so what differs is submission, binding and
+                                      # residency and nothing else. A rung that also swapped the compiler
+                                      # could not say that.
+                                      #
+                                      # 3. NO DEPENDENCY BUMP. objc2-metal 0.3.2 already ships every
+                                      # MTL4* binding plus MTLResidencySet, feature-gated. The whole rung
+                                      # is a feature-list edit plus one module. (Note the cost: a feature
+                                      # edit changes the package metadata hash, so OUT_DIR moves and the
+                                      # 80 FSR3 metallibs transpile cold -- ~55 s, twice here.)
+                                      #
+                                      # 4. probe-metal4 HAD NEVER RUN. `gh run list` shows zero
+                                      # workflow_dispatch runs, so the job answered nothing it was
+                                      # written for. RETIRED in this rung -- K1 prints `metal4 family`
+                                      # and `arg-buffers tier` and K9 builds the objects, on EVERY run.
+                                      # A probe that reports is strictly worse than a gate that runs.
+                                      #
+                                      # THE FOUR THINGS MTL4 TOOK AWAY. Three cost a line of code here
+                                      # and carry a claim the Metal 3 gate cannot make; the fourth
+                                      # deliberately costs none:
+                                      #   * hazard tracking -- MTLDispatchTypeSerial had the driver order
+                                      #     and hazard-track the three dispatches, which is why smoke.rs
+                                      #     says vk/headless.rs's barrier apparatus "has no analogue here
+                                      #     rather than being omitted". Under MTL4 it has one.
+                                      #   * implicit residency -- see 1 above.
+                                      #   * waitUntilCompleted -- the queue signals an MTLSharedEvent and
+                                      #     the CPU blocks with a 2 s timeout, so a submission that never
+                                      #     lands FAILS the gate instead of hanging it. The allocator is
+                                      #     reset only after a wait that actually RETURNED: the timeout
+                                      #     branch is the one case where the GPU provably still owns the
+                                      #     encoded commands, so it leaks rather than resetting on the
+                                      #     strength of a wait that did not happen. Same for the
+                                      #     residency set, which mtl4::pass releases only on success.
+                                      #   * the command buffer's `error`, AND THIS ONE IS NOT REPLACED.
+                                      #     MTL4 has no synchronous error channel anywhere -- not on the
+                                      #     queue, the command buffer or the event. The whole channel is
+                                      #     MTL4CommitFeedback::error, an async BLOCK through
+                                      #     MTL4CommitOptions::addFeedbackHandler:. It is NOT wired,
+                                      #     because reading a captured error after the event wait would
+                                      #     report "none" both when there was none and when the handler
+                                      #     had not run yet -- the FR_ABL probe-reach trap. Doing it
+                                      #     properly means making the FEEDBACK the completion signal
+                                      #     instead of the event, a different design for the wait rather
+                                      #     than a check bolted on. What it costs today is diagnosis and
+                                      #     not coverage: smoke::verify reads all 619 words, so a faulted
+                                      #     submission still fails the gate -- on its DATA, where Metal 3
+                                      #     would have named the command buffer. A rung extending this
+                                      #     path beyond the smoke chain should wire it FIRST.
+                                      #
+                                      # THE LEVERS, CLASSIFIED BY MEASUREMENT AND NOT BY PREDICTION --
+                                      # the D2 lesson (FR_FFX_FCV65535 was planned as a tooth, measured
+                                      # as a no-op, and dropped). The plan predicted the split the other
+                                      # way round and was wrong on both halves:
+                                      #
+                                      #   FR_MTL4_TABLE_INDEX   TOOTH  K10 "indirect args [3, 3, 3]" --
+                                      #                                GRID_POISON intact, exactly its
+                                      #                                Metal 3 twin FR_MTL_ARGBUF_INDEX.
+                                      #   FR_MTL4_NO_BARRIER    TOOTH  K10 "indirect args [4, 1, 1]",
+                                      #                                7/7 identical, plain AND under
+                                      #                                both validation layers.
+                                      #   FR_MTL4_NO_RESIDENCY  MEAS.  UNOBSERVABLE plain and under
+                                      #                                MTL_DEBUG_LAYER=1; observable
+                                      #                                under MTL_SHADER_VALIDATION=1.
+                                      #   FR_MTL4_OFF           --     forces the SKIP branch on a box
+                                      #                                that HAS MTL4. Exits 0 by design.
+                                      #
+                                      # [4, 1, 1] IS THE WHOLE BARRIER ARGUMENT IN ONE NUMBER, and it is
+                                      # not the poison. It is COUNT_POISON.div_ceil(64) -- 238 rounded up
+                                      # over the group size. cs_prep RAN and read `counters` before
+                                      # cs_seed had written it: a plain read-before-write, deterministic,
+                                      # and reported by NEITHER validation layer. This is the one claim
+                                      # this backend gained by moving to MTL4 rather than re-proving.
+                                      #
+                                      # THE RESIDENCY PREDICTION WAS WRONG, and that is the other
+                                      # finding. The rung was planned expecting binding-by-raw-address to
+                                      # make an omitted residency declaration fail outright, promoting
+                                      # Metal 3's MEASUREMENT into a TOOTH. It does not.
+                                      # FR_MTL4_NO_RESIDENCY behaves EXACTLY like FR_MTL_NO_RESIDENCY --
+                                      # invisible until GPU validation is armed, at which point cs_prep
+                                      # never writes `args` and the grid poison survives as [3, 3, 3]. On
+                                      # unified memory a non-heap buffer is already page-backed, and the
+                                      # argument table taking an address rather than an object does not
+                                      # change that. So must_fail() does NOT name it, exactly as
+                                      # smoke::Plant::must_fail does not name its twin.
+                                      #
+                                      # ITS FIRST MEASUREMENT WAS CIRCULAR AND HAD TO BE RETAKEN, which
+                                      # is the methodological finding of the rung. K10 asserted the
+                                      # residency set's allocationCount, and this plant zeroes that BY
+                                      # CONSTRUCTION -- so the gate failed on having noticed its own
+                                      # plant, exited 1, and printed "observable" having learned nothing
+                                      # about the GPU at all. The assertion is now skipped when the lever
+                                      # is armed, which is what leaves only the DATA able to fail. A
+                                      # plant that trips the gate's own bookkeeping is not a measurement
+                                      # of the platform.
+                                      #
+                                      # AND THE ANTI-VACUITY COUNT ITSELF WAS WRONG ON THE FIRST RUN,
+                                      # caught by the check rather than by a reader. K10 expected 9
+                                      # allocations (6 declared resources + 3 argument buffers) and
+                                      # MTLResidencySet reported 7. It DEDUPLICATES: `counters` is
+                                      # reached by all three kernels, so the nine addAllocation: calls
+                                      # name seven distinct allocations. mtl4::pass now dedups by
+                                      # identity before adding and the check is exact equality --
+                                      # a count compared against the number of CALLS would have failed
+                                      # on correct code forever. Note 7 != K4's 6 either: the Metal 3
+                                      # path never declares the argument buffers, because it binds them
+                                      # as OBJECTS and MTL4 cannot.
+                                      #
+                                      # AND THE REVIEW CAUGHT A THIRD DEFECT THAT NO GATE ON THIS BOX
+                                      # COULD HAVE. run_mtl4 was inserted into main.rs between
+                                      # run_mtl_texprobe's doc comment and its #[cfg(target_os =
+                                      # "macos")], so the NEW function took the attribute and
+                                      # run_mtl_texprobe was left with none -- and `mod mtl` is macOS-
+                                      # only, so that function stops compiling on Linux and Windows
+                                      # while all six Metal gates pass on a Mac. The class is invisible
+                                      # from here by construction: a macOS-only insertion into a file
+                                      # whose macOS-only items are gated ONE AT A TIME rather than by a
+                                      # region. Each fn now carries its own doc AND its own cfg, and the
+                                      # check is an audit over every top-level fn in main.rs -- does the
+                                      # body name a platform-gated module, and does its attribute block
+                                      # gate it? -- which reports clean (the three other hits are two
+                                      # comments and #[cfg(ffx_fsr3_metal)], which implies macOS).
+                                      #
+                                      # CI: the K9 guard matches BOTH `K9` and `SKIP K9`, and K10 is
+                                      # deliberately NOT guarded. This runner is an Apple Paravirtual
+                                      # device that nothing has ever probed for Metal 4 -- the job that
+                                      # was meant to answer that never ran -- so the guard asserts only
+                                      # that the STAGE RAN. Read the first green run's K9 line, which
+                                      # prints `metal4 family` either way, and tighten in a FOLLOW-UP.
+                                      # Tightening here would be the --check-metalfx mistake ci.yml
+                                      # already records: a guard on a line never proven to run.
+                                      #
+                                      # Touch mtl::mtl4 / mtl::device::Mtl4 / bind::set_binds /
+                                      # bind::resident_allocations / the objc2-metal feature list ->
+                                      # run --check-mtl clean; then EACH of the four levers SEPARATELY
+                                      # (the two teeth must exit 1, and FR_MTL4_NO_BARRIER x5 because a
+                                      # race that is flaky is not a tooth); then --check-mtl under
+                                      # MTL_DEBUG_LAYER=1 and under MTL_SHADER_VALIDATION=1 SEPARATELY;
+                                      # then --check-msl AND --check-fsr3 AND --check-metalfx AND
+                                      # --check-spirv, because a Cargo.toml feature edit has whole-graph
+                                      # reach and those four share it; then --check + cargo test LAST
+                                      # and restore the Windows goldens.
+                                      #
+                                      # THE wasm32 STEP IS NOT RUNNABLE ON A MAC, and the run-list says
+                                      # so rather than listing a step that always fails. `cargo check
+                                      # --target wasm32-unknown-unknown` dies in zstd-sys, which hands
+                                      # Apple clang an x86-64 .S file (huf_decompress_amd64.S) with
+                                      # --target=wasm32 -- reproducible on a clean target dir, and
+                                      # nothing to do with this tree. CI's check-wasm runs on
+                                      # ubuntu-latest and is green; that job IS the coverage. What made
+                                      # it worth attempting at all is that a Cargo.toml feature edit
+                                      # has whole-graph reach -- but this one is nine strings inside
+                                      # the `cfg(target_os = "macos")` objc2-metal block, so it cannot
+                                      # reach a wasm build by construction.
+
+cargo run --release -- --check-mtl     # D4b -- THE MTL4 ERROR CHANNEL, and it turned out to be
+                                      # the wait as well (macOS; src/mtl/device.rs +
+                                      # src/mtl/mtl4.rs). K11.
+                                      #
+                                      # D4 SHIPPED THE MTL4 PATH WITH NO ERROR CHECK AT ALL, and said so
+                                      # at length rather than hiding it. Metal 3 next door reads
+                                      # `cb.error()` and its comment gives the reason -- "the only channel a
+                                      # committed buffer has; dropping it silently is how a failed dispatch
+                                      # reads as a black image". MTL4 has no synchronous equivalent
+                                      # ANYWHERE: not on the queue, not on the command buffer, not on the
+                                      # allocator (checked against all 32 generated MTL4* files). The whole
+                                      # channel is MTL4CommitFeedback::error, delivered as a block.
+                                      #
+                                      # D4 declined to bolt it on, and the refusal was correct: a handler
+                                      # ordered against nothing the wait observes reports "no error"
+                                      # identically when there was none and when it has simply not run yet.
+                                      # That is the FR_ABL probe-reach trap, which this project has fallen
+                                      # into four times. D4 named the fix in its own doc -- "making the
+                                      # FEEDBACK the completion signal instead of the event" -- and left it
+                                      # for the rung that first extended the path beyond the smoke chain.
+                                      #
+                                      # THE TWO REMOVALS ARE ONE REMOVAL, and that is the finding that made
+                                      # the rung small. MTL4 took away waitUntilCompleted AND the error
+                                      # accessor, and MTL4CommitFeedback is the replacement for BOTH -- it
+                                      # is the only thing that reports completion without polling and the
+                                      # only thing that carries an error. So the wait is not "an event plus
+                                      # a check": it is one handler whose ARRIVAL is completion and whose
+                                      # error() is the diagnosis. MTLSharedEvent, the monotone `signalled`
+                                      # counter and MTLEvent in Cargo.toml all went with it.
+                                      #
+                                      # REACH IS NOW STRUCTURAL RATHER THAN ASSERTED, which is the whole
+                                      # point. Nothing but the handler can unblock Mtl4::submit, so there is
+                                      # no state in which it did not run and we return Ok anyway. Non-reach
+                                      # is a 2000 ms timeout and a red gate, not a confident green line.
+                                      #
+                                      # MEASURED, Apple M1, macOS 26.5.1, quick profile:
+                                      #
+                                      #   check-mtl: K11 commit feedback OK -- 3 commits, 3 handlers,
+                                      #              GPU 0.015 ms on the last one; 0 errors reported
+                                      #
+                                      #   clean runs                     10/10 quick, then 5/5 release after
+                                      #                                  the counter fix below -- 3/3 every run
+                                      #   FR_MTL4_NO_FEEDBACK            exit 1, ~3 s: K10 "did not arrive
+                                      #                                  within 2000 ms", K11 "1 commits but
+                                      #                                  0 feedback handlers"
+                                      #   FR_MTL4_TABLE_INDEX            exit 1, [3, 3, 3] -- SIGNATURE UNCHANGED
+                                      #   FR_MTL4_NO_BARRIER             exit 1, [4, 1, 1] -- SIGNATURE UNCHANGED
+                                      #   FR_MTL4_NO_RESIDENCY           exit 0            -- SIGNATURE UNCHANGED
+                                      #   FR_MTL4_OFF                    exit 0, SKIP K9   -- SIGNATURE UNCHANGED
+                                      #   MTL_DEBUG_LAYER=1              exit 0
+                                      #   MTL_SHADER_VALIDATION=1        exit 0
+                                      #   --check-msl/-spirv/-metalfx/-fsr3   all exit 0
+                                      #
+                                      # THE 10x CLEAN RUN IS NOT PADDING. It is the only instrument for the
+                                      # question the bindings do not settle: is feedback delivered strictly
+                                      # AFTER the work completes, so that the readback after the wait is
+                                      # race-free? smoke::verify reads every one of 619 words, so an early
+                                      # wakeup would flake. Ten clean readbacks is evidence; one is not.
+                                      # Apple's own wording ("after completing a workload", GPUEndTime = "the
+                                      # host time when the GPU finishes execution") agrees, but it is prose.
+                                      #
+                                      # THE TIMESTAMPS ARE THE OTHER HALF OF THE REACH PROOF, and they cost
+                                      # nothing: objc2-core-foundation was already in the build graph. We
+                                      # cannot fabricate them. A block handed a stub, or one for a workload
+                                      # that never executed, yields 0.0/0.0; nonzero and correctly ordered is
+                                      # evidence the handler arrived carrying real data about OUR submission.
+                                      # K11 also bounds GPUEndTime-GPUStartTime by the wall time of the wait
+                                      # that contained it -- a DURATION comparison across two clocks, never
+                                      # an epoch one, because the GPU execution must be a subinterval of the
+                                      # wait and that holds without knowing what zero means on either clock.
+                                      # Comparing absolute values would need a timebase unreachable without a
+                                      # new dependency, and a mis-derived epoch fails a CORRECT run.
+                                      #
+                                      # A ZERO READING IS A PLATFORM FACT AND NOT A FAILURE. K11 prints NOT
+                                      # POPULATED and says the reach then rests on the structure alone. This
+                                      # box populates them; the CI runner never reaches K11 at all.
+                                      #
+                                      # "3 HANDLERS" IS COUNTED IN THE HANDLER, AND THE FIRST DRAFT OF THIS
+                                      # RUNG DID NOT DO THAT -- caught in review of the uncommitted change,
+                                      # recorded because the mistake is more instructive than the fix. The
+                                      # count started life on the WAITING thread, ticked once per successful
+                                      # wait. That is once per commit BY CONSTRUCTION: tracing every path
+                                      # between the two increments, the only exit that skips the second is the
+                                      # timeout, so "handled != commits" could mean nothing except "a wait
+                                      # timed out" -- which FR_MTL4_NO_FEEDBACK already reports one line up.
+                                      # The field's doc meanwhile claimed it caught two undocumented
+                                      # behaviours, per-buffer-vs-per-commit delivery and a double fire, and
+                                      # it could see NEITHER. A counter that restates its own denominator,
+                                      # wearing a second name and a coverage claim.
+                                      #
+                                      # THE SHAPE IS THE FR_ABL PROBE-REACH TRAP ARRIVING IN THE COUNTER
+                                      # instead of in the check, one layer below where this rung was watching
+                                      # for it -- the rung whose entire subject is not trusting a green line
+                                      # from a probe that may not have run. Fixed by moving the tick INSIDE
+                                      # the block (Arc<AtomicU64>, SeqCst, ordered ahead of the mutex release
+                                      # that publishes the payload), so it counts invocations rather than
+                                      # observations. K11 reads it after every wait has returned, so a stray
+                                      # second fire on an EARLIER submission is still visible.
+                                      #
+                                      # AND ONLY NOW IS 3/3 A MEASUREMENT. 5/5 clean release runs report 3
+                                      # commits and 3 handlers, which is the first evidence in this campaign
+                                      # that MTL4 delivers feedback exactly once per commit rather than per
+                                      # command buffer -- a thing the bindings state nowhere. Under the old
+                                      # counter those same five runs would have printed 3/3 with the handler
+                                      # stubbed out entirely.
+                                      #
+                                      # ONE ORDERING BUG CAME OUT OF THE SAME READ: the wall-clock bound
+                                      # returned its Err ahead of `inner?`, so a binding error could be masked
+                                      # by a complaint about the platform's clock. submit's own doc states the
+                                      # opposite order and Mtl::compute next door keeps it -- a binding error
+                                      # is reported before the command buffer's own, being usually its cause
+                                      # rather than its symptom. `inner?` now precedes both checks. Unreachable
+                                      # in practice; it is a stated contract in a file that runs on them.
+                                      #
+                                      # THE CHANNEL IS PROVEN DELIVERED AND NOT PROVEN TO REPORT FAULTS, and
+                                      # the entry says so rather than implying coverage. Both of the other
+                                      # teeth produce WRONG BYTES through a command buffer that reports no
+                                      # error -- K11 prints "1 commits, 1 handlers, 0 errors reported" under
+                                      # FR_MTL4_TABLE_INDEX and under FR_MTL4_NO_BARRIER alike. smoke.rs
+                                      # records Metal 3 answering identically for a residency violation under
+                                      # MTL_SHADER_VALIDATION=1: "The command buffer reports no error ... the
+                                      # writes simply do not land."
+                                      #
+                                      # INDUCING A REAL FAULT WAS CONSIDERED AND REJECTED, listed here so the
+                                      # next reader does not spend the afternoon re-deriving it:
+                                      #   * out-of-bounds shader write -- measured silent next door (above)
+                                      #   * a hang -> MTL4CommandQueueError::Timeout -- would work, and is the
+                                      #     class smoke.rs::GRID_POISON exists to PREVENT: on a dev Mac it
+                                      #     takes the WindowServer with it, in CI it is a 45-minute timeout
+                                      #   * an enormous grid -- same class, same refusal
+                                      #   * OutOfMemory -- newBufferWithLength returns nil before submission,
+                                      #     so the channel is never reached
+                                      #   * an unbacked GPU address -- already measured silent, twice
+                                      #   * a misaligned indirect-dispatch address -- undefined and
+                                      #     non-deterministic; a plant that may not repeat is not an instrument
+                                      #
+                                      # dispatch2 IS NOT NEEDED, and the binding settles it rather than a
+                                      # guess: MTL4CommandQueueDescriptor::feedbackQueue says nil is "the
+                                      # default, Metal allocates an internal dispatch queue to service
+                                      # feedback notifications". We set nothing and take that queue, which
+                                      # also dodges the binding's own warning that the queue "is not retained
+                                      # internally". Verified after the edit: cargo tree still shows zero
+                                      # dispatch2 in the macOS graph.
+                                      #
+                                      # WHAT IT DOES COST IS A THREAD, and every capture is owned because of
+                                      # it. The handler runs on that Metal-allocated serial queue, so the
+                                      # NSError is stringified INSIDE the block -- Retained<T> is not Send --
+                                      # and the rendezvous is Arc<Mutex<Option<Feedback>>> + Condvar rather
+                                      # than the Cell the event wait could use. The budget is TOTAL, not
+                                      # per-wakeup: a spurious wakeup re-derives what is left from the start
+                                      # instant, because passing MTL4_WAIT_MS again would make the constant a
+                                      # per-wakeup bound instead of the total bound its doc claims.
+                                      #
+                                      # block2 IS A DIRECT DEPENDENCY NOW, AND IT COSTS NO COMPILE. objc2-
+                                      # metal does not re-export it (its lib.rs re-exports only its own
+                                      # modules), so RcBlock::new is reachable only by naming the crate --
+                                      # which is why the "objc2-foundation is deliberately NOT a direct
+                                      # dependency" rule does not extend to it: that rule works because we
+                                      # only ever RECEIVE an NSError, and here we must CONSTRUCT a block.
+                                      # cargo tree already showed block2 0.6 twice in this build (objc2-metal
+                                      # enables it for objc2-metal-fx's MTLFX* features; wgpu-hal enables it
+                                      # independently), so naming it converts an accident into an intention --
+                                      # the same lesson the MTL4Compiler note in Cargo.toml already records.
+                                      #
+                                      # AND ONE STALE COMMENT FELL OUT. msl.rs said newLibraryWithData: "is
+                                      # gated behind objc2-metal's dispatch2 feature and would pull block2 in
+                                      # with it". The block2 half is now false and was corrected in place, not
+                                      # deleted -- the wrong half is the one a reader weighing the two routes
+                                      # reaches first. The dispatch2 half stands, and so does the file route.
+                                      #
+                                      # THE THIRD FAILURE MODE. mtl4::pass skipped its residency teardown on
+                                      # failure and enumerated exactly two reasons; there are now three, since
+                                      # a submission can also fail having REPORTED an error, where the GPU is
+                                      # provably done and teardown would be safe. The skip still covers all
+                                      # three -- distinguishing them there would put a second copy of submit's
+                                      # ending-classification in a second file, where the two could drift.
+                                      # submit's own timeout branch grew the matching rule: it leaks the
+                                      # RcBlock and the options as well as the allocator, because a wait that
+                                      # timed out has not established that the handler will NEVER run -- only
+                                      # that it has not run yet, and freeing a callback Metal may still invoke
+                                      # is the use-after-free arriving through the cleanup path.
+                                      #
+                                      # Mtl4::compute IS NOW A WRAPPER over Mtl4::submit, which owns the
+                                      # command buffer, the commit and the wait. compute keeps only what is
+                                      # about COMPUTE -- making the encoder and reporting a nil one as ours.
+                                      # Done here rather than in the MetalFX rung that needs submit, because
+                                      # this rung was rewriting the function anyway and one wait with two
+                                      # callers cannot drift the way two copies can.
+                                      #
+                                      # CI STILL CANNOT SEE ANY OF THIS, and the ci.yml comment was rewritten
+                                      # from a hedge into the measurement. Run 32309810963 answered D4's open
+                                      # question NO: macos-latest is an Apple Paravirtual device reporting
+                                      # `metal4 family false`, newMTL4CommandQueue returns nil, SKIP K9 every
+                                      # run. --check-fsr3 U2 and --check-metalfx X1 print the same from the
+                                      # same device, so it is the device and not a gate-local quirk. The guard
+                                      # cannot be tightened until GitHub's image moves to macOS 26, and a
+                                      # green check-metal covers the skip branch and nothing else of MTL4.
+                                      #
+                                      # Touch mtl::device::Mtl4::submit / Mtl4::compute / Mtl4::tally /
+                                      # mtl4::Plant / the objc2-metal feature list / the block2 dependency ->
+                                      # run --check-mtl clean, and 10x for the delivery-ordering claim; then
+                                      # EACH of the five levers SEPARATELY (three teeth must exit 1); then
+                                      # --check-mtl under MTL_DEBUG_LAYER=1 and under MTL_SHADER_VALIDATION=1
+                                      # SEPARATELY; then --check-msl AND --check-fsr3 AND --check-metalfx AND
+                                      # --check-spirv, because a Cargo.toml feature edit has whole-graph reach
+                                      # and those four share it; then cargo tree to confirm dispatch2 stayed
+                                      # out; then --check + cargo test LAST and restore the Windows goldens.
 ```
