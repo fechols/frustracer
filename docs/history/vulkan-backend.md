@@ -1,6 +1,6 @@
 # The Vulkan backend
 
-The `--check-vk` gate suite, stages V0 through V21 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths (V19), the present path across a swapchain rebuild (V20), and the HUD composite over the display stage (V21). The single largest entry in the notebook.
+The `--check-vk` gate suite, stages V0 through V22 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths (V19), the present path across a swapchain rebuild (V20), and the HUD composite over the display stage (V21), and the session's HUD flag through `Presenter` to that composite's own decision (V22). The single largest entry in the notebook.
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 
@@ -3136,6 +3136,111 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # scene-sized, near-identical), bare `screenshot` refused by name, key p
                                       # names screenshot_0.png, a shot under the menu hold.
                                       # Verified: all of the above green.
+                                      #
+                                      # B6C RUNG 4 — THE HUD FLAG'S SECOND COPY, AND V22 (2026-08-21;
+                                      # Presenter.last_overlay + swapchain::headless_surface +
+                                      # run_check_vk_hud_present). A REVIEW OF THE RUNG-4 DIFF, not a new feature:
+                                      # rung 4 shipped and the Linux HUD never once composited.
+                                      # THE DEFECT. `Presenter` carried its own `hud_visible` copy beside the `HudVk`
+                                      # it owns. The session fed that one; `present_with` computed `hud_visible &&
+                                      # hud.drawable()`, and `drawable()` is `visible && uploaded` on `HudVk` — whose
+                                      # `visible` had NO WRITER outside V21's own fixture. So `overlay` was false on
+                                      # every frame of every Linux session for the whole rung: `record_upload` ran,
+                                      # `pos.hud_uploads` moved exactly as the dirty-rect discipline promises, V21
+                                      # scored the blend on all three wires, and nothing reached a swapchain. The
+                                      # D3D12 peer (`gpu/mod.rs::set_hud_visible`) never had the second copy, so no
+                                      # Windows run could show it either. ONE FLAG, ONE WRITER now: `set_hud_visible`
+                                      # writes `HudVk::visible`, `present_with` reads `drawable()` alone, and `resize`
+                                      # carries the flag across the rebuild the way the D3D12 resize already did.
+                                      # THE READOUT IS RECORDED, NOT SAMPLED, and that distinction is the rung's
+                                      # second finding. `pos` gained `hud_overlay` to make the defect assertable, and
+                                      # the first draft answered `self.hud.drawable()` — which reads each frame BEFORE
+                                      # its own upload, because `uploaded` flips inside `present_with`'s recording.
+                                      # MEASURED on the live window (`resize 800 600`, then `sync 1` stepping):
+                                      # exactly one iteration of `hud: true, hud_overlay: false` per resize, with
+                                      # `resize_pending` ALREADY back to false and the new extent already reported —
+                                      # indistinguishable from the real defect by any field `pos` carries.
+                                      # `Presenter.last_overlay` takes the value out of the closure by assignment
+                                      # instead, so the getter cannot be a second expression that has to agree with
+                                      # the first — the shape `hud_visible` failed in. Re-measured after: true on
+                                      # every step across the same resize. AND THE INVARIANT IS ONE-DIRECTIONAL, which
+                                      # the first draft's comment got wrong in both directions: `hud: true` without
+                                      # `hud_overlay: true` is the defect, while `hud: false, hud_overlay: true` is a
+                                      # menu opened with F1 off — `pos.hud` is `hd.visible()` alone and the flag fed
+                                      # here is `hd.visible() || hd.menu_open()`.
+                                      # GATED, V22 — THE SEAM, NOT THE PIXELS AGAIN. V21 owns the blend and cannot
+                                      # reach this: every one of its arms drives `HudVk` DIRECTLY, because that is
+                                      # where the blend is decided, and what none of them touch is who computes
+                                      # `overlay`. `Presenter::new` had exactly ONE caller — the live window — which
+                                      # is the structural reason a whole rung shipped broken under a green suite; V22
+                                      # is its second. The claim is the value `present_with` hands `record_frame`,
+                                      # read back through `hud_overlay()`. Four readings in one Presenter's life, over
+                                      # a headless surface at V19's 64x32: visible with nothing ever staged -> no
+                                      # overlay (V21's frame-2 claim, one layer up); hidden with a full frame staged
+                                      # and UPLOADED -> no overlay (the upload is not the licence, and the reading is
+                                      # refused unless the stats show the full w*h*4 arrived, so it cannot pass over
+                                      # an empty image); then `set_hud_visible(true)` with NOTHING RE-STAGED ->
+                                      # overlay, so the flag is the only thing that moved; then the same across
+                                      # `Presenter::resize` with no further `set_hud_visible` -> the fresh `HudVk`
+                                      # records no overlay until it is filled and records one once it is, with
+                                      # `hud_uploads` asserted monotonic across the rebuild (the `carry_stats`
+                                      # sibling). `present_page` throughout, so V22 needs no source image and no
+                                      # tracer — `Draw::None` binds nothing the tonemap set wants, which is also why
+                                      # `resize`'s "the caller must re-`bind_source`" does not apply.
+                                      # ITS OWN STAGE ID, AND THAT IS LOAD-BEARING RATHER THAN TIDY. The first draft
+                                      # tagged it `V21 presenter`, whose skip line reads `SKIP V21 presenter` — and
+                                      # `ci.yml`'s forbidden-skip grep is `SKIP (V6|V7|V8|V9|V18|V21)`, with no word
+                                      # boundary. V22 stands down on V19's environment facts, so on CI's llvmpipe that
+                                      # tag would have failed the Vulkan job on EVERY PUSH, reported as V21 passing
+                                      # vacuously — a green gate turned into a permanent false alarm by a name. V22 is
+                                      # absent from both of that job's lists, exactly as V19 and V20 are, and all four
+                                      # of that job's greps were replayed against a real log to confirm it.
+                                      # THE VACUITY TRAP IN THE RESIZE READING, named because it is the same one
+                                      # `FR_ABL` fired four times: the `HudVk` rebuild is keyed on the extent actually
+                                      # CHANGING, and V20 already met surfaces that negotiate one extent for every
+                                      # request. So the reading proves it REACHED its target — `hud_size()` moved —
+                                      # and prints a SKIPPED line naming the pinned extent rather than banking a pass
+                                      # it never earned.
+                                      # TEETH HAND-FIRED, each on ITS OWN reading and on nothing else in the suite:
+                                      # the `hud_visible` copy restored -> `FAIL V22 visible: the present recorded
+                                      # overlay=false, want true`, with every other line of `--check-vk` byte-
+                                      # identical to the green run; `resize`'s `fresh.visible = self.hud.visible`
+                                      # deleted -> `FAIL V22 resized/filled`; `fresh.uploaded` carried alongside it ->
+                                      # `FAIL V22 resized/unfilled`, which V21 cannot see because V21 never resizes.
+                                      # Perturbations applied to a scratchpad copy and restored from it, never by `git
+                                      # checkout --`.
+                                      # `swapchain::headless_surface` IS AN EXTRACTION, line for line, of
+                                      # `Swapchain::new`'s head — the four stand-downs (surface pair,
+                                      # `VK_KHR_swapchain`, a graphics queue, the lavapipe `vkCreateSwapchainKHR`
+                                      # segfault) plus the surface creation. `Presenter::new` takes a bare
+                                      # `VkSurfaceKHR` because SDL hands it one, and V22 is the second caller that
+                                      # shape buys. ONE PREDICATE, so V19 and V22 can never disagree about whether a
+                                      # box can present; ownership unchanged (the surface passes to the caller,
+                                      # `from_surface` takes it over on success, and a caller that fails before
+                                      # handing it over owes the `destroy_surface` — which is why the loader comes
+                                      # back alongside).
+                                      # STILL NOT COVERED, deliberately: V22 scores the DECISION, not the swapchain's
+                                      # pixels. A `Presenter` present cannot be read back the way V19/V20 read theirs
+                                      # — `prove_vk_present` copies BEFORE presenting because that is the last moment
+                                      # the bytes are readable, and `present_with` records its own closure with no
+                                      # tap. The chain that closes it is V21 proving `record_frame` honours `overlay`
+                                      # both ways plus V22 proving the Presenter computes it, each half scored where
+                                      # it is cheap. Also not here: the loading-page-to-session handoff (safe by
+                                      # `set_loading(false)`'s `force_full`, verified by reading, not gated), and `hud
+                                      # == None` (safe by construction — nothing stages, so `uploaded` stays false).
+                                      # Touch Presenter's last_overlay / present_with's capture / hud_overlay +
+                                      # set_hud_visible / resize's visibility carry / swapchain::headless_surface +
+                                      # Swapchain::new / run_check_vk_hud_present / run_check_vk's stage list /
+                                      # `pos`'s hud_overlay comment -> run --check (LAST, then `git checkout --
+                                      # check.png check_gi.png`), cargo test, --check-vk on RADV AND on llvmpipe (V22
+                                      # SKIPs there, and must not read as `SKIP V21`), ci.yml's four --check-vk greps
+                                      # replayed against the log, the three teeth above each rebuilt and fired, and
+                                      # the window over --qa: `pos` reading hud/hud_overlay, then `resize` + `sync 1`
+                                      # stepping across it.
+                                      # Verified: --check-vk PASSED with V22's two lines and validation clean; --check
+                                      # PASSED with both goldens byte-identical; cargo test 43; the three teeth each
+                                      # failed exactly one reading; the live window read `hud_overlay: true` on every
+                                      # step across a resize where the sampled draft read false on one.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

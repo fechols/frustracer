@@ -710,14 +710,15 @@ pub struct Presenter {
     /// sized to the swapchain and rebuilt with it. `Passes` owns the composite
     /// pipeline and `bind_overlay` joins the two.
     hud: HudVk,
-    /// The session's per-frame answer to "is the HUD/menu on screen". Staging
-    /// continues while false so re-showing needs no special case.
-    hud_visible: bool,
     /// A TONEMAPPED frame has been presented — what licenses the pause menu's
     /// hold (`present` without a `render_frame` re-reads the upscaler's
     /// output, which exists only after the first one). `present_page` does not
     /// set it: a loading page has no frame behind it.
     pub frame_presented: bool,
+    /// What the last present handed `record_frame` as its `overlay` — captured
+    /// at the decision rather than recomputed after it. `hud_overlay`'s doc is
+    /// the why; `--check-vk`'s V22 is what scores it.
+    last_overlay: bool,
 }
 
 impl Presenter {
@@ -759,8 +760,8 @@ impl Presenter {
             passes,
             pacing: Pacing::new(2.0),
             hud,
-            hud_visible: false,
             frame_presented: false,
+            last_overlay: false,
         })
     }
 
@@ -810,6 +811,10 @@ impl Presenter {
             // image's: a `--qa` driver reading `hud_uploads` across a resize
             // must see it monotonic, not reset to the forced full-window rect.
             fresh.carry_stats(self.hud.stats());
+            // ...and so is visibility: a fresh `HudVk` is born hidden, and a
+            // resize must not blank the menu for however many frames pass
+            // before the session's next `set_hud_visible`.
+            fresh.visible = self.hud.visible;
             self.hud.destroy(&hg.vk);
             self.hud = fresh;
         }
@@ -824,8 +829,17 @@ impl Presenter {
     }
 
     /// The session's per-frame visibility answer (`hd.visible() || menu_open`).
+    ///
+    /// It writes `HudVk::visible` — THE flag `present_with` tests — and there
+    /// is deliberately no second copy on the `Presenter`. There was one, and
+    /// for the whole of rung 4 the Linux HUD never composited: the session fed
+    /// the Presenter's copy, `drawable()` read `HudVk`'s, which nothing ever
+    /// set, so `overlay` was false every frame while the uploads ran normally.
+    /// V21 drives `HudVk` directly and sets `visible` itself, so the gate was
+    /// green throughout — the D3D12 peer (`gpu/mod.rs::set_hud_visible`) never
+    /// had the second copy to desync. One flag, one writer.
     pub fn set_hud_visible(&mut self, on: bool) {
-        self.hud_visible = on;
+        self.hud.visible = on;
     }
 
     /// The overlay image's extent — what `crate::hud` must be sized to.
@@ -836,6 +850,35 @@ impl Presenter {
     /// Cumulative HUD upload totals — the live dirty-rect probe for `pos`.
     pub fn hud_stats(&self) -> UploadStats {
         self.hud.stats()
+    }
+
+    /// What the LAST present handed `record_frame` as its `overlay` — the
+    /// composite draw's own decision, read back from where it is made.
+    ///
+    /// RECORDED, NOT SAMPLED, and the difference is observable rather than
+    /// theoretical. `drawable()` is `visible && uploaded`, and `uploaded`
+    /// turns true INSIDE `present_with`'s recording — `record_upload` runs
+    /// first, `drawable()` after it. A getter that answered
+    /// `self.hud.drawable()` would therefore read each frame before its own
+    /// upload, and the iteration that rebuilds the HUD across a resize
+    /// (`resize` hands back a fresh, unfilled `HudVk`) would report false
+    /// while the present it precedes composited normally. MEASURED on a live
+    /// `--qa` session: exactly one iteration of `hud: true, hud_overlay:
+    /// false` per resize, with `resize_pending` already back to false — so a
+    /// driver could not even tell that reading apart from the real defect.
+    ///
+    /// WHAT `pos` MAY ASSERT, in ONE DIRECTION. `hud: true` (or `menu_open:
+    /// true`) held across a `sync` and not answered by `hud_overlay: true` is
+    /// the composite silently not drawing — the defect that cost the whole of
+    /// rung 4. THE CONVERSE IS NOT A DEFECT: `hud` reports `hd.visible()`
+    /// alone while the flag fed here is `hd.visible() || hd.menu_open()`, so a
+    /// menu opened with F1 off is legitimately `hud: false, hud_overlay:
+    /// true`.
+    ///
+    /// A `Stale` acquire records nothing and leaves this reading the last
+    /// present that did.
+    pub fn hud_overlay(&self) -> bool {
+        self.last_overlay
     }
 
     /// Point the display stage at the image it should tonemap.
@@ -904,15 +947,21 @@ impl Presenter {
         let passes = &self.passes;
         let sc = &self.sc;
         let hud = &mut self.hud;
-        let visible = self.hud_visible;
+        // The decision leaves the closure by VALUE, not by recomputation: a
+        // getter that re-derived `drawable()` afterwards would be a second
+        // expression that has to agree with this one, which is the exact shape
+        // the `hud_visible` copy failed in.
+        let mut recorded = false;
         hg.run_present(&wait, &stages, &signal, |d, cmd| {
             hud.record_upload(d, cmd);
             // `drawable()` AFTER the upload: the first staged frame uploads
             // and composites in one recording.
-            let overlay = visible && hud.drawable();
+            let overlay = hud.drawable();
+            recorded = overlay;
             passes.record_frame(d, cmd, img, view, w, h, draw, overlay);
             sc.to_present_layout(d, cmd, idx);
         })?;
+        self.last_overlay = recorded;
         let stale = match self.sc.present(&hg.vk, idx) {
             Ok(()) => false,
             Err(swapchain::Lost::Stale) => true,

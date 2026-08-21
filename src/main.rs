@@ -18025,6 +18025,24 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V22: the session's HUD flag, through `Presenter`. ----
+    //
+    // ITS OWN STAGE ID RATHER THAN A V21 SUFFIX, and that is load-bearing:
+    // this one SKIPS on a box that cannot present, exactly as V19/V20 do,
+    // while `ci.yml` forbids a `SKIP V21` outright — a "V21 presenter" tag
+    // would have failed the Vulkan job on llvmpipe on every push, reported as
+    // V21 passing vacuously. V19 and V20 are absent from both of that job's
+    // lists for this reason, and V22 belongs with them.
+    //
+    // Beside V21 rather than inside it because it needs a surface and V21 does
+    // not — folding it in would stand the offscreen blend arms down on a box
+    // that cannot present, the same reason V19 sits beside V18. After V19/V20
+    // because it drives the whole `Presenter`, chain and rebuild included, and
+    // a failure there should be read at its own layer first.
+    if !run_check_vk_hud_present(&hg, &sp) {
+        ok = false;
+    }
+
     // The compile memo, suite-wide. V5 compiled every tracer unit and the
     // V6/V12/V13 tracers re-requested the same keys, so a memo that never
     // fires cannot get here green — the anti-vacuity half — while the
@@ -19704,6 +19722,253 @@ fn run_check_vk_rebuild(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) ->
             A.0, A.1, B.0, B.1, A.0, A.1
         );
     }
+    ok
+}
+
+/// V22 — the SESSION's HUD flag, through `Presenter`, to the composite draw's
+/// own decision.
+///
+/// V21 ABOVE PROVES THE PIXELS AND CANNOT PROVE THIS. Every one of its arms
+/// drives `HudVk` DIRECTLY, because `HudVk` is where the blend is decided:
+/// `record_frame(overlay = true)` is premultiplied-over to <= 1 LSB on three
+/// wires, `overlay = false` is byte-identical to the tonemap alone, and both
+/// teeth score. What none of it touches is WHO COMPUTES `overlay`.
+///
+/// WHAT THAT COST. `Presenter` carried its own `hud_visible` copy. The session
+/// fed that one; `present_with` computed `hud_visible && hud.drawable()`, and
+/// `HudVk::visible` — the other half of `drawable()` — had no writer outside
+/// V21's own fixture. So `overlay` was false on every frame of every Linux
+/// session for the whole of rung 4: the uploads ran, `hud_uploads` moved, the
+/// suite stayed green, and the HUD never reached a swapchain. The D3D12 peer
+/// never had the second copy, so nothing short of opening a window could show
+/// it.
+///
+/// SO THIS SCORES THE SEAM, NOT THE PIXELS AGAIN. `Presenter::new` had exactly
+/// ONE caller — the live window — which is the structural reason a whole rung
+/// shipped broken under a green suite; this is its second. The claim is the
+/// value `present_with` hands `record_frame`, read back through
+/// `hud_overlay()`, which captures it AT the decision rather than recomputing
+/// it afterwards. Four readings, in one Presenter's life:
+///
+/// - VISIBLE, NOTHING EVER STAGED → no composite. V21's frame-2 claim restated
+///   one layer up: the structural off-state has to survive the wrapper.
+/// - HIDDEN, a full frame staged and uploaded → no composite. The upload is
+///   not the licence; `set_hud_visible` is.
+/// - `set_hud_visible(true)` after it → composite, with NOTHING RE-STAGED, so
+///   the flag is the only thing that moved. THE TOOTH: restore the second copy
+///   and this is the only reading in the suite that changes.
+/// - THE SAME ACROSS A `resize`, with no further `set_hud_visible` → the fresh
+///   `HudVk` records no composite until it is filled, and composites once it
+///   is. `resize` rebuilds `HudVk` at the new extent and a fresh one is born
+///   hidden, so the visibility carry is load-bearing — its absence is a menu
+///   that blanks on every drag — while carrying `uploaded` too would composite
+///   texels no one has written yet, the class V21's creation-time clear exists
+///   for.
+///
+/// THE RESIZE READING IS VACUOUS IF THE SURFACE PINS ITS EXTENT, because the
+/// rebuild is keyed on the size actually CHANGING and V20 already met surfaces
+/// that negotiate one extent for every request. So it proves it REACHED its
+/// target — `hud_size()` moved — before believing its own result, and says it
+/// did not rather than banking a pass it never earned.
+///
+/// `present_page` THROUGHOUT, so this needs no source image and no tracer:
+/// `Draw::None` binds nothing the tonemap set would want, which is also why
+/// `resize`'s "the caller must re-`bind_source`" does not apply here.
+///
+/// SKIPs on V19's environment facts through V19's own predicate
+/// (`swapchain::headless_surface`), so a box that cannot present cannot make
+/// this the one stage that fails. It therefore does not run in CI, for the
+/// reason V19 and V20 do not — which is also why it is a STAGE OF ITS OWN
+/// rather than a V21 suffix: `ci.yml` forbids a `SKIP V21` outright, so a
+/// "V21 presenter" tag would have failed the Vulkan job on llvmpipe on every
+/// push. Like V19 and V20 it belongs in neither of that job's lists.
+///
+/// TEETH, PROVEN ON RADV, each firing on ITS OWN reading and on nothing else
+/// in the suite:
+///
+/// - the `hud_visible` second copy restored -> `FAIL V22 visible: the present
+///   recorded overlay=false, want true`, and every other line of `--check-vk`
+///   byte-identical to the green run;
+/// - `resize`'s `fresh.visible = self.hud.visible` deleted -> `FAIL V22
+///   resized/filled`, the same way;
+/// - `fresh.uploaded` carried alongside it -> `FAIL V22 resized/unfilled`,
+///   which V21 cannot see because V21 never resizes.
+#[cfg(unix)]
+fn run_check_vk_hud_present(hg: &vk::headless::VkHeadless, sp: &vk::spirv::Spirv) -> bool {
+    use gfx::hud_frame::{pack_rects, DirtyRect};
+    use vk::present::{Frame, Presenter};
+
+    let ve0 = vk::device::validation_errors();
+    let vkd = &hg.vk;
+
+    // V19's extents and V20's pair. The headless surface reports
+    // `currentExtent = 0xFFFFFFFF` on both ICDs here, so the chain picks its
+    // own size and the request is a hint — which is exactly why the resize
+    // reading below checks what it GOT rather than what it asked for.
+    const A: (u32, u32) = (64, 32);
+    const B: (u32, u32) = (96, 48);
+
+    let (surface_fn, surface) = match vk::swapchain::headless_surface(hg) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            println!("check-vk: SKIP V22 ({})", vk::swapchain::skip_reason(hg));
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V22 headless surface: {e}");
+            return false;
+        }
+    };
+
+    let mut pres = match Presenter::new(hg, sp, surface, A.0, A.1) {
+        Ok(p) => p,
+        Err(e) => {
+            // `from_surface` refuses without freeing a surface it did not
+            // make, so the caller that made it owes the destroy.
+            unsafe { surface_fn.destroy_surface(surface, None) };
+            eprintln!("check-vk: FAIL V22 Presenter::new: {e}");
+            return false;
+        }
+    };
+
+    // A full-window frame at whatever extent the chain settled on. The BYTES
+    // are never scored here — V21 above owns the blend — so the payload only
+    // has to be non-empty, in-bounds and correctly sized.
+    let full = |w: u32, h: u32| {
+        let bytes = vec![0x80u8; (w * h * 4) as usize];
+        pack_rects(&bytes, w, h, vec![DirtyRect { x: 0, y: 0, w, h }])
+            .expect("a full-window rect over a non-empty window packs")
+    };
+
+    // One present and the decision it recorded. `None` is a stale chain, which
+    // is not this arm's claim to adjudicate: it stands the reading down rather
+    // than scoring it either way.
+    let step = |pres: &mut Presenter, tag: &str, ok: &mut bool| -> Option<bool> {
+        match pres.present_page(hg) {
+            Ok(Frame::Presented) => Some(pres.hud_overlay()),
+            Ok(Frame::Stale) => {
+                println!("check-vk: SKIP V22 {tag} (the chain went stale mid-arm)");
+                None
+            }
+            Err(e) => {
+                eprintln!("check-vk: FAIL V22 {tag} present: {e}");
+                *ok = false;
+                None
+            }
+        }
+    };
+    // Score one reading against what the seam owes it.
+    let want = |tag: &str, got: Option<bool>, want: bool, ok: &mut bool| -> bool {
+        match got {
+            Some(g) if g == want => true,
+            Some(_) => {
+                eprintln!(
+                    "check-vk: FAIL V22 {tag}: the present recorded overlay={}, want {want}",
+                    !want
+                );
+                *ok = false;
+                false
+            }
+            None => false,
+        }
+    };
+
+    let mut ok = true;
+    let readings = |pres: &mut Presenter, ok: &mut bool| -> bool {
+        let (w, h) = pres.hud_size();
+
+        // ---- 1. Visible, nothing ever staged. ----
+        pres.set_hud_visible(true);
+        if !want("unuploaded", step(pres, "unuploaded", ok), false, ok) {
+            return false;
+        }
+
+        // ---- 2. Hidden, a full frame staged and uploaded. ----
+        pres.set_hud_visible(false);
+        pres.hud_stage(full(w, h));
+        if !want("hidden", step(pres, "hidden", ok), false, ok) {
+            return false;
+        }
+        let filled = pres.hud_stats();
+        if filled.bytes != (w * h * 4) as usize {
+            eprintln!(
+                "check-vk: FAIL V22 the hidden frame uploaded {filled:?}, want the \
+                 full {} bytes — the reading below would prove nothing about an image with no \
+                 pixels in it",
+                w * h * 4
+            );
+            *ok = false;
+            return false;
+        }
+
+        // ---- 3. The flag, and NOTHING else, moves. ----
+        pres.set_hud_visible(true);
+        if !want("visible", step(pres, "visible", ok), true, ok) {
+            return false;
+        }
+        println!(
+            "check-vk: V22 set_hud_visible reaches the composite: unuploaded/hidden \
+             record no overlay, and flipping the flag alone (no re-stage, {} B already \
+             uploaded) records one",
+            filled.bytes
+        );
+
+        // ---- 4. Across a resize, with no further set_hud_visible. ----
+        if let Err(e) = pres.resize(hg, sp, B.0, B.1) {
+            eprintln!("check-vk: FAIL V22 resize: {e}");
+            *ok = false;
+            return false;
+        }
+        let (w2, h2) = pres.hud_size();
+        if (w2, h2) == (w, h) {
+            println!(
+                "check-vk: V22 resize reading SKIPPED — this surface negotiates \
+                 {w}x{h} for both {}x{} and {}x{}, so `resize` never rebuilt `HudVk` and the \
+                 visibility carry was not reached (V20 meets the same surfaces)",
+                A.0, A.1, B.0, B.1
+            );
+            return true;
+        }
+        // The carry is visibility ONLY: the new image has no pixels yet, so
+        // this must record nothing until it is filled.
+        if !want("resized/unfilled", step(pres, "resized/unfilled", ok), false, ok) {
+            return false;
+        }
+        pres.hud_stage(full(w2, h2));
+        if !want("resized/filled", step(pres, "resized/filled", ok), true, ok) {
+            return false;
+        }
+        let after = pres.hud_stats();
+        if after.bytes <= filled.bytes || after.rects <= filled.rects {
+            eprintln!(
+                "check-vk: FAIL V22 the upload counter reset across the resize \
+                 ({filled:?} -> {after:?}) — `carry_stats` is what makes a `--qa` driver's \
+                 `hud_uploads` monotonic"
+            );
+            *ok = false;
+            return false;
+        }
+        println!(
+            "check-vk: V22 resize {w}x{h} -> {w2}x{h2} carried visibility with no \
+             further set_hud_visible: unfilled records no overlay, the refill records one, and \
+             hud_uploads stayed monotonic ({} -> {} B)",
+            filled.bytes, after.bytes
+        );
+        true
+    };
+    readings(&mut pres, &mut ok);
+
+    // The device must be idle before the chain and its semaphores go — V19's
+    // rule, and a presented image is still the presentation engine's.
+    unsafe {
+        let _ = vkd.device.device_wait_idle();
+    }
+    let ve = vk::device::validation_errors() - ve0;
+    if ve > 0 {
+        eprintln!("check-vk: FAIL V22 {ve} validation error(s) driving the HUD seam");
+        ok = false;
+    }
+    pres.destroy(vkd);
     ok
 }
 
@@ -31717,6 +31982,16 @@ fn window_frames(
                             // nothing", headlessly.
                             "menu_open": hud.as_ref().is_some_and(|h| h.menu_open()),
                             "hud": hud.as_ref().is_some_and(|h| h.visible()),
+                            // The session's INTENT above; what the LAST
+                            // present actually handed the composite draw
+                            // below. ONE DIRECTION is assertable: `hud: true`
+                            // (or `menu_open: true`) across a `sync` without
+                            // `hud_overlay: true` is the composite silently
+                            // not drawing. The converse is legitimate — this
+                            // is fed `visible || menu_open` while `hud` above
+                            // is `visible` alone, so a menu opened with F1 off
+                            // reads `hud: false, hud_overlay: true`.
+                            "hud_overlay": pres.hud_overlay(),
                             "fullscreen": ui.fullscreen(),
                             "hud_uploads": {
                                 "rects": pres.hud_stats().rects,

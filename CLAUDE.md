@@ -91,7 +91,7 @@ of NVIDIA's NRD entry names.
 | `--check` | nothing (DLL-free) | the CPU suite + every module `self_test`; writes the goldens |
 | `--check-gpu` | real GPU + DXC | the wavefront tracer — **not in CI** |
 | `--check-dxr` | real RT GPU + DXC | the DXR pipeline — **not in CI** |
-| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V21 |
+| `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V22 |
 | `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
 | `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip + W5 layout audit + W6 hostile scan + W7 tracked corpus golden (`goldens/web_corpus.txt`, regenerated via `--write-golden`; W0 is DXC-free) |
 | `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe, the indirect smoke, **J6 the browser's reference tracer vs the CPU**, **J7 the wavefront quadtree vs that reference** (J0 is pure; the smoke KERNEL is scene-free but the DEVICE is scene-keyed from J1 on — the ask lands in `required_limits`) |
