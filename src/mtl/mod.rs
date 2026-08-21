@@ -104,6 +104,15 @@
 //!   structural rather than asserted: nothing else can unblock the submission,
 //!   which `FR_MTL4_NO_FEEDBACK` proves by timing out. `--check-mtl` K11.
 //!
+//!   D5 then put REAL PIXELS on that path. `mtl::mfx` builds the same MetalFX
+//!   temporal scaler through `newTemporalScalerWithDevice:compiler:` and
+//!   encodes it into an `MTL4CommandBuffer`; the descriptor class, `describe`
+//!   and `configure` are shared verbatim with the Metal 3 arm, because
+//!   `MTLFXTemporalScalerBase` carries every member but the encode. Output is
+//!   BYTE-IDENTICAL across the two APIs. Residency turned out to be a TOOTH
+//!   here where it is only a measurement on the smoke path — MetalFX writes
+//!   nothing without it. `--check-metalfx` X7/X8.
+//!
 //! It also retired the premise the tracer plan was written on: **spirv-cross
 //! lowers `RayQuery` to Metal**, so `leaf`/`reference`/`leaf_fb`/`hemi_leaf`
 //! compile with hardware ray tracing intact and a Metal tracer does not need

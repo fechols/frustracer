@@ -1769,4 +1769,180 @@ cargo run --release -- --check-mtl     # D4b -- THE MTL4 ERROR CHANNEL, and it t
                                       # --check-spirv, because a Cargo.toml feature edit has whole-graph reach
                                       # and those four share it; then cargo tree to confirm dispatch2 stayed
                                       # out; then --check + cargo test LAST and restore the Windows goldens.
+
+cargo run --release -- --check-metalfx  # D5 -- METALFX ON METAL 4, and the fork is two lines
+                                      #
+                                      # D4 put the MTL4 submission path under a 44-line smoke shader; D4b gave it an
+                                      # error channel. D5 is the first REAL WORK on it: the same MetalFX temporal
+                                      # scaler mtl::mfx has always run, built through
+                                      # newTemporalScalerWithDevice:compiler: and encoded into an MTL4CommandBuffer.
+                                      # X7 and X8. Scoped to mfx alone -- mfxdn and mfxfi keep the Metal 3 route,
+                                      # this backend's rule that two unproven things in one rung is not how it got
+                                      # built -- and Cargo.toml names exactly one MTL4FX feature to match.
+                                      #
+                                      # THE RUNG SHRANK BEFORE ANY CODE WAS WRITTEN, off the bindings, the same way
+                                      # D4 shrank when MTL4ComputeCommandEncoder turned out to take a plain
+                                      # MTLComputePipelineState. Three facts, all read rather than assumed:
+                                      #
+                                      #   * MTLFXTemporalScalerBase carries ALL 40 members this module touches --
+                                      #     every texture setter, jitter, MV scale, reset, depthReversed, the four
+                                      #     *TextureUsage getters, and setFence. MTLFXTemporalScaler and
+                                      #     MTL4FXTemporalScaler each add EXACTLY encodeToCommandBuffer: and nothing
+                                      #     else -- the MTL4 binding file is 25 lines.
+                                      #   * There is NO MTL4FXTemporalScalerDescriptor. One descriptor class, and
+                                      #     the factory selector decides which world you get.
+                                      #   * supportsMetal4FX: exists on all four descriptors, has no Metal 3
+                                      #     equivalent, and nothing in this tree called it before D5.
+                                      #
+                                      # So describe() and configure() are shared VERBATIM and the fork is two
+                                      # lines: which factory built the object, and which encodeToCommandBuffer:
+                                      # overload it answers. That is what makes X8's claim strong rather than
+                                      # circular -- there is no second copy of our configuration for a difference
+                                      # to hide in, so a difference could only be Apple's two encode paths.
+                                      #
+                                      # MEASURED, Apple M1, macOS 26.5.1, --release:
+                                      #
+                                      #   check-metalfx: X7 MetalFX supports Metal 4 on this device
+                                      #   check-metalfx: X8 MTL4 scaler built in 178 ms (synchronous init) |
+                                      #              5 allocations resident | 2 dispatches through MTL4CommandQueue
+                                      #   check-metalfx: X8 MTL4 upscale 321x181 -> 642x362 OK -- finite, energy 0.988x
+                                      #   check-metalfx: X8 cross-API compare OK -- 929616 channels, IDENTICAL
+                                      #
+                                      #   clean runs                  5/5 release, 0-of-929616 every run
+                                      #   FR_MFX4_NO_RESIDENCY        TOOTH  exit 1, energy 0.000x -- AGAINST THE
+                                      #                                      PREDICTION, see below
+                                      #   FR_MFX4_NO_ENCODE           TOOTH  exit 1, energy 0.000x
+                                      #   FR_MFX4_OFF                 MEAS.  exit 0, SKIP X7-X8
+                                      #   every K* and X0-X6 signature unchanged
+                                      #
+                                      # RESIDENCY IS A TOOTH HERE AND ONLY A MEASUREMENT ON THE SMOKE PATH, WHICH
+                                      # IS THE RUNG'S REAL FINDING AND THE REVERSE OF WHAT IT WAS PLANNED ON. The
+                                      # plan named residency as the primary risk and predicted the failure mode:
+                                      # "expect a residency mistake to present as wrong pixels rather than an
+                                      # error, since raw-address binding makes bound-but-not-resident a
+                                      # use-after-free." Wrong on the symptom. Armed, MetalFX writes NOTHING -- the
+                                      # output keeps its pre-dispatch clear and X8 fails on the DATA, plain, with
+                                      # no validation layer involved. Its --check-mtl namesake FR_MTL4_NO_RESIDENCY
+                                      # does the opposite and is classified a MEASUREMENT for it: on the smoke
+                                      # chain a missing set is invisible except under MTL_SHADER_VALIDATION=1,
+                                      # because unified memory leaves the pages readable anyway.
+                                      #
+                                      # The difference is MetalFX, not MTL4: Apple's own binding evidently checks
+                                      # residency in a way our hand-built MTL4ArgumentTable cannot. Recorded here
+                                      # rather than generalised, because the next MTL4 consumer inherits the smoke
+                                      # chain's behaviour and not this one's.
+                                      #
+                                      # THE CLASSIFICATION WAS WRITTEN BEFORE THE MEASUREMENT AND HAD TO BE
+                                      # CORRECTED, which is the D2 lesson arriving on schedule. The first draft of
+                                      # mfx::Plant said no_residency "is excluded because it was MEASURED not to
+                                      # bite" -- a sentence copied from the smoke path's result, describing a run
+                                      # that had not happened yet. must_fail() now names it. The rule is cheap and
+                                      # this is the second rung to prove it: never write a lever's class down
+                                      # before watching it.
+                                      #
+                                      # X8 SCORES THE MTL4 ARM ALONE BEFORE COMPARING ANYTHING, and the order is
+                                      # the anti-vacuity rather than a convenience: a byte-compare of two arms that
+                                      # both produced ZEROS passes. So the MTL4 output is held to X3's own energy
+                                      # band first, and BOTH teeth land there -- which is why either one failing
+                                      # reads as "MetalFX wrote nothing" and the message names both causes.
+                                      #
+                                      # THE IDENTITY CLAIM WAS REPORTED BEFORE IT WAS ASSERTED, in that order, on
+                                      # purpose. X3 already proves MetalFX is bit-identical across fresh scaler
+                                      # objects on this box, which made cross-API identity PLAUSIBLE -- and
+                                      # plausible is what the measurement discipline exists for. The first
+                                      # implementation printed the ULP distance and asserted nothing; 5/5 release
+                                      # runs came back 0-of-929616; only then did it become a hard failure, written
+                                      # as an exact integer count rather than a tolerance, for the reason X3 gives
+                                      # about its own ULP claim.
+                                      #
+                                      # AND THE NEW ASSERTION WAS PROVEN BOTH WAYS BEFORE BEING TRUSTED. Mirroring
+                                      # jitter.x on the MTL4 arm ALONE: 561021 of 929616 channels differ, worst
+                                      # 13088 ULP -- and the energy check PASSED at 0.988x on that same run, so the
+                                      # compare caught something no magnitude assertion could. Perturbation
+                                      # reverted; a lever was deliberately NOT left behind for it, because a
+                                      # one-sided jitter mirror is X3's FR_MFX_JITTER and belongs where the
+                                      # correlation that gives it teeth lives.
+                                      #
+                                      # MEASURED ON ONE CHIP, AND THE GATE SAYS SO. Every Apple silicon Mac from
+                                      # the M1 up reaches X7 -- the backend probes at runtime and SKIPs rather than
+                                      # gating at build time -- but 0-of-929616 is an M1 number. Apple is free to
+                                      # vary MetalFX between generations, so X8 prints Mtl::line() on BOTH the pass
+                                      # and the failure, and the failure text says to record the chip and the
+                                      # number here before relaxing anything. A green run on an M3 or M4 extends
+                                      # the claim and is worth adding to the table above; a red one is a
+                                      # per-generation finding, not a tolerance to introduce.
+                                      #
+                                      # METALFX'S OWN MTL4 EFFECT ABORTS UNDER METAL API VALIDATION, and X7-X8 SKIP
+                                      # there. Deterministic, 3/3, macOS 26.5.1 / Xcode 26.6:
+                                      #
+                                      #   Metal4FXTemporalScalingEffectV4.mm:561: failed assertion
+                                      #   `_outputTextureBarrierStages not set'
+                                      #
+                                      # THERE IS NO PUBLIC PROPERTY THAT SATISFIES IT. Checked against the macOS 26
+                                      # SDK header rather than guessed: MTLFXTemporalScaler.h exposes 40 properties
+                                      # across MTLFXTemporalScalerBase and MTLFXTemporalScalerDescriptor, not one of
+                                      # which names a barrier or a stage, and MTL4FXTemporalScaler adds only
+                                      # encodeToCommandBuffer:. objc2-metal-fx 0.3.2 matches the header exactly. The
+                                      # ivar is internal to MetalFX, so there is nothing on our side to set.
+                                      #
+                                      # THE TWO LAYERS SPLIT, AND THE ONE WE LOSE IS THE ONE THAT MATTERS LESS HERE.
+                                      # MTL_SHADER_VALIDATION=1 runs the whole arm and PASSES -- byte-compare intact,
+                                      # exit 0 -- so the stricter layer for code we author still covers this path.
+                                      # What is lost is API validation, which is the layer that would catch a
+                                      # texture-usage or storage-mode mistake of OURS on the MTL4 arm. Stated rather
+                                      # than hidden, because that is a real hole in this stage's coverage and the
+                                      # gate's own NOTE tells people to prefer the validated run.
+                                      #
+                                      # The shape is X6's, one screen up, with the layers reversed: not our kernel,
+                                      # not our property, nothing here to fix, so skip loudly and re-test on a newer
+                                      # OS. Two separate MetalFX effects now abort a validated process on an
+                                      # assertion about MetalFX's own internals, which is worth noticing as a
+                                      # pattern rather than twice as an accident.
+                                      #                                      # MTL4Compiler LIVES ON Mtl4, NOT ON Mfx, and the placement is the argument.
+                                      # MTL4CompilerDescriptor is an extern_class!, so touching it on a Mac that
+                                      # predates Metal 4 PANICS -- exactly what Mtl::mtl4's doc said this path
+                                      # avoids by using only protocols reached through nil-returning methods. It is
+                                      # built below that function's `else { return Ok(None) }`, after a live
+                                      # MTL4CommandQueue has proven the framework's Metal 4 half is present, so the
+                                      # exception costs no probe of its own. Moving it one line up would abort on
+                                      # every pre-macOS-26 Mac and NO GATE ON THIS BOX WOULD NOTICE.
+                                      #
+                                      # TWO FEATURE SEAMS, written down because a mistake in either fails as a
+                                      # MISSING SYMBOL rather than an error. (a) The MTL4FX protocol is cfg-gated on
+                                      # the METAL 3 feature name and mod.rs re-exports it only under
+                                      # all(MTL4FXTemporalScaler, MTLFXTemporalScaler), so enabling one without the
+                                      # other compiles the file and hides the name. (b) MTL4FXTemporalScaler pulls
+                                      # only objc2-metal/MTL4CommandBuffer, which D4 already enabled -- which is
+                                      # exactly why its absence was invisible. MTL4Compiler is now NAMED in the
+                                      # objc2-metal list rather than inherited from objc2-metal-fx: it was already
+                                      # in the graph, and relying on that is the invisible widening the note above
+                                      # the dependency table exists to record. A feature we call into is a feature
+                                      # we ask for. Lockfile delta: ZERO lines.
+                                      #
+                                      # setFence IS STILL NOT SET, AND THAT WAS RE-CHECKED RATHER THAN INHERITED.
+                                      # It lives on the BASE protocol, so an MTL4FX object exposes a Metal 3
+                                      # MTLFence setter. The Metal 3 reason for leaving it alone -- default
+                                      # hazard-tracked textures in one command buffer, the case Apple's fence
+                                      # property explicitly does not cover -- is an argument about a world MTL4
+                                      # removed. What replaces it is not a fence: dispatch4 submits ONE command
+                                      # buffer and blocks on its commit feedback before anything reads the output,
+                                      # so there is no second submission to order against. If this arm ever
+                                      # pipelines, that sentence stops being true.
+                                      #
+                                      # CI CANNOT RUN ANY OF IT, same as D4/D4b: macos-latest is an Apple
+                                      # Paravirtual device with `metal4 family false`, so X7 takes the SKIP branch
+                                      # and X8 never runs. FR_MFX4_OFF exercises that branch locally, which is the
+                                      # only reason it exists -- the skip is the only MTL4 code CI ever reaches.
+                                      #
+                                      # Touch mtl::mfx (describe/configure/new_mtl4/dispatch4/Plant) or
+                                      # mtl::device::Mtl4::compiler or the objc2-metal-fx feature list -> run
+                                      # --check-metalfx clean and EACH FR_MFX4_* separately, recording what each
+                                      # did before writing its class down; then --check-metalfx under
+                                      # MTL_SHADER_VALIDATION=1, which is the layer that still RUNS this arm --
+                                      # MTL_DEBUG_LAYER=1 now SKIPs X7-X8 and proves nothing about them; then
+                                      # --check-mtl, because Mtl::mtl4 now builds a
+                                      # compiler on every call and K9 is where that fails; then --check-msl AND
+                                      # --check-fsr3 AND --check-spirv, because a Cargo.toml feature edit has
+                                      # whole-graph reach; then cargo check --target wasm32-unknown-unknown; then
+                                      # --check + cargo test LAST and restore the Windows goldens.
 ```

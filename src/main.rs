@@ -16843,8 +16843,9 @@ fn run_mtl4(m: &mtl::device::Mtl, pipes: &mtl::smoke::Pipes, plant: mtl::mtl4::P
         }
     };
     println!(
-        "check-mtl: K9 MTL4 queue + allocator OK (commit feedback is the wait) | \
-         metal4 family {} | pipelines SHARED with the Metal 3 path (MTL4Compiler not needed)",
+        "check-mtl: K9 MTL4 queue + allocator + compiler OK (commit feedback is the wait) | \
+         metal4 family {} | pipelines SHARED with the Metal 3 path (this gate needs no \
+         MTL4Compiler; --check-metalfx X7 is what uses it)",
         m.metal4_family()
     );
 
@@ -25026,6 +25027,21 @@ fn run_check_metalfx(
     // Whether a MetalFX scaler was ever reachable in this run — see the NOTE at
     // the bottom, which is about a failure class that needs one to hide in.
     let mut ran = false;
+    // D5's levers, read ONCE and announced, the `mtl4::Plant` idiom. Announced
+    // before anything runs so a log that fails is legible without knowing what
+    // the environment held.
+    let mfx_plant = mtl::mfx::Plant::from_env();
+    if mfx_plant.any() {
+        println!(
+            "check-metalfx: PLANT {} armed — {}",
+            mfx_plant.line(),
+            if mfx_plant.must_fail() {
+                "this run MUST fail; a pass is the finding"
+            } else {
+                "these are MEASUREMENTS, not teeth — the run is expected to pass"
+            }
+        );
+    }
     let mut fail = |m: String| {
         eprintln!("check-metalfx: FAIL {m}");
         ok = false;
@@ -25255,6 +25271,89 @@ fn run_check_metalfx(
                 } else if let Err(e) = metalfx_interp_check(m, scene, bvh, cam0) {
                     fail(format!("X6 {e}"));
                 }
+
+                // ---- X7: MetalFX through the METAL 4 submission path -------
+                //
+                // TWO AVAILABILITY QUESTIONS, AND THEY ARE NOT THE SAME ONE.
+                // `Mtl::mtl4()` asks whether this machine has Metal 4 at all —
+                // the question `--check-mtl` K9 answers, and the one GitHub's
+                // runner answers NO to on every run. `supportsMetal4FX:` asks
+                // whether MetalFX in particular works through it, a separate
+                // selector Apple documents separately, so a device could in
+                // principle have Metal 4 and not this. Both SKIP rather than
+                // fail, and both say which of the two it was.
+                match m.mtl4() {
+                    Err(e) => fail(format!("X7 {e}")),
+                    Ok(None) => println!(
+                        "check-metalfx: SKIP X7-X8 no MTL4 command queue \
+                         (newMTL4CommandQueue returned nil; device reports `metal4 family {}`) \
+                         — Metal 4 is macOS 26.0+",
+                        m.metal4_family()
+                    ),
+                    Ok(Some(g)) if std::env::var("MTL_DEBUG_LAYER").is_ok() => {
+                        // NOT OUR PROPERTY, AND NOT OPTIONAL TO SKIP — the X6
+                        // situation one screen up, in a second framework and
+                        // with the layers the other way round. Under Metal API
+                        // validation, MetalFX's own Metal 4 temporal effect
+                        // aborts the process on an internal assertion:
+                        //
+                        //   Metal4FXTemporalScalingEffectV4.mm:561: failed
+                        //   assertion `_outputTextureBarrierStages not set'
+                        //
+                        // Deterministic, 3/3 on macOS 26.5.1 / Xcode 26.6.
+                        // THERE IS NO PUBLIC SETTER FOR IT: the macOS 26 SDK's
+                        // MTLFXTemporalScaler.h exposes 40 properties across
+                        // MTLFXTemporalScalerBase and the descriptor and not
+                        // one of them names a barrier stage, and
+                        // MTL4FXTemporalScaler adds only
+                        // `encodeToCommandBuffer:`. So there is nothing here
+                        // to fix, and skipping is what keeps a validated run
+                        // runnable at all.
+                        //
+                        // MTL_SHADER_VALIDATION=1 IS UNAFFECTED and runs the
+                        // whole arm — measured, exit 0 with the byte-compare
+                        // intact. That is the stricter layer for code we
+                        // author, so this arm keeps its validated coverage;
+                        // what is lost is API validation, which is the layer
+                        // that would catch a texture-usage or storage-mode
+                        // mistake of OURS. Said rather than hidden. Re-test on
+                        // a newer OS.
+                        let _ = &g;
+                        println!(
+                            "check-metalfx: SKIP X7-X8 — MTL_DEBUG_LAYER is set, and MetalFX's \
+                             own Metal 4 temporal effect aborts the process on an internal \
+                             assertion (`_outputTextureBarrierStages not set`) that no public \
+                             property can satisfy. Run X7-X8 unvalidated, or under \
+                             MTL_SHADER_VALIDATION=1, which is unaffected."
+                        );
+                    }
+                    Ok(Some(g)) => {
+                        if !mtl::mfx::Mfx::supported_mtl4(m, mfx_plant) {
+                            println!(
+                                "check-metalfx: SKIP X7-X8 — this device has Metal 4 \
+                                 (`metal4 family {}`) but MTLFXTemporalScalerDescriptor.\
+                                 supportsMetal4FX is false{}",
+                                m.metal4_family(),
+                                if mfx_plant.off { " (FR_MFX4_OFF armed)" } else { "" }
+                            );
+                        } else {
+                            ran = true;
+                            println!(
+                                "check-metalfx: X7 MetalFX supports Metal 4 on this device \
+                                 — MTL4Compiler built, one descriptor class shared with the \
+                                 Metal 3 arm (there is no MTL4FXTemporalScalerDescriptor)"
+                            );
+                            // The residency teardown lives INSIDE the check,
+                            // beside the `Mfx` that owns the set — see the
+                            // comment on `four.drop_residency` there for why
+                            // it is on the success path only.
+                            match metalfx_mtl4_check(m, &g, scene, bvh, cam0, mfx_plant) {
+                                Ok(()) => {}
+                                Err(e) => fail(format!("X8 {e}")),
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -25277,6 +25376,19 @@ fn run_check_metalfx(
              validation-only failure class (texture storage modes, usage flags, unbound \
              arguments) is INVISIBLE in this run. Re-run with both =1."
         );
+    }
+    // THE VERDICT ENFORCES THE TEETH, the `--check-mtl` K5 idiom. A planted
+    // run that PASSES is the finding, not a relief: it means the lever did not
+    // reach what it was aimed at, which is the `FR_ABL` probe-reach trap and
+    // the reason this clause exists rather than a comment saying "remember to
+    // check the exit code".
+    if mfx_plant.must_fail() && ok {
+        eprintln!(
+            "check-metalfx: FAIL the plant {} was armed and every stage still passed — the \
+             lever did not reach its target, which is the finding",
+            mfx_plant.line()
+        );
+        ok = false;
     }
     println!("check-metalfx: {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
@@ -26384,6 +26496,283 @@ fn metalfx_interp_check(
              now assertable: promote it"
         }
     );
+    Ok(())
+}
+
+/// X8: the SAME scaler configuration through both submission APIs, compared.
+///
+/// **THIS IS K10'S CLAIM FOR MetalFX**, and deliberately the same shape: one
+/// scaler description, one set of inputs, two submission paths, and a
+/// comparison of what came out. What differs is that K10 compares 619 words we
+/// computed ourselves, and this compares an image APPLE computed — so the two
+/// arms share our configuration but not their implementation, and identity is
+/// a hypothesis rather than an arithmetic certainty.
+///
+/// # The order here is the anti-vacuity, not a convenience
+///
+/// A byte-compare of two arms that both produced ZEROS passes. So the MTL4
+/// arm is scored on its own FIRST — finite, and energy within the same
+/// `[0.5, 2]` band X3 uses — and only then compared. `FR_MFX4_NO_ENCODE` is
+/// the lever that proves that ordering earns its place: it configures
+/// everything, submits a real command buffer, and encodes nothing, which the
+/// compare alone would wave through.
+///
+/// # The compare is REPORTED before it is asserted
+///
+/// X3 already proves MetalFX is bit-identical across fresh scaler objects on
+/// this box (0 differing channels, an integer ULP claim). That made identity
+/// across the two APIs plausible — but plausible is what the measurement
+/// discipline in `CLAUDE.md` was written about, and a different compiler path
+/// could legitimately differ, so the first implementation REPORTED the ULP
+/// distance and asserted nothing.
+///
+/// **IT MEASURED 0 OF 929616, 5/5 ON RELEASE, AND IS NOW ASSERTED.** The
+/// sequence is the point and is recorded rather than smoothed away: this
+/// project has published a wrong number by assuming, and a claim this strong
+/// is exactly the kind that gets written before it is earned.
+///
+/// # Measured on ONE chip, and the gate says which
+///
+/// Every Apple silicon Mac from the M1 up reaches this stage — the whole
+/// backend probes at runtime and SKIPs rather than gating at build time — but
+/// the identity above was measured on an M1 alone. Apple is free to vary
+/// MetalFX between generations, so both the pass line and the failure carry
+/// `Mtl::line()`. A green run on an M3 or M4 EXTENDS the claim and is worth
+/// recording; a red one is a per-generation finding to write down, not a
+/// tolerance to introduce.
+#[cfg(target_os = "macos")]
+fn metalfx_mtl4_check(
+    m: &mtl::device::Mtl,
+    g: &mtl::device::Mtl4,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    plant: mtl::mfx::Plant,
+) -> Result<(), String> {
+    use std::sync::atomic::AtomicU32;
+
+    // The same extents and quality as X3, so a disagreement between the two
+    // stages is about the submission path and not about the workload.
+    let (rw, rh) = (321usize, 181usize);
+    let (uw, uh) = (rw * 2, rh * 2);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi_bounces: 0.0,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+
+    let render = |gb: &dlss::GBufs,
+                  accum: &[AtomicU32],
+                  basis: camera::CamBasis,
+                  prev: Option<camera::CamBasis>,
+                  frame: u32,
+                  jitter: (f32, f32)| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: false,
+            rw,
+            rh,
+            accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(gb),
+            fsr_buf: None,
+            prev_cam: prev,
+            frame_jitter: Some(jitter),
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+    };
+
+    // NO `FR_MFX_JITTER` HERE, and that is deliberate. This stage's subject is
+    // the submission path, and both arms are driven from one value, so a lever
+    // that mirrors the jitter would move them together and score nothing. X3
+    // owns that lever and the correlation that gives it teeth.
+    let jit = |f: u32| {
+        let (jx, jy) = dlss::jitter_for(f);
+        (jx * mtl::mfx::JITTER_SIGN, jy * mtl::mfx::JITTER_SIGN)
+    };
+
+    let accum_a = alloc32(rw * rh * 3);
+    let accum_b = alloc32(rw * rh * 3);
+    let ga = dlss::GBufs::new_slim(rw, rh);
+    let gb = dlss::GBufs::new_slim(rw, rh);
+    let basis_a = cam0.basis(rw, rh);
+    let cam_b = Camera { pos: cam0.pos + cam0.forward() * (0.02 * scene.diag), ..cam0 };
+    let basis_b = cam_b.basis(rw, rh);
+    render(&ga, &accum_a, basis_a, None, 0, dlss::jitter_for(0));
+    render(&gb, &accum_b, basis_b, Some(basis_a), 1, dlss::jitter_for(1));
+
+    // ONE SEQUENCE, TWO ARMS. A reset frame then an accumulating one, which is
+    // X3's `warm` sequence — the path that exercises history, because a
+    // reset-only frame would compare the half of the scaler with the least
+    // internal state and therefore the least to disagree about.
+    let seq = [(0u32, true), (1u32, false)];
+    let stage_into = |f: &mtl::mfx::Mfx, frame: u32| {
+        let (acc, gg) = if frame == 0 { (&accum_a, &ga) } else { (&accum_b, &gb) };
+        f.stage(m, acc, gg, near, far);
+    };
+
+    let three = mtl::mfx::Mfx::new(m, (rw, rh), (uw, uh))?;
+    for &(frame, reset) in &seq {
+        stage_into(&three, frame);
+        three.dispatch(m, &mtl::mfx::MfxParams { jitter: jit(frame), reset })?;
+    }
+    let three_bits = three.read_output_bits(m)?;
+
+    let t0 = std::time::Instant::now();
+    let four = mtl::mfx::Mfx::new_mtl4(m, g, (rw, rh), (uw, uh), plant)?;
+    let build_ms = t0.elapsed().as_millis();
+    if four.api() != mtl::mfx::Api::Four {
+        return Err("new_mtl4 handed back a Metal 3 scaler".to_string());
+    }
+    for &(frame, reset) in &seq {
+        stage_into(&four, frame);
+        four.dispatch4(m, g, &mtl::mfx::MfxParams { jitter: jit(frame), reset }, plant)?;
+    }
+    let four_out = four.read_output(m)?;
+    let four_bits = four.read_output_bits(m)?;
+
+    println!(
+        "check-metalfx: X8 MTL4 scaler built in {build_ms} ms (synchronous init, \
+         newTemporalScalerWithDevice:compiler:) | {} allocations resident | {} dispatches \
+         through MTL4CommandQueue",
+        four.resident().map_or("no".to_string(), |n| n.to_string()),
+        seq.len()
+    );
+
+    // ---- the MTL4 arm on its OWN, before any comparison --------------------
+    let bad = four_out.iter().filter(|v| !v.is_finite() || **v < 0.0).count();
+    if bad != 0 {
+        return Err(format!(
+            "{bad} of {} MTL4 output channels are non-finite or negative",
+            four_out.len()
+        ));
+    }
+    let mean = |v: &[f32]| {
+        v.chunks(4).map(|p| (p[0] + p[1] + p[2]) / 3.0).sum::<f32>() / (v.len() / 4) as f32
+    };
+    let in_mean = {
+        let mut s = 0.0f64;
+        for i in 0..rw * rh {
+            let px: f32 = (0..3)
+                .map(|c| f32::from_bits(accum_b[i * 3 + c].load(std::sync::atomic::Ordering::Relaxed)))
+                .sum();
+            s += f64::from(px / 3.0);
+        }
+        (s / (rw * rh) as f64) as f32
+    };
+    let out_mean = mean(&four_out);
+    let ratio = out_mean / in_mean;
+    // THE SAME BAND X3 USES, and the same reasoning: an upscaler resamples, it
+    // does not expose. It is also where BOTH of this stage's teeth land, which
+    // is why it fires before the compare can wave two zeros through: a command
+    // buffer that encoded nothing leaves the pre-dispatch clear, and so — as
+    // MEASURED, against the prediction — does one whose textures were never
+    // made resident.
+    if !(0.5..=2.0).contains(&ratio) {
+        return Err(format!(
+            "the MTL4 arm's output mean {out_mean:.4} is {ratio:.3}x the input's {in_mean:.4} \
+             — an upscaler resamples, it does not expose. A ratio near 0 is the output's \
+             pre-dispatch clear surviving, i.e. MetalFX wrote nothing: either the encode never \
+             happened (FR_MFX4_NO_ENCODE) or its textures were not resident \
+             (FR_MFX4_NO_RESIDENCY), and both are planted teeth"
+        ));
+    }
+    println!(
+        "check-metalfx: X8 MTL4 upscale {rw}x{rh} -> {uw}x{uh} OK — finite, energy {ratio:.3}x"
+    );
+
+    // ---- and only now, the two APIs against each other ---------------------
+    if three_bits.len() != four_bits.len() {
+        return Err(format!(
+            "the two arms produced different channel counts, {} vs {}",
+            three_bits.len(),
+            four_bits.len()
+        ));
+    }
+    let (mut n, mut worst) = (0usize, 0i32);
+    for (x, y) in three_bits.iter().zip(&four_bits) {
+        if x != y {
+            n += 1;
+            worst = worst.max((i32::from(*x) - i32::from(*y)).abs());
+        }
+    }
+    // STRICT, AND PROMOTED ONLY AFTER BEING MEASURED — the order this project
+    // insists on, and the one the D5 plan wrote down in advance. The first
+    // implementation REPORTED this number; 5/5 release runs came back
+    // 0-of-929616, so it is now an assertion. Written as an exact integer
+    // count rather than a tolerance for the reason X3 gives about its own ULP
+    // claim: a failure that can be answered by moving a threshold will be.
+    //
+    // WHAT A FUTURE FAILURE WOULD MEAN is worth stating, because it is not
+    // "our wiring broke". Both arms run one shared `configure` over one shared
+    // descriptor class, so a difference cannot come from our configuration —
+    // it would be Apple's two encode paths diverging, which is a finding about
+    // MetalFX and should be recorded as one before anything here is relaxed.
+    if n != 0 {
+        // THE DEVICE RIDES THE MESSAGE, and it is the most important word in
+        // it. This claim was measured on ONE chip; every Apple silicon Mac
+        // from the M1 up runs this gate, and MetalFX's two encode paths
+        // agreeing here is a fact about an implementation that Apple is free
+        // to vary across generations. A reader hitting this on a different Mac
+        // needs to know that before deciding whether they broke something.
+        return Err(format!(
+            "the two submission APIs produced different pixels on {}: {n} of {} channels \
+             differ (worst {worst} ULP). One scaler description, one `configure`, one set of \
+             inputs — so this is MetalFX's two encode paths disagreeing, not our wiring. If \
+             this is not the Apple M1 the claim was measured on, RECORD THE NUMBER AND THE \
+             CHIP in docs/history/metal-backend.md before relaxing anything: a per-generation \
+             difference is a finding, and widening this into a tolerance would discard it",
+            m.line(),
+            three_bits.len()
+        ));
+    }
+    println!(
+        "check-metalfx: X8 cross-API compare OK — {} channels, IDENTICAL between \
+         MTLCommandQueue and MTL4CommandQueue over one scaler description and one set of \
+         inputs, on {}",
+        three_bits.len(),
+        m.line()
+    );
+
+    // THE RESIDENCY SET GOES BACK, AND ONLY HERE. Every `dispatch4` above
+    // blocked on commit feedback, so reaching this line is proof the GPU is
+    // done reading through these addresses — the condition
+    // `Mtl4::drop_residency` requires. Every `?` above skips it, which is
+    // `mtl4::pass`'s rule and its reasoning: MTL4 binds by raw address, so
+    // revoking backing that may still be live is a use-after-free arriving
+    // through the cleanup path, and an over-long residency in a process that
+    // is already failing the gate costs nothing.
+    four.drop_residency(g);
     Ok(())
 }
 

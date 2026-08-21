@@ -160,12 +160,40 @@ impl Mtl {
     /// Unlike `mfxdn` this needs no `AnyClass::get` dance — every MTL4 type
     /// here is a PROTOCOL reached through a method that returns nil, never an
     /// `extern_class!` whose absence would panic.
+    ///
+    /// **D5 ADDED THE ONE EXCEPTION, AND ITS PLACEMENT IS THE WHOLE ARGUMENT.**
+    /// `MTL4CompilerDescriptor` IS an `extern_class!`, so touching it on a Mac
+    /// that predates Metal 4 is the panic the sentence above rules out. It is
+    /// constructed BELOW the `else { return Ok(None) }` — after a live
+    /// `MTL4CommandQueue` has proven the framework's Metal 4 half is present —
+    /// which is why the exception costs no probe of its own. Moving that
+    /// construction one line up, or into a caller that has not checked the
+    /// queue, turns a loud SKIP into an abort on every pre-macOS-26 machine,
+    /// and no gate on THIS box would notice.
     pub fn mtl4(&self) -> Result<Option<Mtl4>, String> {
         let Some(queue) = self.device.newMTL4CommandQueue() else { return Ok(None) };
         let allocator = self
             .device
             .newCommandAllocator()
             .ok_or("the device gave an MTL4 command queue and then refused a command allocator")?;
+        // THE COMPILER HAS NO CALLER IN THIS FILE, and is built here anyway.
+        // MTL4 kernels do not need it — `mtl4.rs` shares the Metal 3 pipeline
+        // object and says so at length — but `MetalFX`'s MTL4 factory
+        // (`newTemporalScalerWithDevice:compiler:`) takes one, and it is the
+        // only route to a scaler that can encode into an MTL4 command buffer.
+        // It lives on `Mtl4` rather than on `Mfx` because its LIFETIME is the
+        // Metal 4 handle's: one per device, shared by every future MTL4FX
+        // consumer, and impossible to build before the queue check above.
+        //
+        // A device that hands over a Metal 4 queue and then refuses a compiler
+        // is broken in the same way the allocator branch describes, so this is
+        // an `Err` and not a second SKIP.
+        let compiler = self
+            .device
+            .newCompilerWithDescriptor_error(&objc2_metal::MTL4CompilerDescriptor::new())
+            .map_err(|e| {
+                format!("the device gave an MTL4 command queue and then refused a compiler: {e}")
+            })?;
         // NO SHARED EVENT, and its absence is D4b's product rather than an
         // omission. MTL4 has no `waitUntilCompleted`, so D4 had the queue signal
         // an `MTLSharedEvent` and blocked on it; D4b replaced that with the
@@ -174,6 +202,7 @@ impl Mtl {
         Ok(Some(Mtl4 {
             queue,
             allocator,
+            compiler,
             commits: std::cell::Cell::new(0),
             handled: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stamps: std::cell::Cell::new((0.0, 0.0)),
@@ -643,6 +672,10 @@ impl Mtl {
 pub struct Mtl4 {
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    /// Built at D5 for MetalFX, which is its only consumer — see `Mtl::mtl4`.
+    /// Our own kernels reach MTL4 through the Metal 3 pipeline object and need
+    /// no compiler at all, which is the D4 measurement that shrank that rung.
+    compiler: Retained<ProtocolObject<dyn objc2_metal::MTL4Compiler>>,
     /// Submissions committed. A `Cell`, because only this thread commits.
     commits: std::cell::Cell<u64>,
     /// Handler INVOCATIONS, and the noun is the whole point of the field.
@@ -971,6 +1004,16 @@ impl Mtl4 {
             gpu_start,
             gpu_end,
         }
+    }
+
+    /// The Metal 4 compiler, for the one framework that needs one.
+    ///
+    /// Handed out as a BORROW rather than cloned, which makes the lifetime
+    /// rule structural: an `MTL4FXTemporalScaler` built against it must not
+    /// outlive this handle, and `Mfx` therefore cannot store one without also
+    /// storing the borrow. See `Mtl::mtl4` for why it lives here.
+    pub fn compiler(&self) -> &ProtocolObject<dyn objc2_metal::MTL4Compiler> {
+        &self.compiler
     }
 
     /// A residency set holding `allocations`, committed, requested and attached

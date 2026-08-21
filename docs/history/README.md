@@ -62,7 +62,7 @@ prefix to the suite that owns it and the file where its story lives:
 | `N0`–`N11` | NRD gates (`--check-nrd`, `--check-gpu`) | denoisers.md |
 | `F0`–`F10` | FRD gates (`--check-gpu`) | denoisers.md |
 | `U0`–`U4` | `--check-fsr3` | metal-backend.md |
-| `X0`–`X6` | `--check-metalfx` | metal-backend.md |
+| `X0`–`X8` | `--check-metalfx` (X7–X8 are D5's Metal 4 arm and are M1-only — the CI runner has no Metal 4, so they SKIP there) | metal-backend.md |
 | `K0`–`K11` | `--check-mtl` (K5 is the VERDICT and stays last-numbered-first — K6–K8, K9–K10 and K11 all came later, and renumbering it would strand this table's own references) | metal-backend.md |
 | `G1`–`G14` | `clouds::self_test` | sky-lighting-clouds.md |
 | `W0`–`W7` | `--check-wgsl` (the browser corpus; W5–W7 not yet built) | web-backend.md |
