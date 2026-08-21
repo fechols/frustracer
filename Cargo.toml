@@ -336,8 +336,13 @@ slint = { version = "1", default-features = false, features = [
 # and dated rather than rewritten to the present tense: the lesson above is
 # about a stay-out list going stale without anyone lying, and a reader who
 # arrives with that expectation needs to see BOTH the intention and the two
-# separate days it stopped holding. `MTL4Compiler` remains the one MTL4 feature
-# in the graph with no caller of ours — see the D4 block in the feature list.
+# separate days it stopped holding.
+#
+# AND THE LAST SENTENCE OF THAT PARAGRAPH — "`MTL4Compiler` remains the one MTL4
+# feature in the graph with no caller of ours" — expired at D5, which is the
+# fourth date on a note whose subject is going stale. `mtl::mfx` calls
+# `newTemporalScalerWithDevice:compiler:`, so the compiler has a caller and is
+# named in the list below rather than inherited from `objc2-metal-fx`.
 #
 # NOTE the `cfg(unix)` block above already applies on macOS (ash + libloading
 # are pulled in and compile there); this is additive and touches neither.
@@ -407,12 +412,22 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     # turns "no MTL4 API is called anywhere in our own code" from true to false;
     # the note above the dependency table is corrected rather than deleted.
     #
-    # MTL4Compiler is NOT here, and its absence is a measurement rather than an
-    # omission: `MTL4ComputeCommandEncoder::setComputePipelineState:` takes a
-    # plain `MTLComputePipelineState` — the object `bind::Kernel` already builds
-    # through the Metal 3 route — so the new path SHARES the pipeline with the
-    # old one and the byte-compare between them has one fewer variable. (It is
-    # in the graph anyway, pulled in by `objc2-metal-fx`; see the note below.)
+    # MTL4Compiler was NOT here at D4, and its absence was a measurement rather
+    # than an omission: `MTL4ComputeCommandEncoder::setComputePipelineState:`
+    # takes a plain `MTLComputePipelineState` — the object `bind::Kernel`
+    # already builds through the Metal 3 route — so the smoke path SHARES the
+    # pipeline with the old one and the byte-compare between them has one fewer
+    # variable. That is still true of `mtl4.rs` and is why it says so.
+    #
+    # D5 GAVE IT A CALLER ANYWAY, from the other direction:
+    # `newTemporalScalerWithDevice:compiler:` is the only way to build a scaler
+    # that encodes into an MTL4 command buffer, so MetalFX needs the compiler
+    # object even though our own kernels do not. It is NAMED here as of D5 —
+    # it was already in the graph, additively enabled by `objc2-metal-fx`, and
+    # relying on that is precisely the invisible widening the note above the
+    # dependency table exists to record. A feature we call into is a feature we
+    # ask for.
+    "MTL4Compiler",
     "MTL4CommandQueue",
     "MTL4CommandBuffer",
     "MTL4CommandAllocator",
@@ -510,11 +525,30 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 # and why "the list is deliberately SHORT" is no longer the whole truth.
 #
 # `std` is NOT implied by the effect feature (the crate has `std = ["alloc"]`),
-# so it must be named explicitly under `default-features = false`. MTL4* — the
-# Metal 4 command-buffer variants — are deliberately absent.
+# so it must be named explicitly under `default-features = false`.
+#
+# "MTL4* — the Metal 4 command-buffer variants — are deliberately absent" WAS
+# TRUE UNTIL D5, and is corrected rather than deleted for the reason the note
+# above the dependency table spends a screen on. `MTL4FXTemporalScaler` is now
+# named, because `mtl::mfx` runs the SAME scaler through both submission APIs.
+# The other three MTL4FX variants stay absent, and that is still an intention:
+# D5 is scoped to the plain temporal scaler, so mfxdn and mfxfi keep their
+# Metal 3 route until a rung measures them.
+#
+# TWO SEAMS MAKE A MISTAKE HERE FAIL AS A MISSING SYMBOL RATHER THAN AN ERROR,
+# so they are written down. (a) The MTL4FX protocol is cfg-gated on the METAL 3
+# feature name — `MTL4FXTemporalScaler.rs` opens `#[cfg(feature =
+# "MTLFXTemporalScaler")]` — and `mod.rs` re-exports the type only under
+# `all(MTL4FXTemporalScaler, MTLFXTemporalScaler)`. Enabling one without the
+# other compiles the file and hides the name. (b) The feature pulls
+# `objc2-metal/MTL4CommandBuffer`, which D4 already enables, so it adds no new
+# objc2-metal surface — which is exactly why its absence was invisible.
 objc2-metal-fx = { version = "0.3", default-features = false, features = [
     "std",
     "MTLFXTemporalScaler",
+    # D5 — the Metal 4 submission variant of the temporal scaler, and the ONE
+    # MTL4FX type this tree names. See the two seams above.
+    "MTL4FXTemporalScaler",
     "MTLFXTemporalDenoisedScaler",
     "MTLFXFrameInterpolator",
 ] }

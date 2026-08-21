@@ -69,18 +69,197 @@
 //!   one bound that catches colour-space mistakes. The FSR3 arm sets
 //!   `FLAG_AUTO_EXPOSURE` and inherits exactly that ambiguity; this one does
 //!   not, and the asymmetry is deliberate.
+//!
+//! # D5 — the same scaler through the Metal 4 submission path
+//!
+//! **THE FORK IS TWO LINES, AND THAT IS A MEASUREMENT OFF THE BINDINGS.**
+//! `MTLFXTemporalScalerBase` carries all 40 members this module touches — every
+//! texture setter, the jitter, the MV scale, `reset`, `depthReversed`, the
+//! `*TextureUsage` getters — and `MTLFXTemporalScaler` and
+//! `MTL4FXTemporalScaler` each add exactly `encodeToCommandBuffer:` and nothing
+//! else. There is no `MTL4FXTemporalScalerDescriptor` either: one descriptor
+//! class, and the factory selector decides which world you get. So `describe`
+//! and `configure` are shared VERBATIM, and the arms differ only in
+//! `newTemporalScalerWithDevice:` vs `…:compiler:` and which command-buffer
+//! type the encode takes. `--check-metalfx` X8's byte-compare is what that
+//! buys: 929616 channels IDENTICAL across the two APIs, because there is no
+//! second copy of our configuration for a difference to hide in.
+//!
+//! **RESIDENCY IS REQUIRED, LOUDLY, AND THAT REVERSED THE PREDICTION.** MTL4
+//! has no `useResource:`, so the five textures go into an `MTLResidencySet`.
+//! The rung was planned expecting a residency mistake to present as WRONG
+//! PIXELS — raw-address binding makes bound-but-not-resident a use-after-free,
+//! and `--check-mtl`'s `FR_MTL4_NO_RESIDENCY` is a MEASUREMENT precisely
+//! because unified memory hides it there. Here it is a TOOTH: armed,
+//! `FR_MFX4_NO_RESIDENCY` makes MetalFX write NOTHING, the output keeps its
+//! pre-dispatch clear, and X8 fails on the data with no validation layer
+//! involved. MetalFX evidently checks residency in a way our hand-built
+//! argument table cannot, which is a fact about MetalFX and should not be
+//! generalised to the next MTL4 consumer.
+//!
+//! **METAL API VALIDATION ABORTS ON APPLE'S SIDE OF IT, so `--check-metalfx`
+//! X7-X8 SKIP under `MTL_DEBUG_LAYER=1`.** MetalFX's own Metal 4 effect fails
+//! an internal assertion — `Metal4FXTemporalScalingEffectV4.mm:561:
+//! _outputTextureBarrierStages not set` — and the macOS 26 SDK exposes no
+//! property that could satisfy it (40 properties across the base protocol and
+//! the descriptor; not one names a barrier or a stage). `MTL_SHADER_VALIDATION
+//! =1` is unaffected and runs the whole arm, so this path keeps the layer that
+//! checks code we author; what it loses is the one that would catch a
+//! texture-usage or storage-mode mistake of ours. That is a real hole and is
+//! said rather than hidden. Same shape as X6's threadgroup-limit skip.
+//!
+//! **SCOPED TO THIS MODULE ON PURPOSE.** `mfxdn` and `mfxfi` keep their Metal 3
+//! route until a rung measures them — this backend's stated rule that two
+//! unproven things in one rung is not how it got built. `Cargo.toml` names
+//! exactly one MTL4FX feature for the same reason.
+//!
+//! **AND IT RUNS ON EVERY APPLE SILICON MAC, OR SKIPS SAYING WHY.**
+//! `supportsMetal4FX:` and `Mtl::mtl4()` are separate runtime probes with
+//! separate SKIP messages, so a Mac without Metal 4 — including every CI
+//! runner today — takes a loud skip rather than a failure. The bit-identity
+//! claim above was measured on an M1 only, so X8 prints `Mtl::line()` on both
+//! the pass and the failure: a green run on an M3 or M4 extends the claim, and
+//! a red one is a per-generation finding rather than a bound to widen.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLPixelFormat, MTLStorageMode, MTLTexture, MTLTextureUsage,
+    MTLAllocation, MTLCommandBuffer, MTLPixelFormat, MTLResidencySet, MTLStorageMode, MTLTexture,
+    MTLTextureUsage,
 };
 use objc2_metal_fx::{
-    MTLFXTemporalScaler, MTLFXTemporalScalerBase, MTLFXTemporalScalerDescriptor,
+    MTL4FXTemporalScaler, MTLFXTemporalScaler, MTLFXTemporalScalerBase,
+    MTLFXTemporalScalerDescriptor,
 };
 use std::sync::atomic::AtomicU32;
 
-use super::device::Mtl;
+use super::device::{Mtl, Mtl4};
+
+/// Which submission API a scaler was built for.
+///
+/// **NOT A QUALITY SETTING AND NOT A PREFERENCE** — it is which of two
+/// factories made the object, and therefore which `encodeToCommandBuffer:`
+/// overload it answers to. Everything between those two points is shared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Api {
+    /// `newTemporalScalerWithDevice:` — `MTLCommandBuffer`, `Mtl::run`.
+    Three,
+    /// `newTemporalScalerWithDevice:compiler:` — `MTL4CommandBuffer`,
+    /// `Mtl4::submit`, and an explicit residency set.
+    Four,
+}
+
+/// The scaler itself, which is the ONLY thing D5 forks.
+///
+/// **THE TWO PROTOCOLS SHARE EVERY MEMBER BUT ONE.** Reading the bindings
+/// rather than assuming: `MTLFXTemporalScalerBase` carries all 40 of them —
+/// every texture setter, `jitterOffsetX/Y`, `motionVectorScaleX/Y`, `reset`,
+/// `depthReversed`, `inputContentWidth/Height`, the four `*TextureUsage`
+/// getters, and `setFence` — while `MTLFXTemporalScaler` and
+/// `MTL4FXTemporalScaler` each add exactly `encodeToCommandBuffer:` and
+/// nothing else. So `configure` below is written ONCE against the base
+/// protocol and is not a shared-looking copy that could drift; the fork is two
+/// factories and two encode calls, and `base()` is what keeps it that small.
+enum Scaler {
+    Three(Retained<ProtocolObject<dyn MTLFXTemporalScaler>>),
+    Four(Retained<ProtocolObject<dyn MTL4FXTemporalScaler>>),
+}
+
+impl Scaler {
+    /// The half of the object both APIs agree about.
+    ///
+    /// An upcast, not a conversion — `ProtocolObject::from_ref` on a
+    /// supertrait, the same move `as_interpolatable` has always made.
+    fn base(&self) -> &ProtocolObject<dyn MTLFXTemporalScalerBase> {
+        match self {
+            Scaler::Three(s) => ProtocolObject::from_ref(&**s),
+            Scaler::Four(s) => ProtocolObject::from_ref(&**s),
+        }
+    }
+}
+
+/// Levers over the Metal 4 MetalFX arm — default off, loud when armed, and
+/// bit-identical to the shipping path when unarmed.
+///
+/// **CLASSIFICATION IS DEFERRED TO MEASUREMENT, per the D2 lesson**: D4
+/// predicted both of its splits the wrong way round, so nothing here is
+/// written down as a TOOTH until `--check-metalfx` has been watched failing
+/// with it armed. See the D5 entry in `docs/history/metal-backend.md` for the
+/// signatures as measured.
+#[derive(Clone, Copy, Default)]
+pub struct Plant {
+    /// Report the Metal 4 MetalFX path as absent on a box that has it, forcing
+    /// the SKIP branch. The `FR_MTL4_OFF` idiom, and worth the same as that
+    /// one: the skip is the only branch CI can ever take, so it is the only
+    /// branch CI can regress, and nothing else exercises it.
+    pub off: bool,
+    /// Build the scaler but attach NO residency set.
+    ///
+    /// The direct test of the claim that drove this rung's design: MTL4 has no
+    /// `useResource:` on any encoder, so a texture MetalFX reads must be made
+    /// resident some other way or not at all. Whether MetalFX manages its own
+    /// arguments — it builds internal resources we never see — is undocumented
+    /// either way, which is why this is a lever and not an assumption.
+    ///
+    /// **A TOOTH, AND MEASURED TO BE ONE, WHICH INVERTS THE D4 RESULT.** Armed,
+    /// the MTL4 dispatch writes NOTHING: the output keeps its pre-dispatch
+    /// clear, X8's energy ratio reads 0.000x, and the gate fails — plain, with
+    /// no validation layer, on the DATA. Its `--check-mtl` namesake
+    /// `FR_MTL4_NO_RESIDENCY` behaves the opposite way and is classified a
+    /// MEASUREMENT for it: on the smoke chain a missing set is unobservable
+    /// except under `MTL_SHADER_VALIDATION=1`, because unified memory leaves
+    /// the pages readable anyway.
+    ///
+    /// The difference is the answer to this rung's stated primary risk, and it
+    /// is the reverse of the prediction: residency was expected to fail
+    /// SILENTLY, as wrong pixels. MetalFX declines instead. That is a fact
+    /// about MetalFX's own binding — it evidently checks, where our hand-built
+    /// argument table cannot — and not about MTL4, so it should not be
+    /// generalised to the next MTL4 consumer.
+    pub no_residency: bool,
+    /// Configure everything, then never call `encodeToCommandBuffer:`.
+    ///
+    /// The anti-vacuity floor for the whole MTL4 arm. The output is cleared
+    /// before every dispatch, so an arm that encodes nothing leaves zeros and
+    /// the gate's energy assertion must fail. If it does NOT fail, then
+    /// something other than this encode is writing the output and the stage is
+    /// scoring the wrong thing.
+    pub no_encode: bool,
+}
+
+impl Plant {
+    pub fn from_env() -> Plant {
+        let on = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
+        Plant {
+            off: on("FR_MFX4_OFF"),
+            no_residency: on("FR_MFX4_NO_RESIDENCY"),
+            no_encode: on("FR_MFX4_NO_ENCODE"),
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.off || self.no_residency || self.no_encode
+    }
+
+    /// The levers that MUST make the gate fail, which the verdict enforces.
+    ///
+    /// `off` is excluded for the reason `mtl4::Plant` gives for its own: its
+    /// whole point is that the gate stays GREEN down the skip branch. The
+    /// other two are TEETH and both were measured biting before being named
+    /// here — `no_residency` against the prediction, see its field doc.
+    pub fn must_fail(&self) -> bool {
+        self.no_encode || self.no_residency
+    }
+
+    pub fn line(&self) -> String {
+        let names = [
+            (self.off, "FR_MFX4_OFF"),
+            (self.no_residency, "FR_MFX4_NO_RESIDENCY"),
+            (self.no_encode, "FR_MFX4_NO_ENCODE"),
+        ];
+        names.iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect::<Vec<_>>().join(" ")
+    }
+}
 
 /// Sign applied to the renderer's sample offset before it reaches
 /// `setJitterOffsetX/Y`.
@@ -113,7 +292,15 @@ pub struct MfxParams {
 }
 
 pub struct Mfx {
-    scaler: Retained<ProtocolObject<dyn MTLFXTemporalScaler>>,
+    scaler: Scaler,
+    /// The five textures made resident, on the MTL4 arm only.
+    ///
+    /// `None` on the Metal 3 arm, and structurally rather than by policy:
+    /// Metal 3 hazard-tracks and infers residency from what was bound, so
+    /// there is nothing for a set to do. `None` on the MTL4 arm too when
+    /// `FR_MFX4_NO_RESIDENCY` is armed, which is the lever that measures
+    /// whether the set was load-bearing.
+    residency: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     trio: super::planes::Trio,
     /// PRIVATE storage, unlike everything else in this harness: Apple documents
     /// "You are responsible for providing a texture with a private
@@ -149,6 +336,123 @@ impl Mfx {
             return Err(format!("zero extent: {rw}x{rh} -> {uw}x{uh}"));
         }
 
+        let desc = Mfx::describe(render, upscale);
+        let (trio, output, exposure) = Mfx::planes(mtl, render, upscale)?;
+
+        let scaler = unsafe { desc.newTemporalScalerWithDevice(mtl.device()) }
+            .ok_or_else(|| Mfx::nil_scaler("newTemporalScalerWithDevice", render, upscale))?;
+
+        Ok(Mfx {
+            scaler: Scaler::Three(scaler),
+            residency: None,
+            trio,
+            output,
+            exposure,
+            render,
+            upscale,
+        })
+    }
+
+    /// The same scaler, built to encode into a **Metal 4** command buffer.
+    ///
+    /// **THE FORK IS THIS FUNCTION AND THE ENCODE CALL, AND NOTHING ELSE** —
+    /// which is a measurement off the bindings rather than a hope. The
+    /// descriptor is the SAME CLASS with the same properties (there is no
+    /// `MTL4FXTemporalScalerDescriptor`), so `describe` is shared verbatim and
+    /// the two arms cannot disagree about a format, an extent, auto-exposure
+    /// or synchronous initialization. What differs is the factory selector,
+    /// which takes an `MTL4Compiler`, and what it hands back: a protocol whose
+    /// only added member is an `encodeToCommandBuffer:` over the other buffer
+    /// type. See `Scaler`.
+    ///
+    /// # Residency, which is the part the bindings do NOT settle
+    ///
+    /// MTL4 removed `useResource:` from every encoder, so nothing infers
+    /// residency from what was bound — `mtl4.rs` is built entirely around that.
+    /// The five textures here are OURS, so they get a residency set. But
+    /// MetalFX also allocates internal resources we never see and cannot name,
+    /// and no binding says who makes those resident. So the set covers what we
+    /// can cover, `FR_MFX4_NO_RESIDENCY` measures whether it was load-bearing,
+    /// and neither this comment nor the gate claims more than that.
+    pub fn new_mtl4(
+        mtl: &Mtl,
+        g: &Mtl4,
+        render: (usize, usize),
+        upscale: (usize, usize),
+        plant: Plant,
+    ) -> Result<Mfx, String> {
+        let (rw, rh) = render;
+        let (uw, uh) = upscale;
+        if rw == 0 || rh == 0 || uw == 0 || uh == 0 {
+            return Err(format!("zero extent: {rw}x{rh} -> {uw}x{uh}"));
+        }
+
+        let desc = Mfx::describe(render, upscale);
+        let (trio, output, exposure) = Mfx::planes(mtl, render, upscale)?;
+
+        // THE ONE LINE THAT IS NOT THE METAL 3 ARM'S. `MTL4Compiler` lives on
+        // the `Mtl4` handle because that is the only place it can be built —
+        // see `Mtl::mtl4`, which explains why touching its descriptor earlier
+        // would panic on a Mac without Metal 4.
+        let scaler = unsafe {
+            desc.newTemporalScalerWithDevice_compiler(mtl.device(), g.compiler())
+        }
+        .ok_or_else(|| Mfx::nil_scaler("newTemporalScalerWithDevice:compiler:", render, upscale))?;
+
+        // ALL FIVE, and the exposure texture is not an afterthought: the
+        // scaler reads it every dispatch (auto-exposure is off, so the 1x1
+        // holding 1.0 is a real input, not a placeholder). Listing four and
+        // calling it done is the shape of bug this whole rung is about.
+        let allocs: Vec<&ProtocolObject<dyn MTLAllocation>> = vec![
+            ProtocolObject::from_ref(&*trio.color),
+            ProtocolObject::from_ref(&*trio.depth),
+            ProtocolObject::from_ref(&*trio.motion),
+            ProtocolObject::from_ref(&*output),
+            ProtocolObject::from_ref(&*exposure),
+        ];
+        let residency = if plant.no_residency {
+            None
+        } else {
+            let (set, n) = g.residency(mtl, &allocs)?;
+            // EXACT, not a floor, and for the reason `mtl4::pass` learned the
+            // hard way: `MTLResidencySet` DEDUPLICATES, so a count compared
+            // against the number of calls fails on correct code. These five
+            // are distinct textures, so the two numbers agree — and asserting
+            // it here is what keeps a set that silently came back empty from
+            // reading like one that covered everything.
+            if n != allocs.len() {
+                return Err(format!(
+                    "the residency set took {n} of {} allocations — the MTL4 arm binds by raw \
+                     address, so a texture that is bound but not resident is a use-after-free \
+                     that presents as wrong pixels rather than as an error",
+                    allocs.len()
+                ));
+            }
+            Some(set)
+        };
+
+        Ok(Mfx {
+            scaler: Scaler::Four(scaler),
+            residency,
+            trio,
+            output,
+            exposure,
+            render,
+            upscale,
+        })
+    }
+
+    /// The descriptor, shared VERBATIM by both arms.
+    ///
+    /// There is no `MTL4FXTemporalScalerDescriptor` — Apple uses one
+    /// descriptor class and decides the world at the factory — so this is not
+    /// a deduplication but a structural guarantee that the two arms describe
+    /// the same scaler. Every property here is load-bearing and documented
+    /// where it is set.
+    fn describe(
+        render: (usize, usize),
+        upscale: (usize, usize),
+    ) -> Retained<MTLFXTemporalScalerDescriptor> {
         let desc = unsafe { MTLFXTemporalScalerDescriptor::new() };
         unsafe {
             // The formats come from `planes`, the same consts the allocation
@@ -157,43 +461,66 @@ impl Mfx {
             desc.setDepthTextureFormat(super::planes::DEPTH);
             desc.setMotionTextureFormat(super::planes::MOTION);
             desc.setOutputTextureFormat(super::planes::OUTPUT);
-            desc.setInputWidth(rw);
-            desc.setInputHeight(rh);
-            desc.setOutputWidth(uw);
-            desc.setOutputHeight(uh);
+            desc.setInputWidth(render.0);
+            desc.setInputHeight(render.1);
+            desc.setOutputWidth(upscale.0);
+            desc.setOutputHeight(upscale.1);
             // Both of these are determinism preconditions — see the header.
             desc.setAutoExposureEnabled(false);
             desc.setRequiresSynchronousInitialization(true);
         }
+        desc
+    }
 
-        // The planes FIRST, so a scaler that creates successfully is never
-        // stranded by a later allocation failure. (`Mfx` has no `Drop` beyond
-        // the automatic `Retained` releases, so this is ordering hygiene rather
-        // than a leak fix — unlike `Fsr3::new`, whose FFX handle really would
-        // leak.)
+    /// The five textures, allocated BEFORE the scaler so that a scaler which
+    /// creates successfully is never stranded by a later allocation failure.
+    ///
+    /// (`Mfx` has no `Drop` beyond the automatic `Retained` releases, so this
+    /// is ordering hygiene rather than a leak fix — unlike `Fsr3::new`, whose
+    /// FFX handle really would leak. It matters more on the MTL4 arm, where a
+    /// half-built `Mfx` would also strand a residency set attached to a queue.)
+    #[allow(clippy::type_complexity)]
+    fn planes(
+        mtl: &Mtl,
+        render: (usize, usize),
+        upscale: (usize, usize),
+    ) -> Result<
+        (
+            super::planes::Trio,
+            Retained<ProtocolObject<dyn MTLTexture>>,
+            Retained<ProtocolObject<dyn MTLTexture>>,
+        ),
+        String,
+    > {
         let trio = super::planes::Trio::new(mtl, render)?;
         let output = mtl
-            .texture(uw, uh, super::planes::OUTPUT, MTLStorageMode::Private)
+            .texture(upscale.0, upscale.1, super::planes::OUTPUT, MTLStorageMode::Private)
             .map_err(|e| format!("output plane: {e}"))?;
         let exposure = mtl
             .texture(1, 1, MTLPixelFormat::R16Float, MTLStorageMode::Shared)
             .map_err(|e| format!("exposure texture: {e}"))?;
         // f16 1.0 is 0x3C00; little-endian on every target this builds for.
         mtl.upload(&exposure, 1, 1, 2, &[0x00, 0x3C]);
+        Ok((trio, output, exposure))
+    }
 
-        let scaler = unsafe { desc.newTemporalScalerWithDevice(mtl.device()) }.ok_or_else(|| {
-            format!(
-                "newTemporalScalerWithDevice returned nil for {rw}x{rh} -> {uw}x{uh} \
-                 ({:?}/{:?}/{:?} -> {:?}) — if `supported()` passed, then the DESCRIPTOR is \
-                 what it rejected (a format or a scale ratio), not the device",
-                super::planes::COLOR,
-                super::planes::DEPTH,
-                super::planes::MOTION,
-                super::planes::OUTPUT,
-            )
-        })?;
-
-        Ok(Mfx { scaler, trio, output, exposure, render, upscale })
+    /// One message for both factories returning nil, which is the same
+    /// diagnosis either way: `supported()` already cleared the DEVICE, so what
+    /// was rejected is the descriptor.
+    fn nil_scaler(what: &str, render: (usize, usize), upscale: (usize, usize)) -> String {
+        format!(
+            "{what} returned nil for {}x{} -> {}x{} ({:?}/{:?}/{:?} -> {:?}) — if `supported()` \
+             passed, then the DESCRIPTOR is what it rejected (a format or a scale ratio), not \
+             the device",
+            render.0,
+            render.1,
+            upscale.0,
+            upscale.1,
+            super::planes::COLOR,
+            super::planes::DEPTH,
+            super::planes::MOTION,
+            super::planes::OUTPUT,
+        )
     }
 
     /// Whether this device has MetalFX temporal scaling at all.
@@ -203,6 +530,53 @@ impl Mfx {
     /// is what it rejected" instead of conflating the two.
     pub fn supported(mtl: &Mtl) -> bool {
         unsafe { MTLFXTemporalScalerDescriptor::supportsDevice(mtl.device()) }
+    }
+
+    /// Whether this device has MetalFX temporal scaling **through Metal 4**.
+    ///
+    /// A SECOND question, not a rephrasing of the first. `supportsDevice:` and
+    /// `supportsMetal4FX:` are separate selectors and Apple documents them
+    /// separately ("temporal scaling compatible with Metal 4"), so a device
+    /// could answer yes to one and no to the other — and this gate must SKIP on
+    /// that rather than fail, exactly as `Mtl::mtl4` returning `None` SKIPs.
+    /// Nothing in this tree called it before D5.
+    ///
+    /// `FR_MFX4_OFF` forces a `false` here, which is the only way to exercise
+    /// the SKIP branch on a box that has Metal 4 — and the branch CI takes
+    /// every run, since `macos-latest` has no Metal 4 at all.
+    pub fn supported_mtl4(mtl: &Mtl, plant: Plant) -> bool {
+        if plant.off {
+            return false;
+        }
+        unsafe { MTLFXTemporalScalerDescriptor::supportsMetal4FX(mtl.device()) }
+    }
+
+    /// Which API this scaler was built against.
+    pub fn api(&self) -> Api {
+        match self.scaler {
+            Scaler::Three(_) => Api::Three,
+            Scaler::Four(_) => Api::Four,
+        }
+    }
+
+    /// How many allocations this arm made resident. `None` on Metal 3, where
+    /// the question does not arise; `Some(0)` is a set that did not take.
+    pub fn resident(&self) -> Option<usize> {
+        self.residency.as_ref().map(|s| s.allocationCount())
+    }
+
+    /// Release the residency set, which only the MTL4 arm has.
+    ///
+    /// **ONLY WHERE THE CALLER CAN PROVE THE GPU IS DONE**, which is the rule
+    /// `Mtl4::drop_residency` states and `mtl4::pass` follows: these textures
+    /// are reachable by raw address, so revoking their backing while work is in
+    /// flight is a use-after-free rather than a tidy-up. Every `dispatch4`
+    /// blocks on commit feedback, so a caller that has returned from one has
+    /// that proof; a caller that has not must leave the set alone.
+    pub fn drop_residency(&self, g: &Mtl4) {
+        if let Some(s) = &self.residency {
+            g.drop_residency(s);
+        }
     }
 
     /// The input-scale range this device supports, as `(min, max)`.
@@ -228,12 +602,13 @@ impl Mfx {
     /// it is about USAGE, and the requirement that actually bites on this API
     /// is the output's STORAGE MODE, which no usage comparison can reach.
     pub fn required_usage(&self) -> Usage {
+        let b = self.scaler.base();
         unsafe {
             Usage {
-                color: self.scaler.colorTextureUsage(),
-                depth: self.scaler.depthTextureUsage(),
-                motion: self.scaler.motionTextureUsage(),
-                output: self.scaler.outputTextureUsage(),
+                color: b.colorTextureUsage(),
+                depth: b.depthTextureUsage(),
+                motion: b.motionTextureUsage(),
+                output: b.outputTextureUsage(),
             }
         }
     }
@@ -265,39 +640,126 @@ impl Mfx {
         // applies would make that assertion silently untestable.
         mtl.clear_private(&self.output, self.upscale.0, self.upscale.1, 8, super::planes::OUTPUT)?;
 
+        // CHECKED BEFORE ANY WORK, and reported rather than ignored. The two
+        // protocols are distinct types, so this cannot be a silent no-op —
+        // encoding nothing would leave the cleared output and read as "the
+        // scaler produced black", the one failure this module's energy
+        // assertion is least able to explain. The mismatch is a caller bug,
+        // and its symptom should name itself. `dispatch4` says the mirror
+        // image for the same reason.
+        let Scaler::Three(scaler) = &self.scaler else {
+            return Err(
+                "Mfx::dispatch was called on a scaler built for Metal 4 — an \
+                 MTL4FXTemporalScaler encodes only into an MTL4CommandBuffer; use \
+                 Mfx::dispatch4"
+                    .to_string(),
+            );
+        };
+
+        self.configure(p);
+
+        mtl.run(|cb: &ProtocolObject<dyn MTLCommandBuffer>| unsafe {
+            scaler.encodeToCommandBuffer(cb);
+        })
+    }
+
+    /// The same upscale, submitted through **Metal 4**.
+    ///
+    /// **EVERY PROPERTY IS WRITTEN BY THE SAME `configure` THE METAL 3 ARM
+    /// USES**, against the shared base protocol, so this function is the
+    /// encode and the submission and nothing else. That is the whole claim of
+    /// the rung: if the two arms produce different pixels, the difference is
+    /// in Apple's two encode paths, because there is no second copy of our
+    /// configuration for it to be in.
+    ///
+    /// It blocks, like its twin, and for a better reason than the twin has:
+    /// `Mtl4::submit` blocks on the commit feedback, which is also the only
+    /// error channel MTL4 has (D4b). So a faulted upscale here reports what
+    /// Metal said, where `Mtl::run` next door reads `cb.error()` and this
+    /// path's D4 ancestor read nothing at all.
+    pub fn dispatch4(&self, mtl: &Mtl, g: &Mtl4, p: &MfxParams, plant: Plant) -> Result<(), String> {
+        let Scaler::Four(scaler) = &self.scaler else {
+            return Err(
+                "Mfx::dispatch4 was called on a scaler built for Metal 3 — it encodes only into \
+                 an MTLCommandBuffer and cannot reach an MTL4CommandBuffer; use Mfx::dispatch"
+                    .to_string(),
+            );
+        };
+
+        // The Metal 3 blit, deliberately. The subject of this arm is the
+        // SCALER's submission path, and clearing through the route the other
+        // arm uses keeps the two dispatches starting from byte-identical
+        // state — a cleared-by-MTL4 output would be one more difference to
+        // rule out when the cross-API compare disagrees.
+        mtl.clear_private(&self.output, self.upscale.0, self.upscale.1, 8, super::planes::OUTPUT)?;
+
+        self.configure(p);
+
+        g.submit(mtl, super::device::SubmitPlant::default(), |cb| {
+            // A BRANCH, NOT A SUPPRESSED CALL. The armed arm encodes nothing
+            // into a command buffer that is still begun, committed and waited
+            // on, so what it measures is exactly "did this encode do the
+            // work?" — with the submission machinery held constant. The
+            // unarmed arm is one unconditional call, which is what keeps the
+            // shipping path free of the lever.
+            if !plant.no_encode {
+                unsafe { scaler.encodeToCommandBuffer(cb) };
+            }
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// Every per-dispatch property, written ONCE against the base protocol.
+    ///
+    /// **THE ONE COPY IS THE POINT.** All 40 of these live on
+    /// `MTLFXTemporalScalerBase`, which both `MTLFXTemporalScaler` and
+    /// `MTL4FXTemporalScaler` inherit, so the two submission arms are
+    /// configured by the same code rather than by two copies that agree today.
+    /// A property added here reaches both arms; a property added to one arm's
+    /// dispatch would be a fork, and there is nowhere to put one.
+    fn configure(&self, p: &MfxParams) {
+        let s = self.scaler.base();
         unsafe {
-            self.scaler.setColorTexture(Some(&self.trio.color));
-            self.scaler.setDepthTexture(Some(&self.trio.depth));
-            self.scaler.setMotionTexture(Some(&self.trio.motion));
-            self.scaler.setOutputTexture(Some(&self.output));
-            self.scaler.setExposureTexture(Some(&self.exposure));
+            s.setColorTexture(Some(&self.trio.color));
+            s.setDepthTexture(Some(&self.trio.depth));
+            s.setMotionTexture(Some(&self.trio.motion));
+            s.setOutputTexture(Some(&self.output));
+            s.setExposureTexture(Some(&self.exposure));
             // Equal to the input extent by construction here — this arm does not
             // enable `inputContentPropertiesEnabled`, so there is no smaller
             // content rect to describe. Set anyway, because Apple's documented
             // per-frame sequence names them and a future dynamic-res arm would
             // change only these two lines.
-            self.scaler.setInputContentWidth(self.render.0);
-            self.scaler.setInputContentHeight(self.render.1);
-            self.scaler.setDepthReversed(true);
-            self.scaler.setJitterOffsetX(p.jitter.0);
-            self.scaler.setJitterOffsetY(p.jitter.1);
+            s.setInputContentWidth(self.render.0);
+            s.setInputContentHeight(self.render.1);
+            s.setDepthReversed(true);
+            s.setJitterOffsetX(p.jitter.0);
+            s.setJitterOffsetY(p.jitter.1);
             // THE MV CONVENTION, derived in this module's header from Apple's
             // own documentation and matching `GBufs::mvec` exactly, so the scale
             // is the bare sign — the same value both FSR3 arms pass.
-            self.scaler.setMotionVectorScaleX(crate::fsr::UPSCALE_MV_SIGN.0);
-            self.scaler.setMotionVectorScaleY(crate::fsr::UPSCALE_MV_SIGN.1);
+            s.setMotionVectorScaleX(crate::fsr::UPSCALE_MV_SIGN.0);
+            s.setMotionVectorScaleY(crate::fsr::UPSCALE_MV_SIGN.1);
             // PERSISTENT STATE, not a per-dispatch argument: `reset` is a
             // property on the scaler, so it must be written EVERY frame in both
             // directions. Leaving it true silently makes every frame a reset
             // (history never accumulates); leaving it false on the first frame
             // has the scaler read its own uninitialized history, which is
             // silent in a different and worse way.
-            self.scaler.setReset(p.reset);
+            s.setReset(p.reset);
+            // `setFence` IS STILL NOT SET, AND THAT NEEDED RE-CHECKING RATHER
+            // THAN INHERITING. It lives on the BASE protocol, so an MTL4FX
+            // object exposes a Metal 3 `MTLFence` setter — and the Metal 3
+            // reason for leaving it alone (default hazard-tracked textures in
+            // one command buffer, the case Apple's fence property explicitly
+            // does not cover) is an argument about a world MTL4 removed. What
+            // replaces it is not a fence: it is that `dispatch4` submits ONE
+            // command buffer and blocks on its completion before anything
+            // reads the output, so there is no second submission for a fence
+            // to order against. If this arm ever pipelines, that sentence
+            // stops being true and this is the line to revisit.
         }
-
-        mtl.run(|cb: &ProtocolObject<dyn MTLCommandBuffer>| unsafe {
-            self.scaler.encodeToCommandBuffer(cb);
-        })
     }
 
     /// This scaler as an `MTLFXFrameInterpolatableScaler`, for
@@ -311,7 +773,7 @@ impl Mfx {
     pub fn as_interpolatable(
         &self,
     ) -> &ProtocolObject<dyn objc2_metal_fx::MTLFXFrameInterpolatableScaler> {
-        ProtocolObject::from_ref(&*self.scaler)
+        ProtocolObject::from_ref(self.scaler.base())
     }
 
     /// The upscaled frame as linear f32 RGBA, row-major at the upscale extent.

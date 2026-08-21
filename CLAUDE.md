@@ -97,7 +97,7 @@ of NVIDIA's NRD entry names.
 | `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe, the indirect smoke, **J6 the browser's reference tracer vs the CPU**, **J7 the wavefront quadtree vs that reference** (J0 is pure; the smoke KERNEL is scene-free but the DEVICE is scene-keyed from J1 on — the ask lands in `required_limits`) |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
-| `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |
+| `--check-metalfx` | macOS | MetalFX temporal upscale/denoise, X0–X8 (X7–X8 run it over **Metal 4**; they SKIP without one) |
 | `--check-fsr3` | macOS | FSR3 over the hand-written Metal backend |
 | `--check-dlss` `--check-xess` `--check-fsr` `--check-nrd` | nothing | DLL-free contract self-tests |
 | `--check-oidn` `--check-nppd` | those DLLs + model | denoiser wiring end to end |
@@ -314,7 +314,9 @@ per-feature A/B: `FR_NGXFG_*` `FR_NGXRR_*` `FR_NRD_*` `FR_FRD_*` `FR_MFX*` `FR_A
 map, the threadgroup size and residency) · `FR_MTL4_*` (the Metal 4 path's five: the argument
 table's bind point, the inter-dispatch barriers and the commit-feedback handler are TEETH,
 residency is a measurement, and `FR_MTL4_OFF` forces the SKIP branch on a box that has
-MTL4) · `FR_FFX_MSL` — **the one
+MTL4) · `FR_MFX4_*` (MetalFX over Metal 4, `--check-metalfx` X7–X8: the encode and — unlike
+its `FR_MTL4_` namesake — **residency** are both TEETH, since MetalFX writes nothing without
+a residency set; `FR_MFX4_OFF` forces the SKIP) · `FR_FFX_MSL` — **the one
 BUILD-time lever**, so it needs `cargo build` and the gate run to see it alike, and a stale
 binary measures the other arm
 `FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` `FR_WEB_TEX`
