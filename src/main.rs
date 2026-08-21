@@ -397,6 +397,7 @@ fn main() {
         check_metalfx,
         check_spirv,
         check_wgsl,
+        write_golden,
         check_wgpu,
         check_msl,
         check_mtl,
@@ -425,6 +426,17 @@ fn main() {
         mut world_flag,
         ..
     } = parsed;
+
+    // Refused HERE, before anything loads: --write-golden is a gate modifier,
+    // and a bare invocation would otherwise sail past every headless dispatch
+    // and open an interactive session (measured — it did).
+    if write_golden && !check_wgsl {
+        eprintln!(
+            "--write-golden only composes with --check-wgsl (it regenerates the W7 corpus \
+             golden, and only a green W0-W6 run may write it)"
+        );
+        std::process::exit(2);
+    }
 
     // Settings side channels the parse loop couldn't carry through &mut Opts.
     // A file-forced FSR level flips the adapter-preference default exactly
@@ -1428,13 +1440,15 @@ fn main() {
     if check_wgsl {
         // Uncfg'd like the gate: W0 (the naga round-trip) runs on any target,
         // wasm included; W1+ skip loudly where no DXC drop can load.
-        let code = run_check_wgsl(&scene);
+        // `structural` is the default-scene predicate (the check-<tag>.png
+        // routing rule) — W7's golden pins the default corpus only.
+        let code = run_check_wgsl(&scene, structural, write_golden);
         std::process::exit(code);
     }
     if check_wgpu {
         #[cfg(any(unix, windows))]
         {
-            let code = run_check_wgpu();
+            let code = run_check_wgpu(&scene, &bvh, cam0);
             std::process::exit(code);
         }
         #[cfg(not(any(unix, windows)))]
@@ -15146,7 +15160,6 @@ fn run_check_spirv(scene: &scene::Scene) -> i32 {
 #[cfg(any(unix, windows))]
 fn web_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, String> {
     use gfx::shaders as sh;
-    use gfx::vocab::Vendor;
 
     // The corpus premise, asserted rather than assumed: without --sw-rays the
     // trace units declare a RaytracingAccelerationStructure, which WebGPU
@@ -15157,15 +15170,14 @@ fn web_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, Strin
                     acceleration structure WebGPU cannot express"
             .into());
     }
-    let web = |src: String| format!("{}\n{}", sh::web_defs(), src);
-    // Trace units additionally take the generated WEB_TEX block (the
-    // bindless texs[] replacement — gfx::texweb): pasted BETWEEN the define
-    // prelude and the unit, so its helpers are declared before trace_common
-    // and shade consume them. Non-trace units never touch textures and stay
-    // on the bare prelude.
+    // Both wrappers and the key set are `gfx::shaders`', SHARED with
+    // `webgpu::tracer` — the text this gate validates and pins in the W7
+    // golden is byte-for-byte the text that tracer compiles and runs. See
+    // `sh::web_keys`.
+    let web = |src: String| sh::web_unit(&src);
     let texweb = gfx::texweb::hlsl(&gfx::texweb::plan(scene));
-    let webt = |src: String| format!("{}\n{}\n{}", sh::web_defs(), texweb, src);
-    let t = sh::trace_sources(&sh::TraceKeys { scene, vendor: Vendor::Nvidia, sway_armed: false });
+    let webt = |src: String| sh::web_trace_unit(&texweb, &src);
+    let t = sh::trace_sources(&sh::web_keys(scene));
     let f = sh::frd_sources();
     Ok(vec![
         ("reference".into(), webt(t.reference), Shape::Compute("cs_6_5")),
@@ -15196,13 +15208,28 @@ fn web_units(scene: &scene::Scene) -> Result<Vec<(String, String, Shape)>, Strin
 /// is present — naga and the reference validator catch different things) |
 /// W3 naga spv-in | W4 validate at the WebGPU-core capability floor + WGSL
 /// out + RE-PARSE the emitted text (the round-trip: the text is what a
-/// browser's compiler eats, and naga's writer and reader are separate code).
+/// browser's compiler eats, and naga's writer and reader are separate code) |
+/// W5 per-entry layout audit vs `wgsl::BUDGET` (the C2 ask-limits contract) |
+/// W6 hostile-construct scan + the planted WEB_TEX-off arm | W7 the tracked
+/// corpus golden (`goldens/web_corpus.txt`), default scene only.
+///
+/// `default_scene` = main's `structural` predicate (the check-`<tag>`.png
+/// routing rule): the golden pins the DEFAULT corpus, and a scene-keyed run
+/// must neither compare against it nor overwrite it. `write_golden` =
+/// `--write-golden`, which refuses unless W0–W6 are green in this same run.
 ///
 /// Wx failures during bring-up are the PRODUCT, not noise: what naga refuses
 /// on this corpus is the work-list for the corpus fixes (the F2/WEB_TEX
 /// stage), exactly as `--check-msl`'s refusals were for the Metal port.
-fn run_check_wgsl(scene: &scene::Scene) -> i32 {
+fn run_check_wgsl(scene: &scene::Scene, default_scene: bool, write_golden: bool) -> i32 {
     let mut ok = true;
+    if write_golden && !default_scene {
+        eprintln!(
+            "check-wgsl: --write-golden REFUSED on a scene-keyed run — the golden pins the \
+             default corpus (drop the scene argument)"
+        );
+        return 2;
+    }
 
     // ---- W0: the pure half. No DXC, no GPU, no file on disk. ----
     match wgsl::self_test() {
@@ -15218,6 +15245,10 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = scene;
+        if write_golden {
+            eprintln!("check-wgsl: --write-golden REFUSED — the golden needs W1+ (a DXC target)");
+            return 2;
+        }
         println!(
             "check-wgsl: SKIP W1 (no dynamic loader for DXC on this target — W0 is the pure \
              half; W1+ run on native CI)"
@@ -15244,6 +15275,10 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
         let dxc = match crate::spirv::Spirv::load(&dir) {
             Ok(d) => d,
             Err(e) => {
+                if write_golden {
+                    eprintln!("check-wgsl: --write-golden REFUSED — the golden needs W1+ ({e})");
+                    return 2;
+                }
                 println!("check-wgsl: SKIP W1 ({e})");
                 return i32::from(!ok);
             }
@@ -15282,7 +15317,10 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
         }
         let tmp = std::env::temp_dir().join(format!("frustracer-wgsl-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
-        let mut modules: Vec<(String, Vec<u32>)> = Vec::new();
+        // (what, target, words) — the target rides along for the W7 golden's
+        // entry lines (the profile model of a vs_6_0 module is meaningless
+        // without saying so).
+        let mut modules: Vec<(String, String, Vec<u32>)> = Vec::new();
         let (mut failed, mut validated) = (0usize, 0usize);
         let mut split_clones = 0usize;
         for (name, src, shape) in &units {
@@ -15356,7 +15394,7 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
                         let _ = std::fs::remove_file(&path);
                     }
                 }
-                modules.push((what, words));
+                modules.push((what, target, words));
             }
         }
         let _ = std::fs::remove_dir(&tmp);
@@ -15391,7 +15429,12 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
             }
         }
         let (mut parsed, mut tripped) = (0usize, 0usize);
-        for (what, words) in &modules {
+        // (what, target, Profile) in module order — W5 audits them, W7's
+        // golden serializes them; module order IS unit order, which is what
+        // lets the golden assembly group entries under their unit below.
+        let mut profiles: Vec<(String, String, wgsl::Profile)> = Vec::new();
+        let (mut scanned, mut scan_dirty) = (0usize, 0usize);
+        for (what, target, words) in &modules {
             let stem = what.replace(['[', ']', ':', '+'], "_");
             if let Some(d) = dump.as_ref() {
                 let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -15424,6 +15467,15 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
                     continue;
                 }
             };
+            // W5's raw material, collected while the module is alive (the
+            // loop drops it; nothing whole-corpus survives but the words).
+            match wgsl::profile(&module) {
+                Ok(p) => profiles.push((what.clone(), target.clone(), p)),
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W5 {what}: {e}");
+                    ok = false;
+                }
+            }
             let text = match wgsl::emit_wgsl(&module, &info) {
                 Ok(t) => t,
                 Err(e) => {
@@ -15434,6 +15486,14 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
             };
             if let Some(d) = dump.as_ref() {
                 let _ = std::fs::write(d.join(format!("{stem}.wgsl")), &text);
+            }
+            // W6's text half, on the text the browser's compiler will eat.
+            scanned += 1;
+            let hits = wgsl::scan_wgsl(&text);
+            if !hits.is_empty() {
+                eprintln!("check-wgsl: FAIL W6 {what}: hostile constructs: {}", hits.join(", "));
+                ok = false;
+                scan_dirty += 1;
             }
             match wgsl::parse_wgsl(&text).and_then(|re| wgsl::validate(&re).map(|_| ())) {
                 Ok(()) => tripped += 1,
@@ -15448,30 +15508,303 @@ fn run_check_wgsl(scene: &scene::Scene) -> i32 {
             modules.len(),
             modules.len()
         );
+
+        // ---- W5: the per-entry layout audit vs the C2 ask-limits budget. ----
+        // `wgsl::BUDGET` is what the browser session will ASK for, not the
+        // WebGPU defaults — the audit proves the corpus fits the ask; whether
+        // browsers grant it is C2's go/no-go. Buckets are scene-keyed and
+        // audited against the scene's own plan, never the fixed budget.
+        let plan_buckets = gfx::texweb::plan(scene).buckets.len() as u32;
+        for (what, _, p) in &profiles {
+            for v in wgsl::audit(what, p) {
+                eprintln!("check-wgsl: FAIL W5 {v}");
+                ok = false;
+            }
+            if p.buckets > plan_buckets {
+                eprintln!(
+                    "check-wgsl: FAIL W5 {what}: {} web_bucket_* bindings vs the scene plan's \
+                     {plan_buckets}",
+                    p.buckets
+                );
+                ok = false;
+            }
+        }
+        // Anti-vacuity, both probes: a corpus where the Frame pin reached
+        // nothing (renamed cbuffer, stripped OpName) or where no module
+        // classified a bucket (on a bucketed scene) is a gate scoring air.
+        if !profiles.is_empty() && profiles.iter().all(|(_, _, p)| p.frame_span.is_none()) {
+            eprintln!(
+                "check-wgsl: FAIL W5 no module reported a Frame span — the cbuffer pin \
+                 reached nothing (renamed? OpName stripped?)"
+            );
+            ok = false;
+        }
+        if plan_buckets > 0 && profiles.iter().all(|(_, _, p)| p.buckets == 0) {
+            eprintln!(
+                "check-wgsl: FAIL W5 the scene plans {plan_buckets} buckets but no module \
+                 classified a web_bucket_* binding — the classifier reached nothing"
+            );
+            ok = false;
+        }
+        let worst = |f: &dyn Fn(&wgsl::Profile) -> u32| {
+            profiles.iter().map(|(_, _, p)| f(p)).max().unwrap_or(0)
+        };
+        let b = &wgsl::BUDGET;
+        let frame = profiles.iter().find_map(|(_, _, p)| p.frame_span);
+        // `tex`: worst fixed / the budget, then the scene's bucket count and
+        // the worst per-entry TOTAL vs WebGPU's untouched 16/stage default —
+        // the honest browser-headroom number (a naive fixed+buckets sum mixes
+        // two different modules' worsts and overstated it, measured).
+        println!(
+            "check-wgsl: W5 layout audit {} modules | worst sb {}/{} st {}/{} tex {}/{} \
+             +{plan_buckets} buckets (worst total {} vs 16 default/stage) samp {}/{} \
+             ub {}/{} | gs max {}/{} B | Frame {} -> stride {}",
+            profiles.len(),
+            worst(&|p| p.storage_bufs),
+            b.storage_bufs,
+            worst(&|p| p.storage_tex),
+            b.storage_tex,
+            worst(&|p| p.sampled - p.buckets),
+            b.sampled_fixed,
+            worst(&|p| p.sampled),
+            worst(&|p| p.samplers),
+            b.samplers,
+            worst(&|p| p.uniform_bufs),
+            b.uniform_bufs,
+            worst(&|p| p.groupshared),
+            b.groupshared,
+            frame.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            b.frame_stride,
+        );
+
+        // ---- W6: the planted WEB_TEX-off arm, every run. ----
+        // A trace unit assembled WITHOUT the texweb block keeps the bindless
+        // texs[] — exactly the leak the scan + capability floor exist to
+        // refuse. Planting it each run proves the refusal machinery still
+        // fires (a scan that never flags anything proves nothing); the
+        // probe-reach reflect step proves the planted module really carries
+        // the unbounded table before any refusal is credited.
+        {
+            use gfx::shaders as sh;
+            use gfx::vocab::Vendor;
+            let t = sh::trace_sources(&sh::TraceKeys {
+                scene,
+                vendor: Vendor::Nvidia,
+                sway_armed: false,
+            });
+            let texoff = format!("{}\n{}", sh::web_defs(), t.leaf);
+            let verdict: Result<String, String> = (|| {
+                let entry = compute_entries(&texoff)
+                    .into_iter()
+                    .next()
+                    .ok_or("no entry point in the planted unit")?;
+                let words = dxc
+                    .compile_args(
+                        &texoff,
+                        &entry,
+                        "cs_6_5",
+                        "webtexoff-leaf",
+                        false,
+                        &["-fspv-target-env=vulkan1.1"],
+                    )
+                    .map_err(|e| format!("compile: {e}"))?;
+                let words = wgsl::normalize(&words);
+                let descs =
+                    crate::reflect::reflect(&words).map_err(|e| format!("reflect: {e}"))?;
+                if !descs.iter().any(|d| {
+                    matches!(d.kind, crate::reflect::DescKind::SampledImage) && d.count == 0
+                }) {
+                    return Err("the planted unit carries no unbounded texs[] — the arm \
+                                proves nothing"
+                        .into());
+                }
+                let module = match wgsl::parse_spv(&words) {
+                    Err(_) => return Ok("W3 parse refused it".into()),
+                    Ok(m) => m,
+                };
+                let info = match wgsl::validate(&module) {
+                    Err(_) => return Ok("W4 validate refused it".into()),
+                    Ok(i) => i,
+                };
+                let text = match wgsl::emit_wgsl(&module, &info) {
+                    Err(_) => return Ok("W4 wgsl-out refused it".into()),
+                    Ok(t) => t,
+                };
+                if !wgsl::scan_wgsl(&text).is_empty() {
+                    return Ok("the text scan flagged it".into());
+                }
+                Err("the planted WEB_TEX-off unit sailed through unflagged — a real bindless \
+                     leak would too"
+                    .into())
+            })();
+            match verdict {
+                Ok(how) => println!(
+                    "check-wgsl: W6 hostile scan {}/{scanned} texts clean | planted \
+                     WEB_TEX-off leaf refused ({how}) — the tooth bit",
+                    scanned - scan_dirty
+                ),
+                Err(e) => {
+                    eprintln!("check-wgsl: FAIL W6 planted arm: {e}");
+                    ok = false;
+                }
+            }
+        }
+
+        // ---- W7: the tracked corpus golden (default scene only). ----
+        // What the golden pins: per unit, the fnv1a64 of its assembled HLSL
+        // (\r-stripped — Windows checkouts are CRLF, CI is LF); per compiled
+        // entry, its whole W5 profile. Hashes moving on a shaders/ edit is
+        // expected churn; COUNTS moving is the signal. spirv.rs's S-side
+        // cross-job pin names this golden as the shape it was waiting for.
+        let golden_path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/goldens/web_corpus.txt"
+        ));
+        if !default_scene {
+            println!(
+                "check-wgsl: SKIP W7 (scene-keyed corpus — the golden pins the default scene)"
+            );
+        } else if profiles.len() != modules.len() {
+            // Earlier stages already reddened the run; a partial-corpus
+            // compare would only bury their message under diff noise.
+            println!("check-wgsl: SKIP W7 (corpus incomplete — earlier stages failed)");
+        } else {
+            use std::fmt::Write as _;
+            let mut g = String::new();
+            let _ = writeln!(g, "web-corpus v1 buckets={plan_buckets}");
+            let mut pi = 0usize;
+            for (name, src, _) in &units {
+                let bytes: Vec<u8> = src.bytes().filter(|&b| b != b'\r').collect();
+                let _ = writeln!(g, "unit {name} hlsl=fnv1a64:{:016x}", wgsl::fnv1a64(&bytes));
+                let prefix = format!("{name}:");
+                while pi < profiles.len() && profiles[pi].0.starts_with(&prefix) {
+                    let (what, target, p) = &profiles[pi];
+                    let _ = writeln!(
+                        g,
+                        "{}",
+                        wgsl::golden_entry_line(&what[prefix.len()..], target, p)
+                    );
+                    pi += 1;
+                }
+            }
+            let _ = writeln!(g, "modules={}", profiles.len());
+            if pi != profiles.len() {
+                eprintln!(
+                    "check-wgsl: FAIL W7 golden assembly desynced ({pi} of {} profiles \
+                     grouped) — unit/entry naming drifted",
+                    profiles.len()
+                );
+                ok = false;
+            } else if write_golden {
+                if !ok {
+                    eprintln!(
+                        "check-wgsl: --write-golden REFUSED — W0-W6 must be green in the \
+                         same run"
+                    );
+                    println!("CHECK-WGSL FAILED");
+                    return 1;
+                }
+                if let Some(dir) = golden_path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                match std::fs::write(&golden_path, g.as_bytes()) {
+                    Ok(()) => println!(
+                        "check-wgsl: W7 corpus golden WRITTEN ({} units, {} modules) -> {}",
+                        units.len(),
+                        profiles.len(),
+                        golden_path.display()
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "check-wgsl: FAIL W7 writing {}: {e}",
+                            golden_path.display()
+                        );
+                        ok = false;
+                    }
+                }
+            } else {
+                match std::fs::read(&golden_path) {
+                    Err(e) => {
+                        // A tracked file's absence is a defect, not an
+                        // environment condition — a SKIP here would be
+                        // permanently-green vacuity.
+                        eprintln!(
+                            "check-wgsl: FAIL W7 {} unreadable ({e}) — regenerate with \
+                             --check-wgsl --write-golden",
+                            golden_path.display()
+                        );
+                        ok = false;
+                    }
+                    Ok(bytes) => {
+                        let disk: Vec<u8> = bytes.into_iter().filter(|&b| b != b'\r').collect();
+                        if disk == g.as_bytes() {
+                            println!(
+                                "check-wgsl: W7 corpus golden matches ({} units, {} modules)",
+                                units.len(),
+                                profiles.len()
+                            );
+                        } else {
+                            let d = String::from_utf8_lossy(&disk).into_owned();
+                            match d.lines().zip(g.lines()).enumerate().find(|(_, (a, b))| a != b)
+                            {
+                                Some((i, (a, c))) => eprintln!(
+                                    "check-wgsl: FAIL W7 golden mismatch at line {}:\n  \
+                                     golden: {a}\n  corpus: {c}\n  (a deliberate corpus \
+                                     change regenerates with --check-wgsl --write-golden)",
+                                    i + 1
+                                ),
+                                None => eprintln!(
+                                    "check-wgsl: FAIL W7 golden mismatch (line counts \
+                                     differ: {} vs {})",
+                                    d.lines().count(),
+                                    g.lines().count()
+                                ),
+                            }
+                            ok = false;
+                        }
+                    }
+                }
+            }
+        }
+
         println!("CHECK-WGSL {}", if ok { "PASSED" } else { "FAILED" });
         i32::from(!ok)
     }
 }
 
-/// `--check-wgpu`: the WebGPU host, stages J0..J3 (`J*` — `U*` is taken by
+/// `--check-wgpu`: the WebGPU host, stages J0..J6 (`J*` — `U*` is taken by
 /// `--check-fsr3`). `--check-wgsl` proves the browser corpus VALIDATES;
 /// this proves a wgpu device EXECUTES what the translator emits, and those
 /// are different claims — the same distinction `--check-vk` draws against
 /// `--check-spirv`.
 ///
 /// J0 pure (adapter-pick semantics + the limits math; no GPU) | J1 a real
-/// adapter + device, printing the granted limits — THE DAY-ONE RISK PROBE:
-/// DXC's register shifts put bindings at 2000+, above WebGPU's default
-/// 1000-per-group ceiling, and whether adapters (and one day browsers)
-/// grant more decides Stage C2's layout strategy | J2 the smoke kernel
-/// through the browser's real chain (DXC -> normalize -> spv_to_wgsl ->
-/// ShaderModule) | J3 the indirect-dispatch smoke, the same two-pass
-/// verdict the D3D12/Vulkan/Metal twins assert — "three backends, one
-/// kernel" becomes four.
+/// adapter + device, printing the ask against the WebGPU DEFAULTS — THE
+/// BROWSER GO/NO-GO TABLE: every over-default row is one a page must request
+/// and a browser may refuse | J2 the smoke kernel through the browser's real
+/// chain (DXC -> normalize -> spv_to_wgsl -> ShaderModule) | J3 the
+/// indirect-dispatch smoke, the same two-pass verdict the D3D12/Vulkan/Metal
+/// twins assert — "three backends, one kernel" becomes four | **J6 the
+/// REFERENCE TRACER against the CPU** — the browser recorder rendering this
+/// scene, scored by `--check-vk` V6's own two verdicts (primary visibility
+/// per pixel, then a radiance A/B over accumulated frames).
 ///
-/// NOT scene-keyed and NO --sw-rays arming: smoke.hlsl pastes nothing.
+/// SCENE-KEYED FROM J1 ON, and the distinction is worth being exact about.
+/// The SMOKE KERNEL is scene-free — smoke.hlsl pastes nothing, so what J2
+/// translates and J3 dispatches does not vary. The DEVICE is not: the ask
+/// must be spent before `request_device`, and the WEB_TEX bucket count, the
+/// largest buffer and the render resolution all land in `required_limits`.
+/// So `--check-wgpu <scene>` runs J2 and J3 on a device opened with THAT
+/// scene's limits — a stricter or looser device, never a different kernel.
+/// That ordering is not an accident of this gate: it is what a browser page
+/// must do too.
+///
+/// `--sw-rays` IS REQUIRED and asserted rather than assumed: WebGPU has no
+/// ray tracing, so the browser corpus traverses our own BVH through
+/// `rt_sw.hlsli`, and the corpus without the lever declares an acceleration
+/// structure WebGPU cannot express.
 #[cfg(any(unix, windows))]
-fn run_check_wgpu() -> i32 {
+fn run_check_wgpu(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
     let mut ok = true;
 
     // ---- J0: the pure half — meaningful on a box with no GPU at all. ----
@@ -15487,7 +15820,16 @@ fn run_check_wgpu() -> i32 {
     // FR_WGPU_ADAPTER (or a refused request on a chosen adapter) is not —
     // reporting "you typoed the lever" as "this box has no GPU" exits 0 on
     // a run that gated nothing.
-    let hg = match webgpu::headless::WgpuHeadless::new() {
+    // The ask is a function of the SCENE AND THE RESOLUTION, and is computed
+    // with no device in hand — the bucket count and the largest buffer must
+    // be known before `request_device`, exactly as a page must know them
+    // before it asks. The resolution is taken at the LARGER arm because which
+    // arm J6 will use depends on the adapter, which does not exist yet
+    // (`wgpu_gate_res`); an ask above what a run spends is free, one below is
+    // a device the tracer cannot allocate on.
+    let (aw, ah) = wgpu_gate_res(false);
+    let ask = webgpu::scene::ask_for(scene, bvh, aw as u32, ah as u32);
+    let hg = match webgpu::headless::WgpuHeadless::new(ask) {
         Ok(h) => h,
         Err(e) if e.absent => {
             println!("check-wgpu: SKIP J1 ({e})");
@@ -15500,6 +15842,11 @@ fn run_check_wgpu() -> i32 {
         }
     };
     println!("check-wgpu: J1 {}", hg.dev.line());
+    println!(
+        "check-wgpu: J1 session ask ({aw}x{ah}) — {} WEB_TEX bucket(s), largest buffer {:.1} MB",
+        ask.buckets,
+        ask.buffer_bytes as f64 / (1024.0 * 1024.0)
+    );
     for r in hg.dev.limits_risks() {
         println!("check-wgpu: J1 limit {r}");
     }
@@ -15546,8 +15893,701 @@ fn run_check_wgpu() -> i32 {
         }
     }
 
+    // ---- J6: the tracer. ----
+    ok &= run_check_wgpu_render(&hg, &sp, scene, bvh, cam0);
+
     println!("CHECK-WGPU {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
+}
+
+/// `FR_WGPU_RES=WxH` — J6/J7's render size, or `None`.
+#[cfg(any(unix, windows))]
+fn wgpu_res_override() -> Option<(usize, usize)> {
+    let v = std::env::var("FR_WGPU_RES").ok()?;
+    let (a, b) = v.split_once(['x', 'X'])?;
+    let (w, h) = (a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// The default frame per adapter class: a software adapter (lavapipe, the CI
+/// arm) running a software intersector is two orders of magnitude off
+/// hardware, so it gets a small one — enough to score every verdict, not
+/// enough to be a number anyone should quote.
+#[cfg(any(unix, windows))]
+fn wgpu_gate_res_default(soft: bool) -> (usize, usize) {
+    if soft { (160, 120) } else { (400, 300) }
+}
+
+/// J6/J7's render size.
+///
+/// HOISTED OUT OF J6 because the DEVICE ASK needs it: the tracer's buffers
+/// are resolution-derived (`webgpu::scene::ask_for`), and the ask is spent
+/// before an adapter exists — while `soft` is only knowable after. So the ask
+/// is taken at the LARGER arm (`soft = false`), which is an upper bound over
+/// both, and the override — an environment variable, readable at any time —
+/// wins over both.
+#[cfg(any(unix, windows))]
+fn wgpu_gate_res(soft: bool) -> (usize, usize) {
+    wgpu_res_override().unwrap_or_else(|| wgpu_gate_res_default(soft))
+}
+
+/// J6 — the reference tracer on WebGPU, against the CPU.
+///
+/// THE VERDICTS ARE `--check-vk` V6's, to the line, and that is deliberate
+/// rather than convenient: the two backends score the same frame with the
+/// same two statistics, so a disagreement between THEM is directly readable
+/// instead of merely suggestive. What the two verdicts are for:
+///
+/// * **Primary visibility, per pixel.** The CPU and the GPU must agree about
+///   what each ray HIT — hit-vs-sky classification and the distance to it.
+///   This is the stream/layout check: a stream bound at the wrong slot, a
+///   skewed material stride or a cbuffer that packs differently shows up
+///   here as geometry in the wrong place, before any radiance noise can hide
+///   it. Anti-vacuity both ways — an all-sky frame scores the intersector
+///   not at all, and a frame with no sky never runs the miss path (the dome,
+///   the disc, the two cloud caches this stage dispatches kernels to fill).
+/// * **Radiance, accumulated.** The ratio of channel SUMS, not a mean of
+///   per-pixel relative errors: the two sides draw INDEPENDENT sample
+///   streams by design, so a per-pixel mean reads ~16% on a correct image
+///   and measures nothing but 1-spp noise. The sum ratio asks the question
+///   that separates a wired-wrong renderer from a noisy one — do the two
+///   converge to the same picture.
+///
+/// RESOLUTION AND FRAME COUNT FOLLOW THE ADAPTER, which is a departure from
+/// V6 and is stated rather than hidden. A software adapter (lavapipe, the CI
+/// arm) running a software intersector is two orders of magnitude off
+/// hardware, so the default there is a small frame — enough to score every
+/// verdict, not enough to be a number anyone should quote. `FR_WGPU_RES` and
+/// `FR_WGPU_AB_FRAMES` override both, and the chosen pair is always printed
+/// beside the result so no reading of this line is ambiguous about which arm
+/// produced it.
+#[cfg(any(unix, windows))]
+fn run_check_wgpu_render(
+    hg: &webgpu::headless::WgpuHeadless,
+    sp: &crate::spirv::Spirv,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // The corpus premise, ARMED HERE so a bare `--check-wgpu` is sufficient
+    // — `--check-wgsl` does exactly this, for exactly this reason. Printed
+    // because it changes the assembly (the lever-line rule); a session flag
+    // never reaches this point armed differently, since the gate exits the
+    // process.
+    if !gfx::shaders::sw_rays() {
+        println!(
+            "check-wgpu: arming --sw-rays (WebGPU has no ray tracing, so the browser corpus \
+             is the software-ray corpus by definition)"
+        );
+        gfx::shaders::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let soft = hg.dev.info.device_type == wgpu::DeviceType::Cpu;
+    let dframes = if soft { 4u32 } else { 16 };
+    let (gw, gh) = wgpu_gate_res(soft);
+    if let Some((w, h)) = wgpu_res_override() {
+        println!("check-wgpu: FR_WGPU_RES={w}x{h} (default {:?})", wgpu_gate_res_default(soft));
+    }
+    // Accumulated frames on each side of the radiance A/B. The RNG streams
+    // differ by design, so this is variance reduction, not agreement: too
+    // few and the bar measures noise. The override is the instrument that
+    // tells a BIAS from a slowly-converging one — a disagreement that halves
+    // as the count doubles was never a defect.
+    let frames: u32 = std::env::var("FR_WGPU_AB_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(dframes);
+
+    let ws = match webgpu::scene::WgpuScene::new(&hg.dev, scene, bvh) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("check-wgpu: FAIL J6 scene upload: {e}");
+            return false;
+        }
+    };
+    let tg = match webgpu::tracer::WgpuTracer::new(
+        &hg.dev,
+        sp,
+        scene,
+        &ws,
+        bvh,
+        gw as u32,
+        gh as u32,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-wgpu: FAIL J6 tracer init: {e}");
+            return false;
+        }
+    };
+    println!(
+        "check-wgpu: J6 scene uploaded ({} tris, {:.1} MB streams + {:.1} MB tracer), \
+         {} texture(s) in {} bucket(s), {} units -> {:.1} KB WGSL — tracer at \
+         {gw}x{gh}{}",
+        scene.tri_count(),
+        ws.bytes as f64 / (1024.0 * 1024.0),
+        tg.bytes as f64 / (1024.0 * 1024.0),
+        scene.textures.len(),
+        ws.tex.plan.buckets.len(),
+        tg.units(),
+        tg.wgsl_bytes as f64 / 1024.0,
+        if soft { " (SOFTWARE adapter — coverage, not a number to quote)" } else { "" },
+    );
+
+    let q = Quality::preset(2);
+    let basis = cam0.basis(gw, gh);
+    let params = |frame: u32| gfx::frame::FrameParams {
+        cam: basis,
+        frame,
+        accumulate: true,
+        jitter: frame > 0,
+        frame_jitter: None,
+        prev_cam: None,
+        q,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: clouds::Clouds::check(scene.diag),
+        fireflies: fireflies::Fireflies::check(scene),
+        sway_time: None,
+        sway_prev_time: None,
+        replay: false,
+    };
+
+    // The CPU counterpart: the plain per-pixel reference (hybrid = false),
+    // the same contract `--check-gpu` and `--check-vk` score against.
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..gw * gh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let cpu_frame = |frame: u32| {
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: frame > 0,
+            rw: gw,
+            rh: gh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, false);
+    };
+
+    let mut ok = true;
+    let px = gw * gh;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-wgpu: FAIL J6 {msg}");
+        *ok = false;
+    };
+
+    // ---- visibility: one unjittered frame each ----
+    if let Err(e) = tg.render(hg, &params(0), 1) {
+        fail(&mut ok, format!("reference dispatch: {e}"));
+    }
+    let gpu_t = match tg.read_f32(hg, &tg.tbuf, px) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, format!("tbuf readback: {e}"));
+            vec![f32::NAN; px]
+        }
+    };
+    cpu_frame(0);
+    let cpu_t: Vec<f32> = tbuf.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
+    let (mut n_hit, mut n_sky, mut class_mismatch, mut t_viol) = (0usize, 0usize, 0usize, 0usize);
+    let mut max_rel = 0.0f32;
+    // HIT-vs-SKY THROUGH THE CORPUS'S OWN PREDICATE. A browser-corpus miss
+    // writes FLT_MAX, not an infinity (WGSL has no infinity — see
+    // `gfx::shaders::WEB_INF`), so `is_finite()` — what every native gate
+    // asks — reads sky as geometry. The CPU side goes through the same
+    // function: on a native `t` the sentinel arm never fires, so one
+    // predicate serves both and there is no second rule to keep in step.
+    let miss = gfx::shaders::web_miss;
+    for i in 0..px {
+        let (ct, gt) = (cpu_t[i], gpu_t[i]);
+        match (miss(ct), miss(gt)) {
+            (false, false) => {
+                n_hit += 1;
+                let rel = (ct - gt).abs() / ct.abs().max(1e-6);
+                max_rel = max_rel.max(rel);
+                if rel > 1e-3 {
+                    t_viol += 1;
+                }
+            }
+            (true, true) => n_sky += 1,
+            _ => class_mismatch += 1,
+        }
+    }
+    println!(
+        "check-wgpu: J6 primary visibility ({px} px): hit {n_hit} | sky {n_sky} | \
+         class-mismatch {class_mismatch} | rel-t > 1e-3: {t_viol} | max rel t err {max_rel:.2e}"
+    );
+    if n_hit == 0 || n_sky == 0 {
+        fail(
+            &mut ok,
+            format!(
+                "the frame is {} — nothing is being scored",
+                if n_hit == 0 { "all sky" } else { "all geometry" }
+            ),
+        );
+    }
+    // The SAME bars the Vulkan twin holds. Both sides run the identical
+    // software intersector here (`rt_sw.hlsli` is a port of `bvh.rs`'s
+    // traversal, not a second one), so the two-intersector grazing-edge set
+    // V6 must tolerate does not exist on this backend — but the bars stay
+    // where they are rather than being tightened on one scene's luck.
+    if class_mismatch as f64 > px as f64 * 5e-4 {
+        fail(&mut ok, format!("hit/sky classification mismatch {class_mismatch} above 0.05%"));
+    }
+    if t_viol as f64 > px as f64 * 1e-4 {
+        fail(&mut ok, format!("rel-t violations {t_viol} above 0.01%"));
+    }
+
+    // ---- radiance: FRAMES accumulated each ----
+    for f in 1..frames {
+        if let Err(e) = tg.render(hg, &params(f), f + 1) {
+            fail(&mut ok, format!("frame {f}: {e}"));
+            break;
+        }
+        cpu_frame(f);
+    }
+    // Named rather than defaulted: an empty vec would still FAIL below (every
+    // channel reads non-finite) but under the wrong diagnosis, and "the
+    // accumulator is full of NaN" sends a reader somewhere very different
+    // from "the readback did not happen".
+    let gpu_a = match tg.read_f32(hg, &tg.accum, px * 3) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, format!("accum readback: {e}"));
+            Vec::new()
+        }
+    };
+    let inv = 1.0 / frames as f32;
+    let mut sum_c = [0.0f64; 3];
+    let mut sum_g = [0.0f64; 3];
+    let mut sum_abs = 0.0f64;
+    // NON-FINITE AND NEGATIVE ARE DIFFERENT FAILURES — the correction the
+    // D3D12 and Vulkan suites both carry. A NaN or Inf is always a defect. A
+    // negative sample is not: the GI ladder's stochastic rungs estimate the
+    // ambient as `tail + (G - tail)/p`, an UNBIASED estimator of a
+    // non-negative quantity, which may legitimately sample below zero. And a
+    // `continue` on negatives would BIAS the mean upward, which is the one
+    // property the ladder exists not to have — so negatives are counted AND
+    // accumulated, and only non-finites are skipped (one NaN would make
+    // every statistic below it NaN).
+    let mut nonfinite = 0usize;
+    let mut negative = 0usize;
+    for i in 0..px * 3 {
+        let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
+        let g = gpu_a.get(i).copied().unwrap_or(f32::NAN) * inv;
+        if !g.is_finite() {
+            nonfinite += 1;
+            continue;
+        }
+        if g < 0.0 {
+            negative += 1;
+        }
+        sum_c[i % 3] += f64::from(c);
+        sum_g[i % 3] += f64::from(g);
+        sum_abs += f64::from((c - g).abs());
+    }
+    let mut mean_rel = 0.0f64;
+    for ch in 0..3 {
+        mean_rel = mean_rel.max((sum_c[ch] - sum_g[ch]).abs() / sum_c[ch].max(1e-9));
+    }
+    println!(
+        "check-wgpu: J6 radiance A/B over {frames} frames: per-channel mean rel diff {:.3}% | \
+         mean abs px diff {:.4} | non-finite {nonfinite} | negative {negative}",
+        mean_rel * 100.0,
+        sum_abs / (px * 3) as f64
+    );
+    if nonfinite > 0 {
+        fail(&mut ok, format!("{nonfinite} non-finite channel(s) in the GPU accumulator"));
+    }
+    if mean_rel > 0.02 {
+        fail(&mut ok, format!("per-channel mean rel diff {:.3}% above 2%", mean_rel * 100.0));
+    }
+    // A sum that agrees because BOTH sides are zero agrees about nothing.
+    if sum_c.iter().sum::<f64>() <= 0.0 || sum_g.iter().sum::<f64>() <= 0.0 {
+        fail(&mut ok, "one side accumulated no radiance at all".into());
+    }
+
+    // ---- J7: the wavefront quadtree, against the reference kernel. ----
+    ok &= run_check_wgpu_wavefront(hg, &tg, gw, gh, &params);
+    ok
+}
+
+/// J7 — the WAVEFRONT QUADTREE on WebGPU, and this backend's first EXACT-ZERO
+/// gates.
+///
+/// J6 is scored against the CPU, so every bar there is statistical: the RNG
+/// streams differ by design. This is scored against the WEBGPU REFERENCE
+/// KERNEL, which J6 just proved renders the same picture the CPU does — and
+/// two kernels on one device running the same rays through the same
+/// `shade.hlsli` have no such excuse. Under `--sw-rays` they do not even have
+/// two intersectors: `rt_sw.hlsli` is the only one, so the grazing-edge set
+/// `--check-vk` V7 must tolerate on hardware RayQuery does not exist here.
+///
+/// The transplanted `--check-gpu`/V7 family, at its own strength:
+///
+/// - **claim-violation** — THE soundness contract, asserted directly. A
+///   tile's inherited `t_start` claims that frustum ∩ ball(origin, t_start)
+///   is empty; this reads the claim out of the leaf queue and checks it
+///   against the reference kernel's own `t`. Exact zero.
+/// - **false-sky** — a tile that proved empty space it does not own shows up
+///   as a pixel the ladder calls sky and the reference calls geometry. Exact
+///   zero, and it is the bug class the whole quadtree exists inside.
+/// - **tmin-overshoot** — the inherited `t_start` skipped a nearer hit, so
+///   the ladder's `t` lands FARTHER than the reference's. Exact zero.
+/// - **exactly-once coverage + queue accounting** — the leaf and sky rects
+///   must PARTITION the screen, no pixel may be left holding the sentinel,
+///   the tile queues must have drained, and `CTR_OVERFLOW` /
+///   `CTR_CUT_FALLBACK` must be 0 (both queues and the cut pool are sized to
+///   a STRUCTURAL bound, so either is a sizing transcription error and never
+///   a scene — the Vulkan port caught exactly one that way).
+/// - **the same-seed image A/B** — same device, same seed, same shading
+///   code, so this bar is far tighter than J6's.
+#[cfg(any(unix, windows))]
+fn run_check_wgpu_wavefront(
+    hg: &webgpu::headless::WgpuHeadless,
+    tg: &webgpu::tracer::WgpuTracer,
+    gw: usize,
+    gh: usize,
+    params: &dyn Fn(u32) -> gfx::frame::FrameParams,
+) -> bool {
+    use gfx::shaders as gs;
+
+    let mut ok = true;
+    let px = gw * gh;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-wgpu: FAIL J7 {msg}");
+        *ok = false;
+    };
+    // ACCUMULATION OFF on both arms: an exact A/B needs each render to
+    // OVERWRITE `accum`, and J6 left sixteen frames in it.
+    let one = |f: u32| {
+        let mut p = params(f);
+        p.accumulate = false;
+        p.jitter = false;
+        p
+    };
+
+    // The reference arm first — it is the oracle, and rendering it second
+    // would leave the ladder's own `tbuf` overwritten before it was read.
+    if let Err(e) = tg.render(hg, &one(0), 1) {
+        fail(&mut ok, format!("reference frame: {e}"));
+        return ok;
+    }
+    let (ref_t, ref_a) = match (tg.read_f32(hg, &tg.tbuf, px), tg.read_f32(hg, &tg.accum, px * 3)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            fail(&mut ok, "reference readback".into());
+            return false;
+        }
+    };
+    // ANTI-VACUITY, and it has to be a SENTINEL rather than a zero check —
+    // MEASURED here, not inherited. A planted ping-pong bug made the ladder
+    // emit zero terminal records, and the image A/B below compared CLEAN,
+    // because `accum` still held the reference frame nothing had overwritten.
+    // The coverage gates caught that plant; the A/B did not, and an A/B that
+    // cannot fail on a kernel that never ran is not an A/B (the M3d lesson).
+    const POISON: u32 = 0xEEEE_EEEE;
+    tg.poison(hg, POISON);
+    if let Err(e) = tg.render_wavefront(hg, &one(0), true) {
+        fail(&mut ok, format!("wavefront frame: {e}"));
+        return false;
+    }
+    let (wav_t, wav_info, wav_a, ctrs) = match (
+        tg.read_f32(hg, &tg.tbuf, px),
+        tg.read_u32(hg, &tg.info, px),
+        tg.read_f32(hg, &tg.accum, px * 3),
+        tg.read_counters(hg),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            fail(&mut ok, "wavefront readback".into());
+            return false;
+        }
+    };
+    let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+    let (n_leaf, n_sky) = (ctr(gs::CTR_LEAF) as usize, ctr(gs::CTR_SKY) as usize);
+    let depth_full = tg.depth_full();
+    let (cap_leaf, cap_sky) = tg.caps();
+    println!(
+        "check-wgpu: J7 wavefront frame (depth {depth_full}, caps leaf {cap_leaf} sky {cap_sky}): \
+         leaves {n_leaf} | sky-tiles {n_sky} | splits {} | blocked {} | cuts {} (fallback {}) | \
+         overflow {}",
+        ctr(gs::CTR_SPLIT),
+        ctr(gs::CTR_BLOCKED),
+        ctr(gs::CTR_CUT),
+        ctr(gs::CTR_CUT_FALLBACK),
+        ctr(gs::CTR_OVERFLOW),
+    );
+    // The ladder must have RUN. A frame that emitted no terminal record at
+    // all would sail through every "exactly zero" gate below.
+    if n_leaf == 0 && n_sky == 0 {
+        fail(&mut ok, "the ladder emitted no terminal records — nothing below is being scored".into());
+        return false;
+    }
+
+    // ---- queue accounting + exactly-once coverage ----
+    let (leaf_recs, sky_recs) = match tg.read_queues(hg, n_leaf, n_sky) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, format!("queue readback: {e}"));
+            return false;
+        }
+    };
+    const LEAF_REC_U32S: usize = (gs::LEAF_REC_BYTES / 4) as usize;
+    let rect_px = |xy0: u32, xy1: u32| -> u64 {
+        let (x0, y0) = (xy0 & 0xffff, xy0 >> 16);
+        let (x1, y1) = (xy1 & 0xffff, xy1 >> 16);
+        u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0))
+    };
+    let mut covered: u64 = 0;
+    // The inherited t_start per pixel, scattered from the leaf queue once (a
+    // per-pixel scan of the rects would be O(px * n_leaf)). NaN = not a leaf
+    // pixel — sky rects carry no claim.
+    let mut t_start_of = vec![f32::NAN; px];
+    for r in 0..n_leaf.min(leaf_recs.len() / LEAF_REC_U32S) {
+        let base = r * LEAF_REC_U32S;
+        let (xy0, xy1) = (leaf_recs[base], leaf_recs[base + 1]);
+        covered += rect_px(xy0, xy1);
+        let ts = f32::from_bits(leaf_recs[base + 2]);
+        let (x0, y0) = ((xy0 & 0xffff) as usize, (xy0 >> 16) as usize);
+        let (x1, y1) = ((xy1 & 0xffff) as usize, (xy1 >> 16) as usize);
+        for y in y0..y1.min(gh) {
+            for x in x0..x1.min(gw) {
+                t_start_of[y * gw + x] = ts;
+            }
+        }
+    }
+    for r in 0..n_sky.min(sky_recs.len() / 4) {
+        covered += rect_px(sky_recs[r * 4], sky_recs[r * 4 + 1]);
+    }
+    let sentinels = wav_info.iter().filter(|&&i| i == 0xffff_ffff).count();
+    // The last level consumed one tile queue and must have appended nothing
+    // into the other. WHICH one is a parity question — `cs_prep` zeroes only
+    // the OUT counter, so the last level's IN counter legitimately still
+    // holds the tiles it consumed. `FR_WGPU_RES` runs the other parity.
+    let dangling = if depth_full % 2 == 0 { ctr(gs::CTR_TILE_A) } else { ctr(gs::CTR_TILE_B) };
+    println!(
+        "check-wgpu: J7 coverage: rect area {covered}/{px} | info sentinels {sentinels} | \
+         dangling tile queue {dangling}"
+    );
+    if covered != px as u64 {
+        fail(&mut ok, format!("the leaf+sky rects cover {covered} px, not {px} — not a partition"));
+    }
+    if sentinels != 0 {
+        fail(&mut ok, format!("{sentinels} px left holding the info sentinel — not covered once"));
+    }
+    if dangling != 0 {
+        fail(&mut ok, format!("{dangling} tiles left in the out queue after the last level"));
+    }
+    if ctr(gs::CTR_OVERFLOW) != 0 {
+        fail(&mut ok, "queue overflow (the queues are sized to the structural worst case)".into());
+    }
+    // A fallback is SOUND (an ancestor's cut is valid for any descendant
+    // frustum), which is why D3D12 reports it and moves on. But the pool is
+    // sized to a STRUCTURAL bound in both arms — one slot per split, doubled
+    // under `--sw-rays` + FTREE for `level_finish`'s translated copy — so a
+    // nonzero count here is a sizing transcription error and nothing else,
+    // which is exactly the class a fourth backend introduces.
+    if ctr(gs::CTR_CUT_FALLBACK) != 0 {
+        fail(
+            &mut ok,
+            format!(
+                "{} cut-pool fallbacks — SOUND, but the pool is sized to a structural bound, so \
+                 this is a sizing transcription error",
+                ctr(gs::CTR_CUT_FALLBACK)
+            ),
+        );
+    }
+
+    // ---- the three soundness counters, per pixel ----
+    let miss = gfx::shaders::web_miss;
+    let (mut false_sky, mut overshoot, mut claim_viol) = (0usize, 0usize, 0usize);
+    let (mut worst_over, mut worst_claim) = (0.0f32, 0.0f32);
+    for i in 0..px {
+        let (rt, wt) = (ref_t[i], wav_t[i]);
+        // A tile's claim is false if ANY ray in it hit inside the ball it
+        // declared empty. Scored against the reference's `t`, which is the
+        // most pessimistic ground truth available here.
+        let ts = t_start_of[i];
+        if !miss(rt) && ts.is_finite() && rt < ts {
+            claim_viol += 1;
+            worst_claim = worst_claim.max(ts - rt);
+        }
+        match (miss(rt), miss(wt)) {
+            // The reference found geometry and the ladder called it sky: the
+            // tile proved empty space it does not own.
+            (false, true) => false_sky += 1,
+            (false, false) => {
+                // Both hit. The ladder's inherited tmin may only ever skip
+                // space the reference also found empty, so its `t` may not be
+                // FARTHER. (Nearer is impossible for the same reason and would
+                // read as a plain disagreement.)
+                let d = wt - rt;
+                if d > rt.abs().max(1e-6) * 1e-4 {
+                    overshoot += 1;
+                    worst_over = worst_over.max(d / rt.abs().max(1e-6));
+                }
+            }
+            _ => {}
+        }
+    }
+    println!(
+        "check-wgpu: J7 soundness ({px} px): claim-violation {claim_viol} (worst {worst_claim:.3e}) \
+         | false-sky {false_sky} | tmin-overshoot {overshoot} (worst rel {worst_over:.2e})"
+    );
+    for (n, name) in [
+        (claim_viol, "claim-violation"),
+        (false_sky, "false-sky"),
+        (overshoot, "tmin-overshoot"),
+    ] {
+        if n != 0 {
+            fail(&mut ok, format!("{n} {name} — this counter is never a tolerance to widen"));
+        }
+    }
+
+    // ---- the same-seed image A/B ----
+    //
+    // Same device, same seed, same `shade.hlsli`, and under `--sw-rays` the
+    // same single intersector — so this is far tighter than J6's CPU bar, and
+    // the BITWISE count is reported because it is the number that says
+    // whether the two agree exactly or merely closely.
+    //
+    // THE GATED STATISTIC IS PER-CHANNEL ABSOLUTE, not the sum ratio, and the
+    // difference is the whole point of having a bar at all. J6 scores a SUM
+    // ratio because its two sides draw independent sample streams — there,
+    // "do they converge to the same picture" is the only answerable question.
+    // Here they do not: same seed, same rays. A sum CANCELS, and this is
+    // MEASURED, not argued: rotating the ladder's accumulator by 137 pixels
+    // — every channel in the frame misplaced — scores **sum rel diff
+    // 0.0000%** (bit-unchanged, as a permutation must) against **36.04% of
+    // the frame mean** on the statistic below. Every other J7 verdict passes
+    // that plant too, because a permutation writes every pixel: the coverage
+    // partition, the poison survivors, and all three soundness counters are
+    // clean. So this bar is the ONLY thing standing between misplaced light
+    // and a green gate, which is why it is the gated one — the repo's own
+    // rule ("pick the statistic from the failure you are hunting") points the
+    // other way from J6's here. The sum ratio is still printed, because a
+    // large one alongside a small mean-abs is a DIFFERENT diagnosis (uniform
+    // bias, not misplaced light).
+    let mut bitwise = 0usize;
+    let mut sum_r = 0.0f64;
+    let mut sum_w = 0.0f64;
+    let mut sum_abs = 0.0f64;
+    let mut worst_abs = 0.0f64;
+    let mut scale = 0.0f64;
+    let mut nonfinite = 0usize;
+    let mut survived = 0usize;
+    for i in 0..px * 3 {
+        let (r, w) = (ref_a[i], wav_a[i]);
+        if w.to_bits() == POISON {
+            survived += 1;
+        }
+        if r.to_bits() != w.to_bits() {
+            bitwise += 1;
+        }
+        if !w.is_finite() {
+            nonfinite += 1;
+            continue;
+        }
+        let d = (f64::from(r) - f64::from(w)).abs();
+        sum_abs += d;
+        worst_abs = worst_abs.max(d);
+        scale += f64::from(r).abs();
+        sum_r += f64::from(r);
+        sum_w += f64::from(w);
+    }
+    let t_survived = wav_t.iter().filter(|t| t.to_bits() == POISON).count();
+    let n = (px * 3) as f64;
+    let rel = (sum_r - sum_w).abs() / sum_r.abs().max(1e-9);
+    // RELATIVE TO THE FRAME'S OWN MEAN, so the bar travels across scenes and
+    // exposures instead of being an absolute radiance nobody can read (the
+    // "a relative bound travels where an absolute one does not" rule). A dark
+    // frame is not thereby given a free pass: `scale` is floored, so a frame
+    // with no light left cannot make any difference look small.
+    let mean_abs = sum_abs / n;
+    let mean_ref = (scale / n).max(1e-6);
+    let rel_abs = mean_abs / mean_ref;
+    println!(
+        "check-wgpu: J7 wavefront vs reference image: {bitwise}/{} channels differ bitwise | \
+         mean abs diff {:.3e} ({:.4}% of the frame mean, worst channel {:.3e}) | sum rel diff \
+         {:.4}% | non-finite {nonfinite} | poison survivors {survived} accum, {t_survived} tbuf",
+        px * 3,
+        mean_abs,
+        rel_abs * 100.0,
+        worst_abs,
+        rel * 100.0
+    );
+    // The poison IS the assertion (see its plant above): a channel still
+    // holding it is a pixel the ladder never wrote, and no comparison of
+    // aggregates can tell that from agreement.
+    if survived != 0 || t_survived != 0 {
+        fail(
+            &mut ok,
+            format!(
+                "{survived} accum + {t_survived} tbuf words still hold the poison — the ladder \
+                 did not write them, and an unwritten pixel compares clean against its own oracle"
+            ),
+        );
+    }
+    if nonfinite != 0 {
+        fail(&mut ok, format!("{nonfinite} non-finite channel(s) from the ladder"));
+    }
+    // THE BAR THAT BITES. 0.1% of the frame mean is two orders of magnitude
+    // above the 0/360000 this measures on every scene tried and still far
+    // below anything a misplaced tile could hide under — the two kernels have
+    // no source of disagreement, so the number to defend against is drift,
+    // not noise. Kept as a bound rather than `bitwise == 0` because bitwise
+    // identity across every future adapter is a claim this gate has not yet
+    // earned; the count is printed so the day it stops being 0 is visible in
+    // the log before it is a failure.
+    if rel_abs > 0.001 {
+        fail(
+            &mut ok,
+            format!(
+                "mean abs channel diff {mean_abs:.3e} is {:.4}% of the frame mean, above 0.1% — \
+                 the ladder and the reference kernel run the same rays through the same shading",
+                rel_abs * 100.0
+            ),
+        );
+    }
+    // The sum ratio is a SEPARATE diagnosis, not a second copy of the one
+    // above: a large sum ratio with a small mean-abs is a uniform bias, and
+    // a small one with a large mean-abs is misplaced light.
+    if rel > 0.005 {
+        fail(&mut ok, format!("sum rel diff {:.4}% above 0.5%", rel * 100.0));
+    }
+    ok
 }
 
 /// `--check-msl`: the Metal shader toolchain — the corpus's THIRD code
@@ -34579,6 +35619,23 @@ fn run_check(
         }
     };
 
+    // The browser generator's pure teeth (naga round-trip, the normalize
+    // passes, the W5 profile/budget audit, the W6 scan, the W7 line format
+    // and fnv1a64 pins) — `--check-wgsl`'s W0 runs the same fn, but THIS
+    // sweep is what the three OS CI jobs execute (they carry no DXC and
+    // never run the wgsl gate), so without this line those teeth had no CI
+    // home outside the one Vulkan job.
+    let wgsl_ok = match wgsl::self_test() {
+        Ok(()) => {
+            eprintln!("wgsl self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("wgsl self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Material-classifier self-test — deterministic spot checks over the
     // real San Miguel naming patterns (keyword precedence, whole-token
     // safety, the name/Ns/illum fallback tiers).
@@ -37397,6 +38454,7 @@ fn run_check(
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
         ("texweb", texweb_ok),
+        ("wgsl", wgsl_ok),
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
         ("surface-point", surfpt_ok),

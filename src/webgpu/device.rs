@@ -166,40 +166,96 @@ pub fn pick(cands: &[Cand], force: Option<&str>) -> Result<usize, WgpuError> {
     })
 }
 
-/// The highest binding number the smoke's layout reaches, plus one —
-/// DERIVED from the one shift rule (`spirv::binding_of`), never a literal,
-/// so a moved shift moves the ask with it. smoke.hlsl's largest register is
-/// `u2`.
+/// The highest binding number the corpus reaches, plus one — DERIVED from
+/// the one shift rule (`spirv::binding_of`), never a literal, so a moved
+/// shift moves the ask with it.
+///
+/// `s` carries the highest shift (3000) and `s1` is the highest sampler
+/// register the corpus declares (`trace_common.hlsli`'s `samp_lin`/
+/// `samp_aniso`), so this covers every `b`/`t`/`u` register below it too.
+/// The TOOTH is downstream and exact: `tracer.rs` asserts that no unit it
+/// compiled declares a binding at or above this number, so a corpus that
+/// grows an `s2` fails loudly at construction instead of at some browser's
+/// `createBindGroupLayout`.
 pub fn needed_bindings() -> u32 {
-    spirv::binding_of(Reg::U, 2) + 1
+    spirv::binding_of(Reg::S, 1) + 1
 }
 
-/// The device ask: WebGPU's own defaults with exactly ONE field raised —
-/// the binding-number ceiling the DXC shifts overrun (the module note).
-/// Deliberately NOT `adapter.limits()` wholesale: Stage C2 must eventually
-/// run under a browser-granted limit set, and a gate that always requests
-/// native maxima measures nothing about the WebGPU floor. A second raised
-/// field cannot ride in silently — `self_test` pins the equality.
-pub fn ask_limits() -> wgpu::Limits {
+/// What a session needs ON TOP of the corpus-wide contract — the two rows
+/// that are properties of the SCENE rather than of the shader corpus.
+///
+/// Everything else in the ask is fixed by `wgsl::BUDGET`, which is what
+/// `--check-wgsl` W5 audits every entry point against. These two cannot be:
+/// a bucket is a texture the scene has (0 on the default scene, 21 on
+/// bistro, 165 on san-miguel), and the biggest buffer is its BVH.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ask {
+    /// `gfx::texweb::plan(scene).buckets.len()` — sampled-texture bindings
+    /// ON TOP of `BUDGET.sampled_fixed`.
+    pub buckets: u32,
+    /// The largest single buffer the session will bind.
+    pub buffer_bytes: u64,
+}
+
+impl Ask {
+    /// The empty ask — no scene, no tracer, so the corpus-wide contract
+    /// alone. `self_test`'s fixture, and nothing else: the RUNNER always asks
+    /// for the real scene, because a device is opened once and the tracer
+    /// runs on the same one the smoke did.
+    pub fn none() -> Ask {
+        Ask::default()
+    }
+}
+
+/// The device ask: WebGPU's own defaults with exactly the rows this corpus
+/// overruns raised, and no others.
+///
+/// **The count rows come from [`crate::wgsl::BUDGET`]**, which is the same
+/// table `--check-wgsl` W5 audits every entry point against — so the limit a
+/// device is asked for and the limit the corpus was PROVEN to fit under are
+/// one constant, not two that must be kept in step. That join is the whole
+/// reason W5 exists as a gate rather than as a report.
+///
+/// Deliberately NOT `adapter.limits()` wholesale: a browser grants the
+/// defaults plus what the page asks for, and a gate that always requested
+/// native maxima would measure nothing about the WebGPU floor. The two
+/// SCENE rows are the exception and are argued at [`Ask`] — for those,
+/// asking for what the scene needs is exactly what a page does, and J1's
+/// print of ask-vs-default is the browser go/no-go datum.
+///
+/// `self_test` pins the whole delta field by field: a row that drifts away
+/// from BUDGET, or a new row raised without a reason, fails there.
+pub fn ask_limits(ask: &Ask) -> wgpu::Limits {
+    let b = &crate::wgsl::BUDGET;
     let mut l = wgpu::Limits::default();
     l.max_bindings_per_bind_group = needed_bindings();
+    l.max_storage_buffers_per_shader_stage = b.storage_bufs;
+    l.max_storage_textures_per_shader_stage = b.storage_tex;
+    l.max_sampled_textures_per_shader_stage = b.sampled_fixed + ask.buckets;
+    l.max_samplers_per_shader_stage = b.samplers;
+    l.max_uniform_buffers_per_shader_stage = b.uniform_bufs;
+    // `max` rather than `=`: the WebGPU defaults already exceed what a small
+    // scene needs, and asking DOWN would be a refusal a browser never makes.
+    l.max_buffer_size = l.max_buffer_size.max(ask.buffer_bytes);
+    l.max_storage_buffer_binding_size =
+        l.max_storage_buffer_binding_size.max(ask.buffer_bytes);
     l
 }
 
-/// `Some(reason)` when an adapter cannot grant `ask_limits()` — fed into
+/// `Some(reason)` when an adapter cannot grant `ask_limits(ask)` — fed into
 /// `Cand::reject` so the pick, not `request_device`, is where refusal
 /// surfaces (with the adapter's name attached).
 ///
-/// EVERY field of the ask, not just the raised one: `request_device` asks
+/// EVERY field of the ask, not just the raised ones: `request_device` asks
 /// for the full WebGPU default set too, and an adapter below a DEFAULT
 /// would otherwise slip the pick and surface as a told-FAIL from
 /// `request_device` — a driver-defect report for what is really an
 /// environment fact. `fatal: false` so the reason names every shortfall,
 /// not the first; the "vs asked" phrasing is direction-neutral because the
 /// `min_*` alignment limits fail the other way around.
-pub fn limit_reject(adapter: &wgpu::Limits) -> Option<String> {
+pub fn limit_reject(adapter: &wgpu::Limits, ask: &Ask) -> Option<String> {
     let mut fails = Vec::new();
-    ask_limits().check_limits_with_fail_fn(adapter, false, |name, asked, granted| {
+    ask_limits(ask).check_limits_with_fail_fn(adapter, false, |name, asked, granted| {
         let why = if name == "max_bindings_per_bind_group" { " (DXC register shifts)" } else { "" };
         fails.push(format!("{name} {granted} vs {asked} asked{why}"));
     });
@@ -217,6 +273,8 @@ pub struct Wgpu {
     pub limits: wgpu::Limits,
     /// What the adapter COULD have granted (J1's risk table).
     pub adapter_limits: wgpu::Limits,
+    /// The scene rows this device was opened for.
+    pub ask: Ask,
     errors: Arc<AtomicU32>,
 }
 
@@ -224,7 +282,7 @@ impl Wgpu {
     /// Instance -> enumerate -> pick -> device. Absence is a normal
     /// condition (`absent`); a mis-set lever or a refused request on a
     /// chosen adapter is not (`told`).
-    pub fn new() -> Result<Wgpu, WgpuError> {
+    pub fn new(ask: Ask) -> Result<Wgpu, WgpuError> {
         // `_from_env` honors WGPU_BACKEND — a free lever; announce it when
         // armed (the lever-line rule).
         if let Ok(b) = std::env::var("WGPU_BACKEND") {
@@ -243,7 +301,7 @@ impl Wgpu {
                     // the same physical GPU enumerates once per backend.
                     name: format!("{} ({:?})", i.name, i.backend),
                     rank: type_rank(i.device_type),
-                    reject: limit_reject(&a.limits()),
+                    reject: limit_reject(&a.limits(), &ask),
                 }
             })
             .collect();
@@ -261,7 +319,7 @@ impl Wgpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("frustracer check-wgpu"),
             required_features: wgpu::Features::empty(),
-            required_limits: ask_limits(),
+            required_limits: ask_limits(&ask),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -284,6 +342,7 @@ impl Wgpu {
             info: adapter.get_info(),
             device,
             queue,
+            ask,
             errors,
         })
     }
@@ -310,47 +369,83 @@ impl Wgpu {
         )
     }
 
-    /// The J1 risk table: adapter capability vs the WebGPU DEFAULT (what a
-    /// browser grants before any ask) vs what the TRACER corpus is known to
-    /// need. Facts, not verdicts — the runner prints, Stage C2 decides.
+    /// The J1 risk table: what this session ASKED FOR against the WebGPU
+    /// DEFAULT (what a browser grants before any ask) and against what the
+    /// adapter could have given. Facts, not verdicts — the runner prints.
+    ///
+    /// The middle column is the browser question in one number: every row
+    /// where `ask > default` is a row a page must request and a browser may
+    /// refuse. The right column is why the corpus needs it, and every one of
+    /// those reasons is a MEASURED `--check-wgsl` W5 print rather than an
+    /// estimate.
     pub fn limits_risks(&self) -> Vec<String> {
         let a = &self.adapter_limits;
+        let g = &self.limits;
         let d = wgpu::Limits::default();
-        let rows: [(&str, u64, u64, &str); 5] = [
+        let k = ask_limits(&self.ask);
+        let b = &crate::wgsl::BUDGET;
+        let bucket_note = format!(
+            "BUDGET.sampled_fixed {} + {} WEB_TEX bucket(s) for this scene",
+            b.sampled_fixed, self.ask.buckets
+        );
+        let rows: [(&str, u64, u64, u64, u64, String); 6] = [
             (
                 "max_bindings_per_bind_group",
-                a.max_bindings_per_bind_group as u64,
+                k.max_bindings_per_bind_group as u64,
                 d.max_bindings_per_bind_group as u64,
-                "shifts reach u:2000+/s:3000+ — if browsers cap at the default, C2 compacts",
+                g.max_bindings_per_bind_group as u64,
+                a.max_bindings_per_bind_group as u64,
+                "DXC register shifts reach s:3000+ — if browsers cap at the default, C2 compacts"
+                    .into(),
             ),
             (
                 "max_storage_buffers_per_shader_stage",
-                a.max_storage_buffers_per_shader_stage as u64,
+                k.max_storage_buffers_per_shader_stage as u64,
                 d.max_storage_buffers_per_shader_stage as u64,
-                "tracer worst entry needs ~24-29",
+                g.max_storage_buffers_per_shader_stage as u64,
+                a.max_storage_buffers_per_shader_stage as u64,
+                format!("BUDGET.storage_bufs {} (W5 worst 22)", b.storage_bufs),
             ),
             (
                 "max_storage_textures_per_shader_stage",
-                a.max_storage_textures_per_shader_stage as u64,
+                k.max_storage_textures_per_shader_stage as u64,
                 d.max_storage_textures_per_shader_stage as u64,
-                "frd_temporal needs 9",
+                g.max_storage_textures_per_shader_stage as u64,
+                a.max_storage_textures_per_shader_stage as u64,
+                format!("BUDGET.storage_tex {} (W5 worst 9, frd_temporal)", b.storage_tex),
             ),
             (
                 "max_sampled_textures_per_shader_stage",
-                a.max_sampled_textures_per_shader_stage as u64,
+                k.max_sampled_textures_per_shader_stage as u64,
                 d.max_sampled_textures_per_shader_stage as u64,
-                "one WEB_TEX bucket = one binding (scene-keyed count)",
+                g.max_sampled_textures_per_shader_stage as u64,
+                a.max_sampled_textures_per_shader_stage as u64,
+                bucket_note,
             ),
             (
                 "max_storage_buffer_binding_size",
-                a.max_storage_buffer_binding_size,
-                d.max_storage_buffer_binding_size,
-                "big scenes' vertex/BVH buffers",
+                k.max_storage_buffer_binding_size as u64,
+                d.max_storage_buffer_binding_size as u64,
+                g.max_storage_buffer_binding_size as u64,
+                a.max_storage_buffer_binding_size as u64,
+                "this scene's largest single buffer (its BVH)".into(),
+            ),
+            (
+                "max_buffer_size",
+                k.max_buffer_size,
+                d.max_buffer_size,
+                g.max_buffer_size,
+                a.max_buffer_size,
+                "same, as an allocation rather than a binding".into(),
             ),
         ];
         rows.iter()
-            .map(|(name, have, def, need)| {
-                format!("{name}: adapter {have} vs WebGPU default {def} — {need}")
+            .map(|(name, ask, def, granted, adapter, why)| {
+                let flag = if ask > def { " OVER-DEFAULT" } else { "" };
+                format!(
+                    "{name}: ask {ask} vs WebGPU default {def}{flag} \
+                     (granted {granted}, adapter {adapter}) — {why}"
+                )
             })
             .collect()
     }
@@ -465,39 +560,98 @@ pub fn self_test() -> Result<(), String> {
     }
 
     // The limits math: derived from the shift rule, both ways, and the
-    // anti-drift equality — a second raised field cannot ride in silently.
-    if needed_bindings() != spirv::binding_of(Reg::U, 2) + 1 {
-        return Err("wgpu: needed_bindings is not the derived u2+1".into());
+    // anti-drift equality — a row cannot drift from BUDGET, and a new raised
+    // row cannot ride in silently.
+    let smoke = Ask::none();
+    if needed_bindings() != spirv::binding_of(Reg::S, 1) + 1 {
+        return Err("wgpu: needed_bindings is not the derived s1+1".into());
     }
-    let mut low = wgpu::Limits::default();
+    // It must cover every register class the corpus uses, not just its own —
+    // `s` carries the highest shift, so this is the claim that makes one
+    // number enough.
+    for (r, n) in [(Reg::B, 1u32), (Reg::T, 12), (Reg::U, 32)] {
+        if spirv::binding_of(r, n) >= needed_bindings() {
+            return Err(format!("wgpu: needed_bindings does not cover {r:?}{n}"));
+        }
+    }
+    let sufficient = ask_limits(&smoke);
+    let mut low = sufficient.clone();
     low.max_bindings_per_bind_group = needed_bindings() - 1;
-    match limit_reject(&low) {
+    match limit_reject(&low, &smoke) {
         Some(r) if r.contains(&needed_bindings().to_string()) => {}
         Some(r) => return Err(format!("wgpu: limit_reject names neither number: {r}")),
         None => return Err("wgpu: a too-low binding ceiling was not rejected".into()),
     }
-    let mut ok = wgpu::Limits::default();
-    ok.max_bindings_per_bind_group = needed_bindings();
-    if limit_reject(&ok).is_some() {
-        return Err("wgpu: an exactly-sufficient ceiling was rejected".into());
+    if limit_reject(&sufficient, &smoke).is_some() {
+        return Err("wgpu: an exactly-sufficient adapter was rejected".into());
     }
     // The completeness tooth: the reject covers the WHOLE ask. An adapter
-    // below a WebGPU DEFAULT on some other field must be rejected at pick
-    // time too — and with `fatal: false` the reason must name BOTH
+    // below a WebGPU DEFAULT on a field the ask never raises must be
+    // rejected too — and with `fatal: false` the reason must name BOTH
     // shortfalls, not stop at the first.
-    let mut low2 = wgpu::Limits::default();
-    low2.max_storage_buffers_per_shader_stage -= 1;
-    match limit_reject(&low2) {
+    let mut low2 = sufficient.clone();
+    low2.max_compute_workgroup_storage_size -= 1;
+    low2.max_bindings_per_bind_group = 1;
+    match limit_reject(&low2, &smoke) {
         Some(r)
-            if r.contains("max_storage_buffers_per_shader_stage")
+            if r.contains("max_compute_workgroup_storage_size")
                 && r.contains("max_bindings_per_bind_group") => {}
         Some(r) => return Err(format!("wgpu: below-default reject named only: {r}")),
         None => return Err("wgpu: an adapter below a WebGPU default was not rejected".into()),
     }
-    let mut want = wgpu::Limits::default();
+
+    // THE JOIN: every count row of the ask IS `wgsl::BUDGET`, the table
+    // `--check-wgsl` W5 proves the corpus fits under. If these two ever
+    // drift, a corpus audited green would be run under a limit it was never
+    // audited against — so the equality is asserted rather than trusted.
+    let b = &crate::wgsl::BUDGET;
+    let d = wgpu::Limits::default();
+    let k = ask_limits(&smoke);
+    let rows: [(&str, u32, u32); 5] = [
+        ("storage buffers", k.max_storage_buffers_per_shader_stage, b.storage_bufs),
+        ("storage textures", k.max_storage_textures_per_shader_stage, b.storage_tex),
+        ("sampled textures", k.max_sampled_textures_per_shader_stage, b.sampled_fixed),
+        ("samplers", k.max_samplers_per_shader_stage, b.samplers),
+        ("uniform buffers", k.max_uniform_buffers_per_shader_stage, b.uniform_bufs),
+    ];
+    for (what, asked, budget) in rows {
+        if asked != budget {
+            return Err(format!("wgpu: ask_limits {what} = {asked}, BUDGET says {budget}"));
+        }
+    }
+    // The scene rows move with the Ask and nothing else does — the buckets
+    // land on the sampled row, the bytes on the two size rows.
+    let scened = ask_limits(&Ask { buckets: 7, buffer_bytes: 3 << 30 });
+    if scened.max_sampled_textures_per_shader_stage != b.sampled_fixed + 7 {
+        return Err("wgpu: the bucket ask did not reach the sampled-texture row".into());
+    }
+    if scened.max_buffer_size != 3 << 30 || scened.max_storage_buffer_binding_size != 3 << 30 {
+        return Err(format!(
+            "wgpu: the byte ask did not reach the size rows ({} / {})",
+            scened.max_buffer_size, scened.max_storage_buffer_binding_size
+        ));
+    }
+    // A scene SMALLER than the WebGPU defaults must not ask DOWN — a
+    // refusal a browser never makes, and one that would fail a device the
+    // defaults already cover.
+    let tiny = ask_limits(&Ask { buckets: 0, buffer_bytes: 1024 });
+    if tiny.max_buffer_size != d.max_buffer_size
+        || tiny.max_storage_buffer_binding_size != d.max_storage_buffer_binding_size
+    {
+        return Err("wgpu: a tiny scene asked the size rows DOWN from the defaults".into());
+    }
+    // Nothing outside the named delta moved. `Limits` is `PartialEq`, so
+    // reconstructing the expected value field by field and comparing wholesale
+    // is what makes a silently-added row a failure.
+    let mut want = d.clone();
     want.max_bindings_per_bind_group = needed_bindings();
-    if ask_limits() != want {
-        return Err("wgpu: ask_limits raised more than the one named field".into());
+    want.max_storage_buffers_per_shader_stage = b.storage_bufs;
+    want.max_storage_textures_per_shader_stage = b.storage_tex;
+    want.max_sampled_textures_per_shader_stage = b.sampled_fixed;
+    want.max_samplers_per_shader_stage = b.samplers;
+    want.max_uniform_buffers_per_shader_stage = b.uniform_bufs;
+    if k != want {
+        return Err("wgpu: ask_limits raised a field outside the BUDGET delta".into());
     }
 
     Ok(())

@@ -32,6 +32,14 @@ scenes/**/*.ogg filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.wav filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.mp3 filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.flac filter=lfs diff=lfs merge=lfs -text
+# The --check-wgsl W7 corpus golden (goldens/web_corpus.txt): a tracked TEXT
+# golden byte-compared by the gate on the dev box AND the check-vulkan CI job.
+# PINNED -text so the blob's LF bytes survive every checkout unmangled — the
+# writer emits LF and the compare strips \r as belt-and-braces, but a golden
+# that round-trips through autocrlf would still dirty `git status` after a
+# --write-golden, which reads exactly like a regression (the check-<tag>.png
+# lesson).
+goldens/* -text
 # Git hooks (tools/hooks/, installed per clone into .git/hooks — see the header
 # in tools/hooks/pre-commit). PINNED TO LF: a shell script checked out with
 # CRLF has "#!/bin/sh\r" as its shebang, which is a "bad interpreter" failure

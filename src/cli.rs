@@ -856,6 +856,13 @@ pub struct Cli {
     /// the `--sw-rays` corpus BY DEFINITION (WebGPU has no ray query), so
     /// the gate arms that lever itself.
     pub check_wgsl: bool,
+    /// `--write-golden`: regenerate `goldens/web_corpus.txt` — the W7 corpus
+    /// golden `--check-wgsl` byte-compares. Composes ONLY with `--check-wgsl`
+    /// on the default scene, and the runner refuses to write unless W0-W6
+    /// are green in the same run (a broken corpus must never become the
+    /// expectation). The tracked-goldens discipline in CLAUDE.md applies:
+    /// a rewrite is either a regression or a deliberate re-baseline.
+    pub write_golden: bool,
     /// `--check-wgpu`: the WebGPU host, one claim past `--check-wgsl` —
     /// bring up a real `wgpu` adapter and device (Vulkan/D3D12/Metal
     /// natively; the browser is the same API's other arm), print the
@@ -1188,6 +1195,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_metalfx = false;
     let mut check_spirv = false;
     let mut check_wgsl = false;
+    let mut write_golden = false;
     let mut check_wgpu = false;
     let mut check_msl = false;
     let mut check_mtl = false;
@@ -1260,6 +1268,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--check-metalfx" => check_metalfx = true,
             "--check-spirv" => check_spirv = true,
             "--check-wgsl" => check_wgsl = true,
+            "--write-golden" => write_golden = true,
             "--check-wgpu" => check_wgpu = true,
             "--check-msl" => check_msl = true,
             "--check-mtl" => check_mtl = true,
@@ -2637,6 +2646,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_metalfx,
         check_spirv,
         check_wgsl,
+        write_golden,
         check_wgpu,
         check_msl,
         check_mtl,
@@ -2840,7 +2850,10 @@ pub fn usage() {
                 eprintln!("  --check-wgsl  headless: the BROWSER corpus (the web unit subset, --sw-rays + no wave");
                 eprintln!("                ops by construction) through the browser's whole generator chain —");
                 eprintln!("                SPIR-V (DXC) -> naga validate at the WebGPU-core floor -> WGSL text ->");
-                eprintln!("                re-parse. W0 is pure and runs anywhere; W1+ need a DXC drop; no GPU");
+                eprintln!("                re-parse. W0 is pure and runs anywhere; W1+ need a DXC drop; no GPU.");
+                eprintln!("                W5 audits per-entry layouts vs the C2 ask budget, W6 scans for hostile");
+                eprintln!("                constructs, W7 byte-compares goldens/web_corpus.txt (default scene);");
+                eprintln!("                --write-golden regenerates it (refused unless W0-W6 green)");
                 eprintln!("  --check-wgpu  headless: a real wgpu device EXECUTING what that chain emits — adapter");
                 eprintln!("                probe with the granted-limits table, then the indirect-dispatch smoke");
                 eprintln!("                (the same kernel the D3D12/Vulkan/Metal smokes prove). J0 is pure; J1+");
