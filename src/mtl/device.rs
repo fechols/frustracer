@@ -20,12 +20,13 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue,
-    MTL4ComputeCommandEncoder, MTLArgumentBuffersTier, MTLBlitCommandEncoder, MTLBuffer,
+    MTL4CommitFeedback, MTL4CommitOptions, MTL4ComputeCommandEncoder, MTLArgumentBuffersTier,
+    MTLBlitCommandEncoder, MTLBuffer,
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLCreateSystemDefaultDevice, MTLDevice,
     MTLGPUFamily, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResidencySet, MTLResourceOptions,
     MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-    MTLSamplerState, MTLSharedEvent, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
+    MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage,
 };
 use std::ffi::c_void;
@@ -150,7 +151,7 @@ impl Mtl {
     /// `MtlError::absent` draws one level up. `newMTL4CommandQueue` returning
     /// nil means this macOS predates Metal 4 or this device does not implement
     /// it — a loud SKIP. A device that HANDS OVER a Metal 4 queue and then
-    /// refuses an allocator or a shared event is broken, and that is an `Err`.
+    /// refuses an allocator is broken, and that is an `Err`.
     ///
     /// Probed at RUNTIME rather than gated at build time, following the reason
     /// `mfxdn` states at length: a build.rs check keys on the BUILD host, which
@@ -165,14 +166,18 @@ impl Mtl {
             .device
             .newCommandAllocator()
             .ok_or("the device gave an MTL4 command queue and then refused a command allocator")?;
-        // THE ONLY WAY THE CPU CAN WAIT. MTL4 has no `waitUntilCompleted` —
-        // `MTL4CommandQueue` offers `commit:count:` and nothing that blocks —
-        // so the queue signals this event and `Mtl4::compute` blocks on it.
-        let event = self
-            .device
-            .newSharedEvent()
-            .ok_or("the device gave an MTL4 command queue and then refused a shared event")?;
-        Ok(Some(Mtl4 { queue, allocator, event, signalled: std::cell::Cell::new(0) }))
+        // NO SHARED EVENT, and its absence is D4b's product rather than an
+        // omission. MTL4 has no `waitUntilCompleted`, so D4 had the queue signal
+        // an `MTLSharedEvent` and blocked on it; D4b replaced that with the
+        // commit-feedback handler, which reports completion AND carries the
+        // error the event never could. `Mtl4`'s doc has the argument.
+        Ok(Some(Mtl4 {
+            queue,
+            allocator,
+            commits: std::cell::Cell::new(0),
+            handled: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stamps: std::cell::Cell::new((0.0, 0.0)),
+        }))
     }
 
     /// Which argument-buffer tier the device supports.
@@ -598,52 +603,115 @@ impl Mtl {
 /// * **No implicit residency.** There is no `useResource:` on any MTL4 encoder
 ///   (checked against every binding in the crate), and the argument table takes
 ///   a raw GPU ADDRESS, so nothing infers residency from what was bound.
-/// * **No `waitUntilCompleted`.** Hence `event` and `signalled` below.
+/// * **No `waitUntilCompleted`.** See the fourth entry, which turns out to be
+///   the same removal wearing a different hat.
 ///
-/// # And a fourth it removed that costs NO line here, deliberately
+/// # And a fourth, which D4b showed is not a fourth at all
 ///
-/// **There is no `error` on an MTL4 command buffer, and this path therefore
-/// checks none.** `Mtl::run` next door checks `cb.error()` and says why —
-/// *"the only channel a committed buffer has; dropping it silently is how a
-/// failed dispatch reads as a black image"* — and MTL4 has no synchronous
-/// equivalent anywhere: not on the queue, not on the command buffer, not on
-/// the event. The whole channel is `MTL4CommitFeedback::error`, delivered as a
-/// BLOCK through `MTL4CommitOptions::addFeedbackHandler:` and
-/// `commit:count:options:`, on a dispatch queue.
+/// **There is no `error` on an MTL4 command buffer**, anywhere: not on the
+/// queue, not on the command buffer, not on the allocator (checked against all
+/// 32 generated `MTL4*` files). `Mtl::run` next door checks `cb.error()` and
+/// says why — *"the only channel a committed buffer has; dropping it silently
+/// is how a failed dispatch reads as a black image"*.
 ///
-/// It is not wired, and the reason is that wiring it naively would be a probe
-/// that has not been shown to REACH its target — the `FR_ABL` trap this
-/// project has fallen into four times. The callback is asynchronous and
-/// ordered against nothing this function waits on, so reading a captured error
-/// after `waitUntilSignaledValue:` returns would report "no error" both when
-/// there was none and when the handler had simply not run yet, and the two are
-/// indistinguishable from here. Doing it properly means making the FEEDBACK
-/// the completion signal instead of the event, which is a different design for
-/// the wait rather than a check bolted onto this one.
+/// D4 shipped without the check and its doc argued, at length, that bolting one
+/// on would be a probe not shown to REACH its target — the `FR_ABL` trap this
+/// project has fallen into four times. A handler ordered against nothing the
+/// wait observes reports "no error" identically when there was none and when it
+/// simply had not run yet. That argument was right, and its conclusion named
+/// the fix: *"making the FEEDBACK the completion signal instead of the event."*
 ///
-/// What that costs today is diagnosis, not coverage: `smoke::verify` reads
-/// every word of the result, so a faulted submission fails the gate on its
-/// DATA. It fails with "out[0] is 0xDEADBEEF" where Metal 3 would have said
-/// which command buffer died and why. **A rung that extends this path beyond
-/// the smoke chain should wire the handler first**, because the further the
-/// work gets from a fully-verified 619-word readback, the more of that
-/// distinction stops being cosmetic.
+/// **THAT IS WHAT D4b DID, AND THE TWO REMOVALS COLLAPSE INTO ONE.**
+/// `MTL4CommitFeedback` is both halves — it is the only thing that carries an
+/// error AND the only thing that reports completion without polling. So the
+/// wait is not "an event, plus a check": it is one handler whose arrival IS
+/// completion and whose `error()` is the diagnosis, read at a point where
+/// "has it run yet?" is answered by the fact that we are running at all.
+/// `MTLSharedEvent`, `signalled`, and `MTLEvent` in Cargo.toml went with it.
 ///
-/// # `signalled` is a monotone counter, not a fence index
+/// # Why the handler is trusted, which is a separate question
 ///
-/// Each `compute` takes the next value, signals it AFTER the commit, and blocks
-/// until the event reaches it. Reusing one value across passes would make the
-/// second wait return instantly on the first pass's signal — a readback racing
-/// a live GPU on unified memory, which is exactly the failure `Mtl::compute`'s
-/// "read outside the closure" comment describes, with no diagnostic.
+/// A completion signal that never fires is a hang, and this one bounds it
+/// (`MTL4_WAIT_MS`). But a completion signal that fires *without the platform
+/// having filled it in* would be worse than the event it replaced: it would
+/// report "no error" with authority. So `submit` also carries out the timestamps
+/// — `GPUStartTime`/`GPUEndTime` — and `mtl4::run` asserts they are nonzero and
+/// ordered. **They are the reach proof.** We cannot fabricate them; the platform
+/// fills them in; a block that ran with real data has them and one that did not
+/// cannot. Without that assertion this struct would have swapped one unproven
+/// silence for another.
 pub struct Mtl4 {
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
-    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    signalled: std::cell::Cell<u64>,
+    /// Submissions committed. A `Cell`, because only this thread commits.
+    commits: std::cell::Cell<u64>,
+    /// Handler INVOCATIONS, and the noun is the whole point of the field.
+    ///
+    /// **IT IS INCREMENTED INSIDE THE BLOCK, WHICH IS THE ONLY PLACE THAT CAN
+    /// COUNT WHAT IT CLAIMS TO COUNT.** The first draft of D4b counted on the
+    /// waiting thread instead, one tick per successful wait — which is one tick
+    /// per commit BY CONSTRUCTION, so `handled != commits` could only ever mean
+    /// "a wait timed out" and the two undocumented behaviours the count exists
+    /// to catch were both invisible to it. That is the shape of a probe that
+    /// cannot reach its target, arriving in the counter rather than in the
+    /// check, and it is the reason this is an atomic behind an `Arc` rather
+    /// than the tidier `Cell` beside `commits`.
+    ///
+    /// What it now catches, because the two really are independent: feedback
+    /// delivered per command buffer rather than per commit (we send one buffer
+    /// per commit today, so a divergence would be the API telling us the
+    /// mapping is not what we assumed), and a handler that fires twice. Neither
+    /// is documented either way, which is why it is counted rather than
+    /// assumed. K11 reads it after every submission has returned, so a stray
+    /// second fire on an EARLIER submission is still visible by then.
+    ///
+    /// It does not change `Mtl4`'s thread affinity: the atomic lives behind the
+    /// `Arc`, not in the struct's own cell state, so this handle stays as
+    /// non-`Sync` as the rest of it.
+    handled: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The most recent handler's timestamps, for K11 to report. `(0.0, 0.0)`
+    /// means "no submission yet", which K11 distinguishes from "the platform
+    /// left them unpopulated" by also having the counts.
+    stamps: std::cell::Cell<(f64, f64)>,
 }
 
-/// How long `compute` will wait for a submission before calling it a failure.
+/// What `Mtl4::submit` has seen, for the gate to report and assert on.
+#[derive(Clone, Copy)]
+pub struct Tally {
+    pub commits: u64,
+    pub handled: u64,
+    pub gpu_start: f64,
+    pub gpu_end: f64,
+}
+
+/// Which parts of the submission a gate has deliberately broken.
+///
+/// **Here rather than in `mtl4::Plant` because `device.rs` reads no `FR_*`
+/// variable anywhere and must not start** — the lever registry belongs in the
+/// gate module beside the other four, and this is only how the answer travels.
+#[derive(Clone, Copy, Default)]
+pub struct SubmitPlant {
+    /// Commit with `commit:count:` and no options, so no handler is ever
+    /// registered. Expected to make the wait time out, which is the point:
+    /// it is the direct test of the claim that feedback is the completion
+    /// signal. See `mtl4::Plant`.
+    pub no_feedback: bool,
+}
+
+/// What the commit-feedback handler carried out of the block.
+///
+/// `error` is the diagnosis; the two timestamps are the REACH PROOF that makes
+/// a `None` error mean something. See `Mtl4`'s doc.
+pub struct Feedback {
+    /// `MTL4CommitFeedback::error`, already stringified — the `NSError` cannot
+    /// outlive the block it arrived in without more lifetime apparatus than one
+    /// message is worth.
+    pub error: Option<String>,
+    pub gpu_start: f64,
+    pub gpu_end: f64,
+}
+
+/// How long `submit` will wait for a submission before calling it a failure.
 ///
 /// A NUMBER RATHER THAN `u64::MAX`, because the failure this bounds is a gate
 /// that never returns. The smoke chain is three dispatches over 619 words and
@@ -652,16 +720,50 @@ pub struct Mtl4 {
 /// `smoke.rs`'s `GRID_POISON` exists to prevent the OTHER version of this — a
 /// dispatch that runs 5e10 threadgroups — and this covers the case where the
 /// work never starts at all.
+///
+/// **THE HEADROOM ARGUMENT IS ABOUT THE ONLY CONSUMER THIS HAS**, and the day a
+/// second one arrives it is the sentence to re-check rather than the number.
+/// The bound now also covers a handler that never fires at all, which is a
+/// different failure from a dispatch that never finishes: D4's event could only
+/// go unsignalled, where a feedback block can go undelivered. Both end here.
 const MTL4_WAIT_MS: u64 = 2_000;
 
 impl Mtl4 {
     /// `Mtl::compute`'s twin: encode one compute pass, submit it, and block.
     ///
-    /// The shape is deliberately identical — the closure returns a `Result` so
-    /// a binding error is reported before the command buffer's own, which is
-    /// usually its downstream consequence — and the differences are all MTL4's:
-    /// an allocator to begin against, an explicit `endCommandBuffer`, and a
-    /// signal-and-wait instead of `waitUntilCompleted`.
+    /// A thin wrapper over `submit`, which owns everything about the
+    /// submission and the wait. What is left here is the one thing that is
+    /// about COMPUTE: making the encoder, and reporting a nil one as ours
+    /// rather than as a mystery. The closure returning a `Result` is
+    /// deliberate and matches `Mtl::compute` — a binding error is reported
+    /// before the command buffer's own, which is usually its downstream
+    /// consequence.
+    pub fn compute<F>(&self, m: &Mtl, plant: SubmitPlant, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&ProtocolObject<dyn MTL4ComputeCommandEncoder>) -> Result<(), String>,
+    {
+        self.submit(m, plant, |cb| {
+            let enc = cb
+                .computeCommandEncoder()
+                .ok_or("MTL4CommandBuffer::computeCommandEncoder() returned nil")?;
+            let r = f(&enc);
+            enc.endEncoding();
+            r
+        })
+        .map(|_| ())
+    }
+
+    /// Encode one command buffer, commit it, and block until the GPU says it
+    /// is done — returning what the GPU said.
+    ///
+    /// **THE WAIT IS THE COMMIT FEEDBACK, AND THAT IS THE WHOLE DESIGN.** MTL4
+    /// has no `waitUntilCompleted` and no synchronous `error`; it has one
+    /// callback that carries both. D4 waited on an `MTLSharedEvent` and checked
+    /// no error at all, and its own doc explained why bolting a check on would
+    /// have been a probe that could not be shown to have reached its target.
+    /// Making the handler the ONLY thing that can unblock this function answers
+    /// that structurally: there is no state in which the handler did not run
+    /// and we return `Ok` anyway. See `Mtl4`'s doc.
     ///
     /// **THE ALLOCATOR IS RESET AFTER THE WAIT, NEVER BEFORE — AND NOT AT ALL
     /// IF THE WAIT TIMES OUT.** It owns the memory the encoded commands live
@@ -669,53 +771,206 @@ impl Mtl4 {
     /// use-after-free that would present as corrupted output rather than as an
     /// error — the same class as the readback race above, and invisible for the
     /// same reason. The timeout branch is the one place where the GPU is
-    /// PROVABLY still reading, so it returns the error and leaks the allocator
-    /// rather than resetting on the strength of a wait that did not happen.
-    pub fn compute<F>(&self, m: &Mtl, f: F) -> Result<(), String>
+    /// PROVABLY still reading, so it returns the error and leaks rather than
+    /// resetting on the strength of a wait that did not happen.
+    ///
+    /// **AND ON THAT BRANCH IT LEAKS THE BLOCK TOO**, which is new with the
+    /// feedback wait and follows from exactly the same sentence. A wait that
+    /// timed out has NOT established that the handler will never run — only
+    /// that it has not run yet. Dropping the `RcBlock` and the options on the
+    /// way out would leave Metal holding a freed callback, which is the
+    /// use-after-free arriving through the cleanup path instead of the work
+    /// path. `drop_residency`'s doc rejects the identical move for the
+    /// identical reason.
+    ///
+    /// A reported error, by contrast, DOES reset: the feedback is delivered at
+    /// completion, so an error describes how the work ended rather than whether
+    /// it ended, and the "provably still reading" condition does not hold.
+    pub fn submit<F>(&self, m: &Mtl, plant: SubmitPlant, f: F) -> Result<Feedback, String>
     where
-        F: FnOnce(&ProtocolObject<dyn MTL4ComputeCommandEncoder>) -> Result<(), String>,
+        F: FnOnce(&ProtocolObject<dyn MTL4CommandBuffer>) -> Result<(), String>,
     {
         let cb = m.device().newCommandBuffer().ok_or("newCommandBuffer() returned nil")?;
         cb.beginCommandBufferWithAllocator(&self.allocator);
-        let inner = {
-            let enc = cb
-                .computeCommandEncoder()
-                .ok_or("MTL4CommandBuffer::computeCommandEncoder() returned nil")?;
-            let r = f(&enc);
-            enc.endEncoding();
-            r
-        };
+        let inner = f(&cb);
         cb.endCommandBuffer();
+
+        // THE HANDLER RUNS ON A THREAD THAT IS NOT OURS, and by design rather
+        // than by accident: we set no `feedbackQueue` on the queue descriptor,
+        // and Apple's binding doc says that nil is the default under which
+        // "Metal allocates an internal dispatch queue to service feedback
+        // notifications". Taking the default is what keeps `dispatch2` out of
+        // the build — and what forces every capture below to be OWNED. Nothing
+        // `Retained` and nothing `ProtocolObject` may cross into the `Arc`:
+        // those are not `Send`, and the error is therefore stringified INSIDE
+        // the block, where the `NSError` is still on its own thread.
+        let cell: std::sync::Arc<(std::sync::Mutex<Option<Feedback>>, std::sync::Condvar)> =
+            std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let sink = std::sync::Arc::clone(&cell);
+        let hits = std::sync::Arc::clone(&self.handled);
+        let handler = block2::RcBlock::new(
+            move |fb: std::ptr::NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
+                // COUNTED FIRST, BEFORE THE PAYLOAD IS PUBLISHED, so the tick
+                // is ordered ahead of the mutex release that hands this
+                // submission to the waiter — which is what makes the waiter's
+                // own read of it meaningful rather than a race it usually wins.
+                // `SeqCst` because this is a gate counter read from a third
+                // point in time (K11, after every wait has returned) and the
+                // cost is irrelevant next to being able to reason about it.
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // SAFETY: Metal hands the handler a live feedback object for
+                // the duration of the call; we read three scalars out of it and
+                // keep none of them by reference.
+                let fb = unsafe { fb.as_ref() };
+                let got = Feedback {
+                    error: fb.error().map(|e| e.localizedDescription().to_string()),
+                    gpu_start: fb.GPUStartTime(),
+                    gpu_end: fb.GPUEndTime(),
+                };
+                let (lock, cv) = &*sink;
+                if let Ok(mut slot) = lock.lock() {
+                    *slot = Some(got);
+                }
+                cv.notify_one();
+            },
+        );
+        let options = MTL4CommitOptions::new();
+        // SAFETY: `handler` is a valid block for the whole of this function,
+        // and on the one path where it might still be invoked afterwards — the
+        // timeout — it is deliberately leaked rather than dropped.
+        unsafe { options.addFeedbackHandler(block2::RcBlock::as_ptr(&handler)) };
 
         // `commit:count:` takes a C ARRAY of command buffers, so even one needs
         // a slot to point at. Built here rather than at the call site because
         // the lifetime is the delicate part: `cb` must outlive the call, and it
         // does — `one` borrows it and both live to the end of this function.
         let mut one = [std::ptr::NonNull::from(&*cb)];
-        // SAFETY: `count` is 1 and `one` holds exactly one valid, non-null
-        // pointer to a command buffer that outlives the call.
-        unsafe { self.queue.commit_count(std::ptr::NonNull::from(&mut one[0]), 1) };
+        let started = std::time::Instant::now();
+        self.commits.set(self.commits.get() + 1);
+        // A BRANCH, NOT A FLAG PASSED TO ONE CALL. The two commit selectors are
+        // different entry points and the armed arm registers no handler at all
+        // — an off-state that is structural, which is what the feature-addition
+        // rule asks for and what makes the shipping path bit-identical.
+        //
+        // SAFETY (both arms): `count` is 1 and `one` holds exactly one valid,
+        // non-null pointer to a command buffer that outlives the call.
+        if plant.no_feedback {
+            unsafe { self.queue.commit_count(std::ptr::NonNull::from(&mut one[0]), 1) };
+        } else {
+            unsafe {
+                self.queue.commit_count_options(
+                    std::ptr::NonNull::from(&mut one[0]),
+                    1,
+                    &options,
+                )
+            };
+        }
 
-        let want = self.signalled.get() + 1;
-        self.signalled.set(want);
-        self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), want);
-        if !self.event.waitUntilSignaledValue_timeoutMS(want, MTL4_WAIT_MS) {
-            // RETURNED WITHOUT RESETTING, and that is the whole point of the
-            // paragraph above. A wait that timed out is the ONE case where the
-            // GPU is provably still holding the commands this allocator owns,
-            // so resetting on the way out would be precisely the use-after-free
-            // the success path is careful to avoid — committed on the strength
-            // of a wait that, by hypothesis, did not happen. Leaking the
-            // allocator instead ends the gate with a message a reader can act
-            // on; the process is failing either way, and only one of the two
-            // endings is defined behaviour.
+        // A SPURIOUS WAKEUP IS NOT A TIMEOUT, and the budget is TOTAL rather
+        // than per-wakeup. `Condvar::wait_timeout` may return early having not
+        // timed out, so the loop re-checks the slot and re-derives what is left
+        // of the budget from `started` each time. Deriving it by subtracting
+        // from the previous remainder would compound, and passing the full
+        // `MTL4_WAIT_MS` again would make the constant a per-wakeup bound
+        // instead of the total bound its doc claims.
+        // NO `?` ANYWHERE IN THE WAIT, and that is deliberate rather than
+        // stylistic. Every early exit between the commit and the handler's
+        // arrival is subject to the same rule the timeout branch states below:
+        // the handler may still run, so the block must be leaked rather than
+        // dropped. A `?` here would be an exit that silently skipped it. Lock
+        // poisoning is the only such exit and is close to impossible — the
+        // block's own critical section is one assignment — but "close to
+        // impossible" is how the interesting ones get in, and the rule is
+        // cheaper to keep universal than to reason about per site.
+        let total = std::time::Duration::from_millis(MTL4_WAIT_MS);
+        let (lock, cv) = &*cell;
+        let got = match lock.lock() {
+            Err(_) => None,
+            Ok(mut slot) => loop {
+                if let Some(got) = slot.take() {
+                    break Some(got);
+                }
+                let left = total.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    break None;
+                }
+                match cv.wait_timeout(slot, left) {
+                    Ok((next, _)) => slot = next,
+                    Err(_) => break None,
+                }
+            },
+        };
+
+        let Some(got) = got else {
+            // RETURNED WITHOUT RESETTING ANYTHING, per the two paragraphs
+            // above. The handler has not run; it may still. So the allocator is
+            // not reset, and the block and its options are forgotten rather
+            // than dropped — freeing a callback Metal may yet invoke is the one
+            // way this cleanup could be worse than no cleanup at all.
+            std::mem::forget(handler);
+            std::mem::forget(options);
             return Err(format!(
-                "the MTL4 submission did not signal {want} within {MTL4_WAIT_MS} ms — the \
-                 command buffer never completed"
+                "the MTL4 commit feedback did not arrive within {MTL4_WAIT_MS} ms — the \
+                 command buffer never reported completion"
+            ));
+        };
+        self.allocator.reset();
+        // NOTHING COUNTS `handled` HERE. The block already did, and that is the
+        // point of the field — see its doc. Ticking it on this line instead
+        // would make it a restatement of `commits` wearing another name.
+        self.stamps.set((got.gpu_start, got.gpu_end));
+
+        // THE CLOSURE'S ERROR FIRST, AND BEFORE BOTH OF THE CHECKS BELOW. This
+        // function's doc states the rule and `Mtl::compute` next door keeps it:
+        // a binding error is reported ahead of the command buffer's own,
+        // because the second is usually the downstream consequence of the
+        // first. Everything from here down is the command buffer's own — the
+        // wall bound is a statement about the submission, not about the
+        // binding — so a `?` placed after them would let a clock complaint mask
+        // the error that actually explains the run.
+        inner?;
+
+        // THE WALL BOUND, and it is deliberately a DURATION comparison rather
+        // than an epoch one. `GPUStartTime`/`GPUEndTime` are on the GPU's clock
+        // and `started` is on the CPU's; nothing here assumes the two share a
+        // zero. What must hold regardless is that the GPU's execution is a
+        // subinterval of the wait that contained it, so its duration cannot
+        // exceed ours. Comparing the two clocks' ABSOLUTE values would need a
+        // timebase we cannot reach without a new dependency, and a mis-derived
+        // epoch would fail a correct run — worse than no check.
+        let wall = started.elapsed().as_secs_f64();
+        if got.gpu_start > 0.0 && got.gpu_end - got.gpu_start > wall {
+            return Err(format!(
+                "the MTL4 commit feedback reports a GPU duration of {:.6} s inside a wait of \
+                 {wall:.6} s — the timestamps cannot describe this submission",
+                got.gpu_end - got.gpu_start
             ));
         }
-        self.allocator.reset();
-        inner
+        match &got.error {
+            None => Ok(got),
+            Some(e) => Err(format!("the MTL4 commit reported: {e}")),
+        }
+    }
+
+    /// What every `submit` on this handle has seen so far.
+    ///
+    /// The gate's material for K11: the two counts must agree, and the
+    /// timestamps are the reach proof that a `None` error means anything.
+    ///
+    /// The two counts come from two threads and are read here without a lock,
+    /// which is sound for what K11 asks of them because every submission has
+    /// already returned by the time it asks — so any handler that ran is
+    /// ordered before this load by the wait that observed it, and the only
+    /// thing racing is a handler that has not fired yet, which is the failure
+    /// being reported either way.
+    pub fn tally(&self) -> Tally {
+        let (gpu_start, gpu_end) = self.stamps.get();
+        Tally {
+            commits: self.commits.get(),
+            handled: self.handled.load(std::sync::atomic::Ordering::SeqCst),
+            gpu_start,
+            gpu_end,
+        }
     }
 
     /// A residency set holding `allocations`, committed, requested and attached

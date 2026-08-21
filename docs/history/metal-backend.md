@@ -1561,4 +1561,212 @@ cargo run --release -- --check-mtl    # THE METAL BACKEND ACTUALLY RUNNING SOMET
                                       # has whole-graph reach -- but this one is nine strings inside
                                       # the `cfg(target_os = "macos")` objc2-metal block, so it cannot
                                       # reach a wasm build by construction.
+
+cargo run --release -- --check-mtl     # D4b -- THE MTL4 ERROR CHANNEL, and it turned out to be
+                                      # the wait as well (macOS; src/mtl/device.rs +
+                                      # src/mtl/mtl4.rs). K11.
+                                      #
+                                      # D4 SHIPPED THE MTL4 PATH WITH NO ERROR CHECK AT ALL, and said so
+                                      # at length rather than hiding it. Metal 3 next door reads
+                                      # `cb.error()` and its comment gives the reason -- "the only channel a
+                                      # committed buffer has; dropping it silently is how a failed dispatch
+                                      # reads as a black image". MTL4 has no synchronous equivalent
+                                      # ANYWHERE: not on the queue, not on the command buffer, not on the
+                                      # allocator (checked against all 32 generated MTL4* files). The whole
+                                      # channel is MTL4CommitFeedback::error, delivered as a block.
+                                      #
+                                      # D4 declined to bolt it on, and the refusal was correct: a handler
+                                      # ordered against nothing the wait observes reports "no error"
+                                      # identically when there was none and when it has simply not run yet.
+                                      # That is the FR_ABL probe-reach trap, which this project has fallen
+                                      # into four times. D4 named the fix in its own doc -- "making the
+                                      # FEEDBACK the completion signal instead of the event" -- and left it
+                                      # for the rung that first extended the path beyond the smoke chain.
+                                      #
+                                      # THE TWO REMOVALS ARE ONE REMOVAL, and that is the finding that made
+                                      # the rung small. MTL4 took away waitUntilCompleted AND the error
+                                      # accessor, and MTL4CommitFeedback is the replacement for BOTH -- it
+                                      # is the only thing that reports completion without polling and the
+                                      # only thing that carries an error. So the wait is not "an event plus
+                                      # a check": it is one handler whose ARRIVAL is completion and whose
+                                      # error() is the diagnosis. MTLSharedEvent, the monotone `signalled`
+                                      # counter and MTLEvent in Cargo.toml all went with it.
+                                      #
+                                      # REACH IS NOW STRUCTURAL RATHER THAN ASSERTED, which is the whole
+                                      # point. Nothing but the handler can unblock Mtl4::submit, so there is
+                                      # no state in which it did not run and we return Ok anyway. Non-reach
+                                      # is a 2000 ms timeout and a red gate, not a confident green line.
+                                      #
+                                      # MEASURED, Apple M1, macOS 26.5.1, quick profile:
+                                      #
+                                      #   check-mtl: K11 commit feedback OK -- 3 commits, 3 handlers,
+                                      #              GPU 0.015 ms on the last one; 0 errors reported
+                                      #
+                                      #   clean runs                     10/10 quick, then 5/5 release after
+                                      #                                  the counter fix below -- 3/3 every run
+                                      #   FR_MTL4_NO_FEEDBACK            exit 1, ~3 s: K10 "did not arrive
+                                      #                                  within 2000 ms", K11 "1 commits but
+                                      #                                  0 feedback handlers"
+                                      #   FR_MTL4_TABLE_INDEX            exit 1, [3, 3, 3] -- SIGNATURE UNCHANGED
+                                      #   FR_MTL4_NO_BARRIER             exit 1, [4, 1, 1] -- SIGNATURE UNCHANGED
+                                      #   FR_MTL4_NO_RESIDENCY           exit 0            -- SIGNATURE UNCHANGED
+                                      #   FR_MTL4_OFF                    exit 0, SKIP K9   -- SIGNATURE UNCHANGED
+                                      #   MTL_DEBUG_LAYER=1              exit 0
+                                      #   MTL_SHADER_VALIDATION=1        exit 0
+                                      #   --check-msl/-spirv/-metalfx/-fsr3   all exit 0
+                                      #
+                                      # THE 10x CLEAN RUN IS NOT PADDING. It is the only instrument for the
+                                      # question the bindings do not settle: is feedback delivered strictly
+                                      # AFTER the work completes, so that the readback after the wait is
+                                      # race-free? smoke::verify reads every one of 619 words, so an early
+                                      # wakeup would flake. Ten clean readbacks is evidence; one is not.
+                                      # Apple's own wording ("after completing a workload", GPUEndTime = "the
+                                      # host time when the GPU finishes execution") agrees, but it is prose.
+                                      #
+                                      # THE TIMESTAMPS ARE THE OTHER HALF OF THE REACH PROOF, and they cost
+                                      # nothing: objc2-core-foundation was already in the build graph. We
+                                      # cannot fabricate them. A block handed a stub, or one for a workload
+                                      # that never executed, yields 0.0/0.0; nonzero and correctly ordered is
+                                      # evidence the handler arrived carrying real data about OUR submission.
+                                      # K11 also bounds GPUEndTime-GPUStartTime by the wall time of the wait
+                                      # that contained it -- a DURATION comparison across two clocks, never
+                                      # an epoch one, because the GPU execution must be a subinterval of the
+                                      # wait and that holds without knowing what zero means on either clock.
+                                      # Comparing absolute values would need a timebase unreachable without a
+                                      # new dependency, and a mis-derived epoch fails a CORRECT run.
+                                      #
+                                      # A ZERO READING IS A PLATFORM FACT AND NOT A FAILURE. K11 prints NOT
+                                      # POPULATED and says the reach then rests on the structure alone. This
+                                      # box populates them; the CI runner never reaches K11 at all.
+                                      #
+                                      # "3 HANDLERS" IS COUNTED IN THE HANDLER, AND THE FIRST DRAFT OF THIS
+                                      # RUNG DID NOT DO THAT -- caught in review of the uncommitted change,
+                                      # recorded because the mistake is more instructive than the fix. The
+                                      # count started life on the WAITING thread, ticked once per successful
+                                      # wait. That is once per commit BY CONSTRUCTION: tracing every path
+                                      # between the two increments, the only exit that skips the second is the
+                                      # timeout, so "handled != commits" could mean nothing except "a wait
+                                      # timed out" -- which FR_MTL4_NO_FEEDBACK already reports one line up.
+                                      # The field's doc meanwhile claimed it caught two undocumented
+                                      # behaviours, per-buffer-vs-per-commit delivery and a double fire, and
+                                      # it could see NEITHER. A counter that restates its own denominator,
+                                      # wearing a second name and a coverage claim.
+                                      #
+                                      # THE SHAPE IS THE FR_ABL PROBE-REACH TRAP ARRIVING IN THE COUNTER
+                                      # instead of in the check, one layer below where this rung was watching
+                                      # for it -- the rung whose entire subject is not trusting a green line
+                                      # from a probe that may not have run. Fixed by moving the tick INSIDE
+                                      # the block (Arc<AtomicU64>, SeqCst, ordered ahead of the mutex release
+                                      # that publishes the payload), so it counts invocations rather than
+                                      # observations. K11 reads it after every wait has returned, so a stray
+                                      # second fire on an EARLIER submission is still visible.
+                                      #
+                                      # AND ONLY NOW IS 3/3 A MEASUREMENT. 5/5 clean release runs report 3
+                                      # commits and 3 handlers, which is the first evidence in this campaign
+                                      # that MTL4 delivers feedback exactly once per commit rather than per
+                                      # command buffer -- a thing the bindings state nowhere. Under the old
+                                      # counter those same five runs would have printed 3/3 with the handler
+                                      # stubbed out entirely.
+                                      #
+                                      # ONE ORDERING BUG CAME OUT OF THE SAME READ: the wall-clock bound
+                                      # returned its Err ahead of `inner?`, so a binding error could be masked
+                                      # by a complaint about the platform's clock. submit's own doc states the
+                                      # opposite order and Mtl::compute next door keeps it -- a binding error
+                                      # is reported before the command buffer's own, being usually its cause
+                                      # rather than its symptom. `inner?` now precedes both checks. Unreachable
+                                      # in practice; it is a stated contract in a file that runs on them.
+                                      #
+                                      # THE CHANNEL IS PROVEN DELIVERED AND NOT PROVEN TO REPORT FAULTS, and
+                                      # the entry says so rather than implying coverage. Both of the other
+                                      # teeth produce WRONG BYTES through a command buffer that reports no
+                                      # error -- K11 prints "1 commits, 1 handlers, 0 errors reported" under
+                                      # FR_MTL4_TABLE_INDEX and under FR_MTL4_NO_BARRIER alike. smoke.rs
+                                      # records Metal 3 answering identically for a residency violation under
+                                      # MTL_SHADER_VALIDATION=1: "The command buffer reports no error ... the
+                                      # writes simply do not land."
+                                      #
+                                      # INDUCING A REAL FAULT WAS CONSIDERED AND REJECTED, listed here so the
+                                      # next reader does not spend the afternoon re-deriving it:
+                                      #   * out-of-bounds shader write -- measured silent next door (above)
+                                      #   * a hang -> MTL4CommandQueueError::Timeout -- would work, and is the
+                                      #     class smoke.rs::GRID_POISON exists to PREVENT: on a dev Mac it
+                                      #     takes the WindowServer with it, in CI it is a 45-minute timeout
+                                      #   * an enormous grid -- same class, same refusal
+                                      #   * OutOfMemory -- newBufferWithLength returns nil before submission,
+                                      #     so the channel is never reached
+                                      #   * an unbacked GPU address -- already measured silent, twice
+                                      #   * a misaligned indirect-dispatch address -- undefined and
+                                      #     non-deterministic; a plant that may not repeat is not an instrument
+                                      #
+                                      # dispatch2 IS NOT NEEDED, and the binding settles it rather than a
+                                      # guess: MTL4CommandQueueDescriptor::feedbackQueue says nil is "the
+                                      # default, Metal allocates an internal dispatch queue to service
+                                      # feedback notifications". We set nothing and take that queue, which
+                                      # also dodges the binding's own warning that the queue "is not retained
+                                      # internally". Verified after the edit: cargo tree still shows zero
+                                      # dispatch2 in the macOS graph.
+                                      #
+                                      # WHAT IT DOES COST IS A THREAD, and every capture is owned because of
+                                      # it. The handler runs on that Metal-allocated serial queue, so the
+                                      # NSError is stringified INSIDE the block -- Retained<T> is not Send --
+                                      # and the rendezvous is Arc<Mutex<Option<Feedback>>> + Condvar rather
+                                      # than the Cell the event wait could use. The budget is TOTAL, not
+                                      # per-wakeup: a spurious wakeup re-derives what is left from the start
+                                      # instant, because passing MTL4_WAIT_MS again would make the constant a
+                                      # per-wakeup bound instead of the total bound its doc claims.
+                                      #
+                                      # block2 IS A DIRECT DEPENDENCY NOW, AND IT COSTS NO COMPILE. objc2-
+                                      # metal does not re-export it (its lib.rs re-exports only its own
+                                      # modules), so RcBlock::new is reachable only by naming the crate --
+                                      # which is why the "objc2-foundation is deliberately NOT a direct
+                                      # dependency" rule does not extend to it: that rule works because we
+                                      # only ever RECEIVE an NSError, and here we must CONSTRUCT a block.
+                                      # cargo tree already showed block2 0.6 twice in this build (objc2-metal
+                                      # enables it for objc2-metal-fx's MTLFX* features; wgpu-hal enables it
+                                      # independently), so naming it converts an accident into an intention --
+                                      # the same lesson the MTL4Compiler note in Cargo.toml already records.
+                                      #
+                                      # AND ONE STALE COMMENT FELL OUT. msl.rs said newLibraryWithData: "is
+                                      # gated behind objc2-metal's dispatch2 feature and would pull block2 in
+                                      # with it". The block2 half is now false and was corrected in place, not
+                                      # deleted -- the wrong half is the one a reader weighing the two routes
+                                      # reaches first. The dispatch2 half stands, and so does the file route.
+                                      #
+                                      # THE THIRD FAILURE MODE. mtl4::pass skipped its residency teardown on
+                                      # failure and enumerated exactly two reasons; there are now three, since
+                                      # a submission can also fail having REPORTED an error, where the GPU is
+                                      # provably done and teardown would be safe. The skip still covers all
+                                      # three -- distinguishing them there would put a second copy of submit's
+                                      # ending-classification in a second file, where the two could drift.
+                                      # submit's own timeout branch grew the matching rule: it leaks the
+                                      # RcBlock and the options as well as the allocator, because a wait that
+                                      # timed out has not established that the handler will NEVER run -- only
+                                      # that it has not run yet, and freeing a callback Metal may still invoke
+                                      # is the use-after-free arriving through the cleanup path.
+                                      #
+                                      # Mtl4::compute IS NOW A WRAPPER over Mtl4::submit, which owns the
+                                      # command buffer, the commit and the wait. compute keeps only what is
+                                      # about COMPUTE -- making the encoder and reporting a nil one as ours.
+                                      # Done here rather than in the MetalFX rung that needs submit, because
+                                      # this rung was rewriting the function anyway and one wait with two
+                                      # callers cannot drift the way two copies can.
+                                      #
+                                      # CI STILL CANNOT SEE ANY OF THIS, and the ci.yml comment was rewritten
+                                      # from a hedge into the measurement. Run 32309810963 answered D4's open
+                                      # question NO: macos-latest is an Apple Paravirtual device reporting
+                                      # `metal4 family false`, newMTL4CommandQueue returns nil, SKIP K9 every
+                                      # run. --check-fsr3 U2 and --check-metalfx X1 print the same from the
+                                      # same device, so it is the device and not a gate-local quirk. The guard
+                                      # cannot be tightened until GitHub's image moves to macOS 26, and a
+                                      # green check-metal covers the skip branch and nothing else of MTL4.
+                                      #
+                                      # Touch mtl::device::Mtl4::submit / Mtl4::compute / Mtl4::tally /
+                                      # mtl4::Plant / the objc2-metal feature list / the block2 dependency ->
+                                      # run --check-mtl clean, and 10x for the delivery-ordering claim; then
+                                      # EACH of the five levers SEPARATELY (three teeth must exit 1); then
+                                      # --check-mtl under MTL_DEBUG_LAYER=1 and under MTL_SHADER_VALIDATION=1
+                                      # SEPARATELY; then --check-msl AND --check-fsr3 AND --check-metalfx AND
+                                      # --check-spirv, because a Cargo.toml feature edit has whole-graph reach
+                                      # and those four share it; then cargo tree to confirm dispatch2 stayed
+                                      # out; then --check + cargo test LAST and restore the Windows goldens.
 ```

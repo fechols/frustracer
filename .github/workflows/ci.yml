@@ -947,20 +947,34 @@ jobs:
       # absent, so PASSED alone would go green on a runner that lost either. K4
       # is the line only a real dispatch prints.
       #
-      # THE K9 GUARD IS DELIBERATELY THE WEAK FORM, AND K10 IS DELIBERATELY NOT
-      # GUARDED AT ALL. D4 added the Metal 4 submission path; it needs macOS 26
-      # AND a device that implements MTL4, and this runner is an Apple
-      # Paravirtual device that NOTHING has ever probed for it — the
-      # `probe-metal4` job that was supposed to answer this was
-      # workflow_dispatch-only and never ran once, which is why D4 retired it in
-      # favour of --check-mtl reporting the same facts on every run. So the
-      # guard asserts only that the STAGE RAN: `K9` and `SKIP K9` both match,
-      # because both are legitimate answers and only their absence means the
-      # stage was removed. Read the first green run's K9 line — it prints
-      # `metal4 family` either way — and tighten onto K10 in a FOLLOW-UP if it
-      # says the runner has Metal 4. Tightening it here would be the
-      # --check-metalfx mistake this file already records one screen down: a
-      # guard on a line that has not been proven to run.
+      # THE K9 GUARD STAYS THE WEAK FORM, AND K10/K11 STAY UNGUARDED — AND THAT
+      # IS NOW A MEASUREMENT RATHER THAN A PRECAUTION. D4 added the Metal 4
+      # submission path, which needs macOS 26 AND a device that implements MTL4.
+      # D4 landed the weak guard because nothing had ever probed this runner
+      # (the `probe-metal4` job meant to answer it was workflow_dispatch-only
+      # and never ran once, which is why D4 retired it in favour of --check-mtl
+      # reporting the same facts on every run), and said to read the first green
+      # run and tighten if the answer allowed.
+      #
+      # THE ANSWER CAME BACK NO. Run 32309810963, 2026-08-19, this job:
+      #
+      #   check-mtl: K1 Apple Paravirtual device | unified true
+      #              | arg-buffers tier 2 | metal4 family false
+      #   check-mtl: SKIP K9 no MTL4 command queue (newMTL4CommandQueue
+      #              returned nil; device reports `metal4 family false`)
+      #
+      # --check-fsr3 U2 and --check-metalfx X1 print `metal4 family false` from
+      # the same device on the same run, so it is the device and not a
+      # gate-local quirk. The guard therefore CANNOT be tightened until GitHub's
+      # macOS image moves to macOS 26, and `SKIP K9` is not a degraded answer
+      # here — it is the only one this runner can give.
+      #
+      # SO READ A GREEN check-metal NARROWLY. It proves the MTL4 stage was
+      # REACHED and took its skip. It proves nothing about K10's barriers,
+      # residency set or cross-API byte-compare, and nothing about K11's commit
+      # feedback: those are M1-only teeth, run by hand. `FR_MTL4_OFF` exercises
+      # the same skip branch locally, which is more useful than it looked when
+      # it was written — the skip is the ONLY MTL4 branch CI ever takes.
       #
       # K8 IS THE SECOND GUARD AND IT IS K8 RATHER THAN K6 ON PURPOSE. C3 added
       # three stages; K8 is the LAST of them and the only one that proves the

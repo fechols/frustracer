@@ -97,6 +97,13 @@
 //!   the two paths' readbacks word for word — one shader, one pipeline, two
 //!   submission APIs, identical bytes. `--check-mtl` K9/K10.
 //!
+//!   D4b then gave it the one thing MTL4 removed and D4 left unreplaced: an
+//!   ERROR CHANNEL. `MTL4CommitFeedback` is both halves of it — MTL4 has no
+//!   synchronous `error` and no `waitUntilCompleted` — so the wait is built ON
+//!   the handler rather than beside it, and the shared event is gone. Reach is
+//!   structural rather than asserted: nothing else can unblock the submission,
+//!   which `FR_MTL4_NO_FEEDBACK` proves by timing out. `--check-mtl` K11.
+//!
 //! It also retired the premise the tracer plan was written on: **spirv-cross
 //! lowers `RayQuery` to Metal**, so `leaf`/`reference`/`leaf_fb`/`hemi_leaf`
 //! compile with hardware ray tracing intact and a Metal tracer does not need

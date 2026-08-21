@@ -15742,11 +15742,12 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
     i32::from(!ok)
 }
 
-/// `--check-mtl` K9-K10: the same smoke chain through the **Metal 4** API.
+/// `--check-mtl` K9-K11: the same smoke chain through the **Metal 4** API.
 ///
 /// K9 builds the MTL4 submission objects or SKIPs; K10 runs the chain, holds it
 /// to `smoke::verify` — the SAME function the Metal 3 path is held to — and
-/// then compares the two paths' readbacks word for word.
+/// then compares the two paths' readbacks word for word. K11 scores the commit
+/// feedback every one of those submissions waited on.
 ///
 /// # The SKIP is this stage's vacuity hazard, and it is stated rather than
 /// hidden
@@ -15757,11 +15758,12 @@ fn run_check_msl(scene: &scene::Scene) -> i32 {
 /// `metal4 family`, so a run that SKIPPED while the device claimed the family
 /// is visibly odd rather than merely quiet; and `FR_MTL4_OFF` forces the SKIP
 /// branch on a machine that does have MTL4, so the branch itself is reachable
-/// for inspection. The CI guard is deliberately NOT tightened onto K10 in the
-/// commit that adds it — the runner is an Apple Paravirtual device and nothing
-/// has ever probed it for Metal 4, and `.github/workflows/ci.yml` records at
-/// length what happens when a guard is tightened onto a line that was never
-/// proven to run.
+/// for inspection. The CI guard is deliberately NOT tightened onto K10 or K11,
+/// and that is no longer a precaution but a MEASUREMENT: run 32309810963
+/// (2026-08-19) printed `SKIP K9 ... metal4 family false` from GitHub's
+/// macos-latest, an Apple Paravirtual device. The SKIP branch is the only MTL4
+/// code CI will run until that image moves to macOS 26, so a green
+/// `check-metal` covers this stage's skip and nothing else of it.
 ///
 /// # Why K10 re-runs the Metal 3 pass instead of reusing K4's
 ///
@@ -15801,8 +15803,8 @@ fn run_mtl4(m: &mtl::device::Mtl, pipes: &mtl::smoke::Pipes, plant: mtl::mtl4::P
         }
     };
     println!(
-        "check-mtl: K9 MTL4 queue + allocator + shared event OK | metal4 family {} | \
-         pipelines SHARED with the Metal 3 path (MTL4Compiler not needed)",
+        "check-mtl: K9 MTL4 queue + allocator OK (commit feedback is the wait) | \
+         metal4 family {} | pipelines SHARED with the Metal 3 path (MTL4Compiler not needed)",
         m.metal4_family()
     );
 
@@ -15875,6 +15877,81 @@ fn run_mtl4(m: &mtl::device::Mtl, pipes: &mtl::smoke::Pipes, plant: mtl::mtl4::P
                 ok = false;
             }
         }
+    }
+
+    // K11 — THE COMMIT FEEDBACK ITSELF, which every submission above rode on.
+    //
+    // It runs LAST because it scores a tally the earlier stages accumulate, and
+    // it is the stage that keeps D4b from being the trap it was written to
+    // avoid. The reach argument is structural — with the shared event gone,
+    // nothing but the handler can unblock `Mtl4::submit`, so a green K10 is
+    // already evidence the handler ran three times. This stage is what makes
+    // that evidence LEGIBLE rather than implicit, and adds the two things the
+    // structure cannot say by itself.
+    let t = g.tally();
+    // ANTI-VACUITY FIRST. A K11 that ran after zero submissions would otherwise
+    // print a confident line having scored nothing — the failure mode K3's
+    // slot count and K10's allocation count are both written against.
+    if t.commits == 0 {
+        eprintln!(
+            "check-mtl: FAIL K11 the feedback tally saw no submissions at all — K11 scored \
+             nothing and the stages above cannot have run"
+        );
+        ok = false;
+    } else if t.handled != t.commits {
+        // NOT DOCUMENTED EITHER WAY, which is why it is counted rather than
+        // assumed: whether feedback is delivered per commit or per command
+        // buffer, and whether a handler can fire twice. One buffer per commit
+        // today makes the two agree if the API is sane, and this is how we find
+        // out that it is rather than supposing so.
+        //
+        // THE COUNT IS TAKEN INSIDE THE HANDLER — see `Mtl4::handled`, whose
+        // doc carries the reason at length. Counting it on the waiting thread
+        // instead, as the first draft did, makes it a restatement of `commits`
+        // that can only ever disagree when a wait timed out, and blind to both
+        // of the behaviours named above. This branch is worth reading as a real
+        // check only because of where the increment lives.
+        eprintln!(
+            "check-mtl: FAIL K11 {} commits but {} feedback handlers — the completion signal \
+             is not one-to-one with the submission",
+            t.commits, t.handled
+        );
+        ok = false;
+    } else if t.gpu_start > 0.0 {
+        // THE REACH PROOF, and the reason it is worth a line: we cannot
+        // fabricate these. A block that ran with a stub, or for a workload that
+        // never executed, yields zeros. Nonzero and correctly ordered is
+        // evidence the handler arrived carrying real data about OUR submission,
+        // which is what turns "error() was None" from a tautology into a fact.
+        // `submit` has already bounded the duration against its own wall clock.
+        if t.gpu_end < t.gpu_start {
+            eprintln!(
+                "check-mtl: FAIL K11 the feedback timestamps run backwards \
+                 (start {:.6}, end {:.6})",
+                t.gpu_start, t.gpu_end
+            );
+            ok = false;
+        } else {
+            println!(
+                "check-mtl: K11 commit feedback OK — {} commits, {} handlers, GPU {:.3} ms \
+                 on the last one; 0 errors reported",
+                t.commits,
+                t.handled,
+                (t.gpu_end - t.gpu_start) * 1e3
+            );
+        }
+    } else {
+        // A PLATFORM FACT, NOT A FAILURE. `GPUStartTime` being unpopulated says
+        // nothing about our code, and failing here would fail a correct machine
+        // — the rule `FR_MTL4_NO_RESIDENCY` is classified by, in another
+        // currency. The reach proof then rests on the structure alone, and this
+        // line says so rather than quietly dropping the claim.
+        println!(
+            "check-mtl: K11 commit feedback OK — {} commits, {} handlers, 0 errors reported. \
+             NOTE GPUStartTime/GPUEndTime NOT POPULATED on this device, so reach rests on the \
+             wait being structural (nothing else can unblock it) rather than on timestamps",
+            t.commits, t.handled
+        );
     }
     ok
 }

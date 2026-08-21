@@ -310,9 +310,10 @@ ablation and probes: `FR_ABL` `FR_BALLAST` `FR_WIDTH` `FR_ORACLE` `FR_RANGE` `FR
 tuning sweeps: `FR_LEAF` `FR_LGROUP` `FR_LSTACK` `FR_WIDE` `FR_STACK_LAYOUT` `FR_FRD_GROUP` ·
 per-feature A/B: `FR_NGXFG_*` `FR_NGXRR_*` `FR_NRD_*` `FR_FRD_*` `FR_MFX*` `FR_AEXP_*`
 `FR_MTL_*` (the `--check-mtl` plants: eight teeth and measurements over the argument-buffer
-map, the threadgroup size and residency) · `FR_MTL4_*` (the Metal 4 path's four: the argument
-table's bind point and the inter-dispatch barriers are TEETH, residency is a measurement, and
-`FR_MTL4_OFF` forces the SKIP branch on a box that has MTL4) · `FR_FFX_MSL` — **the one
+map, the threadgroup size and residency) · `FR_MTL4_*` (the Metal 4 path's five: the argument
+table's bind point, the inter-dispatch barriers and the commit-feedback handler are TEETH,
+residency is a measurement, and `FR_MTL4_OFF` forces the SKIP branch on a box that has
+MTL4) · `FR_FFX_MSL` — **the one
 BUILD-time lever**, so it needs `cargo build` and the gate run to see it alike, and a stale
 binary measures the other arm
 `FR_DXR_LEAN` `FR_DXR_STACK` `FR_FG_*` `FR_RTGI_NOWEIGHT` `FR_SWAY_*` `FR_WEB_TEX`

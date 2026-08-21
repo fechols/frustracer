@@ -431,6 +431,16 @@ impl Msl {
     /// costs no dependency (`newLibraryWithData:` is gated behind objc2-metal's
     /// `dispatch2` feature and would pull `block2` in with it).
     ///
+    /// **HALF OF THAT PARENTHETICAL IS NOW STALE, 2026-08-19**, and it is
+    /// corrected rather than deleted because the wrong half is the one a reader
+    /// weighing the two routes reaches first. `block2` costs NOTHING: it was
+    /// already in the build graph through `objc2-metal-fx`, and D4b now names
+    /// it in `Cargo.toml` outright for the commit-feedback handler. Only
+    /// `dispatch2` is still a real dependency — nothing in the tree enables it,
+    /// and D4b deliberately avoided needing it. So `newLibraryWithData:` is
+    /// cheaper than this says; it is still not free, and the file route is
+    /// still what `bind` wants.
+    ///
     /// The caller owns the file. Every caller here writes into `Msl::scratch`,
     /// which the gate removes wholesale when it finishes.
     pub fn compile_lib(&self, msl: &str, stem: &str) -> Result<PathBuf, String> {
