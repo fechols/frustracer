@@ -43,15 +43,16 @@ hardware root traversal. The durable result is more specific:
 - an inherited BVH cut can help custom software traversal;
 - merely increasing a hardware ray's `tmin` changes traversal cost very little.
 
-A July 2026 Arc Pro B70 pass at 1080p measured the moving procedural workload at
-0.74 ms/frame for the plain hardware-RayQuery reference and 1.07–1.08 ms/frame
-for the original quadtree hybrid. Removing terminal cut refinement that hardware
-rays could not consume reduced materialized cut records from 257 to 65; batching
-homogeneous child-queue reservations removed more global atomics. Together they
-reduced the hybrid to 1.02–1.03 ms—about 5% across these laps—without changing
-a pixel or visibility counter. These are engineering A/Bs over deterministic
-camera laps after a 1,600-frame Intel shader warm-up, not publication-grade
-cross-vendor results.
+Two Arc Pro B70 results appear later in this document, and they point in
+opposite directions until the baseline is named. Against the **DXR pipeline**,
+the wavefront hybrid renders THE WORLD 1.2–1.6× faster (~42% on average) — but
+that margin is roughly nine parts "Arc prefers this workload as compute" to one
+part quadtree (see [On Intel Arc](#on-intel-arc)). Against the cheapest arm
+that exists — the **same RayQuery traversal in a bare compute kernel** — the
+quadtree's marginal sample costs within a few percent of hardware root
+traversal on both vendors, and what separates the arms is a fixed front-end
+cost it does not earn back: 1.38–1.39× at 1 spp on the B70 (see
+[What the quadtree is actually worth](#what-the-quadtree-is-actually-worth)).
 
 ### Relation to prior work
 
@@ -1715,6 +1716,15 @@ frames:
 | Plain hardware `RayQuery` | 0.74 | 1.00× |
 | Hybrid before this B70 pass | 1.07–1.08 | 1.45–1.46× |
 | Hybrid, current | 1.02–1.03 | 1.38–1.39× |
+
+The July 2026 pass between those two hybrid rows: removing terminal cut
+refinement that hardware rays could not consume reduced materialized cut
+records from 257 to 65, and batching homogeneous child-queue reservations
+removed more global atomics — about 5% across these laps, without changing a
+pixel or visibility counter (`FR_ABL=oldcut,nobatch` reconstructs the pre-pass
+code for a pixel-identical A/B). These are engineering A/Bs over deterministic
+camera laps after a 1,600-frame Intel shader warm-up, not publication-grade
+cross-vendor results.
 
 The independent in-suite, interleaved `--check-gpu` speedometer tells the same
 story. These are synchronous wall-clock values; its two local warm-up frames
