@@ -218,69 +218,19 @@ impl Swapchain {
     /// Create a headless surface and a swapchain on it, or say why not.
     ///
     /// `Ok(None)` is "this box cannot present" and is a SKIP; `Err` is a real
-    /// failure of something that should have worked.
+    /// failure of something that should have worked. The stand-downs and the
+    /// surface itself are `headless_surface`'s, so a gate that builds its own
+    /// chain over that surface skips on exactly the facts this does.
     pub fn new(hg: &VkHeadless, w: u32, h: u32) -> Result<Option<Swapchain>, String> {
-        let vkd = &hg.vk;
+        let (surface_fn, surface) = match headless_surface(hg)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
 
-        // THE THREE INDEPENDENT ENVIRONMENT FACTS, checked separately so the
-        // skip line names which one is missing. They fail for unrelated
-        // reasons: the surface pair is a loader/ICD property, the swapchain
-        // extension is a device property, and a graphics queue is a property
-        // of the family the pick chose.
-        if !vkd.headless_surface {
-            return Ok(None);
-        }
-        if !vkd.info.swapchain {
-            return Ok(None);
-        }
-        if !vkd.info.graphics_queue {
-            return Ok(None);
-        }
-
-        // A SOFTWARE DEVICE IS STOOD DOWN BEFORE THE CALL, NOT AFTER IT, and
-        // that asymmetry with V11/V13's software skips is the whole point:
-        // those skip on an ERROR the API returned, which is a thing a gate can
-        // catch. This one cannot be caught at all.
-        //
-        // MEASURED on Mesa 25.x lavapipe (`libvulkan_lvp.so`): it advertises
-        // `VK_KHR_swapchain`, accepts a headless surface, and answers EVERY
-        // capability query — present support true, a non-empty format list,
-        // FIFO present mode, `supportedUsageFlags` containing everything asked
-        // for — and then `vkCreateSwapchainKHR` JUMPS TO ADDRESS ZERO inside
-        // its own frames. Backtrace: `#0 0x0 / #1..#4 libvulkan_lvp.so / #5
-        // libvulkan.so.1 / #8 ash create_swapchain`. It reproduces identically
-        // with the validation layer disabled, so the layer is not implicated,
-        // and RADV runs this exact code path clean with validation armed. So
-        // it is lavapipe advertising support it does not have.
-        //
-        // A segfault is not a failure mode a gate can report — it takes the
-        // process down mid-suite and every stage after it goes unrun — and CI
-        // runs `--check-vk` on llvmpipe on every push, so making that call is
-        // not an option. Refusing to make it is.
-        //
-        // `FR_VK_PRESENT_SOFTWARE=1` forces the attempt anyway, so the day a
-        // Mesa release fixes this the re-test is one variable rather than a
-        // patch: the escape is RECORDED rather than pre-applied, and if it
-        // comes back clean this whole block is deleted and V19 joins CI's
-        // forbidden-skip list.
-        let force = std::env::var("FR_VK_PRESENT_SOFTWARE").is_ok_and(|v| v != "0");
-        if vkd.info.kind == vk::PhysicalDeviceType::CPU && !force {
-            return Ok(None);
-        }
-
-        let surface_fn = ash::khr::surface::Instance::new(&vkd.entry, &vkd.instance);
-        let headless_fn = ash::ext::headless_surface::Instance::new(&vkd.entry, &vkd.instance);
-
-        let surface = unsafe {
-            headless_fn.create_headless_surface(&vk::HeadlessSurfaceCreateInfoEXT::default(), None)
-        }
-        .map_err(|e| format!("vkCreateHeadlessSurfaceEXT: {e}"))?;
-
-        // From here on a failure must destroy the surface before returning, so
-        // the body is a closure and the surface is freed on every path out.
-        // Leaking an instance-level handle would outlive the device teardown
-        // below it and surface (pun intended) as a validation error in an
-        // unrelated later stage.
+        // From here on a failure must destroy the surface before returning:
+        // `headless_surface` handed it over, and leaking an instance-level
+        // handle would outlive the device teardown below it and surface (pun
+        // intended) as a validation error in an unrelated later stage.
         let built = Self::build(hg, &surface_fn, surface, w, h, vk::SwapchainKHR::null());
         match built {
             Ok(mut sc) => {
@@ -969,6 +919,82 @@ fn decodable(fmt: vk::Format) -> bool {
     // The 10-bit wire is unpacked arithmetically rather than by byte offset,
     // so it is listed here rather than in `rgb_offsets`.
     fmt == vk::Format::A2B10G10R10_UNORM_PACK32 || display::rgb_offsets(fmt).is_some()
+}
+
+
+/// Create a headless surface ALONE — the half of `Swapchain::new` before the
+/// chain, for a caller that builds its own over it. `Presenter::new` takes a
+/// bare `VkSurfaceKHR` because SDL hands it one, and `--check-vk`'s V22 is
+/// the second caller that shape buys.
+///
+/// `Ok(None)` is "this box cannot present", on the SAME four facts `new`
+/// stands down on and `skip_reason` names — ONE predicate, so a gate built on
+/// this and V19 can never disagree about whether the box can present.
+///
+/// OWNERSHIP: the surface passes to the caller, exactly as SDL's does. On
+/// success `Swapchain::from_surface` takes it over and `destroy` frees it; a
+/// caller that fails BEFORE handing it over owes the `destroy_surface` itself,
+/// which is why the loader comes back alongside it.
+pub fn headless_surface(
+    hg: &VkHeadless,
+) -> Result<Option<(ash::khr::surface::Instance, vk::SurfaceKHR)>, String> {
+    let vkd = &hg.vk;
+
+    // THE THREE INDEPENDENT ENVIRONMENT FACTS, checked separately so the
+    // skip line names which one is missing. They fail for unrelated
+    // reasons: the surface pair is a loader/ICD property, the swapchain
+    // extension is a device property, and a graphics queue is a property
+    // of the family the pick chose.
+    if !vkd.headless_surface {
+        return Ok(None);
+    }
+    if !vkd.info.swapchain {
+        return Ok(None);
+    }
+    if !vkd.info.graphics_queue {
+        return Ok(None);
+    }
+
+    // A SOFTWARE DEVICE IS STOOD DOWN BEFORE THE CALL, NOT AFTER IT, and
+    // that asymmetry with V11/V13's software skips is the whole point:
+    // those skip on an ERROR the API returned, which is a thing a gate can
+    // catch. This one cannot be caught at all.
+    //
+    // MEASURED on Mesa 25.x lavapipe (`libvulkan_lvp.so`): it advertises
+    // `VK_KHR_swapchain`, accepts a headless surface, and answers EVERY
+    // capability query — present support true, a non-empty format list,
+    // FIFO present mode, `supportedUsageFlags` containing everything asked
+    // for — and then `vkCreateSwapchainKHR` JUMPS TO ADDRESS ZERO inside
+    // its own frames. Backtrace: `#0 0x0 / #1..#4 libvulkan_lvp.so / #5
+    // libvulkan.so.1 / #8 ash create_swapchain`. It reproduces identically
+    // with the validation layer disabled, so the layer is not implicated,
+    // and RADV runs this exact code path clean with validation armed. So
+    // it is lavapipe advertising support it does not have.
+    //
+    // A segfault is not a failure mode a gate can report — it takes the
+    // process down mid-suite and every stage after it goes unrun — and CI
+    // runs `--check-vk` on llvmpipe on every push, so making that call is
+    // not an option. Refusing to make it is.
+    //
+    // `FR_VK_PRESENT_SOFTWARE=1` forces the attempt anyway, so the day a
+    // Mesa release fixes this the re-test is one variable rather than a
+    // patch: the escape is RECORDED rather than pre-applied, and if it
+    // comes back clean this whole block is deleted and V19 joins CI's
+    // forbidden-skip list.
+    let force = std::env::var("FR_VK_PRESENT_SOFTWARE").is_ok_and(|v| v != "0");
+    if vkd.info.kind == vk::PhysicalDeviceType::CPU && !force {
+        return Ok(None);
+    }
+
+    let surface_fn = ash::khr::surface::Instance::new(&vkd.entry, &vkd.instance);
+    let headless_fn = ash::ext::headless_surface::Instance::new(&vkd.entry, &vkd.instance);
+
+    let surface = unsafe {
+        headless_fn.create_headless_surface(&vk::HeadlessSurfaceCreateInfoEXT::default(), None)
+    }
+    .map_err(|e| format!("vkCreateHeadlessSurfaceEXT: {e}"))?;
+
+    Ok(Some((surface_fn, surface)))
 }
 
 /// A human-readable reason the present path stood down, for the SKIP line.

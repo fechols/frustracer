@@ -31,7 +31,7 @@
 //! between the two paths is submission, binding and residency, and nothing
 //! else. A rung that also swapped the compiler could not say that.
 //!
-//! # The three things MTL4 took away
+//! # The four things MTL4 took away — which are really three
 //!
 //! Each is a line of code here and a claim the Metal 3 gate cannot make.
 //!
@@ -54,17 +54,24 @@
 //! expectation this rung was planned on. The API contract is real; the unified
 //! memory model hides its violation exactly as it hides Metal 3's.
 //!
-//! **3. `waitUntilCompleted`.** `Mtl4::compute` signals a shared event and
-//! blocks on it with a timeout, so a submission that never lands fails the gate
-//! instead of hanging it.
+//! **3. `waitUntilCompleted`.** `Mtl4::submit` blocks on the commit feedback
+//! with a timeout, so a submission that never lands fails the gate instead of
+//! hanging it. D4 blocked on a shared event here; see entry 4 for why that
+//! became the same entry.
 //!
-//! **4. The command buffer's `error`, and this one is NOT replaced.** MTL4 has
-//! no synchronous error channel at all — only `MTL4CommitFeedback::error`
-//! through an asynchronous block — so a faulted submission is caught here by
-//! `smoke::verify` reading every word of the result rather than by Metal saying
-//! so. `Mtl4`'s own doc carries the argument for why wiring the handler naively
-//! would be a probe that cannot be shown to have reached its target, and why
-//! the next rung to extend this path should wire it properly first.
+//! **4. The command buffer's `error` — REPLACED AT D4b, and this entry is
+//! corrected rather than deleted because it said the opposite for a reason.**
+//! MTL4 has no synchronous error channel at all, only `MTL4CommitFeedback::
+//! error` through an asynchronous block, and D4 shipped without it: `Mtl4`'s
+//! doc argued that a handler ordered against nothing the wait observes reports
+//! "no error" identically when it has not run yet, and that doing it properly
+//! meant making the FEEDBACK the completion signal instead of the event.
+//!
+//! That is what D4b did, and it turned entry 3 and entry 4 into one entry.
+//! `Mtl4::submit` registers the handler through `MTL4CommitOptions`, blocks
+//! until it arrives, and reports its `error`; the `MTLSharedEvent` is gone.
+//! Reach is no longer asserted but STRUCTURAL — nothing else can unblock the
+//! wait — and `FR_MTL4_NO_FEEDBACK` is the tooth that says so.
 //!
 //! # What this file deliberately does NOT do
 //!
@@ -109,9 +116,9 @@ const BARRIER: (MTLStages, MTLStages, MTL4VisibilityOptions) =
 
 /// Levers, the `FR_ABL` read-only-probe idiom — default off, loud when armed.
 ///
-/// **TWO TEETH AND ONE MEASUREMENT, and the split was MEASURED rather than
-/// predicted — the plan predicted it the other way round.** Apple M1, macOS
-/// 26.5.1, 2026-08-19:
+/// **THREE TEETH AND ONE MEASUREMENT, and every split here was MEASURED rather
+/// than predicted — D4 predicted its one the other way round.** Apple M1, macOS
+/// 26.5.1; the first three 2026-08-19, the fourth added at D4b:
 ///
 /// ```text
 ///  FR_MTL4_TABLE_INDEX    TOOTH   K10 "indirect args [3, 3, 3], expected [9, 1, 1]"
@@ -120,7 +127,30 @@ const BARRIER: (MTLStages, MTLStages, MTL4VisibilityOptions) =
 ///                                 — 7/7 identical, plain and under BOTH layers
 ///  FR_MTL4_NO_RESIDENCY   MEAS.   UNOBSERVABLE plain and under MTL_DEBUG_LAYER=1;
 ///                                 observable under MTL_SHADER_VALIDATION=1 only
+///  FR_MTL4_NO_FEEDBACK    TOOTH   K10 "the MTL4 commit feedback did not arrive
+///                                 within 2000 ms", then K11 "1 commits but 0
+///                                 feedback handlers". Exit 1, ~3 s wall (ONE
+///                                 timeout, not three — run's first `?` aborts
+///                                 the chain).
 /// ```
+///
+/// **THE FOURTH IS THE ONE THAT COULD NOT EXIST BEFORE D4b**, and it is what
+/// makes the error channel's reach structural rather than asserted. Drop the
+/// handler and nothing can wake the wait, because the handler IS the wait. A
+/// clean run answers the same question from the other side: K11 reports 3
+/// commits and 3 handlers with populated GPU timestamps, so the block arrived,
+/// arrived once per commit, and arrived carrying real data about our
+/// submission.
+///
+/// **AND THE OTHER TWO TEETH ARE EVIDENCE FOR THE CHANNEL'S HONEST LIMIT.**
+/// Both `TABLE_INDEX` and `NO_BARRIER` produce wrong bytes through a command
+/// buffer that reports NO error — K11 prints `1 commits, 1 handlers, 0 errors
+/// reported` on both. So D4b wired the channel and proved it is delivered; it
+/// did NOT prove the channel reports faults, because nothing available here
+/// faults. `smoke.rs`'s residency note records Metal 3 answering the same way.
+/// The error branch is a MEASUREMENT this rung reports, not a tooth, and the
+/// rejected candidates for inducing a real fault are listed in the D4b entry of
+/// `docs/history/metal-backend.md` so the next reader need not re-derive them.
 ///
 /// **`[4, 1, 1]` IS THE WHOLE BARRIER ARGUMENT IN ONE NUMBER.** It is not the
 /// poison — it is `COUNT_POISON.div_ceil(64)`, i.e. 238 rounded up over the
@@ -166,6 +196,20 @@ pub struct Plant {
     /// exercised somewhere it can be observed. Not a tooth: its whole point is
     /// that the gate stays green.
     pub off: bool,
+    /// Commit with no feedback handler registered at all.
+    ///
+    /// **THE DIRECT TEST OF D4b'S CENTRAL CLAIM**, which is that the commit
+    /// feedback IS the completion signal rather than a check sitting beside
+    /// one. If that is true, a submission with no handler has nothing that can
+    /// wake the wait and `Mtl4::submit` must time out. If the gate passes
+    /// anyway, something else is completing the wait and the reach argument in
+    /// `Mtl4`'s doc is wrong — which is the finding, not a nuisance.
+    ///
+    /// TOOTH, and unlike the other two it could not have been one before D4b:
+    /// there was no handler to drop. Predicted as a tooth and then MEASURED
+    /// biting before `must_fail` named it — see the struct doc's table for the
+    /// signature, and the D2 lesson for why the order matters.
+    pub no_feedback: bool,
 }
 
 impl Plant {
@@ -176,11 +220,12 @@ impl Plant {
             no_barrier: on("FR_MTL4_NO_BARRIER"),
             table_index: on("FR_MTL4_TABLE_INDEX"),
             off: on("FR_MTL4_OFF"),
+            no_feedback: on("FR_MTL4_NO_FEEDBACK"),
         }
     }
 
     pub fn any(&self) -> bool {
-        self.no_residency || self.no_barrier || self.table_index || self.off
+        self.no_residency || self.no_barrier || self.table_index || self.off || self.no_feedback
     }
 
     /// The levers that MUST make the gate fail, which K5's verdict enforces.
@@ -192,7 +237,15 @@ impl Plant {
     /// `smoke::Plant` gives for the identical exclusion. The other two are here
     /// and both were measured biting: see the struct doc for their signatures.
     pub fn must_fail(&self) -> bool {
-        self.table_index || self.no_barrier
+        self.table_index || self.no_barrier || self.no_feedback
+    }
+
+    /// The half of this plant that reaches the submission itself.
+    ///
+    /// `device.rs` reads no `FR_*` variable and must not start; this is how the
+    /// answer travels the one level down.
+    pub fn submit(&self) -> crate::mtl::device::SubmitPlant {
+        crate::mtl::device::SubmitPlant { no_feedback: self.no_feedback }
     }
 
     /// The armed levers, for the gate's PLANT line.
@@ -202,6 +255,7 @@ impl Plant {
             (self.no_barrier, "FR_MTL4_NO_BARRIER"),
             (self.table_index, "FR_MTL4_TABLE_INDEX"),
             (self.off, "FR_MTL4_OFF"),
+            (self.no_feedback, "FR_MTL4_NO_FEEDBACK"),
         ];
         names.iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect::<Vec<_>>().join(" ")
     }
@@ -335,7 +389,7 @@ pub fn pass(
         }
     };
 
-    g.compute(m, |enc| {
+    g.compute(m, plant.submit(), |enc| {
         // The set is attached to the QUEUE by `Mtl4::residency`, and also
         // declared on the command buffer through the encoder's owner — see
         // `Mtl4::residency`'s doc for why all of it is one function.
@@ -407,13 +461,23 @@ pub fn pass(
     // AND ONLY ON THE SUCCESS PATH, WHICH IS DELIBERATE AND NOT A LEAK LEFT
     // LYING. The `?` on `compute` above skips this, so a failed submission
     // leaves the set attached to the queue — and that is the SAFE ending, not
-    // the untidy one. `compute` fails either before anything was submitted or
-    // because the wait TIMED OUT, and in the second case the GPU may still be
-    // reading through exactly these addresses; `endResidency` there would
-    // revoke the backing out from under live work, which is worse than an
-    // over-long residency in a process that is already failing the gate. The
-    // set is released when the run that can prove the GPU is done with it says
-    // so, and at no other time. See `Mtl4::drop_residency`.
+    // the untidy one.
+    //
+    // THERE ARE NOW THREE WAYS `compute` FAILS, not the two this comment used
+    // to name, and the third arrived with D4b: before anything was submitted;
+    // because the feedback never arrived (the old "wait TIMED OUT"); or because
+    // the feedback arrived AND REPORTED AN ERROR. Only the middle one leaves
+    // the GPU possibly still reading through exactly these addresses, and
+    // `endResidency` there would revoke the backing out from under live work —
+    // worse than an over-long residency in a process that is already failing
+    // the gate. The third case is provably done and could safely tear down.
+    //
+    // It is still skipped for all three, and that is a choice rather than an
+    // oversight: distinguishing them here would put a second copy of
+    // `submit`'s ending-classification in a second file, where the two could
+    // drift. An over-long residency in a failing process costs nothing. The set
+    // is released when the run that can prove the GPU is done with it says so,
+    // and at no other time. See `Mtl4::drop_residency`.
     if let Some(s) = &set {
         g.drop_residency(s);
     }

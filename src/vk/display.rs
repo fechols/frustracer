@@ -29,6 +29,20 @@
 //! this one renders into an image it owns, which is what makes it gateable on
 //! a device with no surface support at all — and therefore on llvmpipe, and
 //! therefore in CI.
+//!
+//! THE HUD COMPOSITE JOINED IT (B6b rung 4): `hud.hlsl` is the third pair in
+//! the union, drawn with `layout::Blend::Premultiplied` as a second draw INSIDE
+//! the same rendering instance, after the tonemap or blit — `gpu/mod.rs`'s
+//! `fullscreen_to_backbuffer` shape, the ONE insertion point every present arm
+//! passes through. The pipeline lives HERE rather than in `vk/hud.rs` for a
+//! reason D3D12 does not have: `Passes` can be rebuilt (a format renegotiation
+//! on resize), and a pipeline created against a destroyed layout is exactly
+//! the silent class this backend refuses — keyed on `fmt` with tonemap/blit,
+//! it dies and is reborn with them. A SECOND descriptor set (`hud_set`) points
+//! `t0` at the HUD image while `set`'s `t0` stays the tonemap source; `b0` is
+//! the same UBO in both, which is what makes `hud.hlsl`'s "mirrors tonemap's
+//! Params" claim structural — one `set_params` serves both draws. `vk/hud.rs`
+//! owns the image and the uploads; V21 is the gate.
 
 use ash::vk;
 
@@ -339,18 +353,32 @@ struct Target {
     h: u32,
 }
 
-/// The display pipelines, their one derived layout, and the descriptor set
-/// both draw against.
+/// The display pipelines, their one derived layout, and the descriptor sets
+/// they draw against — `set` for tonemap/blit (t0 = the source), `hud_set`
+/// for the overlay (t0 = the HUD image); same `b0`, same sampler.
 pub struct Passes {
     pub map: Map,
     layouts: Layouts,
     pub tonemap: vk::Pipeline,
     pub blit: vk::Pipeline,
+    /// The HUD composite — `hud.hlsl`, premultiplied blend. B6b rung 4.
+    pub hud: vk::Pipeline,
     sampler: vk::Sampler,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
+    hud_set: vk::DescriptorSet,
     ubo: Buffer,
     pub fmt: vk::Format,
+}
+
+/// What the first draw of `Passes::record_frame` is — the tonemap, the blit,
+/// or nothing at all (the loading page: a clear with the HUD composited over
+/// it, before any source exists to tonemap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Draw {
+    Tonemap,
+    Blit,
+    None,
 }
 
 impl Passes {
@@ -389,6 +417,12 @@ impl Passes {
         let tm_ps = compile(&tm_src, ps_e, "ps_6_0", "tonemap-ps")?;
         let bl_vs = compile(crate::gfx::shaders::BLIT_HLSL, vs_e, "vs_6_0", "blit-vs")?;
         let bl_ps = compile(crate::gfx::shaders::BLIT_HLSL, ps_e, "ps_6_0", "blit-ps")?;
+        // The HUD pair joins the SAME union: `hud.hlsl` declares t0 and b0 with
+        // the names and kinds tonemap.hlsl already put there, so `Map::add`
+        // sees no conflict and `Layouts::build` sees nothing new — the shader's
+        // own "reuses the tonemap root signature" header, made a fact here.
+        let hd_vs = compile(crate::gfx::shaders::HUD_HLSL, vs_e, "vs_6_0", "hud-vs")?;
+        let hd_ps = compile(crate::gfx::shaders::HUD_HLSL, ps_e, "ps_6_0", "hud-ps")?;
 
         // No unbounded array in this corpus, so the cap is inert — passed as 1
         // rather than the device ceiling so a stray unbounded binding would be
@@ -409,6 +443,26 @@ impl Passes {
             Ok(p) => p,
             Err(e) => {
                 unsafe { d.destroy_pipeline(tonemap, None) };
+                layouts.destroy(vkd);
+                return Err(e);
+            }
+        };
+        let hud = match layout::graphics_pipeline_blend(
+            vkd,
+            &layouts,
+            &hd_vs,
+            vs_e,
+            &hd_ps,
+            ps_e,
+            fmt,
+            layout::Blend::Premultiplied,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    d.destroy_pipeline(tonemap, None);
+                    d.destroy_pipeline(blit, None);
+                }
                 layouts.destroy(vkd);
                 return Err(e);
             }
@@ -439,11 +493,13 @@ impl Passes {
             true,
         )?;
 
-        // Sized from the map, like the tracer's — one set, so no copies term.
+        // Sized from the map, like the tracer's — TWO sets of the one layout
+        // (the tonemap/blit set and the HUD set), so every count doubles.
+        const SETS: u32 = 2;
         let mut counts: std::collections::BTreeMap<vk::DescriptorType, u32> = Default::default();
         for e in map.entries.values() {
             let n = if e.count == 0 { 1 } else { e.count };
-            *counts.entry(layout::desc_type(e.kind)).or_default() += n;
+            *counts.entry(layout::desc_type(e.kind)).or_default() += n * SETS;
         }
         let sizes: Vec<vk::DescriptorPoolSize> = counts
             .iter()
@@ -451,50 +507,78 @@ impl Passes {
             .collect();
         let pool = unsafe {
             d.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),
+                &vk::DescriptorPoolCreateInfo::default().max_sets(SETS).pool_sizes(&sizes),
                 None,
             )
         }
         .map_err(|e| format!("vkCreateDescriptorPool: {e}"))?;
-        let set = unsafe {
+        let set_layouts: Vec<vk::DescriptorSetLayout> =
+            std::iter::repeat_n(layouts.sets[0], SETS as usize).collect();
+        let sets = unsafe {
             d.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
-                    .set_layouts(&layouts.sets),
+                    .set_layouts(&set_layouts),
             )
         }
-        .map_err(|e| format!("vkAllocateDescriptorSets: {e}"))?[0];
+        .map_err(|e| format!("vkAllocateDescriptorSets: {e}"))?;
+        let (set, hud_set) = (sets[0], sets[1]);
 
-        let p = Passes { map, layouts, tonemap, blit, sampler, pool, set, ubo, fmt };
+        let p = Passes { map, layouts, tonemap, blit, hud, sampler, pool, set, hud_set, ubo, fmt };
         p.wire_static(vkd);
         Ok(p)
     }
 
-    /// The bindings that never change: the sampler and the constant buffer.
+    /// The bindings that never change: the sampler and the constant buffer —
+    /// into BOTH sets, so one `set_params` reaches the tonemap and the HUD
+    /// draws alike (the `b0` both shaders declare is one buffer).
     fn wire_static(&self, vkd: &Vk) {
         let bi = [vk::DescriptorBufferInfo::default()
             .buffer(self.ubo.buf)
             .range(vk::WHOLE_SIZE)];
         let si = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
-        let mut writes = vec![vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
-            .dst_binding(binding_of(Reg::B, 0))
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(&bi)];
-        // Guarded on the map, the `--sw-rays`/TLAS rule: a write to a binding
-        // the layout does not carry is not a no-op. `blit.hlsl` alone declares
-        // no sampler, so this is only unconditional while tonemap is in the
-        // union — which it is, and the guard is what keeps that a fact rather
-        // than an assumption.
-        if self.map.entries.contains_key(&(0, binding_of(Reg::S, 0))) {
+        let mut writes = Vec::new();
+        for set in [self.set, self.hud_set] {
             writes.push(
                 vk::WriteDescriptorSet::default()
-                    .dst_set(self.set)
-                    .dst_binding(binding_of(Reg::S, 0))
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&si),
+                    .dst_set(set)
+                    .dst_binding(binding_of(Reg::B, 0))
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&bi),
             );
+            // Guarded on the map, the `--sw-rays`/TLAS rule: a write to a
+            // binding the layout does not carry is not a no-op. `blit.hlsl`
+            // alone declares no sampler, so this is only unconditional while
+            // tonemap is in the union — which it is, and the guard is what
+            // keeps that a fact rather than an assumption.
+            if self.map.entries.contains_key(&(0, binding_of(Reg::S, 0))) {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(binding_of(Reg::S, 0))
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&si),
+                );
+            }
         }
+        unsafe { vkd.device.update_descriptor_sets(&writes, &[]) };
+    }
+
+    /// Point the HUD set's `t0` at the overlay image (`vk::hud::HudVk`'s).
+    ///
+    /// Called once per image — at build and again after every resize, since a
+    /// resize recreates the image AND may recreate `Passes` (a fresh one has an
+    /// unwritten `hud_set`). The image rests in `GENERAL` for the backend's
+    /// standing reason (`upload_rgba16f`'s doc), and the descriptor says so.
+    pub fn bind_overlay(&self, vkd: &Vk, view: vk::ImageView) {
+        let ii = [vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(self.hud_set)
+            .dst_binding(binding_of(Reg::T, 0))
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&ii)];
         unsafe { vkd.device.update_descriptor_sets(&writes, &[]) };
     }
 
@@ -582,6 +666,41 @@ impl Passes {
         h: u32,
         tonemap: bool,
     ) {
+        self.record_frame(d, cmd, img, view, w, h, if tonemap { Draw::Tonemap } else { Draw::Blit }, false);
+    }
+
+    /// `record_to` with the first draw CHOSEN and the HUD composite OPTIONAL —
+    /// the whole frame's recording, B6b rung 4.
+    ///
+    /// `record_to` above stays the thin wrapper (`tonemap: bool`, no overlay)
+    /// so V18/V19/V20's recording is TEXTUALLY the rung-1 body — the same
+    /// trick `record` pulled on `record_to` when the swapchain arrived.
+    ///
+    /// THE OVERLAY IS A SECOND DRAW INSIDE THE SAME RENDERING INSTANCE, after
+    /// the first, with no barrier between: the premultiplied blend reads the
+    /// attachment the first draw wrote, and rasterization order within a
+    /// subpass is what the spec guarantees for exactly that. It binds `hud_set`
+    /// (t0 = the HUD image) against the SAME pipeline layout, viewport and
+    /// scissor already set. `Draw::None` is the loading page — clear, then
+    /// overlay — and binds nothing the tonemap would need, so the tonemap set's
+    /// unwritten `t0` (no source exists yet) is never consulted.
+    ///
+    /// `overlay` is the caller's `visible && drawable` conjunction: a HUD that
+    /// is hidden, or one whose image has never been uploaded, records NOTHING
+    /// here — the structural off-state, which V21's hidden/unstaged frames pin
+    /// as byte identity with a tonemap-only render.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_frame(
+        &self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        img: vk::Image,
+        view: vk::ImageView,
+        w: u32,
+        h: u32,
+        draw: Draw,
+        overlay: bool,
+    ) {
         let dst = Target { img, view, w, h };
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -625,19 +744,21 @@ impl Passes {
                 .layer_count(1)
                 .color_attachments(&att);
             d.cmd_begin_rendering(cmd, &ri);
-            d.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                if tonemap { self.tonemap } else { self.blit },
-            );
-            d.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.layouts.pipeline,
-                0,
-                &[self.set],
-                &[],
-            );
+            if draw != Draw::None {
+                d.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    if draw == Draw::Tonemap { self.tonemap } else { self.blit },
+                );
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.layouts.pipeline,
+                    0,
+                    &[self.set],
+                    &[],
+                );
+            }
             d.cmd_set_viewport(
                 cmd,
                 0,
@@ -658,7 +779,21 @@ impl Passes {
                     extent: vk::Extent2D { width: dst.w, height: dst.h },
                 }],
             );
-            d.cmd_draw(cmd, 3, 1, 0, 0);
+            if draw != Draw::None {
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+            }
+            if overlay {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.hud);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.layouts.pipeline,
+                    0,
+                    &[self.hud_set],
+                    &[],
+                );
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+            }
             d.cmd_end_rendering(cmd);
 
             d.cmd_pipeline_barrier(
@@ -685,6 +820,7 @@ impl Passes {
         unsafe {
             vkd.device.destroy_pipeline(self.tonemap, None);
             vkd.device.destroy_pipeline(self.blit, None);
+            vkd.device.destroy_pipeline(self.hud, None);
             vkd.device.destroy_sampler(self.sampler, None);
             vkd.device.destroy_descriptor_pool(self.pool, None);
         }

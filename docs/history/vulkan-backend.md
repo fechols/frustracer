@@ -1,6 +1,6 @@
 # The Vulkan backend
 
-The `--check-vk` gate suite, stages V0 through V20 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths (V19), and the present path across a swapchain rebuild (V20). The single largest entry in the notebook.
+The `--check-vk` gate suite, stages V0 through V22 — device pick, the derived descriptor map, the reference kernel, the wavefront quadtree, hemisphere tiers, structure replay, FSR3, NRD, and the display and present paths (V19), the present path across a swapchain rebuild (V20), and the HUD composite over the display stage (V21), and the session's HUD flag through `Presenter` to that composite's own decision (V22). The single largest entry in the notebook.
 
 Extracted verbatim from `CLAUDE_Historical.md`, which keeps a stub pointing here. Nothing in this file was rewritten.
 
@@ -2821,6 +2821,426 @@ cargo run --release -- --check-vk     # THE VULKAN BACKEND ACTUALLY RUNNING SOME
                                       # deliver synthetically: the swapchain-only stale turn, the `tracer kept` split line, and
                                       # the hidden idle — all reachable only through `Frame::Stale` or the visibility events,
                                       # and recorded as reasoned rather than measured.
+                                      # B6b RUNG 4 — THE HUD (2026-08-19; slint on Linux + gfx::hud_frame + vk/hud.rs +
+                                      # Passes::record_frame + V21 + Ui + the menu/loading page in window_frames). The one rung
+                                      # the tree named as next, three times over: "no loading screen yet — that is the HUD rung",
+                                      # "there is no F11 ... those arrive with the HUD rung", and `run_window_vk`'s "STILL NOT
+                                      # HERE" list. It lands the HUD (F1), the pause menu (ESC / pad Start), the loading page
+                                      # behind the world boot, `input.rs`'s edge drain (and with it F11 fullscreen), the settings
+                                      # writeback, `--qa key` and `--cinematic-hud` on the Vulkan capture arm — in three commits,
+                                      # each verifiable alone: the cfg move and the pure gates (A), the GPU half and V21 (B), the
+                                      # window (C+D+F).
+                                      # THE DECISION THE RUNG RESTS ON: `Hud` LIVES ON THE RENDER THREAD. Slint's objects are
+                                      # `Rc`-based, so ONE thread owns the menu, and the render thread is the one that has the
+                                      # pose, the frame time, the hour and the swapchain — putting the HUD on the pump would ship
+                                      # all of those MAIN-ward every frame and the dirty rects back, give "menu open" two owners,
+                                      # and collapse to this under FR_VK_PUMP_INLINE anyway. So `Win::pump` FORWARDS: its mirror
+                                      # pass is unchanged and runs first, then every drained `sdl3::event::Event` is appended to
+                                      # the new `present::Ui` cell (the type is `Send` — sdl3 0.18's own `unsafe impl`, pinned at
+                                      # build so a bump that drops it fails there) and `window_frames` runs `input::Edges::feed`
+                                      # over them with the menu in hand — the SAME routing table `Input::poll` loops on Windows,
+                                      # factored into a per-event body so there is one. Mode is re-read per event (`poll`'s own
+                                      # rule: a forwarded click can focus a text field and the next key must see it). The three
+                                      # SDL calls only the window's thread may make cross BACK as requests in `WinSize::want`'s
+                                      # shape: `SDL_SetWindowFullscreen` (F11 — a one-shot), `SDL_StartTextInput`/`Stop` (a
+                                      # LEVEL from `menu_open`), plus `fullscreen` riding back for `pos`. The cell is BOUNDED:
+                                      # past 8192 queued events the pump collapses the `MouseMotion`s (hover is state, not
+                                      # history), which is what a ~6-8 s tracer rebuild or a ~20 s world load needs. ESC is no
+                                      # longer the pump's quit — it is forwarded and the session decides (menu, or quit when
+                                      # `Hud::new` failed, `session()`'s rule); window-X stays immediate.
+                                      # WHAT MOVED, AND WHY THE CFG IS FORCED. `slint`, `mod hud`, `mod input`, `build_menu_rows`
+                                      # and `cine_composite_hud` go from cfg(windows) to cfg(any(windows, all(unix,
+                                      # not(macos)))) — "the platforms with a window" — and not to cfg(unix) or bare, because
+                                      # input.rs and hud/events.rs import sdl3, which the macOS and wasm32 tables do not carry
+                                      # (the compile-it-dead alternative cannot even build there). ON LINUX SLINT HARD-LINKS
+                                      # LIBFONTCONFIG: slint std -> i-slint-renderer-software/std -> fontique `system` ->
+                                      # yeslogic-fontconfig-sys 6.0.1, whose build.rs does `pkg_config::find_library
+                                      # ("fontconfig").unwrap()`; so both Linux CI apt steps gain libfontconfig-dev + pkg-config
+                                      # (the list from the pinned crate's source, c9b83d6's lesson) and fonts-dejavu-core (for
+                                      # `--cinematic-hud` on a runner — NO gate needs a font, by design). There is no embedded
+                                      # fallback font on Linux; a fontless box draws no glyphs, loud rather than silent. The
+                                      # CPU->GPU wire (`DirtyRect`, `HudFrame`, the packer extracted from `Hud::raster` as
+                                      # `pack_rects`) moved to the cfg-free `gfx::hud_frame` so `vk/hud.rs` and V21 compile on
+                                      # macOS with no cfg and no Slint; hud/ re-exports. `Cargo.lock` unchanged. Build: a clean
+                                      # quick profile with slint is 55 s on this box; a one-line touch is unmoved.
+                                      # THREE PURE GATES join `--check` on the platforms with a window (and SAY they skip on
+                                      # macOS, the quin_ok rule): hud-frame (the packer's byte count, row content, edge
+                                      # exactness, clamp-then-drop, rect ORDER — a swapped reference must differ), input (both
+                                      # menu modes, repeat filtering, the negatives — F1 forwarded-not-edged under the menu, a
+                                      # nav KeyUp consumed, Quit/Resized/Moved in every mode, pad Start everywhere and the D-pad
+                                      # only while open) and hud-events (MouseMotion->PointerMoved, "é" press+release with the
+                                      # same text, the special-key table, and the negative the module header rests on: a letter
+                                      # KeyDown translates to NOTHING). Planted F1->F11 in the closed arm: CHECK FAILED (input).
+                                      # THE GPU HALF. `layout::graphics_pipeline_blend` adds `Blend::Premultiplied` (src ONE, dst
+                                      # ONE_MINUS_SRC_ALPHA, colour and alpha — gpu/tonemap.rs's premultiplied_blend mirrored);
+                                      # `graphics_pipeline` is the Opaque wrapper so V18's pipelines are textually unchanged.
+                                      # `Passes` compiles hud.hlsl into the SAME Map union (t0/b0 are tonemap's names and kinds,
+                                      # so the shader's "reuses the tonemap root signature" header becomes a fact), builds the
+                                      # HUD pipeline keyed on `fmt` beside tonemap/blit — HERE rather than in vk/hud.rs because a
+                                      # rebuilt `Passes` (format renegotiation on resize) would otherwise strand a pipeline on a
+                                      # destroyed layout, the silent class this backend refuses — and allocates a SECOND set:
+                                      # t0 = the HUD image, the same b0 UBO as the tonemap set, so one `set_params` serves both
+                                      # draws. `record_frame(.., Draw::{Tonemap|Blit|None}, overlay)` is `record_to`'s body with
+                                      # the overlay drawn INSIDE the same rendering instance after the first draw (rasterization
+                                      # order is the barrier), `record_to` the thin wrapper — V18/V19/V20 record the rung-1 body.
+                                      # `Draw::None` is the loading page. `vk/hud.rs::HudVk` owns the image and the uploads: a
+                                      # ring sized from the new `headless::FRAMES_IN_FLIGHT` (1, named so a fence ring moves it),
+                                      # persistently mapped, TIGHT pitch (Vulkan needs only bufferOffset%4 — D3D12's 256/512
+                                      # dance collapses), one copy region per rect, the defensive clamp, `GENERAL` throughout
+                                      # with memory barriers only (an UNDEFINED old layout would license the driver to DISCARD
+                                      # the rest of the image on a partial upload — RADV/DCC — so it appears exactly once, at
+                                      # creation), no RefCell (present is &mut self). AND THE IMAGE IS CLEARED TO TRANSPARENT
+                                      # BLACK AT CREATION, because V21 caught it: D3D12 never clears its texture and gets away
+                                      # with it through crate::hud's forced full-window FIRST frame — a contract between two
+                                      # modules — and V21's three-small-rect fixture is exactly what breaks it. MEASURED: RADV
+                                      # handed back zeroed memory and the gate passed; llvmpipe did not, and 1320 background
+                                      # texels composited garbage. Structural now.
+                                      # GATED, V21 — THE HUD COMPOSITE, and the first gate anywhere to DRAW hud.hlsl and score
+                                      # it (the D3D12 half has no M-stage; cinematic::over_sdr's header said "no gate compares
+                                      # them and none is wanted"). Offscreen over V18's 64x32 ramp target on its THREE wires,
+                                      # hdr10 mandatory (ToneParams::SDR has scale=mode=1.0, so a zeroed or misrouted Params is
+                                      # INVISIBLE on both SDR wires and only the PQ arm detects it — the class V20 caught first).
+                                      # Synthetic, Slint-free: R0 opaque, R1 mid-alpha {0,0x40,0x80,0xC0} with hashed rgb <= a,
+                                      # R2 touching right+bottom, one over-range rect the GPU half must clamp to 4x2. Five
+                                      # frames per wire: hidden == tonemap-only (byte identity; the structural off-state);
+                                      # visible-but-unuploaded == same (drawable() is false, zero validation errors); full stage
+                                      # == premultiplied over at <= 1 LSB per channel (float-round, cinematic::over_sdr's twin)
+                                      # with the EXACT fraction reported, opaque texels exact on the 8-bit wire, background
+                                      # BYTE-IDENTICAL outside the rects (a CLEAR-then-composite or the HUD set clobbering the
+                                      # tonemap's t0 both fail here), stats (4, 1920); idle (0, 0) and byte identity; partial
+                                      # (1, 140) with the rest untouched. hdr10 scored in float against the un-premultiply ->
+                                      # 2.2 -> scale -> 2020 -> PQ -> re-premultiply -> over chain at V18's 2.5e-3. ANTI-VACUITY
+                                      # EVERY RUN: three perturbed references must FAIL the same bar — straight-alpha over
+                                      # (237/237 mid-alpha texels differ), a one-texel x-shift (357/365), the PQ-passthrough
+                                      # (365/365) — counts printed on the pass line. TEETH HAND-FIRED: imageOffset+1 -> 365 off
+                                      # and the x-shift arm INVERTS to 0/365 (the shifted reference matches the shifted output
+                                      # exactly, its signature); SRC_ALPHA -> 237 off and the straight arm inverts to 0/237.
+                                      # MEASURED, reported rather than asserted: RADV's blender matches float-round on 217/237
+                                      # mid-alpha texels and is within 1 LSB on the rest (float-trunc matches 82); llvmpipe's
+                                      # matches float-round on 237/237 — EXACTLY round-to-nearest, as predicted. On the 10-bit
+                                      # wire an 8-bit source lands 1 LSB low on ~10% of opaque texels on RADV (the fragment
+                                      # export quantises before the 10-bit write), which is why opaque-exact is the 8-bit
+                                      # wire's claim only. hdr10 worst 9.0e-4 (RADV) / 7.0e-4 (llvmpipe). CI forbids `SKIP V21`
+                                      # and asserts it positive beside V18 — it shares V18's two SKIP facts and none of the
+                                      # surface ones, so it RUNS on llvmpipe; V19/V20 stay off both lists. llvmpipe's ten
+                                      # teardown `VkBuffer ... has not been destroyed` lines are the documented FFX stand-down
+                                      # leak, pre-existing and unmoved. cargo test gains three hud.hlsl source pins (Params
+                                      # mirrors tonemap's member for member; psmain reads mode and scale and never the aperture;
+                                      # the `mode > 1.5` literal in both) — 31 total.
+                                      # THE WINDOW. `Presenter` owns `HudVk`, sized to the swapchain and rebuilt with it (the
+                                      # upload counter carried across so `pos.hud_uploads` stays monotonic), `bind_overlay`
+                                      # re-run unconditionally after every resize (a fresh `Passes` has an unwritten set);
+                                      # `present` records the upload then `record_frame` with overlay = visible && drawable()
+                                      # evaluated AFTER the upload (the first staged frame uploads and composites in one
+                                      # recording — the first draft evaluated it before, and V21 would have stayed dark);
+                                      # `present_page` is `Draw::None` + overlay, legal before any tracer. `window_frames`
+                                      # builds the `Hud` on this thread before the load, loads the scene on its own thread
+                                      # behind the page (progress::activate — only an interactive window may; present_page at
+                                      # LOAD_TICK_MS, the constant now shared; a resize during the load reconciles the swapchain
+                                      # alone; quit exits the process, load_tick's rule), repaints once per blocking step
+                                      # (geometry, textures, shaders — KNOWN-ACCEPT: the marquee STALLS within each, there is no
+                                      # tick hook inside VkTracer::new; the SPIR-V memo rung 3 recommended shrinks that window),
+                                      # then runs session()'s menu state machine arm for arm: Start/ESC/East open-close with
+                                      # fly.pause()/resume() (the pump keeps writing the mirror and the paused integrator ignores
+                                      # it — `Mirror::look` only accumulates under a latched drag, which the paused tick drops),
+                                      # the nav cursor, a `LiveView` for this window (one tracer, one upscaler, one denoiser, one
+                                      # quality), `build_menu_rows(.., settings::VK_INERT_LIVE)` badging the 21 Live rows this
+                                      # window cannot act on "n/a" (dimmed, controls inert) — SHOWN NOT HIDDEN, the height_on
+                                      # "unarmed" precedent, one menu on both windows — and `take_actions` with those ids REFUSED
+                                      # before `menu_adjust` can persist anything. The seven that act: hud, tod, move_ease,
+                                      # clouds, fireflies, fireflies_count, emissive_lights (per-frame `live`/FrameCb reads, no
+                                      # frame=0). `settings::self_test` pins the inert list (every id real and Live) AND its
+                                      # complement, so a new Live row must be classified for this window or the gate fails. The
+                                      # HUD block follows the swapchain BY COMPARISON (`hd.size() != pres.hud_size()`) rather
+                                      # than at each of rebuild_at's exits and the stale arm. THE PAUSE HOLD is `present`
+                                      # without `render_frame`: the upscaler's last output re-read under the overlay, `f` frozen
+                                      # (a driver asserts the pause), FIFO pacing it at the display rate — no 7 ms sleep. `--qa
+                                      # key` synthesises edges (esc f1 f11 up down left right enter start back — the nav names
+                                      # accepted whenever, since synthesised edges never route to Slint; p and the mode/toggle
+                                      # keys refused BY NAME), `pos` gains menu_open / hud / fullscreen / hud_uploads. The
+                                      # `--cinematic-hud` cfg flip rides the Vulkan capture arm: the `hud` preset renders the
+                                      # menu, compass, clock, mode plate ("VK" — the window's HUD now wears the same label) and
+                                      # keymap on this box, the cheapest headless proof that Slint + fontconfig rasterise here.
+                                      # VERIFIED LIVE on RADV under FR_VK_VALIDATION=1 — 0 errors — in BOTH pump arms: F1 flips
+                                      # `hud`; 240 idle iterations shown or hidden upload 0 bytes (the dirty-rect discipline,
+                                      # headlessly); ESC opens (menu_open true; `frame` frozen across `sync 60` while `iter`
+                                      # advances; `drive 1 0 0 300` leaves `pos` unchanged — the flycam pause contract); an idle
+                                      # open menu uploads 0 bytes over 120 iterations; down+enter reaches Settings (one 7.5 MB
+                                      # page repaint), right+right crosses into the rows and adjusts the hud row — the HUD flips
+                                      # AND frustracer-settings.json is written with display.hud=false (the writeback, on Linux);
+                                      # ESC x2/x3 backs out and closes and `frame` advances; F11 -> 1440x900 fullscreen
+                                      # (rebuild 1, 6.2 s), back (rebuild 2), `resize 800 600` (rebuild 3), the HUD following
+                                      # each with exactly one full-window rect at the new size; `quit` exits 0. MEASURED: pump
+                                      # gap p50 1.05-1.06 / p99 1.08-1.11 ms throughout, INCLUDING through the loading page, a
+                                      # menu session and the rebuilds — rung 2/3's numbers, unmoved by the forwarding; 105 fps at
+                                      # 1280x720 and 120 fps at 800x600 (FIFO, so the composite's cost is invisible at a
+                                      # vblank-locked pose — this backend still has no GPU timer, present.rs says so); input-to-
+                                      # menu within 3 iterations (`key esc` -> `sync 3` -> menu_open true); first HUD frame =
+                                      # W*H*4 (3.69 MB at 1280x720, 5.18 MB at 1440x900); an F1 fade = 3 rects / ~200 KB. Build:
+                                      # 55 s clean quick profile with slint (first time on this box); tools/win-cross-check.sh
+                                      # caught two Windows-side dead methods across the three commits.
+                                      # KNOWN-ACCEPTS: the loading page's marquee stalls through each blocking step; the rows in
+                                      # VK_INERT_LIVE are badged rather than wired (each for a reason the const's doc names);
+                                      # held-repeat on the gamepad D-pad in the menu is absent (SDL buttons do not auto-repeat,
+                                      # pad.rs's repeat core is XInput); no screenshot verb (P and `--qa screenshot` say so by
+                                      # name); no `--lock-res`; no audio; the 10-bit opaque-texel 1-LSB slack on RADV.
+                                      # STILL NOT HERE (run_window_vk's list, rewritten): audio; the screenshot verb;
+                                      # `--lock-res`; the toggle keys that answer to arms this window has not got; pad
+                                      # held-repeat; a mid-DXC repaint of the page. And the rung's own recommendation stands
+                                      # where rung 3 left it: the SPIR-V memo, which is now also what would let the loading page
+                                      # stay live through the compile.
+                                      # Touch Cargo.toml's window table / mod hud, mod input cfgs / gfx::hud_frame /
+                                      # input::Edges::feed / hud::events::translate / vk/hud.rs / Passes::record_frame +
+                                      # bind_overlay / layout::graphics_pipeline_blend / present::Ui + Win::pump + Presenter's
+                                      # HUD / window_frames' page, edges, menu, hold / settings::VK_INERT_LIVE / build_menu_rows
+                                      # -> run --check (hud-frame, input, hud-events, settings among them; LAST, then
+                                      # `git checkout -- check.png check_gi.png`), cargo test (the hud.hlsl pins), --check-vk
+                                      # (V21 among V0-V21) on RADV AND on llvmpipe (FR_VK_DEVICE=llvmpipe — V21 must RUN there),
+                                      # --check-spirv, tools/win-cross-check.sh (every one of these touches Windows-owned
+                                      # modules), and the window driven over --qa in BOTH pump arms: key f1 / sync 240 twice
+                                      # reading hud_uploads / key esc + sync 60 reading frame and iter / drive under the menu /
+                                      # key down, enter, right, right + the settings file / key f11 twice / resize / quit.
+                                      # Verified: all of the above green; cargo test 31; --check PASSED with both goldens
+                                      # byte-identical; --check-vk validation clean on RADV and llvmpipe.
+                                      #
+                                      # B6C RUNG 1 — THE SPIR-V MEMO + THE COMPILE TICK (2026-08-19; spirv::Memo +
+                                      # Spirv::memo_stats + FR_SPIRV_NOMEMO + VkTracer::new's per-unit tick + S2's
+                                      # determinism arm + the V5 / end-of-suite memo teeth). The slice rungs 3 and 4
+                                      # both recommended, landed as recommended: a memo keyed on what reaches DXC,
+                                      # not a VkTracer split.
+                                      # THE KEY IS THE FULL TUPLE (source, entry, target, debug), COMPARED not just
+                                      # hashed — a DefaultHasher collision that served the wrong kernel would be a
+                                      # wrong-resource read behind a valid module, the binding self_test's failure
+                                      # class through another door. `what` is diagnostic-only and excluded; `extra`
+                                      # calls go through compile_args, which NEVER memoizes ("-enable-16bit-types"
+                                      # is not in the key) — the bypass and the gates' fresh-compile handle are one
+                                      # mechanism. The map is a RefCell on the !Send Spirv, which outlives every
+                                      # rebuild (rebuild_at's survivors list), so there is no version to bump and no
+                                      # lever word; FR_SPIRV_NOMEMO kills it, loud once.
+                                      # THE TEETH, BOTH WAYS, because a memo's failure modes are both silent:
+                                      # (a) --check-spirv S2 grows a DETERMINISM arm — nothing in this tree had ever
+                                      # asserted DXC is bit-reproducible for a fixed (args, source), and every memo
+                                      # claim rests on it. One unit, recompiled fresh, byte-compared; the memo hit
+                                      # compared against both; hits==0 under an unarmed lever FAILS (anti-vacuity).
+                                      # Measured: reference[Nvidia]:cs_reference, 125682 words, byte-identical.
+                                      # (b) --check-vk: V5 re-requests one key where the sources are in hand
+                                      # (hit == fresh == first), and the SUITE asserts hits > 0 at the end — V6/V12/
+                                      # V13 rebuild tracers over V5's keys, so the exact-zero render gates score
+                                      # memo-SERVED modules (fidelity at device strength). Measured: 101 hits / 60
+                                      # misses on RADV, 89 / 60 on llvmpipe (V11/V13 SKIP there).
+                                      # (c) spirv::self_test grows the DXC-free half (hit fidelity, accounting,
+                                      # full-key discrimination — every tuple element must separate two keys) and
+                                      # joins the --check ROSTER as "spirv": it only ran under --check-spirv /
+                                      # --check-mtl before, i.e. one CI job instead of four.
+                                      # THE TICK is the rung's second half: VkTracer::new takes
+                                      # Option<&mut dyn FnMut(done, total)>, called per compiled unit; the window's
+                                      # bring-up repaints the loading page on it with the count in the detail line.
+                                      # Gates/capture/rebuild_at pass None. The rung-4 known-accept NARROWS: the
+                                      # marquee now stalls only within VkScene::new / VkTextures::new and within any
+                                      # one unit (~0.3 s cold, microseconds on a hit).
+                                      # MEASURED (Radeon 8060S / RADV, the window over --qa, resize 800x600 then
+                                      # 1024x768): rebuild split swapchain 2.1-3.0 ms | teardown 2.0-2.6 ms |
+                                      # tracer+upscaler+denoiser 718-833 ms | memo 24 hit(s) — against rung 3's
+                                      # 7.5-8.5 s. The DXC term is GONE; the remaining ~0.8 s is allocation, the
+                                      # FFX/NRD contexts and reflection. Render extent tracked the window through
+                                      # both commits (rebuilds 1 then 2 in `pos`), pump gap held ~1.06 ms.
+                                      # STILL NOT DONE, deliberately: no on-disk cache (the memo dies with the
+                                      # process — no CACHE_VERSION, no staleness class); no D3D12 DXIL twin
+                                      # (gpu/dxc.rs's FR_NOPRECISE strip_precise rewrites the source INSIDE
+                                      # compile_args, so its key must hash post-rewrite — a Windows campaign's
+                                      # slice); the marquee within VkScene::new / VkTextures::new.
+                                      # Touch spirv.rs's Memo/compile/memo_stats/self_test / VkTracer::new's tick /
+                                      # CineVk::build's tick / the bring-up tick closure / S2's determinism arm /
+                                      # V5's memo check / run_check_vk's end-of-suite assert / rebuild_at's split
+                                      # line -> run --check (LAST; "spirv" among the roster), cargo test,
+                                      # --check-spirv (the determinism arm must fire), --check-vk on RADV AND
+                                      # llvmpipe (the end-of-suite hit assert runs on both), FR_SPIRV_NOMEMO=1
+                                      # --check-spirv (loud + exempt), tools/win-cross-check.sh, and the window over
+                                      # --qa: resize twice, read the split line's "memo N hit(s)" and `pos`'s
+                                      # rebuilds/render fields.
+                                      #
+                                      # B6C RUNG 2 — PRESET, SPP AND RELIEF GO LIVE (2026-08-19; CineVk.force_reset
+                                      # + CineVk.spp + the window's quality-key consumer + the MenuFx::Quality/
+                                      # CycleSpp/ToggleHeight arms + VK_INERT_LIVE minus three). The cheapest three
+                                      # un-badges, because all three ride the SHARED FrameCb (gfx/frame.rs's
+                                      # with_frame — the vk tracer calls the same function D3D12 does), so "live" is
+                                      # a cbuffer write, not a rebuild.
+                                      # ONE CONSUMER FOR KEY AND MENU: the MenuFx arms synthesize the key's edge
+                                      # (edges.quality / cycle_spp / toggle_height), D3D12's own shape, and a single
+                                      # block in the window loop consumes both. The un-swallowing is part of the
+                                      # rung: the real 1/2/3/U/V presses used to be silently discarded; --qa key
+                                      # accepts them now and the LiveView reports the real values — which
+                                      # menu_adjust's preset/spp cycles READ, so the truth is load-bearing, not
+                                      # cosmetic.
+                                      # THE RESET IS ONE LATCH, TWO CONSUMERS BY CONSTRUCTION: force_reset ORs into
+                                      # st.reset before either reader, so FSR3's Dispatch.reset and NRD's
+                                      # CommonSettings reset cannot disagree ("both halves" in temporal form). It is
+                                      # consumed by the FIRST sub-frame only — ORing into every sub-frame would
+                                      # re-reset the history a still shot is integrating. Replay stays licensed
+                                      # across a quality flip (tracer.rs:1900's contract: quality rides the
+                                      # cbuffer), so a parked camera keeps its -43%-class win through a preset
+                                      # change while the histories restart.
+                                      # BOUNCE STAYS BADGED — THE PLAN SAID OTHERWISE, THE CODE WON: the design had
+                                      # H going live on the strength of "the hemi units are compiled and V8-gated".
+                                      # They are — but D3D12's OWN upscaler sub-mode refuses H ("still-frame
+                                      # feature": the hemi tiers converge over parked accumulation, which a jittered
+                                      # 1-frame temporal integrator is not), and this window is ALWAYS that
+                                      # sub-mode. Wiring it would have shipped GI in exactly the configuration the
+                                      # reference backend declines to. The refusal is now NAMED for that reason
+                                      # (--qa key h says "still-frame feature", not "missing arm").
+                                      # spp is CineVk state, not Opts: opts.spp seeds it at build and the U key
+                                      # cycles it (next_spp, now both windows' — its not-windows dead_code allowance
+                                      # retired); the capture arm never cycles, so --spp's CLI contract is
+                                      # byte-identical.
+                                      # Touch VK_INERT_LIVE / settings::self_test's want complement / the window's
+                                      # quality consumer + LiveView + MenuFx arms + qa key table / CineVk's
+                                      # force_reset+spp + render_frame's st.reset OR -> run --check (LAST; settings
+                                      # + cli among the roster), cargo test, --check-vk on RADV AND llvmpipe,
+                                      # tools/win-cross-check.sh, and the window over --qa in BOTH pump arms:
+                                      # key 1/3 ("quality preset N" on stderr), key u twice ("spp 2"/"spp 4"),
+                                      # key v (the unarmed refusal, by name), key h (the still-frame refusal),
+                                      # key x (the inert refusal).
+                                      # Verified: all of the above green, goldens byte-identical.
+                                      #
+                                      # B6C RUNG 3 — THE SCREENSHOT VERB (2026-08-19; edges.screenshot consumed +
+                                      # render::resolve_hdr_plain + the qa Shot pending + save_png). P and
+                                      # `--qa screenshot <path>`, built from parts that all existed: Fsr3's
+                                      # persistent readback (linear f32 RGB at output res), the CPU tonemap, and
+                                      # save_png — the "capture arm's resolve+PNG path" the refusals had promised
+                                      # by name since rung 2.
+                                      # THE ONE NEW FUNCTION IS A SUBTRACTION: resolve_hdr_plain is resolve_hdr
+                                      # WITHOUT the glare pass, because this window presents with the glare tap
+                                      # structurally dead (no vk bloom pyramid yet) and a screenshot records what
+                                      # the swapchain SHOWED — adding CPU glare the screen never drew would make
+                                      # the instrument lie. The site is annotated to move to resolve_hdr when the
+                                      # pyramid lands.
+                                      # WINDOWS P CONTRACT, KEPT WHOLE: SDR 8-bit; no HUD baked (--cinematic is
+                                      # the arm that composites one); screenshot_{n}.png in the CWD, the counter
+                                      # bumped only for auto-named shots; --qa paths verbatim, spaces rejoined.
+                                      # The vk qa side grows a SINGLE-SLOT Shot pending (at most one outstanding,
+                                      # the Windows rule) with the 30 s backstop — a hidden window's loop
+                                      # `continue`s before the consumer, so a pending must be able to time out —
+                                      # resolved on the save with the written name; a failed capture answers
+                                      # ok:false, never an info line a driver parses as success.
+                                      # MEASURED: a shot is one fence-wait, ~50 ms — the cost the presenter
+                                      # already pays every frame, so one frame's hitch. Two parked shots differ at
+                                      # mean |d| 0.197 LSB with local peaks at cloud/firefly edges: THE WORLD
+                                      # animates even under a parked camera (cloud_time advances per frame), so
+                                      # byte-equality was never this instrument's contract — on either backend.
+                                      # A shot under the menu HOLD reads the held FSR3 output, which is also what
+                                      # the swapchain is showing — consistent, not stale.
+                                      # Touch the screenshot consumer / resolve_hdr_plain / the qa screenshot verb
+                                      # + key p + banner strings / qa_shot_pend -> run --check (LAST), cargo test,
+                                      # --check-vk on RADV AND llvmpipe, tools/win-cross-check.sh, and the window
+                                      # over --qa in BOTH pump arms: parked tp + screenshot twice (files exist,
+                                      # scene-sized, near-identical), bare `screenshot` refused by name, key p
+                                      # names screenshot_0.png, a shot under the menu hold.
+                                      # Verified: all of the above green.
+                                      #
+                                      # B6C RUNG 4 — THE HUD FLAG'S SECOND COPY, AND V22 (2026-08-21;
+                                      # Presenter.last_overlay + swapchain::headless_surface +
+                                      # run_check_vk_hud_present). A REVIEW OF THE RUNG-4 DIFF, not a new feature:
+                                      # rung 4 shipped and the Linux HUD never once composited.
+                                      # THE DEFECT. `Presenter` carried its own `hud_visible` copy beside the `HudVk`
+                                      # it owns. The session fed that one; `present_with` computed `hud_visible &&
+                                      # hud.drawable()`, and `drawable()` is `visible && uploaded` on `HudVk` — whose
+                                      # `visible` had NO WRITER outside V21's own fixture. So `overlay` was false on
+                                      # every frame of every Linux session for the whole rung: `record_upload` ran,
+                                      # `pos.hud_uploads` moved exactly as the dirty-rect discipline promises, V21
+                                      # scored the blend on all three wires, and nothing reached a swapchain. The
+                                      # D3D12 peer (`gpu/mod.rs::set_hud_visible`) never had the second copy, so no
+                                      # Windows run could show it either. ONE FLAG, ONE WRITER now: `set_hud_visible`
+                                      # writes `HudVk::visible`, `present_with` reads `drawable()` alone, and `resize`
+                                      # carries the flag across the rebuild the way the D3D12 resize already did.
+                                      # THE READOUT IS RECORDED, NOT SAMPLED, and that distinction is the rung's
+                                      # second finding. `pos` gained `hud_overlay` to make the defect assertable, and
+                                      # the first draft answered `self.hud.drawable()` — which reads each frame BEFORE
+                                      # its own upload, because `uploaded` flips inside `present_with`'s recording.
+                                      # MEASURED on the live window (`resize 800 600`, then `sync 1` stepping):
+                                      # exactly one iteration of `hud: true, hud_overlay: false` per resize, with
+                                      # `resize_pending` ALREADY back to false and the new extent already reported —
+                                      # indistinguishable from the real defect by any field `pos` carries.
+                                      # `Presenter.last_overlay` takes the value out of the closure by assignment
+                                      # instead, so the getter cannot be a second expression that has to agree with
+                                      # the first — the shape `hud_visible` failed in. Re-measured after: true on
+                                      # every step across the same resize. AND THE INVARIANT IS ONE-DIRECTIONAL, which
+                                      # the first draft's comment got wrong in both directions: `hud: true` without
+                                      # `hud_overlay: true` is the defect, while `hud: false, hud_overlay: true` is a
+                                      # menu opened with F1 off — `pos.hud` is `hd.visible()` alone and the flag fed
+                                      # here is `hd.visible() || hd.menu_open()`.
+                                      # GATED, V22 — THE SEAM, NOT THE PIXELS AGAIN. V21 owns the blend and cannot
+                                      # reach this: every one of its arms drives `HudVk` DIRECTLY, because that is
+                                      # where the blend is decided, and what none of them touch is who computes
+                                      # `overlay`. `Presenter::new` had exactly ONE caller — the live window — which
+                                      # is the structural reason a whole rung shipped broken under a green suite; V22
+                                      # is its second. The claim is the value `present_with` hands `record_frame`,
+                                      # read back through `hud_overlay()`. Four readings in one Presenter's life, over
+                                      # a headless surface at V19's 64x32: visible with nothing ever staged -> no
+                                      # overlay (V21's frame-2 claim, one layer up); hidden with a full frame staged
+                                      # and UPLOADED -> no overlay (the upload is not the licence, and the reading is
+                                      # refused unless the stats show the full w*h*4 arrived, so it cannot pass over
+                                      # an empty image); then `set_hud_visible(true)` with NOTHING RE-STAGED ->
+                                      # overlay, so the flag is the only thing that moved; then the same across
+                                      # `Presenter::resize` with no further `set_hud_visible` -> the fresh `HudVk`
+                                      # records no overlay until it is filled and records one once it is, with
+                                      # `hud_uploads` asserted monotonic across the rebuild (the `carry_stats`
+                                      # sibling). `present_page` throughout, so V22 needs no source image and no
+                                      # tracer — `Draw::None` binds nothing the tonemap set wants, which is also why
+                                      # `resize`'s "the caller must re-`bind_source`" does not apply.
+                                      # ITS OWN STAGE ID, AND THAT IS LOAD-BEARING RATHER THAN TIDY. The first draft
+                                      # tagged it `V21 presenter`, whose skip line reads `SKIP V21 presenter` — and
+                                      # `ci.yml`'s forbidden-skip grep is `SKIP (V6|V7|V8|V9|V18|V21)`, with no word
+                                      # boundary. V22 stands down on V19's environment facts, so on CI's llvmpipe that
+                                      # tag would have failed the Vulkan job on EVERY PUSH, reported as V21 passing
+                                      # vacuously — a green gate turned into a permanent false alarm by a name. V22 is
+                                      # absent from both of that job's lists, exactly as V19 and V20 are, and all four
+                                      # of that job's greps were replayed against a real log to confirm it.
+                                      # THE VACUITY TRAP IN THE RESIZE READING, named because it is the same one
+                                      # `FR_ABL` fired four times: the `HudVk` rebuild is keyed on the extent actually
+                                      # CHANGING, and V20 already met surfaces that negotiate one extent for every
+                                      # request. So the reading proves it REACHED its target — `hud_size()` moved —
+                                      # and prints a SKIPPED line naming the pinned extent rather than banking a pass
+                                      # it never earned.
+                                      # TEETH HAND-FIRED, each on ITS OWN reading and on nothing else in the suite:
+                                      # the `hud_visible` copy restored -> `FAIL V22 visible: the present recorded
+                                      # overlay=false, want true`, with every other line of `--check-vk` byte-
+                                      # identical to the green run; `resize`'s `fresh.visible = self.hud.visible`
+                                      # deleted -> `FAIL V22 resized/filled`; `fresh.uploaded` carried alongside it ->
+                                      # `FAIL V22 resized/unfilled`, which V21 cannot see because V21 never resizes.
+                                      # Perturbations applied to a scratchpad copy and restored from it, never by `git
+                                      # checkout --`.
+                                      # `swapchain::headless_surface` IS AN EXTRACTION, line for line, of
+                                      # `Swapchain::new`'s head — the four stand-downs (surface pair,
+                                      # `VK_KHR_swapchain`, a graphics queue, the lavapipe `vkCreateSwapchainKHR`
+                                      # segfault) plus the surface creation. `Presenter::new` takes a bare
+                                      # `VkSurfaceKHR` because SDL hands it one, and V22 is the second caller that
+                                      # shape buys. ONE PREDICATE, so V19 and V22 can never disagree about whether a
+                                      # box can present; ownership unchanged (the surface passes to the caller,
+                                      # `from_surface` takes it over on success, and a caller that fails before
+                                      # handing it over owes the `destroy_surface` — which is why the loader comes
+                                      # back alongside).
+                                      # STILL NOT COVERED, deliberately: V22 scores the DECISION, not the swapchain's
+                                      # pixels. A `Presenter` present cannot be read back the way V19/V20 read theirs
+                                      # — `prove_vk_present` copies BEFORE presenting because that is the last moment
+                                      # the bytes are readable, and `present_with` records its own closure with no
+                                      # tap. The chain that closes it is V21 proving `record_frame` honours `overlay`
+                                      # both ways plus V22 proving the Presenter computes it, each half scored where
+                                      # it is cheap. Also not here: the loading-page-to-session handoff (safe by
+                                      # `set_loading(false)`'s `force_full`, verified by reading, not gated), and `hud
+                                      # == None` (safe by construction — nothing stages, so `uploaded` stays false).
+                                      # Touch Presenter's last_overlay / present_with's capture / hud_overlay +
+                                      # set_hud_visible / resize's visibility carry / swapchain::headless_surface +
+                                      # Swapchain::new / run_check_vk_hud_present / run_check_vk's stage list /
+                                      # `pos`'s hud_overlay comment -> run --check (LAST, then `git checkout --
+                                      # check.png check_gi.png`), cargo test, --check-vk on RADV AND on llvmpipe (V22
+                                      # SKIPs there, and must not read as `SKIP V21`), ci.yml's four --check-vk greps
+                                      # replayed against the log, the three teeth above each rebuilt and fired, and
+                                      # the window over --qa: `pos` reading hud/hud_overlay, then `resize` + `sync 1`
+                                      # stepping across it.
+                                      # Verified: --check-vk PASSED with V22's two lines and validation clean; --check
+                                      # PASSED with both goldens byte-identical; cargo test 43; the three teeth each
+                                      # failed exactly one reading; the live window read `hud_overlay: true` on every
+                                      # step across a resize where the sampled draft read false on one.
                                       # M3k — THE SCALE M3i IS INSURANCE AGAINST, REACHED (2026-08-11), and a
                                       # gate that named the wrong bug. No Vulkan gate had ever loaded a scene
                                       # past ~5.6M tris, so the 95x scratch cut M3i measured was a mechanism

@@ -21,6 +21,10 @@ pub mod device;
 pub mod display;
 pub mod fsr3;
 pub mod headless;
+// The HUD's GPU half (B6b rung 4): the overlay image and its dirty-rect
+// uploads; the composite pipeline is `display`'s. cfg-free like `display`,
+// because its wire (`gfx::hud_frame`) is, and V21 drives it with no Slint.
+pub mod hud;
 pub mod layout;
 pub mod nrd;
 // The window (B6b rung 1). NOT `cfg(unix)` like its siblings: it is the one

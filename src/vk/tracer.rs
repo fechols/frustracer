@@ -422,6 +422,13 @@ impl VkTracer {
         rw: u32,
         rh: u32,
         opts: TracerOpts,
+        // Called after each compiled unit with (done, total) — the window's
+        // loading page repaints on it (B6c rung 1: a COLD build is still
+        // ~0.3 s per unit through DXC, and the marquee used to freeze for the
+        // whole run; memo-hit builds tick through in microseconds). Gates and
+        // the capture arm pass `None`. `&mut dyn` rather than a generic so
+        // the signature stays object-safe across the four call sites.
+        mut tick: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<VkTracer, String> {
         let vkd = &hg.vk;
         let d = &vkd.device;
@@ -524,7 +531,8 @@ impl VkTracer {
             .chain(feed_units.iter().take(if want_feed { 1 } else { 0 }))
             .chain(nrd_units.iter().take(if opts.nrd { 2 } else { 0 }))
             .collect();
-        for (src, entry, tag) in all {
+        let total = all.len();
+        for (i, (src, entry, tag)) in all.into_iter().enumerate() {
             let w = sp.compile(src, entry, "cs_6_5", tag, false)?;
             let descs = crate::vk::reflect::reflect(&w)?;
             let conflicts = map.add(tag, &descs);
@@ -532,6 +540,9 @@ impl VkTracer {
                 return Err(conflicts.join("; "));
             }
             words.push(w);
+            if let Some(t) = tick.as_deref_mut() {
+                t(i + 1, total);
+            }
         }
 
         // `texs[]` is sized to the scene, not to the device ceiling: this is a
