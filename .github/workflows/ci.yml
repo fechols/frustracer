@@ -667,14 +667,24 @@ jobs:
           cargo run --profile quick -- --check-wgpu 2>&1 | tee wgpu.log
           grep -q "CHECK-WGPU PASSED" wgpu.log \
             || { echo "::error::--check-wgpu failed (or printed no summary)"; exit 1; }
-          for s in J0 J1 J2 J3 J6 J7; do
+          for s in J0 J1 J2 J3 J6 J7 J8 J9; do
             grep -q "check-wgpu: $s " wgpu.log \
               || { echo "::error::--check-wgpu printed no $s line at all — that stage did not run and did not say so"; exit 1; }
           done
+          # A SKIP is not a pass. J8 skips loudly on a tracer with no hemisphere
+          # tiers or a pose with no geometry to probe — neither is true here, so
+          # either would mean the stage silently stopped covering anything.
+          if grep -qE "SKIP J[0-9]" wgpu.log; then
+            echo "::error::--check-wgpu passed vacuously — a stage skipped:"
+            grep -E "SKIP J[0-9]" wgpu.log
+            exit 1
+          fi
           # Their own anti-vacuity: every verdict line must be there. A tracer
           # that built and never rendered would still print the upload line,
           # and "PASSED" would then mean nothing.
-          for v in "J6 primary visibility" "J6 radiance A/B" "J7 coverage" "J7 soundness" "J7 wavefront vs reference image"; do
+          for v in "J6 primary visibility" "J6 radiance A/B" "J7 coverage" "J7 soundness" \
+                   "J7 wavefront vs reference image" "J8 hemi AO A/B" "J8 hemi GI A/B" \
+                   "J8 hemi GI frame" "J9 structure replay (warm frame 1)"; do
             grep -q "check-wgpu: $v" wgpu.log \
               || { echo "::error::--check-wgpu printed no '$v' verdict — that comparison did not run"; exit 1; }
           done

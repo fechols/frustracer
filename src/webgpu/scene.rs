@@ -189,6 +189,12 @@ pub fn ask_for(scene: &Scene, bvh: &crate::bvh::Bvh, rw: u32, rh: u32) -> super:
     // `doubled_cut: true` unconditionally — `--sw-rays` may not be armed yet
     // at ask time (the gate arms it later), and the ask is an upper bound.
     let caps = super::tracer::caps_for(rw, rh, true);
+    // The hemisphere tier's, from the same derivation for the same reason.
+    // These are RESOLUTION-INDEPENDENT — the per-batch reset is what bounds
+    // them — so at a small frame the cut pool here is the largest buffer in
+    // the whole session, and an ask that skipped it would open a device the
+    // tracer cannot allocate its bounce tier on.
+    let (hcell, hcut) = super::tracer::hemi_caps();
     let px = u64::from(rw) * u64::from(rh);
     let big = [
         bvh.nodes.len() as u64 * node,
@@ -204,6 +210,9 @@ pub fn ask_for(scene: &Scene, bvh: &crate::bvh::Bvh, rw: u32, rh: u32) -> super:
         caps.cut * 256,                                       // the cut pool
         caps.leaf * crate::gfx::shaders::LEAF_REC_BYTES,      // the leaf queue
         caps.tile * 24,                                       // one tile queue
+        hcell * 64,                                           // one hemi cell queue
+        hcut * 256,                                           // the hemi cut pool
+        px * 32,                                              // the shading points
     ];
     super::device::Ask {
         buckets: plan.buckets.len() as u32,

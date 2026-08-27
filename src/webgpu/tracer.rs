@@ -1,18 +1,23 @@
 //! The tracer on WebGPU — the recorder the browser will run, running
 //! natively so it can be gated.
 //!
-//! This rung is the REFERENCE KERNEL (`cs_reference` into `accum`,
-//! `cs_resolve` into an RGBA16F storage texture) plus the two per-frame
-//! cloud caches it reads. That is deliberately the same thing the Vulkan
-//! port landed first, and for the reason `vk/tracer.rs`'s header gives: the
-//! reference kernel is the smallest thing that can be WRONG in an
-//! interesting way. Every kernel above it reads the same streams through the
-//! same layout and shades through the same `shade.hlsli`, so a stream bound
-//! at the wrong slot, a skewed material stride, or a cbuffer that packs
-//! differently shows up HERE as a picture that disagrees with the CPU —
-//! before a quadtree is in the way to confuse the attribution.
+//! The REFERENCE KERNEL (`cs_reference` into `accum`, `cs_resolve` into an
+//! RGBA16F storage texture) plus the two per-frame cloud caches it reads, the
+//! WAVEFRONT QUADTREE beside it — seed, the indirect level ladder, and the
+//! leaf + sky terminal fills — the HEMISPHERE BOUNCE TIERS the H key cycles
+//! (`fb_mode > 0`), and STRUCTURE REPLAY.
 //!
-//! FOUR THINGS THIS SPELLS DIFFERENTLY FROM BOTH NATIVE BACKENDS.
+//! The reference kernel landed first, and for the reason `vk/tracer.rs`'s
+//! header gives: it is the smallest thing that can be WRONG in an interesting
+//! way. Every kernel above it reads the same streams through the same layout
+//! and shades through the same `shade.hlsli`, so a stream bound at the wrong
+//! slot, a skewed material stride, or a cbuffer that packs differently shows
+//! up THERE as a picture that disagrees with the CPU — before a quadtree is in
+//! the way to confuse the attribution. Having proven that, the ladder is
+//! scored GPU-vs-GPU against it, which is what lets J7 demand EXACT agreement
+//! rather than a statistical bar.
+//!
+//! FIVE THINGS THIS SPELLS DIFFERENTLY FROM BOTH NATIVE BACKENDS.
 //!
 //! - **One bind group per (entry, variant), not one set for the tracer.**
 //!   D3D12 binds one root signature and dispatches a dozen kernels against
@@ -24,6 +29,18 @@
 //!   point, and so are bind groups. They are still built ONCE, at
 //!   construction, so a dispatch costs a `set_bind_group` and no descriptor
 //!   traffic.
+//!
+//!   THIS IS ALSO WHY THE HEMISPHERE TIER NEEDED NO ARGUMENT HERE. The hemi
+//!   units re-declare u5/u6/u7/u9 as `HemiCellRec` queues where the ladder has
+//!   `TileRec` ones, and the Vulkan port owes a paragraph explaining why that
+//!   is not a conflict for its ONE shared layout (it keys on descriptor kind,
+//!   not on the HLSL type). Per-entry derivation makes the question disappear:
+//!   a hemi entry's layout is built from a hemi entry's IR.
+//! - **The push ring is SIZED FROM THE PROGRAM.** A fixed 64 rows carried the
+//!   ladder; the hemisphere tail is ~10 dispatches per `HEMI_BATCH` slice of
+//!   the framebuffer, so 720p asks for ~580. Because every row is written
+//!   before the submit, a dispatch cannot reuse its predecessor's row and the
+//!   ring's length IS the longest program. See [`push_rows_for`].
 //! - **`b1` is a DYNAMIC-OFFSET UNIFORM RING.** The ladder rewrites the push
 //!   block twice per level. D3D12 has root constants; Vulkan has
 //!   `vkCmdUpdateBuffer` — an inline transfer at the right point in the
@@ -54,7 +71,10 @@
 //! assembled its own sources would be a second corpus wearing the first
 //! one's audit.
 
-use crate::gfx::frame::{CB_STRIDE, FrameCb, FrameParams, GBUF_EXT_STRIDE, GBUF_STRIDE};
+use crate::gfx::frame::{
+    CB_STRIDE, FrameCb, FrameParams, GBUF_EXT_STRIDE, GBUF_STRIDE, HEMI_BATCH, HEMI_MAX_DEPTH,
+    fb_mode_of,
+};
 use crate::gfx::shaders as gs;
 use crate::scene::Scene;
 use crate::spirv::{Reg, Spirv, binding_of};
@@ -65,13 +85,37 @@ use super::headless::WgpuHeadless;
 use super::layout::{self, Unit};
 use super::scene::WgpuScene;
 
-/// How many push rows one frame can need. The reference path uses ONE; the
-/// ladder (Stage C2b) writes two per level over at most 11 levels plus the
-/// terminal fills, so this is that worst case with headroom. Sized here
-/// rather than grown on demand because every row must be written before the
-/// submit — a ring that had to grow mid-recording would mean a second
-/// submit, which is the one thing the design does not do.
-const PUSH_ROWS: u64 = 64;
+/// How many push rows one frame's program can need.
+///
+/// SIZED FROM THE PROGRAM rather than fixed at a literal, and that is forced
+/// rather than tidy: every row is written before the submit (module header),
+/// so a dispatch cannot reuse the row of the one before it and the ring must
+/// be at least as long as the longest program a frame can record. The
+/// HEMISPHERE TAIL is what makes this a real number — it is ~10 steps per
+/// `HEMI_BATCH` slice of the framebuffer, so 1280x720 asks for ~580 rows where
+/// the ladder alone asks for ~30. The literal 64 this replaced would have
+/// refused every fb frame at every resolution.
+///
+/// A ring that had to GROW mid-recording would mean a second submit, which is
+/// the one thing this design does not do — so the sizing is up front, and
+/// `run_steps` still refuses loudly on an overrun. That refusal is what keeps
+/// this a sizing decision rather than a soundness one.
+fn push_rows_for(depth_full: u32, px: u64, hemi: bool) -> u64 {
+    // seed + clear_info + clear_h, the ladder's prep/level pair per level, and
+    // the terminal fills (two preps, two cloud caches, leaf, sky).
+    let ladder = 3 + 2 * u64::from(depth_full) + 6;
+    let tail = if hemi {
+        // Per batch: prep_batch, the root, a prep/cell pair per level, then the
+        // leaf prep and the leaf rays. Plus the one compose splat per frame.
+        let levels = u64::from(HEMI_MAX_DEPTH - 1);
+        px.div_ceil(u64::from(HEMI_BATCH)) * (4 + 2 * levels) + 1
+    } else {
+        0
+    };
+    // Headroom for the probe path, which plans its own short program. A spare
+    // row costs one alignment quantum.
+    ladder + tail + 8
+}
 
 /// Which resource sits behind a slot. The three things a WebGPU bind group
 /// entry can be, and the reason this is an enum rather than three tables:
@@ -96,8 +140,12 @@ enum Res<'a> {
 /// table the bind-group builder was given, and the bind groups for every
 /// (entry, variant) pair are built once at construction.
 ///
-/// The hemisphere's two parities are Stage C2c and are absent rather than
-/// stubbed — a variant nothing binds would be a bind group nothing proves.
+/// The hemisphere's two parities move FIVE slots at once rather than two, and
+/// the extra three are the reason they are variants at all rather than a
+/// second base: `u7` to the hemi leaf queue, `u9` to the hemi cut pool, and
+/// `t0` back to the BINARY tree, because the hemi kernels compile
+/// `frustum.hlsli`'s binary `bound_query` deliberately (short queries lose on
+/// the wide tree — measured +35% there against -54% on the tile path).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Variant {
     /// The terminal phase: `u5`/`u6` are the cloud caches, `t0`/`t1` the
@@ -108,12 +156,23 @@ pub enum Variant {
     LadderA,
     /// Ladder, odd levels: the swap.
     LadderB,
+    /// Hemisphere, even levels: `u5` = cell queue A (in), `u6` = B (out).
+    HemiA,
+    /// Hemisphere, odd levels: the swap. THE ROOT PASS RUNS UNDER THIS ONE —
+    /// it WRITES `hqout`, so the parity dance is one step off the ladder's and
+    /// level 0 then reads hq_a as `hqin` under the even variant. Getting it
+    /// backwards costs the whole batch SILENTLY: the root's output lands in a
+    /// queue nothing reads. MEASURED, by planting exactly that — J8 answers
+    /// `leaf-rays 0`, `psa-viol 45/56` with max error 3.14 (the whole
+    /// hemisphere unaccounted) and an AO error of 0.59 against a 0.02 bar.
+    HemiB,
 }
 
 /// Every variant, in `Variant as usize` order — the bind-group table's index
 /// space, stated once so the builder and the dispatcher cannot disagree about
 /// how long it is.
-const VARIANTS: [Variant; 3] = [Variant::Terminal, Variant::LadderA, Variant::LadderB];
+const VARIANTS: [Variant; 5] =
+    [Variant::Terminal, Variant::LadderA, Variant::LadderB, Variant::HemiA, Variant::HemiB];
 
 /// One compiled entry point plus its per-variant bind groups.
 struct Pass {
@@ -138,11 +197,33 @@ const P_LEVEL: usize = 8;
 const P_LEVEL_WIDE: usize = 9;
 const P_LEAF: usize = 10;
 const P_SKY: usize = 11;
+// The hemisphere tiers, appended to the same index space. `cs_leaf` appears
+// TWICE across the table — once from `srcs.leaf` and once from `srcs.leaf_fb`
+// — and that is the point rather than an accident: they are two pipelines from
+// ONE source separated by `LEAF_NO_FB`, a register-pressure decision, and an
+// fb frame needs the second or its leaf pass appends no shading points at all
+// and every hemisphere gate below goes vacuous.
+const P_HEMI_ROOT: usize = 12;
+const P_HEMI_CELL: usize = 13;
+const P_HEMI_LEAF: usize = 14;
+const P_COMPOSE: usize = 15;
+const P_PREP_BATCH: usize = 16;
+const P_SEED_PROBES: usize = 17;
+const P_CLEAR_H: usize = 18;
+const P_LEAF_FB: usize = 19;
+/// Structure replay's seed: re-dispatches the persisted terminal queues
+/// instead of running the ladder that filled them.
+const P_SEED_REPLAY: usize = 20;
 
-/// `cs_prep`'s "do not zero any counter" sentinel, and the two args slots the
-/// terminal fills use — lockstep with `gpu/trace.rs`'s consts (which are
-/// `#[cfg(windows)]`-only) and `vk/tracer.rs`'s copies.
+/// `cs_prep`'s "do not zero any counter" sentinel, and the args slots the
+/// terminal fills and the hemisphere passes launch from — lockstep with
+/// `gpu/trace.rs`'s consts (which are `#[cfg(windows)]`-only) and
+/// `vk/tracer.rs`'s copies. The ladder owns slots 0..=10 (one per level), so
+/// the hemi three sit above it and the terminal two at the top of the 16.
 const NO_RESET: u32 = 0xffff_ffff;
+const ARG_HEMI_ROOT: u32 = 11;
+const ARG_HEMI_CELL: u32 = 12;
+const ARG_HEMI_LEAF: u32 = 13;
 const ARG_LEAF: u32 = 14;
 const ARG_SKY: u32 = 15;
 
@@ -171,6 +252,45 @@ struct Wave {
     depth_full: u32,
     cap_leaf: u32,
     cap_sky: u32,
+}
+
+/// The hemisphere bounce tiers' own half: the batch-transient cell queues and
+/// cut pool, the per-pixel planes the leaf/compose pair passes radiance
+/// through, and the shading-point queue.
+///
+/// Separate from [`Wave`] because it is optional for a different reason. The
+/// queues are sized to ONE BATCH of the worst-case cell fan-out
+/// (`HEMI_BATCH * 4^(HEMI_MAX_DEPTH-1)` = 1,048,576 records), which is ~280 MB
+/// of buffers a run with no interest in fb should not be asked for. That
+/// per-batch reset IS the memory bound — the whole reason the hemisphere
+/// wavefront is batched at all.
+///
+/// EVERY ONE OF THESE FITS UNDER WEBGPU'S DEFAULTS, which is worth stating
+/// because C2's bistro run did not: the largest is the cut pool at 88 MB and
+/// the cell queues are 64 MB each, all under the 128 MB default
+/// `max_storage_buffer_binding_size`. So this tier costs device MEMORY without
+/// costing a limits row — and `scene::ask_for` carries the rows anyway, so the
+/// ask stays derived from the same arithmetic rather than from that reading.
+struct Hemi {
+    /// Cell ping-pong. See [`Variant::HemiB`] for why the root writes hq_a.
+    hq_a: wgpu::Buffer,
+    hq_b: wgpu::Buffer,
+    hq_leaf: wgpu::Buffer,
+    cut: wgpu::Buffer,
+    /// u10/u11: the leaf pass's ambient-free colour and its `kd` weight — what
+    /// makes compose a pure weight x mass multiply (`compose.hlsl`'s header).
+    partial: wgpu::Buffer,
+    ambw: wgpu::Buffer,
+    /// u12: the FIXED-POINT accumulator. Integer atomics are order-independent,
+    /// which is what makes a queue-driven integrator reproducible run to run —
+    /// and what makes a sun disc reaching a gather path a saturation bug rather
+    /// than a brightness one.
+    hbuf: wgpu::Buffer,
+    /// u13: the shading points. `cs_leaf` (the fb arm) appends into it on a
+    /// frame; the probe path writes it from the host.
+    pts: wgpu::Buffer,
+    cap_cell: u64,
+    cap_cut: u64,
 }
 
 /// The ladder's STRUCTURAL queue caps for one resolution.
@@ -214,6 +334,22 @@ pub fn caps_for(rw: u32, rh: u32, doubled_cut: bool) -> Caps {
     }
 }
 
+/// The hemisphere tier's per-BATCH caps: cell records and cut slots.
+///
+/// A peer of [`caps_for`] and public for the same reason — `scene::ask_for`
+/// sizes the device ask from it before a device exists, and
+/// [`WgpuTracer::new`] allocates from it afterwards. Two copies of this
+/// arithmetic is exactly the duplicated-constant hazard nobody catches: the
+/// buffers would be one size and `set_caps` would tell the shaders another.
+///
+/// `HEMI_BATCH * 4^(HEMI_MAX_DEPTH-1)` is the worst-case fan-out of one batch,
+/// and the batch reset is what keeps it a bound rather than a frame total.
+pub fn hemi_caps() -> (u64, u64) {
+    let cell = u64::from(HEMI_BATCH) * (1u64 << (2 * (HEMI_MAX_DEPTH - 1)));
+    let cut = u64::from(HEMI_BATCH) * (((1u64 << (2 * (HEMI_MAX_DEPTH - 1))) - 1) / 3 + 1);
+    (cell, cut)
+}
+
 /// One recorded dispatch: which entry, under which variant, with which push
 /// row, launched how.
 ///
@@ -251,12 +387,17 @@ pub struct WgpuTracer {
     /// The push ring — see the module header.
     push: wgpu::Buffer,
     push_stride: u64,
+    /// Rows the ring holds, from [`push_rows_for`]. Kept so `run_steps` gates
+    /// against what was ALLOCATED rather than against a constant that could
+    /// drift from it.
+    push_rows: u64,
     /// The BINARY BVH and `bvh.tri_idx`: what `rt_sw.hlsli` descends and the
     /// triangle ids its leaves hold. Under `--sw-rays` — which the browser
     /// corpus REQUIRES — these are the whole intersector.
     binary: wgpu::Buffer,
     sw_tri: wgpu::Buffer,
     wave: Option<Wave>,
+    hemi: Option<Hemi>,
     _hdr: wgpu::Texture,
     hdr: wgpu::TextureView,
     passes: Vec<Pass>,
@@ -300,7 +441,7 @@ impl WgpuTracer {
         // ONE index space, in `P_*` order — the ladder is appended rather
         // than kept in a second table, so `go` takes a pass number and
         // nothing has to know which half it came from.
-        let units: [(&str, &str, &str); 12] = [
+        let units: [(&str, &str, &str); 21] = [
             (&srcs.reference, "cs_reference", "reference"),
             (&srcs.resolve, "cs_resolve", "resolve"),
             (&srcs.sky, "cs_sky_lod", "sky-lod"),
@@ -313,6 +454,17 @@ impl WgpuTracer {
             (&srcs.wavefront, "cs_level_wide", "wf-level-wide"),
             (&srcs.leaf, "cs_leaf", "wf-leaf"),
             (&srcs.sky, "cs_sky", "wf-sky"),
+            // The hemisphere tiers. `srcs.leaf_fb` is the SAME kernel as
+            // `srcs.leaf` with the hemi arm compiled in — see `P_LEAF_FB`.
+            (&srcs.hemi_wave, "cs_hemi_root", "hemi-root"),
+            (&srcs.hemi_wave, "cs_hemi_cell", "hemi-cell"),
+            (&srcs.hemi_leaf, "cs_hemi_leaf", "hemi-leaf"),
+            (&srcs.compose, "cs_compose", "compose"),
+            (&srcs.wavefront, "cs_prep_batch", "wf-prep-batch"),
+            (&srcs.wavefront, "cs_seed_probes", "wf-seed-probes"),
+            (&srcs.wavefront, "cs_clear_h", "wf-clear-h"),
+            (&srcs.leaf_fb, "cs_leaf", "wf-leaf-fb"),
+            (&srcs.wavefront, "cs_seed_replay", "wf-seed-replay"),
         ];
 
         // The one hand-made entry in a derived layout (module header): the
@@ -395,37 +547,48 @@ impl WgpuTracer {
         };
         let cloud_shadow = buf("cloud_shadow", csn * csn * 4, sb);
 
+        // The ladder's queue caps come from `caps_for`, which is also what the
+        // DEVICE ASK was sized from before this device existed — one
+        // derivation, two callers (see its doc comment). Hoisted ABOVE the push
+        // ring because the ring is sized from the PROGRAM and the program's
+        // length is a function of the quadtree depth.
+        let caps = caps_for(rw, rh, gs::sw_rays_leaf() && srcs.ftree_on);
+        let dd = caps.depth;
+        if dd > 11 {
+            return Err(format!("{rw}x{rh} needs quadtree depth {dd} > 11 indirect-arg slots"));
+        }
+
         let ub = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
         let frame_cb = buf("frame_cb", CB_STRIDE as u64, ub);
         // The ring stride is the DEVICE's alignment, read back from what was
         // granted rather than assumed to be the 256-byte default — a device
         // that grants a coarser one would silently misalign every row.
         let push_stride = u64::from(dev.limits.min_uniform_buffer_offset_alignment).max(16);
-        let push = buf("push ring", push_stride * PUSH_ROWS, ub);
+        let push_rows = push_rows_for(dd, px, true);
+        let push = buf("push ring", push_stride * push_rows, ub);
 
         let binary = super::scene::stream(dev, "bvh", &bvh.nodes, crate::gfx::scene::gpu_bvh_node, sb);
         let sw_tri = super::scene::stream(dev, "tri_idx", &bvh.tri_idx, |t| *t, sb);
         bytes.set(bytes.get() + binary.size() + sw_tri.size());
 
         // ---- the ladder ----
-        //
-        // The queue caps come from `caps_for`, which is also what the DEVICE
-        // ASK was sized from before this device existed — one derivation, two
-        // callers (see its doc comment).
         let ft = if srcs.ftree_on { Some(crate::ftree::FTree::build(bvh)) } else { None };
-        let caps = caps_for(rw, rh, gs::sw_rays_leaf() && srcs.ftree_on);
-        let dd = caps.depth;
-        if dd > 11 {
-            return Err(format!("{rw}x{rh} needs quadtree depth {dd} > 11 indirect-arg slots"));
-        }
         let (cap_tile, cap_leaf, cap_cut) = (caps.tile, caps.leaf, caps.cut);
+        let (cap_hcell, cap_hcut) = hemi_caps();
         let mut cb_base = FrameCb::base(scene, rw, rh);
         // The kernels read every one of these off the cbuffer, so a buffer
         // sized here and a cap written there must be the same number — hence
-        // one place computing both. The hemi three stay 0: that tier is C2c,
-        // and a cap for a queue nothing allocates would be a lie the shader
-        // would believe.
-        cb_base.set_caps(cap_tile as u32, cap_leaf as u32, cap_leaf as u32, cap_cut as u32, 0, 0, 0);
+        // one place computing both, and why the hemi three come from
+        // `hemi_caps()` rather than from a second copy of its arithmetic.
+        cb_base.set_caps(
+            cap_tile as u32,
+            cap_leaf as u32,
+            cap_leaf as u32,
+            cap_cut as u32,
+            cap_hcell as u32,
+            cap_hcell as u32,
+            cap_hcut as u32,
+        );
 
         let tree = match &ft {
             // The QUANTIZED wire format — the per-processor split `ftree.rs`
@@ -464,6 +627,30 @@ impl WgpuTracer {
             cap_sky: cap_leaf as u32,
         };
 
+        // ---- the hemisphere tiers ----
+        //
+        // Built unconditionally, as the Vulkan port builds them: this tracer
+        // always has a ladder, and a tier that existed only on some runs would
+        // mean the gate covers a configuration and the browser ships another.
+        // The cost is ~280 MB, which is what the per-batch reset buys back —
+        // see [`Hemi`].
+        let hemi = Hemi {
+            hq_a: buf("hemi qa", cap_hcell * 64, sb),
+            hq_b: buf("hemi qb", cap_hcell * 64, sb),
+            hq_leaf: buf("hemi qleaf", cap_hcell * 64, sb),
+            cut: buf("hemi cut pool", cap_hcut * 256, sb),
+            partial: buf("hemi partial", px * 12, sb),
+            ambw: buf("hemi ambw", px * 12, sb),
+            hbuf: buf("hemi hbuf", px * 16, sb),
+            // 32 bytes a point, not 16 — one `HemiPointRec` carries the
+            // position, the normal and the pixel it belongs to. `COPY_DST` is
+            // already in `sb`, which is what lets the probe path write points
+            // from the host where Vulkan asks for a host-visible allocation.
+            pts: buf("hemi pts", px * 32, sb),
+            cap_cell: cap_hcell,
+            cap_cut: cap_hcut,
+        };
+
         let hdr_tex = dev.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("hdr"),
             size: wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
@@ -493,9 +680,11 @@ impl WgpuTracer {
             frame_cb,
             push,
             push_stride,
+            push_rows,
             binary,
             sw_tri,
             wave: Some(wave),
+            hemi: Some(hemi),
             _hdr: hdr_tex,
             hdr,
             passes: Vec::new(),
@@ -577,6 +766,48 @@ impl WgpuTracer {
                     }
                 }
             }
+            // FIVE moved slots, not two: the cell ping-pong, the hemi leaf
+            // queue and cut pool at u7/u9 — which OVERRIDE the ladder's own
+            // queues at those registers, since the hemi units re-declare them
+            // as `HemiCellRec` streams — and t0 back to the BINARY tree,
+            // because these kernels compile the binary `bound_query`
+            // deliberately. `tri_idx` follows t0, since `cs_hemi_leaf` shoots
+            // its rays through the same software loops.
+            //
+            // On this backend that re-declaration needs no argument at all,
+            // where the Vulkan twin owes one: layouts here are DERIVED PER
+            // ENTRY POINT from each unit's own naga IR, so a hemi entry's
+            // layout already describes a `HemiCellRec` queue where the ladder's
+            // describes a `TileRec` one. Nothing is shared to conflict.
+            Variant::HemiA | Variant::HemiB => {
+                if let Some(h) = &self.hemi {
+                    let (q0, q1) = if variant == Variant::HemiA {
+                        (&h.hq_a, &h.hq_b)
+                    } else {
+                        (&h.hq_b, &h.hq_a)
+                    };
+                    table.extend([
+                        (0, Reg::T, 0, Res::Buf(&self.binary)),
+                        (0, Reg::T, 1, Res::Buf(&self.sw_tri)),
+                        (0, Reg::U, 5, Res::Buf(q0)),
+                        (0, Reg::U, 6, Res::Buf(q1)),
+                        (0, Reg::U, 7, Res::Buf(&h.hq_leaf)),
+                        (0, Reg::U, 9, Res::Buf(&h.cut)),
+                    ]);
+                }
+            }
+        }
+        if let Some(h) = &self.hemi {
+            // The per-pixel planes and the shading-point queue. These do NOT
+            // vary by variant — only the queues behind u5..u9 and the tree at
+            // t0 do — so they belong in the base beside everything else, and
+            // the compose pass reads them under TERMINAL.
+            table.extend([
+                (0, Reg::U, 10, Res::Buf(&h.partial)),
+                (0, Reg::U, 11, Res::Buf(&h.ambw)),
+                (0, Reg::U, 12, Res::Buf(&h.hbuf)),
+                (0, Reg::U, 13, Res::Buf(&h.pts)),
+            ]);
         }
         if let Some(w) = &self.wave {
             // The ladder's own streams, in the BASE rather than a variant:
@@ -824,7 +1055,7 @@ impl WgpuTracer {
                 *push = [inv.to_bits(), 0, 0, 0];
             }
         }
-        self.run_steps(hg, &steps)
+        self.run_steps(hg, &steps, true)
     }
 
     /// ONE WAVEFRONT QUADTREE FRAME: seed -> depth_full x (prep-args ->
@@ -840,11 +1071,10 @@ impl WgpuTracer {
     /// makes the exactly-once coverage gate possible: a pixel no terminal
     /// record covered still reads the sentinel afterwards.
     ///
-    /// NO HEMISPHERE TIER (Stage C2c): with fb off the leaf and sky passes
+    /// COMPOSE IS PLANNED ONLY UNDER fb, and that is D3D12's and Vulkan's rule
+    /// verbatim rather than an omission: with fb off the leaf and sky passes
     /// splat straight into `accum` through `queues.hlsli::accum_splat`, so
-    /// compose would be a buffer-to-buffer copy of a full screen — which is
-    /// D3D12's and Vulkan's rule verbatim, not an omission. A frame that ASKS
-    /// for a bounce tier is refused rather than quietly rendered without one.
+    /// compose would be a buffer-to-buffer copy of a full screen.
     pub fn render_wavefront(
         &self,
         hg: &WgpuHeadless,
@@ -852,13 +1082,10 @@ impl WgpuTracer {
         clear_sentinel: bool,
     ) -> Result<(), String> {
         let w = self.wave.as_ref().ok_or("this tracer has no wavefront ladder")?;
-        let fb_mode = crate::gfx::frame::fb_mode_of(&p.q);
-        if fb_mode != 0 {
-            return Err(format!(
-                "fb_mode {fb_mode}: the WebGPU tracer has no hemisphere tier yet (Stage C2c) — \
-                 rendering without one would silently drop the ambient term"
-            ));
-        }
+        // Read from the SAME function that writes the cbuffer's `fb_mode`, so
+        // the kernels this plans and the constant they branch on cannot
+        // disagree about which tier is running.
+        let fb_mode = fb_mode_of(&p.q);
         let dev = &hg.dev;
         self.write_cb(dev, p);
 
@@ -887,6 +1114,7 @@ impl WgpuTracer {
                 gy: clear_groups.div_ceil(32768),
             });
         }
+        self.plan_clear_h(&mut steps, fb_mode);
         for lvl in 0..w.depth_full {
             let (in_ctr, out_ctr) = if lvl % 2 == 0 {
                 (gs::CTR_TILE_A, gs::CTR_TILE_B)
@@ -915,14 +1143,195 @@ impl WgpuTracer {
                 slot: lvl,
             });
         }
-        self.plan_terminal_fills(&mut steps);
-        self.run_steps(hg, &steps)
+        self.plan_terminal_fills(&mut steps, fb_mode);
+        self.plan_hemi_tail(&mut steps, fb_mode, p.q.fb.depth, clear_groups);
+        self.run_steps(hg, &steps, true)
+    }
+
+    /// STRUCTURE REPLAY: a bit-equal-basis frame re-dispatches the persisted
+    /// terminal queues and skips the seed and the WHOLE level ladder. The
+    /// ladder is the wavefront's fixed cost, and on a parked camera this
+    /// deletes it (D3D12 measured -43% of the GPU frame span there).
+    ///
+    /// Soundness is entirely in one sentence: the terminal structure is a pure
+    /// function of (scene, BVH, basis, rw, rh), while spp/jitter/frame/fb/
+    /// quality/clouds all ride the cbuffer — so a replay frame re-shades from a
+    /// fresh `FrameParams` against a structure that provably still describes
+    /// this view, and the result must be BIT-IDENTICAL to a fresh trace. That
+    /// is a gate, not a hope: J9 compares tbuf/info/accum bitwise.
+    ///
+    /// The queues stay byte-intact between producing frames because only
+    /// `cs_seed` and the ladder ever WRITE them — the leaf and sky passes read,
+    /// the hemi passes rebind u5..u9 to their own transients, and the
+    /// reference/resolve units declare no queues at all.
+    ///
+    /// THE CALLER PROVES THE BIT-EQUALITY. D3D12 keeps a `last_struct` key and
+    /// auto-selects inside `record_frame`; there is no per-frame driver on this
+    /// backend yet, so that predicate lands with the presenter (Stage D) rather
+    /// than being written here as a field nothing reads.
+    pub fn render_wavefront_replay(
+        &self,
+        hg: &WgpuHeadless,
+        p: &FrameParams,
+        clear_sentinel: bool,
+    ) -> Result<(), String> {
+        self.wave.as_ref().ok_or("structure replay is the ladder's, and this tracer has none")?;
+        let fb_mode = fb_mode_of(&p.q);
+        self.write_cb(&hg.dev, p);
+        let clear_groups = (self.rw * self.rh).div_ceil(256);
+
+        // The TERMINAL variant throughout the head: nothing here touches the
+        // tile queues, so the ladder's A/B parities have no work to do.
+        let mut steps: Vec<Step> = vec![Step::Direct {
+            pass: P_SEED_REPLAY,
+            variant: Variant::Terminal,
+            push: [0, 0, 0, 0],
+            gx: 1,
+            gy: 1,
+        }];
+        if clear_sentinel {
+            steps.push(Step::Direct {
+                pass: P_CLEAR_INFO,
+                variant: Variant::Terminal,
+                push: [0, 0, 0, 0],
+                gx: clear_groups.min(32768),
+                gy: clear_groups.div_ceil(32768),
+            });
+        }
+        self.plan_clear_h(&mut steps, fb_mode);
+        self.plan_terminal_fills(&mut steps, fb_mode);
+        self.plan_hemi_tail(&mut steps, fb_mode, p.q.fb.depth, clear_groups);
+        // NO COUNTER CLEAR: `cs_seed_replay` keeps the terminal structure it is
+        // about to re-dispatch. See `run_steps`.
+        self.run_steps(hg, &steps, false)
+    }
+
+    /// Zero the fixed-point H accumulator, once per fb FRAME.
+    ///
+    /// MANDATORY rather than tidy, and the Vulkan port had it missing from the
+    /// frame path until the replay factoring put the two next to each other:
+    /// `hbuf` is written by ATOMIC ADD (that is what makes the integrator
+    /// order-independent), so an unzeroed frame integrates on top of the
+    /// previous one's answer — and nothing downstream can tell, because compose
+    /// folds whatever is there into `accum` and J8's frame half scores
+    /// accounting, not radiance.
+    fn plan_clear_h(&self, steps: &mut Vec<Step>, fb_mode: u32) {
+        if fb_mode == 0 || self.hemi.is_none() {
+            return;
+        }
+        let g = (self.rw * self.rh * 4).div_ceil(256);
+        steps.push(Step::Direct {
+            pass: P_CLEAR_H,
+            variant: Variant::Terminal,
+            push: [0, 0, 0, 0],
+            gx: g.min(32768),
+            gy: g.div_ceil(32768),
+        });
+    }
+
+    /// The hemisphere wavefront plus its one compose splat. No-op with fb off,
+    /// for the reason [`Self::render_wavefront`]'s header gives.
+    fn plan_hemi_tail(
+        &self,
+        steps: &mut Vec<Step>,
+        fb_mode: u32,
+        fb_depth: u32,
+        clear_groups: u32,
+    ) {
+        if fb_mode == 0 || self.hemi.is_none() {
+            return;
+        }
+        // Every hit pixel appended a point, so batch over the WORST CASE;
+        // batches past the GPU-side count dispatch zero groups, which is what
+        // lets this be planned statically with no readback anywhere.
+        self.plan_hemi(steps, u64::from(self.rw) * u64::from(self.rh), fb_depth);
+        // partial + ambW * ambient(H) -> accum: the single splat, and the ONE
+        // pass in the tracer that is per-PIXEL rather than queue-driven.
+        steps.push(Step::Direct {
+            pass: P_COMPOSE,
+            variant: Variant::Terminal,
+            push: [0, 0, 0, 0],
+            gx: clear_groups.min(32768),
+            gy: clear_groups.div_ceil(32768),
+        });
+    }
+
+    /// The hemisphere wavefront over the points in `pts`, in `HEMI_BATCH`
+    /// slices. Each batch resets the transient cell queues and cut pool
+    /// (`cs_prep_batch`), and THAT reset is what bounds the memory: the caps
+    /// size one batch, not one frame.
+    ///
+    /// The parity dance is one step off the ladder's, deliberately — see
+    /// [`Variant::HemiB`] for what getting it backwards costs, and what
+    /// planting it measured.
+    fn plan_hemi(&self, steps: &mut Vec<Step>, max_points: u64, fb_depth: u32) {
+        let n_batches = max_points.div_ceil(u64::from(HEMI_BATCH));
+        let levels = fb_depth.clamp(2, HEMI_MAX_DEPTH) - 1;
+        for b in 0..n_batches {
+            let base = (b * u64::from(HEMI_BATCH)) as u32;
+            // Batch prep: the root pass's args PLUS the batch-scoped counter
+            // reset — one kernel, because the reset has to happen before
+            // anything in the batch enqueues.
+            steps.push(Step::Direct {
+                pass: P_PREP_BATCH,
+                variant: Variant::HemiB,
+                push: [gs::CTR_HEMI_PT, base, 32, ARG_HEMI_ROOT],
+                gx: 1,
+                gy: 1,
+            });
+            steps.push(Step::Indirect {
+                pass: P_HEMI_ROOT,
+                variant: Variant::HemiB,
+                push: [base, gs::CTR_HEMI_A, 0, 0],
+                slot: ARG_HEMI_ROOT,
+            });
+
+            for l in 0..levels {
+                let (in_ctr, out_ctr) = if l % 2 == 0 {
+                    (gs::CTR_HEMI_A, gs::CTR_HEMI_B)
+                } else {
+                    (gs::CTR_HEMI_B, gs::CTR_HEMI_A)
+                };
+                let variant = if l % 2 == 0 { Variant::HemiA } else { Variant::HemiB };
+                steps.push(Step::Direct {
+                    pass: P_PREP,
+                    variant,
+                    push: [in_ctr, out_ctr, 32, ARG_HEMI_CELL],
+                    gx: 1,
+                    gy: 1,
+                });
+                steps.push(Step::Indirect {
+                    pass: P_HEMI_CELL,
+                    variant,
+                    push: [in_ctr, out_ctr, 0, 0],
+                    slot: ARG_HEMI_CELL,
+                });
+            }
+
+            // Leaf rays: FOUR threads per leaf cell (one stratified Arvo ray
+            // per midpoint sub-cell), so 8 records per 32-wide group.
+            steps.push(Step::Direct {
+                pass: P_PREP,
+                variant: Variant::HemiA,
+                push: [gs::CTR_HEMI_LEAF, NO_RESET, 8, ARG_HEMI_LEAF],
+                gx: 1,
+                gy: 1,
+            });
+            steps.push(Step::Indirect {
+                pass: P_HEMI_LEAF,
+                variant: Variant::HemiA,
+                push: [0, 0, 0, 0],
+                slot: ARG_HEMI_LEAF,
+            });
+        }
     }
 
     /// The leaf and sky fills, appended to a step program. Shared so the
-    /// replay path (Stage C2c) records the SAME code rather than a second
-    /// block that looks like it.
-    fn plan_terminal_fills(&self, steps: &mut Vec<Step>) {
+    /// replay path records the SAME code rather than a second block that looks
+    /// like it — that factoring was the only real work in porting replay, and
+    /// it is what makes "a replayed frame is bit-identical" a claim about one
+    /// piece of code rather than about two that agree today.
+    fn plan_terminal_fills(&self, steps: &mut Vec<Step>, fb_mode: u32) {
         steps.push(Step::Direct {
             pass: P_PREP,
             variant: Variant::Terminal,
@@ -943,8 +1352,13 @@ impl WgpuTracer {
         // Both cloud caches, ahead of BOTH consumers — `cs_sky` on the
         // proven-empty rects and `cs_leaf`'s own miss branch.
         self.plan_cloud_caches(steps);
+        // fb frames take the OTHER leaf pipeline — same source, hemi arm
+        // compiled IN — because that arm is what appends the shading points the
+        // hemisphere passes below consume. Sharing one pipeline here would
+        // leave the hemi point queue empty and every gate below vacuous.
+        let leaf = if fb_mode > 0 && self.hemi.is_some() { P_LEAF_FB } else { P_LEAF };
         steps.push(Step::Indirect {
-            pass: P_LEAF,
+            pass: leaf,
             variant: Variant::Terminal,
             push: [gs::CTR_LEAF, 0, 0, 0],
             slot: ARG_LEAF,
@@ -966,12 +1380,36 @@ impl WgpuTracer {
     /// removes the write-after-read hazard the Vulkan twin has to barrier
     /// for by hand (its `push` carries a WAR edge whose omission silently
     /// cost the whole ladder past level 0 on the first run).
-    fn run_steps(&self, hg: &WgpuHeadless, steps: &[Step]) -> Result<(), String> {
+    /// `clear_counters` is the PROGRAM's decision, not this function's, and
+    /// making it a parameter is the fix for two bugs one blanket clear caused.
+    /// Both paths that keep counters across a submit spell their keep-set in
+    /// the KERNEL, and a host-side clear silently overrode it:
+    ///
+    /// * `cs_seed_replay` keeps CTR_LEAF / CTR_SKY / CTR_CUT / CTR_SKY_PX —
+    ///   the whole terminal structure it is about to re-dispatch. Cleared, the
+    ///   fills launched zero groups and the replay wrote NOTHING (J9 measured
+    ///   120000 poison survivors).
+    /// * `cs_seed_probes` keeps the verify and stats counters across
+    ///   accumulate seeds deliberately, so the exact-zero gates observe every
+    ///   seed's rays. Cleared, J8 scored one seed in eight and still PASSED —
+    ///   the quieter of the two by far, and the reason this is a parameter
+    ///   rather than a `!replay` special case. (Measured: leaf-rays 344 with
+    ///   the clear, 2752 without. Exactly 8x, and the gate never said a word.)
+    ///
+    /// So the caller passes what its seed kernel expects, and the two
+    /// statements of the keep-set cannot drift apart.
+    fn run_steps(
+        &self,
+        hg: &WgpuHeadless,
+        steps: &[Step],
+        clear_counters: bool,
+    ) -> Result<(), String> {
         let dev = &hg.dev;
-        if steps.len() as u64 > PUSH_ROWS {
+        if steps.len() as u64 > self.push_rows {
             return Err(format!(
-                "{} dispatches in one frame exceeds the {PUSH_ROWS}-row push ring",
-                steps.len()
+                "{} dispatches in one frame exceeds the {}-row push ring",
+                steps.len(),
+                self.push_rows
             ));
         }
         for (row, s) in steps.iter().enumerate() {
@@ -987,8 +1425,11 @@ impl WgpuTracer {
         hg.run(|enc| {
             // Counters are PER FRAME, and `cs_seed` zeroes the ones it owns —
             // but `clear_buffer` here is what makes an "> 0" must-fire mean
-            // something on the counters no kernel resets.
-            enc.clear_buffer(&self.counters, 0, None);
+            // something on the counters no kernel resets. See the doc comment
+            // for why it is the caller's decision.
+            if clear_counters {
+                enc.clear_buffer(&self.counters, 0, None);
+            }
             let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             for (row, s) in steps.iter().enumerate() {
                 match *s {
@@ -1009,6 +1450,95 @@ impl WgpuTracer {
                 }
             }
         })
+    }
+
+    /// The `--check-wgpu` probe path: upload a CPU-generated shading-point set
+    /// and run ONLY the hemisphere passes over it — `run_hemi_probes`' peer on
+    /// the CPU side.
+    ///
+    /// Both sides of the A/B then integrate at the EXACT same `(o, n)`, which
+    /// is what makes a statistical comparison against a CPU cosine reference
+    /// mean anything. The CB `frame` seeds the Arvo draws, so calling again
+    /// with `clear = false` and a different frame ACCUMULATES another
+    /// independent estimate into H — and `cs_seed_probes` keeps the verify
+    /// counters across those passes deliberately, so the exact-zero gates
+    /// observe every seed's rays rather than only the last seed's.
+    pub fn run_hemi_probes(
+        &self,
+        hg: &WgpuHeadless,
+        p: &FrameParams,
+        probes: &[(glam::Vec3A, glam::Vec3A)],
+        clear: bool,
+    ) -> Result<(), String> {
+        let h = self.hemi.as_ref().ok_or("this tracer has no hemisphere tiers")?;
+        self.wave.as_ref().ok_or("this tracer has no wavefront ladder")?;
+        if probes.len() > (self.rw * self.rh) as usize {
+            return Err(format!("{} probes exceeds the hbuf/pts capacity", probes.len()));
+        }
+        let dev = &hg.dev;
+        self.write_cb(dev, p);
+
+        // `HemiPointRec` — o | pixel | n | pad. `pixel` is the probe INDEX, so
+        // probe i's estimate lands at hbuf[i].
+        let mut bytes = Vec::with_capacity(probes.len() * 32);
+        for (i, (o, n)) in probes.iter().enumerate() {
+            for v in [o.x, o.y, o.z] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes.extend_from_slice(&(i as u32).to_le_bytes());
+            for v in [n.x, n.y, n.z] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // Ordered before the submit below, which is what makes this the peer of
+        // Vulkan's host-visible write rather than a staging copy needing its
+        // own edge.
+        dev.queue.write_buffer(&h.pts, 0, &bytes);
+
+        let n = probes.len() as u32;
+        let clear_groups = (self.rw * self.rh * 4).div_ceil(256);
+        // Any variant would serve these two — they touch `counters` and `hbuf`,
+        // which every variant holds identically — but planning them under the
+        // one the batch loop starts with keeps the stream readable.
+        let mut steps: Vec<Step> = vec![Step::Direct {
+            pass: P_SEED_PROBES,
+            variant: Variant::HemiB,
+            push: [n, u32::from(clear), 0, 0],
+            gx: 1,
+            gy: 1,
+        }];
+        if clear {
+            steps.push(Step::Direct {
+                pass: P_CLEAR_H,
+                variant: Variant::HemiB,
+                push: [0, 0, 0, 0],
+                gx: clear_groups.min(32768),
+                gy: clear_groups.div_ceil(32768),
+            });
+        }
+        self.plan_hemi(&mut steps, u64::from(n), p.q.fb.depth);
+        // `clear` is the same flag `cs_seed_probes` takes as push1 — one
+        // decision, spelled once on each side.
+        self.run_steps(hg, &steps, clear)
+    }
+
+    /// The fixed-point H accumulator, as raw u32 — 4 per point (`x|y|z|psa`).
+    pub fn read_hbuf(&self, hg: &WgpuHeadless, n_points: usize) -> Result<Vec<u32>, String> {
+        let h = self.hemi.as_ref().ok_or("this tracer has no hemisphere tiers")?;
+        let b = hg.read_buffer(&h.hbuf, n_points * 4 * 4)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+
+    /// Are the hemisphere tiers live? Always, today — the `Option` stays for
+    /// the same reason `Wave`'s does.
+    pub fn has_hemi(&self) -> bool {
+        self.hemi.is_some()
+    }
+
+    /// The hemisphere tier's per-batch caps, for the gate's accounting line.
+    pub fn hemi_caps(&self) -> (u64, u64) {
+        self.hemi.as_ref().map_or((0, 0), |h| (h.cap_cell, h.cap_cut))
     }
 
     /// The ladder's structural queues, for the gate's accounting.

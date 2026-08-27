@@ -824,3 +824,124 @@ then plain `--check` LAST with the tracked goldens byte-identical.
 Next: C2c — the hemisphere tiers and replay (J8/J9), then the display stage
 (J18), and then Stage D: the web shell, and the first frustracer pixels in a
 browser tab.
+
+---
+
+## Stage C2c (2026-08-21): the hemisphere tiers and structure replay
+
+The last two render-path arms the WebGPU tracer did not have. Nine more entry
+points (21 total), two more bind-group variants, eight more buffers, and two
+gates: **J8** the bounce tiers, **J9** replay.
+
+The port itself is `vk/tracer.rs`'s design read off the page — the hemi units
+re-declaring u5/u6/u7/u9 as `HemiCellRec` queues, the root pass running under
+the ODD parity because it WRITES `hqout`, the per-batch reset that bounds the
+memory, `cs_leaf` compiled twice from one source because `LEAF_NO_FB` is a
+register-pressure decision an fb frame cannot take. All of that transferred
+without incident. Three things did not.
+
+### The push ring was a literal, and the hemisphere tail is not literal-sized
+
+`PUSH_ROWS = 64` carried the ladder. Every push row must be written before the
+submit — the WebGPU constraint this backend is built around — so a dispatch
+cannot reuse its predecessor's row, and the ring's length IS the longest
+program. The hemisphere tail is ~10 dispatches per `HEMI_BATCH` slice of the
+framebuffer: 30000 px at 200x150 is 8 batches, 720p is 57. The literal would
+have refused **every fb frame at every resolution**.
+
+`push_rows_for(depth_full, px, hemi)` now derives it, and `run_steps` gates
+against what was allocated rather than against a constant that can drift from
+it. The refusal was already loud, which is what made this a sizing decision
+rather than a soundness one.
+
+### One blanket `clear_buffer` broke two gates, and only one of them said so
+
+`run_steps` opened every frame with `enc.clear_buffer(&self.counters, ...)` —
+added for the ladder, where it is what makes a "> 0" must-fire mean anything on
+counters no kernel resets. Two kernels spell a KEEP-SET in HLSL, and a
+host-side clear silently overrides it:
+
+- **`cs_seed_replay` keeps CTR_LEAF / CTR_SKY / CTR_CUT / CTR_SKY_PX** — the
+  entire terminal structure it is about to re-dispatch. Cleared, the fills
+  launched zero groups and the replay wrote NOTHING. J9 said so immediately:
+  120000 poison survivors, all three diffs at full count.
+- **`cs_seed_probes` keeps the verify and stats counters across accumulate
+  seeds**, so the exact-zero gates observe every seed's rays. Cleared, J8
+  scored one seed in eight — **and PASSED**. The measurement: leaf-rays
+  **344 → 2752** and empty-cells **19 → 152** once the clear was lifted.
+  Exactly 8x, and the gate never said a word.
+
+That second one is the transferable half. The loud failure was found in the
+first run of a new gate; the quiet one was found only because fixing the loud
+one required understanding what the keep-set was FOR. A gate scoring 1/8 of its
+evidence reports the same verdicts as a gate scoring all of it — every counter
+was still exactly 0, because the seven unobserved seeds were also correct.
+
+The fix makes the clear a parameter, so the caller passes what its seed kernel
+expects and the two statements of the keep-set cannot drift apart. The probes
+path passes the same `clear` flag it hands `cs_seed_probes` as `push1` — one
+decision, spelled once on each side.
+
+### A fixed probe stride is a bar that means different things on different arms
+
+J8's probe set uses V8's construction: a scattered lattice, `surface_point`ed
+so both sides integrate at the exact same `(o, n)`. V8's strides are fixed at
+(41, 53). This gate renders at 400x300 on hardware and **160x120 on a software
+adapter — the CI arm** — where those strides yield SIX probes.
+
+Every bar in J8 is a statement about a MEAN, and a mean's noise floor scales as
+1/sqrt(N). At six probes the AO signed mean measured **-0.0050 against its
++/-0.005 bar**: a gate failing on sampling noise. Measured across three
+resolutions the reading was **+0.0006 (46 probes) / -0.0049 (12) / -0.0050
+(6)** — it straddles zero, which is what says the estimator is unbiased and the
+SAMPLE was the defect.
+
+The stride is derived from the frame now (9 candidate positions per axis), so
+the probe count sits near 50 on every adapter class and a bar means the same
+thing wherever it runs. Both arms then read **-0.0008**, hardware and software
+alike. Widening the tolerance was the available alternative and would have
+hidden the real bias this bar exists to catch.
+
+### Teeth, both ways
+
+- **The root-parity inversion** — the failure `vk/tracer.rs` calls silent, and
+  it is: the root writes `hqout`, so running it under the EVEN variant lands
+  its output in a queue nothing reads. Planted, J8 answers `leaf-rays 0`,
+  `psa-viol 45/56` with max error **3.14** (the whole hemisphere unaccounted),
+  AO mean |d| **0.5912** against a 0.02 bar and GI **100%** against 5%. The
+  `leaf-rays 0` must-fire is the universal detector — psa-viol caught only
+  45 of 56 probes in the AO arm.
+- **The stale cbuffer** — `render_wavefront_replay` with its `write_cb`
+  removed. J9's warm arm answers **45399 words** differing, and **arm 1 stays
+  completely clean** (0/0/0). That is the two arms proven non-redundant rather
+  than argued: arm 1 replays the same params, so both frames use the same
+  cbuffer and it structurally cannot see this.
+
+### Measured
+
+Procedural at 400x300 (hardware) and 160x120 (the CI arm), 21 units,
+9021.5 KB of WGSL, ~285 MB of tracer buffers of which ~280 MB is the
+hemisphere tier's per-batch transients (three 64 MB cell queues and an 88 MB
+cut pool — all under the 128 MB default `max_storage_buffer_binding_size`, so
+the tier costs device memory without costing a limits row).
+
+| | 400x300 | 160x120 |
+|---|---|---|
+| probes | 54 | 56 |
+| psa-viol / false-empty / tmin-overshoot | 0 / 0 / 0 | 0 / 0 / 0 |
+| AO mean \|d\| (limit 0.02) | 0.0070 | 0.0071 |
+| AO signed mean (limit ±0.005) | -0.0008 | -0.0008 |
+| GI mean rel (limit 5%) | 2.85% | 2.35% |
+| hemi-points vs hit-px | 85346 = 85346 | 13655 = 13655 |
+| J9 tbuf / info / accum diff | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The `hemi-points == hit-px` identity is exact rather than a tolerance, and it
+is spelled with `gfx::shaders::web_miss` rather than `is_finite` — a
+browser-corpus miss is FLT_MAX, the C2 constraint that once read 5545 of 19200
+sky pixels as geometry. An accounting identity is exactly what that predicate
+breaks silently.
+
+Next: the display stage (J18) — `tonemap.hlsl` and `blit.hlsl` DRAWN rather
+than dispatched, which needs `webgpu/layout.rs` to learn stage visibility and
+to union a vs/ps pair into one pipeline layout. Then the shader bake, and then
+Stage D: the web shell, and the first frustracer pixels in a browser tab.

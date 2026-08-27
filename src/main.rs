@@ -1448,7 +1448,7 @@ fn main() {
     if check_wgpu {
         #[cfg(any(unix, windows))]
         {
-            let code = run_check_wgpu(&scene, &bvh, cam0);
+            let code = run_check_wgpu(&scene, &bvh, cam0, structural);
             std::process::exit(code);
         }
         #[cfg(not(any(unix, windows)))]
@@ -15804,7 +15804,12 @@ fn run_check_wgsl(scene: &scene::Scene, default_scene: bool, write_golden: bool)
 /// `rt_sw.hlsli`, and the corpus without the lever declares an acceleration
 /// structure WebGPU cannot express.
 #[cfg(any(unix, windows))]
-fn run_check_wgpu(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
+fn run_check_wgpu(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    structural: bool,
+) -> i32 {
     let mut ok = true;
 
     // ---- J0: the pure half — meaningful on a box with no GPU at all. ----
@@ -15894,7 +15899,7 @@ fn run_check_wgpu(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
     }
 
     // ---- J6: the tracer. ----
-    ok &= run_check_wgpu_render(&hg, &sp, scene, bvh, cam0);
+    ok &= run_check_wgpu_render(&hg, &sp, scene, bvh, cam0, structural);
 
     println!("CHECK-WGPU {}", if ok { "PASSED" } else { "FAILED" });
     i32::from(!ok)
@@ -15968,6 +15973,7 @@ fn run_check_wgpu_render(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
     cam0: Camera,
+    structural: bool,
 ) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -16240,6 +16246,10 @@ fn run_check_wgpu_render(
 
     // ---- J7: the wavefront quadtree, against the reference kernel. ----
     ok &= run_check_wgpu_wavefront(hg, &tg, gw, gh, &params);
+    // ---- J8: the hemisphere bounce tiers. ----
+    ok &= run_check_wgpu_hemi(hg, &tg, scene, bvh, basis, q, gw, gh, structural);
+    // ---- J9: structure replay. ----
+    ok &= run_check_wgpu_replay(hg, &tg, gw, gh, &params);
     ok
 }
 
@@ -16586,6 +16596,557 @@ fn run_check_wgpu_wavefront(
     // a small one with a large mean-abs is misplaced light.
     if rel > 0.005 {
         fail(&mut ok, format!("sum rel diff {:.4}% above 0.5%", rel * 100.0));
+    }
+    ok
+}
+
+/// J8 — the HEMISPHERE BOUNCE TIERS (the H key's AO and GI) on WebGPU.
+///
+/// `--check-vk` V8's verdicts to the line, and for the reason J6 shares V6's:
+/// the two backends score the same integrator with the same statistics, so a
+/// disagreement between THEM is directly readable instead of merely
+/// suggestive.
+///
+/// Two halves, answering different questions. The PROBE half runs only the
+/// hemisphere passes over a CPU-generated point set, so both sides integrate at
+/// the exact same `(o, n)`:
+///
+/// - **psa-viol** — every point's projected solid angle must account to exactly
+///   pi. That is the integrator's own partition-of-unity: empty cells
+///   contribute analytically and leaf cells by sampling, and if the two
+///   together do not tile the hemisphere the estimate is wrong by whatever is
+///   missing, silently and in a way no image comparison localizes.
+/// - **false-empty** — an empty-cell claim re-validated with six real rays
+///   through the claimed-empty region. The hemisphere's spelling of the
+///   false-sky bug: a cell that proves emptiness it does not own drops
+///   occlusion on the floor.
+/// - **tmin-overshoot** — a leaf ray inherits `tc` from its OWN apex's tmin
+///   chain, never the primary tile's, and a tmin=0 reference ray must not hit
+///   strictly inside the claimed ball.
+///
+/// All three exact zero. The A/Bs are statistical BY CONSTRUCTION and stay at
+/// the CPU suite's own tolerances: AO against a 4096-sample cosine reference
+/// gates the SIGNED mean too, because that estimator is unbiased and a bias is
+/// the failure a mean-absolute bar cannot see; GI runs the same depth-1
+/// `BOUNCE_Q` policy on both sides so the comparison isolates integrator error
+/// from policy — which is also why `BOUNCE_Q.ao_samples` must stay > 0. At 0
+/// the estimator and the oracle share the policy constant, GI collapses toward
+/// a flat ambient, and every line below still passes.
+///
+/// The FRAME half then runs one real wavefront frame with GI on, which is the
+/// only thing that exercises what the probe path bypasses: `cs_leaf`'s fb arm
+/// appending one shading point per hit pixel (gated exactly, `pts == hits` — an
+/// accounting identity, not a tolerance), the batch loop draining them, and
+/// `cs_compose` turning `partial + ambw * ambient(H)` into finite radiance.
+///
+/// ONE THING SPELLED DIFFERENTLY FROM V8, and it is this backend's own
+/// constraint rather than a choice: **a hit is `!web_miss(t)`, not
+/// `t.is_finite()`**. WGSL has no infinity, so a browser-corpus miss is
+/// FLT_MAX — the C2 finding that read 5545 of 19200 sky pixels as geometry
+/// before `gfx::shaders::web_miss` existed. The `pts == hits` identity is
+/// exactly the kind of accounting that predicate silently breaks.
+///
+/// NOT covered here, and a real gap rather than an oversight: the CPU suite's
+/// `cut-miss` counter, which re-traverses from the root to prove a cut-seeded
+/// query saw everything the full tree would. That instrument lives in
+/// `hemi::VerifyCounters` and has no GPU counterpart on any backend.
+#[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
+fn run_check_wgpu_hemi(
+    hg: &webgpu::headless::WgpuHeadless,
+    tg: &webgpu::tracer::WgpuTracer,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    basis: camera::CamBasis,
+    q: Quality,
+    gw: usize,
+    gh: usize,
+    structural: bool,
+) -> bool {
+    use gfx::shaders as gs;
+
+    if !tg.has_hemi() {
+        println!("check-wgpu: SKIP J8 (this tracer has no hemisphere tiers)");
+        return true;
+    }
+    let mut ok = true;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-wgpu: FAIL J8 {msg}");
+        *ok = false;
+    };
+
+    // The probe set: center rays on a scattered lattice, `surface_point`ed so
+    // the apex and normal are EXACTLY what the CPU reference will use — the
+    // `--check-gpu` and V8 construction.
+    //
+    // THE STRIDE IS DERIVED FROM THE FRAME, and that is this gate's one
+    // departure from V8. Those suites use fixed (41, 53) strides, which is fine
+    // at their resolutions and degenerates here: this gate renders at 400x300
+    // on hardware but 160x120 on a software adapter — the CI arm — where the
+    // fixed stride yields SIX probes. Every bar below is a statement about a
+    // MEAN, and a mean's noise floor scales as 1/sqrt(N), so at six probes the
+    // AO signed mean measured -0.0050 against its +/-0.005 bar: a gate failing
+    // on sampling noise rather than on bias. (Measured across three
+    // resolutions the reading swings +0.0006 / -0.0049 / -0.0050 — it
+    // straddles zero, which is what says the estimator is unbiased and the
+    // SAMPLE was the defect.) Deriving the stride holds the probe count near
+    // 50 on every adapter class, so a bar means the same thing wherever it
+    // runs. Widening the tolerance instead would have hidden the real bias
+    // this bar exists to catch.
+    const AXIS: usize = 9; // candidate positions per axis -> ~50 probes after misses
+    let mut pts: Vec<(Vec3A, Vec3A)> = Vec::new();
+    {
+        let mut vls = stats::LocalStats::default();
+        let (sx, sy) = ((gw / AXIS).max(1), (gh / AXIS).max(1));
+        // The odd offsets stay: they keep the lattice off the frame's own
+        // symmetry axes, which is what the coprime strides were buying.
+        let mut y = 7usize;
+        while y < gh && pts.len() < 512 {
+            let mut x = 11usize;
+            while x < gw && pts.len() < 512 {
+                let ray =
+                    bvh::Ray::new(basis.origin, basis.ray_dir(x as f32 + 0.5, y as f32 + 0.5));
+                if let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes)
+                {
+                    pts.push(shade::surface_point(scene, &ray, &h));
+                }
+                x += sx;
+            }
+            y += sy;
+        }
+    }
+    if pts.is_empty() {
+        println!("check-wgpu: SKIP J8 (this pose has no geometry to place probes on)");
+        return true;
+    }
+    let (cap_cell, cap_cut) = tg.hemi_caps();
+    println!(
+        "check-wgpu: J8 hemi probe set: {} points | per-batch caps: {cap_cell} cells, {cap_cut} \
+         cut slots ({:.1} MB of transients)",
+        pts.len(),
+        (cap_cell * 3 * 64 + cap_cut * 256) as f64 / (1024.0 * 1024.0),
+    );
+
+    for (mode_name, fb) in [
+        ("AO", shade::FrustumBounce { ao: true, gi: false, depth: 3 }),
+        ("GI", shade::FrustumBounce { ao: false, gi: true, depth: 3 }),
+    ] {
+        // Multi-seed: the CB `frame` seeds the Arvo draws, so each pass is an
+        // independent estimate accumulating into the SAME H. The verify
+        // counters are kept across them (see `cs_seed_probes`), so the
+        // exact-zero gates below observe every seed's rays; PSA therefore
+        // totals SEEDS * pi rather than pi.
+        const SEEDS: u32 = 8;
+        let hq = Quality { fb, ..q };
+        let mut dispatch_ok = true;
+        for s in 0..SEEDS {
+            let p = gfx::frame::FrameParams {
+                cam: basis,
+                frame: s,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q: hq,
+                verify: true,
+                spp: 1,
+                probe_sample: 0,
+                clouds: clouds::Clouds::check(scene.diag),
+                fireflies: fireflies::Fireflies::check(scene),
+                sway_time: None,
+                sway_prev_time: None,
+                replay: false,
+            };
+            if let Err(e) = tg.run_hemi_probes(hg, &p, &pts, s == 0) {
+                fail(&mut ok, format!("hemi {mode_name} probes: {e}"));
+                dispatch_ok = false;
+                break;
+            }
+        }
+        if !dispatch_ok {
+            continue;
+        }
+        let (h, ctrs) = match (tg.read_hbuf(hg, pts.len()), tg.read_counters(hg)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                fail(&mut ok, format!("hemi {mode_name} readback"));
+                continue;
+            }
+        };
+        let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+
+        const FIXED: f64 = 262144.0;
+        let seeds_f = f64::from(SEEDS);
+        let mut psa_viol = 0usize;
+        let mut max_psa_err = 0.0f64;
+        for i in 0..pts.len() {
+            let acc = f64::from(h[i * 4 + 3]) / FIXED / seeds_f;
+            let err = (acc - std::f64::consts::PI).abs();
+            max_psa_err = max_psa_err.max(err);
+            if err > 1e-3 {
+                psa_viol += 1;
+            }
+        }
+        let (fe, tm) = (ctr(gs::CTR_V_FALSE_EMPTY), ctr(gs::CTR_V_TMIN));
+        println!(
+            "check-wgpu: J8 hemi {mode_name} gates ({} probes x {SEEDS} seeds): psa-viol \
+             {psa_viol} (max err {max_psa_err:.2e}) | false-empty {fe} | tmin-overshoot {tm} | \
+             empty-cells {} | leaf-rays {} | overflow {}",
+            pts.len(),
+            ctr(gs::CTR_HEMI_EMPTY),
+            ctr(gs::CTR_HEMI_RAYS),
+            ctr(gs::CTR_OVERFLOW),
+        );
+        if psa_viol != 0 || fe != 0 || tm != 0 {
+            fail(&mut ok, format!("hemi {mode_name} exact-zero gates"));
+        }
+        if ctr(gs::CTR_OVERFLOW) != 0 {
+            fail(
+                &mut ok,
+                format!("hemi {mode_name} queue overflow (a sizing bug, never a scene)"),
+            );
+        }
+        // ANTI-VACUITY, and it is doing real work: every gate above is
+        // satisfied by a run that integrated NOTHING. Leaf rays are the
+        // universal half — the sampled tier fires on any scene, and it is
+        // exactly what a mis-parity'd batch loses, since the root writing a
+        // queue nothing reads reads as `leaf-rays 0`.
+        if ctr(gs::CTR_HEMI_RAYS) == 0 {
+            fail(&mut ok, format!("hemi {mode_name} leaf rays 0 — the sampled tier never fired"));
+        }
+        // The ANALYTIC half is scene-dependent and follows the suite's own
+        // structural convention: a real scene can legitimately have no cell it
+        // can prove empty (V8 measured DamagedHelmet reading `empty-cells 0` at
+        // its default pose, with the CPU estimator agreeing per point).
+        if structural && ctr(gs::CTR_HEMI_EMPTY) == 0 {
+            fail(&mut ok, format!("hemi {mode_name} empty cells 0 — the analytic tier never fired"));
+        }
+
+        // ---- the A/B against a CPU reference at the same points ----
+        const REF_N: u32 = 4096;
+        let mut rng = fastrand::Rng::with_seed(0x1234_5678);
+        let mut vls = stats::LocalStats::default();
+        let sun = render::sun_dir(scene);
+        if mode_name == "AO" {
+            let (mut sum_abs, mut sum_signed) = (0.0f64, 0.0f64);
+            for (i, &(o, n)) in pts.iter().enumerate() {
+                let gpu_ao = f64::from(h[i * 4]) / FIXED / seeds_f / std::f64::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut open = 0.0f64;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    // `transmittance`, in lockstep with the estimator: tinted
+                    // shadows fold glass to its gray tint, and an opaque scene
+                    // keeps the old 0/1 counts exactly.
+                    let tp = bvh.transmittance(
+                        scene,
+                        &bvh::Ray::new(o, d),
+                        0.0,
+                        scene.ao_radius,
+                        &mut vls.ray_nodes,
+                    );
+                    open += f64::from((tp.x + tp.y + tp.z) / 3.0);
+                }
+                let cpu_ao = open / f64::from(REF_N);
+                sum_abs += (gpu_ao - cpu_ao).abs();
+                sum_signed += gpu_ao - cpu_ao;
+            }
+            let mean_abs = sum_abs / pts.len() as f64;
+            let mean_signed = sum_signed / pts.len() as f64;
+            println!(
+                "check-wgpu: J8 hemi AO A/B vs {REF_N}-sample cosine reference: mean |d| \
+                 {mean_abs:.4} (limit 0.02) | signed mean {mean_signed:+.4} (limit +/-0.005)"
+            );
+            if mean_abs >= 0.02 || mean_signed.abs() >= 0.005 {
+                fail(&mut ok, "hemi AO A/B (bias or error above the CPU-suite tolerances)".into());
+            }
+        } else {
+            let mut sum_rel = 0.0f64;
+            for (i, &(o, n)) in pts.iter().enumerate() {
+                let gpu_gi = Vec3A::new(
+                    h[i * 4] as f32 / FIXED as f32,
+                    h[i * 4 + 1] as f32 / FIXED as f32,
+                    h[i * 4 + 2] as f32 / FIXED as f32,
+                ) / SEEDS as f32
+                    / std::f32::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut sum = Vec3A::ZERO;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    let ray = bvh::Ray::new(o, d);
+                    sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes)
+                    {
+                        // GATHER, not radiance, and this is the sun-disc rule
+                        // rather than a detail of the reference: every gather
+                        // path calls `sky::gather`, which carries no disc.
+                        // A disc reaching here would double-count light the
+                        // direct loop already delivered AND fire ~1e3 radiance
+                        // into the fixed-point accumulator this A/B reads.
+                        None => {
+                            sky::gather(d, sun, scene.sky_scale, scene.night, scene.light_gain)
+                        }
+                        Some(hh) => shade::shade(
+                            scene,
+                            bvh,
+                            &ray,
+                            &hh,
+                            None,
+                            &hemi::BOUNCE_Q,
+                            &mut rng,
+                            sun,
+                            &clouds::Clouds::check(scene.diag),
+                            // The same bounce cone `hemi.rs`'s leaf shades use —
+                            // both arms have to sample textures alike.
+                            shade::Cone::bounce(),
+                            1,
+                            &mut vls,
+                            None,
+                            shade::VisCtl::Off,
+                            None,
+                            // Fireflies and emissive NEE both excluded, like the
+                            // hemi leaf shades this gates: the gather IS the
+                            // emissive transport.
+                            None,
+                            None,
+                        ),
+                    };
+                }
+                let cpu_gi = sum / REF_N as f32;
+                sum_rel +=
+                    f64::from((gpu_gi - cpu_gi).length()) / f64::from(cpu_gi.length().max(1e-6));
+            }
+            let mean_rel = sum_rel / pts.len() as f64;
+            println!(
+                "check-wgpu: J8 hemi GI A/B vs {REF_N}-sample BOUNCE_Q reference: mean rel \
+                 {:.2}% (limit 5%)",
+                mean_rel * 100.0
+            );
+            if mean_rel >= 0.05 {
+                fail(&mut ok, "hemi GI A/B (above the CPU-suite 5% tolerance)".into());
+            }
+        }
+    }
+
+    // ---- the frame half: one real GI frame through the whole pipeline ----
+    //
+    // This is what the probe path cannot reach. `cs_leaf`'s fb arm appends the
+    // shading points, the batch loop drains them, and compose folds H into
+    // accum — and the point count against the hit count is an exact ACCOUNTING
+    // identity, so it catches an append that silently drops or doubles.
+    {
+        let p = gfx::frame::FrameParams {
+            cam: basis,
+            frame: 0,
+            accumulate: false,
+            jitter: false,
+            frame_jitter: None,
+            prev_cam: None,
+            q: Quality { fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 }, ..q },
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: clouds::Clouds::check(scene.diag),
+            fireflies: fireflies::Fireflies::check(scene),
+            sway_time: None,
+            sway_prev_time: None,
+            replay: false,
+        };
+        let px = gw * gh;
+        if let Err(e) = tg.render_wavefront(hg, &p, false) {
+            fail(&mut ok, format!("hemi frame dispatch: {e}"));
+            return ok;
+        }
+        let (acc, t_w, ctrs) = match (
+            tg.read_f32(hg, &tg.accum, px * 3),
+            tg.read_f32(hg, &tg.tbuf, px),
+            tg.read_counters(hg),
+        ) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => {
+                fail(&mut ok, "hemi frame readback".into());
+                return ok;
+            }
+        };
+        let ctr = |i: u32| ctrs.get(i as usize).copied().unwrap_or(0);
+        // NOT `is_finite` — see the header. A browser-corpus miss is FLT_MAX.
+        let hits = t_w.iter().filter(|&&t| !gs::web_miss(t)).count();
+        let n_pts = ctr(gs::CTR_HEMI_PT) as usize;
+        let nonfinite = acc.iter().filter(|v| !v.is_finite()).count();
+        println!(
+            "check-wgpu: J8 hemi GI frame: hit-px {hits} | hemi-points {n_pts} | hemi-rays {} | \
+             empty-cells {} | overflow {} | non-finite {nonfinite}",
+            ctr(gs::CTR_HEMI_RAYS),
+            ctr(gs::CTR_HEMI_EMPTY),
+            ctr(gs::CTR_OVERFLOW),
+        );
+        if n_pts != hits {
+            fail(
+                &mut ok,
+                format!("hemi point count {n_pts} != hit pixels {hits} (the leaf-pass append)"),
+            );
+        }
+        if ctr(gs::CTR_OVERFLOW) != 0 || nonfinite != 0 {
+            fail(&mut ok, "hemi frame overflow / non-finite radiance".into());
+        }
+        if hits == 0 || ctr(gs::CTR_HEMI_RAYS) == 0 {
+            fail(
+                &mut ok,
+                "hemi frame must-fires (hit pixels and leaf rays both expected > 0)".into(),
+            );
+        }
+    }
+    ok
+}
+
+/// J9 — STRUCTURE REPLAY: a bit-equal-basis frame skips the seed and the whole
+/// level ladder and re-dispatches the persisted terminal queues.
+///
+/// The claim is exactly one sentence, and it is why this can be gated bitwise
+/// rather than statistically: the terminal structure is a pure function of
+/// (scene, BVH, basis, rw, rh), while spp / jitter / frame / fb / quality /
+/// clouds all ride the cbuffer. So a replay frame re-shades from a FRESH
+/// `FrameParams` against a structure that provably still describes this view,
+/// and the result must be bit-identical to a frame that traced it again.
+///
+/// TWO ARMS, because they fail differently:
+///
+/// * **frame 0** — produce, snapshot, replay the SAME params, compare
+///   tbuf/info/accum bitwise. Catches a replay that re-shades wrongly.
+/// * **warm frame 1** — produce frame 0, then replay at frame 1 against a
+///   fresh trace at frame 1. Catches a replay that quietly reuses frame 0's
+///   cbuffer instead of the one just written, which the first arm cannot see
+///   because there the two cbuffers are identical.
+///
+/// ANTI-VACUITY IS THE HARD PART HERE and it is structural rather than a
+/// counter: a replay that dispatched NOTHING leaves `accum` holding the
+/// produced frame, and every bitwise comparison then passes. So the buffers are
+/// POISONED between the two renders — the C2b lesson, where a planted ping-pong
+/// bug made the ladder emit zero terminal records and the image A/B compared
+/// clean because nothing had overwritten the reference frame.
+#[cfg(any(unix, windows))]
+fn run_check_wgpu_replay(
+    hg: &webgpu::headless::WgpuHeadless,
+    tg: &webgpu::tracer::WgpuTracer,
+    gw: usize,
+    gh: usize,
+    params: &dyn Fn(u32) -> gfx::frame::FrameParams,
+) -> bool {
+    let mut ok = true;
+    let px = gw * gh;
+    let fail = |ok: &mut bool, msg: String| {
+        eprintln!("check-wgpu: FAIL J9 {msg}");
+        *ok = false;
+    };
+    // Each render must OVERWRITE `accum` for a bitwise A/B to mean anything —
+    // J7 and J8 left frames in it.
+    let one = |f: u32| {
+        let mut p = params(f);
+        p.accumulate = false;
+        p.jitter = false;
+        p
+    };
+    const POISON: u32 = 0xEEEE_EEEE;
+    let read = |what: &str| -> Result<(Vec<u32>, Vec<u32>, Vec<u32>), String> {
+        Ok((
+            tg.read_u32(hg, &tg.tbuf, px).map_err(|e| format!("{what} tbuf: {e}"))?,
+            tg.read_u32(hg, &tg.info, px).map_err(|e| format!("{what} info: {e}"))?,
+            tg.read_u32(hg, &tg.accum, px * 3).map_err(|e| format!("{what} accum: {e}"))?,
+        ))
+    };
+    let diff = |a: &[u32], b: &[u32]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+
+    // ---- arm 1: produce, then replay the same params ----
+    if let Err(e) = tg.render_wavefront(hg, &one(0), true) {
+        fail(&mut ok, format!("producing frame: {e}"));
+        return ok;
+    }
+    let produced = match read("produced") {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, e);
+            return ok;
+        }
+    };
+    // The poison, and its own must-fire below: a replay that dispatched nothing
+    // would otherwise be compared against the frame it never overwrote.
+    tg.poison(hg, POISON);
+    if let Err(e) = tg.render_wavefront_replay(hg, &one(0), true) {
+        fail(&mut ok, format!("replay frame: {e}"));
+        return ok;
+    }
+    let replayed = match read("replayed") {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, e);
+            return ok;
+        }
+    };
+    let survived = replayed.2.iter().filter(|&&w| w == POISON).count()
+        + replayed.0.iter().filter(|&&w| w == POISON).count();
+    let (td, idiff, ad) = (
+        diff(&produced.0, &replayed.0),
+        diff(&produced.1, &replayed.1),
+        diff(&produced.2, &replayed.2),
+    );
+    println!(
+        "check-wgpu: J9 structure replay (frame 0): tbuf-diff {td} | info-diff {idiff} | \
+         accum-diff {ad} | poison survivors {survived}"
+    );
+    if survived != 0 {
+        fail(
+            &mut ok,
+            format!(
+                "{survived} words still hold the poison — the replay wrote nothing there, and an \
+                 unwritten buffer compares clean against the frame that filled it"
+            ),
+        );
+    }
+    if td != 0 || idiff != 0 || ad != 0 {
+        fail(&mut ok, "a replayed frame must be BIT-IDENTICAL to the frame it replays".into());
+    }
+
+    // ---- arm 2: the warm frame, against a fresh trace of the same ----
+    //
+    // Beside arm 1 rather than folded into it: there the two cbuffers are
+    // identical, so a replay that reused the PREVIOUS cbuffer instead of the
+    // one just written would pass. Here they differ in `frame`.
+    if let Err(e) = tg.render_wavefront(hg, &one(0), true) {
+        fail(&mut ok, format!("warm producing frame: {e}"));
+        return ok;
+    }
+    tg.poison(hg, POISON);
+    if let Err(e) = tg.render_wavefront_replay(hg, &one(1), true) {
+        fail(&mut ok, format!("warm replay frame: {e}"));
+        return ok;
+    }
+    let warm_replay = match read("warm replay") {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, e);
+            return ok;
+        }
+    };
+    if let Err(e) = tg.render_wavefront(hg, &one(1), true) {
+        fail(&mut ok, format!("warm fresh frame: {e}"));
+        return ok;
+    }
+    let warm_fresh = match read("warm fresh") {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&mut ok, e);
+            return ok;
+        }
+    };
+    let wd = diff(&warm_replay.2, &warm_fresh.2);
+    println!("check-wgpu: J9 structure replay (warm frame 1): accum-diff {wd}");
+    if wd != 0 {
+        fail(
+            &mut ok,
+            format!(
+                "a replay at frame 1 differs from a fresh trace at frame 1 in {wd} words — the \
+                 replay is shading against a stale cbuffer"
+            ),
+        );
     }
     ok
 }

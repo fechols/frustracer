@@ -94,7 +94,7 @@ of NVIDIA's NRD entry names.
 | `--check-vk` | unix + Vulkan | the Vulkan backend, stages V0–V20 |
 | `--check-spirv` | DXC/spirv-val (any OS) | the whole shader corpus → SPIR-V |
 | `--check-wgsl` | DXC (any OS; naga is built in) | the BROWSER corpus → SPIR-V → naga-validated WGSL round-trip + W5 layout audit + W6 hostile scan + W7 tracked corpus golden (`goldens/web_corpus.txt`, regenerated via `--write-golden`; W0 is DXC-free) |
-| `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe, the indirect smoke, **J6 the browser's reference tracer vs the CPU**, **J7 the wavefront quadtree vs that reference** (J0 is pure; the smoke KERNEL is scene-free but the DEVICE is scene-keyed from J1 on — the ask lands in `required_limits`) |
+| `--check-wgpu` | any wgpu adapter (llvmpipe/WARP count) + DXC for J2+ | that chain's output EXECUTING on a WebGPU device — adapter/limits probe, the indirect smoke, **J6 the browser's reference tracer vs the CPU**, **J7 the wavefront quadtree vs that reference**, **J8 the hemisphere bounce tiers** (probe half + one real GI frame), **J9 structure replay, bitwise** (J0 is pure; the smoke KERNEL is scene-free but the DEVICE is scene-keyed from J1 on — the ask lands in `required_limits`) |
 | `--check-msl` | macOS + spirv-cross | the corpus → MSL → metallib |
 | `--check-mtl` | macOS + Metal device | the backend binding and DISPATCHING those metallibs |
 | `--check-metalfx` | macOS | MetalFX temporal upscale/denoise |
